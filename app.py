@@ -5,6 +5,7 @@ import io
 import importlib
 import inspect
 import json
+import logging
 import os
 import re
 import secrets
@@ -51,6 +52,15 @@ DETECTION_CONFIDENCE_THRESHOLD = 0.55
 MAX_USER_STROKES = 2_000
 MAX_POINTS_PER_STROKE = 10_000
 MAX_TOTAL_USER_POINTS = 200_000
+MAX_DEBUG_RASTER_DIMENSION = 1600
+MAX_DEBUG_SVG_BYTES = 16 * 1024 * 1024
+MAX_DEBUG_SVG_PATHS = 2_500
+
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+LOGGER = logging.getLogger("boardlift.pipeline")
 
 app = Flask(__name__)
 app.config.update(
@@ -356,12 +366,37 @@ def vector_result_svg(result: Any) -> bytes:
 
 def vectorize_image(
     image: np.ndarray,
-) -> tuple[bytes, str, list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[bytes, str, list[dict[str, Any]], dict[str, Any], Any | None]:
     try:
         processing = importlib.import_module("processing")
+        mask_started = time.perf_counter()
+        LOGGER.info(
+            "ANALYSIS / MASK GENERATION START dimensions=%dx%d",
+            image.shape[1],
+            image.shape[0],
+        )
         ink = processing.detect_ink(image)
+        LOGGER.info(
+            "ANALYSIS / MASK GENERATION COMPLETE elapsed=%.3fs foreground_pixels=%d",
+            time.perf_counter() - mask_started,
+            int(np.count_nonzero(ink.combined_mask)),
+        )
+        vector_started = time.perf_counter()
+        LOGGER.info("CONTOUR PROCESSING START")
         result = processing.faithful_vectorize(image, ink)
+        LOGGER.info(
+            "CONTOUR PROCESSING COMPLETE elapsed=%.3fs method=%s",
+            time.perf_counter() - vector_started,
+            result.selected_method,
+        )
+        svg_started = time.perf_counter()
+        LOGGER.info("SVG SERIALIZATION START")
         svg = processing.generate_svg(result, metadata={"method": result.selected_method})
+        LOGGER.info(
+            "SVG SERIALIZATION COMPLETE elapsed=%.3fs bytes=%d",
+            time.perf_counter() - svg_started,
+            len(svg.encode("utf-8")),
+        )
         objects: list[dict[str, Any]] = []
         metrics: dict[str, Any] = {}
         if result.selected_method == "conservative" and result.filled is not None:
@@ -398,35 +433,50 @@ def vectorize_image(
                         "width": round(float(path.stroke_width), 3),
                     }
                 )
-        return svg.encode("utf-8"), str(result.selected_method), objects, metrics
+        return svg.encode("utf-8"), str(result.selected_method), objects, metrics, ink
     except (ImportError, ModuleNotFoundError, AttributeError):
-        pass
-    except Exception:
+        LOGGER.exception("Processing package unavailable; using raster SVG fallback")
+    except Exception as error:
+        LOGGER.exception("Conservative vectorization failed: %s", error)
+        # Reuse the completed masks if they exist. Re-running mask generation
+        # after a failure repeated the formerly pathological stage and could
+        # turn one recoverable error into another long request.
+        existing_ink = locals().get("ink")
+        if existing_ink is None:
+            return baseline_svg(image), "baseline", [], {}, None
         try:
-            ink_module = importlib.import_module("processing.ink_detection")
             vector_module = importlib.import_module("processing.vectorization")
-            result = vector_module.vectorize(image, ink_module.detect_ink(image))
+            result = vector_module.vectorize(image, existing_ink)
             return (
                 vector_result_svg(result),
                 str(getattr(result, "method", "centerline")),
                 [],
                 {},
+                existing_ink,
             )
-        except Exception:
-            pass
-    return baseline_svg(image), "baseline", [], {}
+        except Exception as fallback_error:
+            LOGGER.exception("Centerline fallback failed: %s", fallback_error)
+    return baseline_svg(image), "baseline", [], {}, None
 
 
 def write_debug_artifacts(
-    board_dir: Path, metadata: dict[str, Any], master: np.ndarray, svg: bytes
+    board_dir: Path,
+    metadata: dict[str, Any],
+    master: np.ndarray,
+    svg: bytes,
+    ink: Any | None = None,
 ) -> None:
     """Generate optional diagnostics; no diagnostic may fail the board."""
     assets = metadata.setdefault("assets", {})
     analysis_dir = board_dir / "analysis"
     analysis_dir.mkdir(exist_ok=True)
+    if ink is None:
+        LOGGER.warning(
+            "DEBUG RASTERIZATION SKIPPED: analysis masks unavailable; master remains usable"
+        )
+        return
     try:
         processing = importlib.import_module("processing")
-        ink = processing.detect_ink(master)
         atomic_image(analysis_dir / "ink_mask.png", ink.combined_mask)
         assets["mask"] = "analysis/ink_mask.png"
         assets["ink_mask"] = "analysis/ink_mask.png"
@@ -435,18 +485,63 @@ def write_debug_artifacts(
             atomic_image(analysis_dir / filename, mask)
             assets[f"{color}_mask"] = f"analysis/{filename}"
         confidence = np.maximum.reduce(list(ink.confidence_maps.values()))
-        confidence_image = np.clip(confidence * 255.0, 0, 255).astype(np.uint8)
-        atomic_image(analysis_dir / "confidence.png", confidence_image)
+        # A clean, human-readable confidence board: white background with
+        # accepted ink darkened according to confidence. This is derived from
+        # analysis and never modifies the full-color Enhanced Master.
+        confidence_image = np.full(master.shape[:2], 255, dtype=np.uint8)
+        accepted = ink.combined_mask != 0
+        confidence_image[accepted] = np.clip(
+            220.0 * (1.0 - confidence[accepted]), 0, 205
+        ).astype(np.uint8)
         assets["confidence"] = "analysis/confidence.png"
+        atomic_image(analysis_dir / "confidence.png", confidence_image)
         metadata["ink_confidences"] = {
             str(key): round(float(value), 6) for key, value in ink.confidences.items()
         }
-        rendered = processing.rasterize_svg(svg, output_width=master.shape[1], output_height=master.shape[0])
+        debug_scale = min(
+            1.0, MAX_DEBUG_RASTER_DIMENSION / max(master.shape[1], master.shape[0])
+        )
+        debug_width = max(1, round(master.shape[1] * debug_scale))
+        debug_height = max(1, round(master.shape[0] * debug_scale))
+        LOGGER.info(
+            "DEBUG RASTERIZATION START svg_bytes=%d paths=%d render_dimensions=%dx%d",
+            len(svg),
+            svg.count(b"<path"),
+            debug_width,
+            debug_height,
+        )
+        raster_started = time.perf_counter()
+        rendered = None
+        path_count = svg.count(b"<path")
+        if len(svg) <= MAX_DEBUG_SVG_BYTES and path_count <= MAX_DEBUG_SVG_PATHS:
+            rendered = processing.rasterize_svg(
+                svg, output_width=debug_width, output_height=debug_height
+            )
+        else:
+            LOGGER.warning(
+                "SAFETY LIMIT: skipped CairoSVG svg_bytes=%d/%d paths=%d/%d; using mask-derived debug raster",
+                len(svg),
+                MAX_DEBUG_SVG_BYTES,
+                path_count,
+                MAX_DEBUG_SVG_PATHS,
+            )
         if not isinstance(rendered, np.ndarray) or not rendered.size:
             # Keep the required diagnostics useful when Cairo's native runtime
             # is unavailable: render the exact accepted mask pixels in source color.
             rendered = np.full_like(master, 255)
             rendered[ink.combined_mask != 0] = master[ink.combined_mask != 0]
+        elif rendered.shape[:2] != master.shape[:2]:
+            rendered = cv2.resize(
+                rendered,
+                (master.shape[1], master.shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        LOGGER.info(
+            "DEBUG RASTERIZATION COMPLETE elapsed=%.3fs output_dimensions=%dx%d",
+            time.perf_counter() - raster_started,
+            rendered.shape[1],
+            rendered.shape[0],
+        )
         atomic_image(analysis_dir / "svg_raster.png", rendered)
         assets["digitized"] = "analysis/svg_raster.png"
         assets["svg_raster"] = "analysis/svg_raster.png"
@@ -469,6 +564,7 @@ def set_stage(metadata: dict[str, Any], stage: str, started: float) -> None:
 def run_downstream(
     board_dir: Path, metadata: dict[str, Any], image: np.ndarray, corners: np.ndarray
 ) -> None:
+    pipeline_started = time.perf_counter()
     pipeline = metadata.setdefault("pipeline", {})
     pipeline["status"] = "processing"
     errors = pipeline.setdefault("errors", [])
@@ -476,6 +572,11 @@ def run_downstream(
 
     corrected = image
     started = time.perf_counter()
+    LOGGER.info(
+        "PERSPECTIVE CORRECTION START source_dimensions=%dx%d",
+        image.shape[1],
+        image.shape[0],
+    )
     try:
         corrected = perspective_correct(image, corners)
         atomic_image(board_dir / "corrected.png", corrected)
@@ -485,9 +586,19 @@ def run_downstream(
         atomic_image(board_dir / "corrected.png", image)
         metadata["assets"]["corrected"] = "corrected.png"
     set_stage(metadata, "correction", started)
+    LOGGER.info(
+        "PERSPECTIVE CORRECTION COMPLETE output_dimensions=%dx%d",
+        corrected.shape[1],
+        corrected.shape[0],
+    )
 
     master = corrected
     started = time.perf_counter()
+    LOGGER.info(
+        "MASTER ENHANCEMENT START dimensions=%dx%d",
+        corrected.shape[1],
+        corrected.shape[0],
+    )
     try:
         master = enhance_image(corrected)
     except Exception as exc:
@@ -501,8 +612,14 @@ def run_downstream(
             "height": int(master.shape[0]),
         }
     set_stage(metadata, "enhancement", started)
+    LOGGER.info(
+        "MASTER ENHANCEMENT COMPLETE dimensions=%dx%d immutable_source=master.png",
+        master.shape[1],
+        master.shape[0],
+    )
 
     started = time.perf_counter()
+    LOGGER.info("SAVE ANALYSIS METADATA START")
     try:
         analysis = analyze_image(master)
     except Exception as exc:
@@ -514,7 +631,7 @@ def run_downstream(
 
     started = time.perf_counter()
     try:
-        svg, vector_method, vector_objects, vector_metrics = vectorize_image(master)
+        svg, vector_method, vector_objects, vector_metrics, ink = vectorize_image(master)
         atomic_bytes(board_dir / "board.svg", svg)
         metadata["assets"]["svg"] = "board.svg"
         pipeline["vector_method"] = vector_method
@@ -524,7 +641,7 @@ def run_downstream(
             "metrics": vector_metrics,
             "svg_bytes": len(svg),
         }
-        write_debug_artifacts(board_dir, metadata, master, svg)
+        write_debug_artifacts(board_dir, metadata, master, svg, ink)
     except Exception as exc:
         errors.append({"stage": "vectorization", "message": str(exc)})
         try:
@@ -535,7 +652,19 @@ def run_downstream(
             errors.append({"stage": "vector_fallback", "message": str(fallback_exc)})
     set_stage(metadata, "vectorization", started)
     pipeline["status"] = "ready"
+    pipeline["timings_ms"]["total_downstream"] = round(
+        (time.perf_counter() - pipeline_started) * 1000, 2
+    )
+    LOGGER.info(
+        "SAVE ARTIFACTS START board=%s",
+        metadata.get("id", "unknown"),
+    )
     update_metadata(board_dir, metadata)
+    LOGGER.info(
+        "SAVE ARTIFACTS COMPLETE board=%s total=%.3fs",
+        metadata.get("id", "unknown"),
+        time.perf_counter() - pipeline_started,
+    )
 
 
 def validate_corners(value: Any, image: np.ndarray) -> np.ndarray:
@@ -749,6 +878,12 @@ def index() -> str:
 
 @app.post("/upload")
 def upload() -> Response | tuple[str, int]:
+    upload_started = time.perf_counter()
+    LOGGER.info(
+        "UPLOAD START content_length=%s content_type=%s",
+        request.content_length,
+        request.content_type,
+    )
     uploaded = request.files.get("image")
     if uploaded is None or not uploaded.filename:
         return "Select an image to upload.", 400
@@ -759,13 +894,29 @@ def upload() -> Response | tuple[str, int]:
     if content_type not in ALLOWED_MIME_TYPES:
         return "Unsupported image content type.", 415
     data = uploaded.read(app.config["MAX_CONTENT_LENGTH"] + 1)
+    LOGGER.info(
+        "UPLOAD COMPLETE filename=%s bytes=%d elapsed=%.3fs",
+        Path(uploaded.filename).name,
+        len(data),
+        time.perf_counter() - upload_started,
+    )
     if len(data) > app.config["MAX_CONTENT_LENGTH"]:
         raise RequestEntityTooLarge()
     try:
+        load_started = time.perf_counter()
+        LOGGER.info("IMAGE LOAD START encoded_bytes=%d", len(data))
         image_format = inspect_image_content(data)
         if image_format != FORMAT_FOR_EXTENSION[extension] or image_format != FORMAT_FOR_MIME[content_type]:
             raise ValueError("The filename, content type, and image encoding do not match.")
         image = decode_image(data)
+        LOGGER.info(
+            "IMAGE LOAD COMPLETE format=%s dimensions=%dx%d pixels=%d elapsed=%.3fs",
+            image_format,
+            image.shape[1],
+            image.shape[0],
+            image.shape[1] * image.shape[0],
+            time.perf_counter() - load_started,
+        )
     except ValueError as exc:
         return f"Invalid image: {exc}", 400
 
@@ -792,8 +943,18 @@ def upload() -> Response | tuple[str, int]:
     update_metadata(board_dir, metadata)
 
     started = time.perf_counter()
+    LOGGER.info(
+        "BOARD DETECTION START dimensions=%dx%d",
+        image.shape[1],
+        image.shape[0],
+    )
     corners, confidence = detect_corners(image)
     set_stage(metadata, "detection", started)
+    LOGGER.info(
+        "BOARD DETECTION COMPLETE confidence=%.4f elapsed=%.3fs",
+        confidence,
+        time.perf_counter() - started,
+    )
     metadata["detection"] = {
         "confidence": round(float(confidence), 4),
         "threshold": DETECTION_CONFIDENCE_THRESHOLD,
@@ -818,9 +979,19 @@ def upload() -> Response | tuple[str, int]:
         metadata["assets"]["master"] = "master.png"
         metadata["dimensions"] = {"width": int(image.shape[1]), "height": int(image.shape[0])}
         update_metadata(board_dir, metadata)
+        LOGGER.info(
+            "TOTAL COMPLETE board=%s state=needs_corners elapsed=%.3fs",
+            board_id,
+            time.perf_counter() - upload_started,
+        )
         return redirect(url_for("board", board_id=board_id))
 
     run_downstream(board_dir, metadata, image, corners)
+    LOGGER.info(
+        "TOTAL COMPLETE board=%s state=ready elapsed=%.3fs",
+        board_id,
+        time.perf_counter() - upload_started,
+    )
     return redirect(url_for("board", board_id=board_id))
 
 
@@ -837,6 +1008,7 @@ def board(board_id: str) -> str | Response:
 
 @app.post("/board/<board_id>/corners")
 def set_corners(board_id: str) -> Response | tuple[str, int]:
+    request_started = time.perf_counter()
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     image = load_original(board_dir, metadata)
@@ -869,7 +1041,13 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
             pass
     metadata.setdefault("pipeline", {})["status"] = "processing"
     update_metadata(board_dir, metadata)
+    LOGGER.info("MANUAL CORNERS ACCEPTED board=%s", board_id)
     run_downstream(board_dir, metadata, image, corners)
+    LOGGER.info(
+        "TOTAL COMPLETE board=%s state=ready manual=true elapsed=%.3fs",
+        board_id,
+        time.perf_counter() - request_started,
+    )
     if request.is_json:
         return jsonify(id=board_id, status="ready", url=url_for("board", board_id=board_id))
     return redirect(url_for("board", board_id=board_id))

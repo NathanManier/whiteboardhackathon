@@ -115,7 +115,13 @@ def analyze_whiteboard(
     artifacts["ink_mask"] = ink_mask_path
     artifacts["mask_combined"] = ink_mask_path
     confidence = np.maximum.reduce(list(ink.confidence_maps.values()))
-    confidence_image = np.clip(confidence * 255.0, 0, 255).astype(np.uint8)
+    # Human-readable confidence board: accepted ink on white, shaded by
+    # confidence. The numerical detection/ink confidence values are unchanged.
+    confidence_image = np.full(master.image.shape[:2], 255, dtype=np.uint8)
+    accepted = ink.combined_mask != 0
+    confidence_image[accepted] = np.clip(
+        220.0 * (1.0 - confidence[accepted]), 0, 205
+    ).astype(np.uint8)
     artifacts["confidence"] = _write_image(directory / "confidence.png", confidence_image)
 
     stage = time.monotonic()

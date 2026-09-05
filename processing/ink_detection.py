@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import time
 from types import MappingProxyType
 from typing import Mapping
 
@@ -12,6 +14,7 @@ import numpy as np
 from .master_raster import MasterRaster
 
 INK_COLORS = ("black", "red", "blue", "green")
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -32,27 +35,35 @@ def _hue_membership(hue: np.ndarray, center: float, half_width: float) -> np.nda
 
 def _clean_mask(mask: np.ndarray, minimum_contour_area: float) -> np.ndarray:
     """Close one-pixel gaps without widening scale or erasing fine handwriting."""
+    del minimum_contour_area  # Kept for API compatibility with earlier tuning.
+    started = time.monotonic()
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(closed, 8)
-    filtered = np.zeros_like(closed)
-    for label in range(1, count):
-        component = (labels == label).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contour_area = max((abs(cv2.contourArea(contour)) for contour in contours), default=0.0)
-        pixel_area = int(stats[label, cv2.CC_STAT_AREA])
-        box_width = int(stats[label, cv2.CC_STAT_WIDTH])
-        box_height = int(stats[label, cv2.CC_STAT_HEIGHT])
-        # A degenerate but long one-pixel stroke has zero contour area and is
-        # still meaningful. Only reject truly point-like sensor noise.
+    keep = np.ones(count, dtype=bool)
+    keep[0] = False
+    if count > 1:
+        # The previous implementation built a full-resolution temporary mask
+        # and called findContours once per component. On photographic noise
+        # this became O(component_count * pixels) and appeared to hang. These
+        # label statistics express the same conservative point-noise rule in
+        # one O(pixels + components) pass while retaining long one-pixel marks.
+        component_stats = stats[1:]
         extremely_tiny = (
-            contour_area < minimum_contour_area
-            and pixel_area < 3
-            and box_width <= 2
-            and box_height <= 2
+            (component_stats[:, cv2.CC_STAT_AREA] < 3)
+            & (component_stats[:, cv2.CC_STAT_WIDTH] <= 2)
+            & (component_stats[:, cv2.CC_STAT_HEIGHT] <= 2)
         )
-        if not extremely_tiny:
-            filtered[labels == label] = 255
+        keep[1:] = ~extremely_tiny
+    filtered = (keep[labels].astype(np.uint8) * 255)
+    LOGGER.info(
+        "MASK CLEAN END components=%d kept=%d rejected_tiny=%d pixels=%d elapsed=%.3fs",
+        count - 1,
+        int(np.count_nonzero(keep[1:])),
+        int(np.count_nonzero(~keep[1:])),
+        mask.size,
+        time.monotonic() - started,
+    )
     return filtered
 
 
@@ -70,6 +81,13 @@ def detect_ink(
     if image.ndim != 3 or image.shape[2] < 3:
         raise ValueError("master must be a BGR color image")
     bgr = image[:, :, :3]
+    started = time.monotonic()
+    LOGGER.info(
+        "ANALYSIS / MASK GENERATION START dimensions=%dx%d pixels=%d",
+        image.shape[1],
+        image.shape[0],
+        image.shape[1] * image.shape[0],
+    )
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     hue, saturation, value = cv2.split(hsv)
@@ -107,6 +125,7 @@ def detect_ink(
     maps: dict[str, np.ndarray] = {}
     summaries: dict[str, float] = {}
     for index, color in enumerate(INK_COLORS):
+        color_started = time.monotonic()
         confidence = confidence_stack[:, :, index]
         threshold = confidence_threshold if color == "black" else min(confidence_threshold, 0.07)
         mask = ((winner == index) & (confidence >= threshold)).astype(np.uint8) * 255
@@ -119,10 +138,22 @@ def detect_ink(
         masks[color] = filtered
         selected = confidence[filtered != 0]
         summaries[color] = float(selected.mean()) if selected.size else 0.0
+        LOGGER.info(
+            "MASK %s END foreground_pixels=%d confidence=%.4f elapsed=%.3fs",
+            color,
+            int(np.count_nonzero(filtered)),
+            summaries[color],
+            time.monotonic() - color_started,
+        )
 
     combined = np.maximum.reduce(list(masks.values()))
     combined = np.ascontiguousarray(combined)
     combined.setflags(write=False)
+    LOGGER.info(
+        "ANALYSIS / MASK GENERATION END foreground_pixels=%d elapsed=%.3fs",
+        int(np.count_nonzero(combined)),
+        time.monotonic() - started,
+    )
     return InkDetectionResult(
         MappingProxyType(masks),
         MappingProxyType(maps),
