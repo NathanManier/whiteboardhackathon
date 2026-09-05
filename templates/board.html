@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f4ef">
+  <title>Board workspace · Boardlift</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="workspace-page">
+  <header class="workspace-header">
+    <a class="brand" href="/" aria-label="Boardlift home">
+      <span class="brand-mark" aria-hidden="true">B</span>
+      <span>Boardlift</span>
+    </a>
+    <div class="board-title">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="board-name">Board workspace</span>
+      <span class="save-status" id="save-status" role="status" aria-live="polite">Ready</span>
+    </div>
+    <div class="header-actions">
+      <a class="button button-ghost button-small" href="/">New board</a>
+      <button class="button button-dark button-small" id="export-button" type="button">
+        Export SVG
+      </button>
+    </div>
+  </header>
+
+  <main id="board-app" class="board-app" data-board-id="{{ board_id|default('', true) }}">
+    <section id="corner-workspace" class="corner-workspace" hidden aria-labelledby="corner-title">
+      <div class="instruction-panel">
+        <p class="step-label">Manual correction</p>
+        <h1 id="corner-title">Mark the four board corners</h1>
+        <p>Drag each numbered handle onto the matching corner. Order matters: start at the top left and move clockwise.</p>
+        <ol class="corner-order">
+          <li><span>1</span>Top left</li>
+          <li><span>2</span>Top right</li>
+          <li><span>3</span>Bottom right</li>
+          <li><span>4</span>Bottom left</li>
+        </ol>
+        <div class="panel-actions">
+          <button class="button button-ghost" id="reset-corners" type="button">Reset</button>
+          <button class="button button-primary" id="submit-corners" type="button">
+            Correct board
+          </button>
+        </div>
+        <p class="inline-error" id="corner-error" role="alert" hidden></p>
+      </div>
+      <div class="corner-stage-wrap">
+        <div class="corner-stage" id="corner-stage" aria-label="Place four corners on the board image">
+          <img id="corner-image" alt="Original board photo for corner selection" draggable="false">
+          <svg id="corner-overlay" viewBox="0 0 1000 700" preserveAspectRatio="none" aria-hidden="true">
+            <polygon id="corner-polygon" points=""></polygon>
+            <polyline id="corner-lines" points=""></polyline>
+          </svg>
+          <button class="corner-handle" data-corner="0" type="button" aria-label="Top-left corner">1</button>
+          <button class="corner-handle" data-corner="1" type="button" aria-label="Top-right corner">2</button>
+          <button class="corner-handle" data-corner="2" type="button" aria-label="Bottom-right corner">3</button>
+          <button class="corner-handle" data-corner="3" type="button" aria-label="Bottom-left corner">4</button>
+        </div>
+        <p class="stage-help">Tip: zoom your browser if a corner is difficult to place.</p>
+      </div>
+    </section>
+
+    <section id="editor-workspace" class="editor-workspace" hidden aria-label="Digital board editor">
+      <aside class="editor-sidebar">
+        <div>
+          <p class="step-label">Workspace</p>
+          <h1>Review & continue</h1>
+        </div>
+
+        <fieldset class="view-picker">
+          <legend>Board view</legend>
+          <label><input type="radio" name="board-view" value="original"><span>Original</span></label>
+          <label><input type="radio" name="board-view" value="corrected"><span>Corrected</span></label>
+          <label><input type="radio" name="board-view" value="enhanced" checked><span>Enhanced master</span></label>
+          <label><input type="radio" name="board-view" value="digitized"><span>Digitized</span></label>
+          <label><input type="radio" name="board-view" value="debug"><span>Debug</span></label>
+        </fieldset>
+
+        <div class="validation-control">
+          <span>Validation layout</span>
+          <div class="segmented" role="group" aria-label="Validation layout">
+            <button class="is-active" data-layout="overlay" type="button">Overlay</button>
+            <button data-layout="side" type="button">Side by side</button>
+          </div>
+        </div>
+
+        <div class="layers-panel">
+          <div class="section-label"><span>Layers</span><small id="object-count">0 objects</small></div>
+          <label class="layer-row">
+            <input id="professor-layer-toggle" type="checkbox" checked>
+            <span class="layer-swatch professor"></span>
+            <span><strong>Professor ink</strong><small>Independent vectors</small></span>
+          </label>
+          <label class="layer-row">
+            <input id="user-layer-toggle" type="checkbox" checked>
+            <span class="layer-swatch user"></span>
+            <span><strong>Your ink</strong><small>Editable strokes</small></span>
+          </label>
+        </div>
+
+        <div class="keyboard-help">
+          <span><kbd>⌘</kbd><kbd>Z</kbd> Undo</span>
+          <span><kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> Redo</span>
+        </div>
+      </aside>
+
+      <section class="canvas-column">
+        <div class="drawing-toolbar" aria-label="Drawing tools">
+          <div class="tool-group">
+            <button class="tool-button is-active" data-tool="pen" type="button" aria-pressed="true" title="Pen">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Zm10-12 3 3"/></svg>
+              <span>Pen</span>
+            </button>
+            <button class="tool-button" data-tool="eraser" type="button" aria-pressed="false" title="Eraser">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 17-3-3 9-9a2 2 0 0 1 3 0l3 3a2 2 0 0 1 0 3l-6 6H7Zm5 0 2 2h6"/></svg>
+              <span>Eraser</span>
+            </button>
+          </div>
+          <div class="tool-divider"></div>
+          <div class="color-tools" aria-label="Ink color">
+            <button class="color-chip is-active" data-color="#183153" style="--chip:#183153" type="button" aria-label="Navy" aria-pressed="true"></button>
+            <button class="color-chip" data-color="#e45c3a" style="--chip:#e45c3a" type="button" aria-label="Coral" aria-pressed="false"></button>
+            <button class="color-chip" data-color="#18816b" style="--chip:#18816b" type="button" aria-label="Green" aria-pressed="false"></button>
+            <button class="color-chip" data-color="#8657b5" style="--chip:#8657b5" type="button" aria-label="Purple" aria-pressed="false"></button>
+            <input id="custom-color" type="color" value="#183153" aria-label="Custom ink color">
+          </div>
+          <label class="size-control">Size
+            <input id="stroke-size" type="range" min="1" max="20" value="4">
+          </label>
+          <div class="toolbar-spacer"></div>
+          <button class="icon-button" id="undo-button" type="button" title="Undo" aria-label="Undo" disabled>↶</button>
+          <button class="icon-button" id="redo-button" type="button" title="Redo" aria-label="Redo" disabled>↷</button>
+          <button class="text-button danger" id="clear-button" type="button">Clear my ink</button>
+          <button class="button button-primary button-small" id="save-button" type="button">Save</button>
+        </div>
+
+        <div class="board-viewport" id="board-viewport">
+          <div class="comparison-grid" id="comparison-grid">
+            <div class="board-frame primary-frame" id="primary-frame">
+              <span class="frame-label" id="primary-label">Enhanced master</span>
+              <img id="board-raster" alt="Selected whiteboard view" draggable="false">
+              <div id="professor-svg-layer" class="svg-layer professor-layer" aria-label="Digitized professor writing"></div>
+              <svg id="drawing-svg" class="drawing-layer" xmlns="http://www.w3.org/2000/svg"
+                   role="img" aria-label="Drawing canvas">
+                <g id="user-strokes"></g>
+                <path id="active-stroke" fill="none"></path>
+              </svg>
+              <div class="empty-state" id="canvas-empty" hidden>
+                <strong>View unavailable</strong>
+                <span>This processing artifact was not generated.</span>
+              </div>
+            </div>
+            <div class="board-frame reference-frame" id="reference-frame" hidden>
+              <span class="frame-label">Original reference</span>
+              <img id="reference-raster" alt="Original board reference" draggable="false">
+            </div>
+          </div>
+        </div>
+
+        <p class="canvas-caption">
+          <span id="canvas-dimensions">Master canvas</span>
+          <span>Drawings stay aligned at every screen size</span>
+        </p>
+      </section>
+
+      <section class="debug-panel" id="debug-panel" hidden aria-labelledby="debug-title">
+        <div class="debug-heading">
+          <div>
+            <p class="step-label">Pipeline inspection</p>
+            <h2 id="debug-title">Visual validation</h2>
+          </div>
+          <span class="confidence-badge" id="confidence-badge">Confidence —</span>
+        </div>
+        <div class="debug-gallery" id="debug-gallery"></div>
+      </section>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script id="board-data" type="application/json">{{ board_data|default(board|default(data|default({}, true), true), true)|tojson }}</script>
+  <script src="{{ url_for('static', filename='board.js') }}" defer></script>
+</body>
+</html>

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f4ef">
+  <title>Boardlift · Turn board photos into working canvases</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="landing">
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="Boardlift home">
+      <span class="brand-mark" aria-hidden="true">B</span>
+      <span>Boardlift</span>
+    </a>
+    <span class="header-note">Digital whiteboard capture</span>
+  </header>
+
+  <main class="landing-main">
+    <section class="hero" aria-labelledby="hero-title">
+      <p class="eyebrow">From camera roll to clean canvas</p>
+      <h1 id="hero-title">Keep the thinking.<br><em>Lose the glare.</em></h1>
+      <p class="hero-copy">
+        Upload a classroom whiteboard photo. Boardlift corrects perspective,
+        separates the professor's writing, and gives you a canvas you can keep working on.
+      </p>
+    </section>
+
+    <section class="upload-card" aria-labelledby="upload-title">
+      <div class="card-heading">
+        <div>
+          <p class="step-label">01 · Add a photo</p>
+          <h2 id="upload-title">Capture your board</h2>
+        </div>
+        <span class="file-hint">JPG · PNG · WEBP</span>
+      </div>
+
+      <form id="upload-form" class="upload-form" method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
+        <label class="drop-zone" id="drop-zone" for="board-image">
+          <input id="board-image" name="image" type="file" accept="image/*" required>
+          <span class="upload-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" role="img"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>
+          </span>
+          <strong id="file-title">Drop a board photo here</strong>
+          <span id="file-detail">or click to browse your device</span>
+          <img id="upload-preview" alt="" hidden>
+        </label>
+
+        <div class="upload-actions">
+          <p class="privacy-note">
+            <span aria-hidden="true">●</span> Your image is used only to build this board.
+          </p>
+          <button class="button button-primary" id="upload-submit" type="submit">
+            <span>Build my board</span>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>
+          </button>
+        </div>
+
+        <div class="processing" id="processing" role="status" aria-live="polite" hidden>
+          <span class="spinner" aria-hidden="true"></span>
+          <div>
+            <strong>Reading the whiteboard…</strong>
+            <span>Correcting perspective and tracing ink. This may take a moment.</span>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <ol class="process-list" aria-label="How Boardlift works">
+      <li><span>01</span><strong>Upload</strong><small>Any board photo</small></li>
+      <li><span>02</span><strong>Correct</strong><small>Flatten the perspective</small></li>
+      <li><span>03</span><strong>Continue</strong><small>Draw, save, and export</small></li>
+    </ol>
+  </main>
+
+  <footer class="site-footer">
+    <span>Built for faster learning.</span>
+    <span>Cal Poly Hackathon · 2026</span>
+  </footer>
+
+  <script>
+    (() => {
+      const form = document.querySelector('#upload-form');
+      const input = document.querySelector('#board-image');
+      const zone = document.querySelector('#drop-zone');
+      const title = document.querySelector('#file-title');
+      const detail = document.querySelector('#file-detail');
+      const preview = document.querySelector('#upload-preview');
+      const processing = document.querySelector('#processing');
+      const submit = document.querySelector('#upload-submit');
+
+      function showFile(file) {
+        if (!file || !file.type.startsWith('image/')) return;
+        title.textContent = file.name;
+        detail.textContent = `${(file.size / 1048576).toFixed(1)} MB · Ready to process`;
+        preview.src = URL.createObjectURL(file);
+        preview.hidden = false;
+        zone.classList.add('has-file');
+      }
+
+      input.addEventListener('change', () => showFile(input.files[0]));
+      ['dragenter', 'dragover'].forEach(type => zone.addEventListener(type, event => {
+        event.preventDefault();
+        zone.classList.add('is-dragging');
+      }));
+      ['dragleave', 'drop'].forEach(type => zone.addEventListener(type, event => {
+        event.preventDefault();
+        zone.classList.remove('is-dragging');
+      }));
+      zone.addEventListener('drop', event => {
+        const file = event.dataTransfer.files[0];
+        if (!file || !file.type.startsWith('image/')) return;
+        const transfer = new DataTransfer();
+        transfer.items.add(file);
+        input.files = transfer.files;
+        showFile(file);
+      });
+      form.addEventListener('submit', () => {
+        processing.hidden = false;
+        submit.disabled = true;
+        submit.querySelector('span').textContent = 'Processing…';
+        zone.setAttribute('aria-busy', 'true');
+      });
+    })();
+  </script>
+</body>
+</html>
