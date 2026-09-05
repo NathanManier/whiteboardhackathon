@@ -182,7 +182,14 @@ def conservative_vectorize(
     color_metrics: dict[str, dict[str, float | int]] = {}
 
     LOGGER.info(
-        "vector proxy=%dx%d master=%dx%d scale=%.6f",
+        "VECTOR PROXY CREATION START master=%dx%d max_dimension=%d max_pixels=%d",
+        width,
+        height,
+        options.max_vector_dimension,
+        options.max_work_pixels,
+    )
+    LOGGER.info(
+        "VECTOR PROXY CREATION COMPLETE proxy=%dx%d master=%dx%d scale=%.6f",
         work_size[0],
         work_size[1],
         width,
@@ -207,7 +214,23 @@ def conservative_vectorize(
             if processing_scale < 1.0
             else mask.copy()
         )
+        extraction_started = time.monotonic()
+        LOGGER.info(
+            "CONTOUR EXTRACTION START color=%s dimensions=%dx%d foreground_pixels=%d",
+            color,
+            work_size[0],
+            work_size[1],
+            int(np.count_nonzero(work_mask)),
+        )
         contours, hierarchy = cv2.findContours(work_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+        raw_point_count = sum(len(contour) for contour in contours)
+        LOGGER.info(
+            "CONTOUR EXTRACTION COMPLETE color=%s contours=%d raw_points=%d elapsed=%.3fs",
+            color,
+            len(contours),
+            raw_point_count,
+            time.monotonic() - extraction_started,
+        )
         if hierarchy is None:
             elapsed = time.monotonic() - color_started
             color_metrics[color] = {
@@ -219,6 +242,8 @@ def conservative_vectorize(
             LOGGER.info("%s raw=0 kept=0 rejected=0 elapsed=%.4fs", color, elapsed)
             continue
         hierarchy = hierarchy[0]
+        LOGGER.info("CONTOUR PROCESSING START color=%s", color)
+        bezier_seconds = 0.0
         for index, contour in enumerate(contours):
             if hierarchy[index][3] != -1:
                 continue
@@ -227,9 +252,28 @@ def conservative_vectorize(
                 break
             hole_indices: list[int] = []
             child = hierarchy[index][2]
+            visited_children: set[int] = set()
             while child != -1:
+                if (
+                    child < 0
+                    or child >= len(contours)
+                    or child in visited_children
+                    or len(visited_children) >= options.max_contours
+                ):
+                    LOGGER.warning(
+                        "SAFETY LIMIT: malformed contour hierarchy color=%s parent=%d child=%d visited=%d",
+                        color,
+                        index,
+                        child,
+                        len(visited_children),
+                    )
+                    truncated = True
+                    break
+                visited_children.add(child)
                 hole_indices.append(child)
                 child = hierarchy[child][0]
+            if truncated:
+                break
             contour_cost = 1 + len(hole_indices)
             if examined_contours + contour_cost > options.max_contours:
                 truncated = True
@@ -259,9 +303,11 @@ def conservative_vectorize(
             paths = []
             point_count = 0
             for source_contour in source_contours:
+                bezier_started = time.monotonic()
                 simplified = _simplify(source_contour, options, inverse_scale)
                 point_count += len(simplified)
                 path = _closed_bezier(simplified, options.bezier_tension)
+                bezier_seconds += time.monotonic() - bezier_started
                 if path:
                     paths.append(path)
             if not paths:
@@ -321,7 +367,27 @@ def conservative_vectorize(
             rejected_invalid,
             elapsed,
         )
+        LOGGER.info(
+            "BEZIER / PATH GENERATION COMPLETE color=%s paths=%d elapsed=%.3fs",
+            color,
+            kept,
+            bezier_seconds,
+        )
+        LOGGER.info(
+            "CONTOUR PROCESSING COMPLETE color=%s kept=%d rejected=%d elapsed=%.3fs",
+            color,
+            kept,
+            rejected,
+            elapsed,
+        )
         if truncated:
+            LOGGER.warning(
+                "SAFETY LIMIT TRIGGERED color=%s examined_contours=%d objects=%d elapsed=%.3fs",
+                color,
+                examined_contours,
+                len(regions),
+                time.monotonic() - started,
+            )
             break
 
     color_order = {color: index for index, color in enumerate(INK_COLORS)}
