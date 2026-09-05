@@ -107,6 +107,10 @@ def _simplify(contour: np.ndarray, options: ConservativeOptions, inverse_scale: 
     scale_adjustment = np.clip(np.sqrt(area) / 250.0, 0.12, 1.5)
     epsilon = max(0.10, perimeter * options.simplification * scale_adjustment)
     simplified = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+    if len(simplified) < 3 and len(contour) >= 3:
+        center, size, angle = cv2.minAreaRect(contour)
+        safe_size = (max(float(size[0]), 1.0), max(float(size[1]), 1.0))
+        simplified = cv2.boxPoints((center, safe_size, angle))
     if len(simplified) > options.max_points_per_region:
         stride = int(np.ceil(len(simplified) / options.max_points_per_region))
         simplified = simplified[::stride]

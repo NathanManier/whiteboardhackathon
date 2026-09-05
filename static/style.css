@@ -367,6 +367,7 @@ kbd { display: inline-block; min-width: 18px; margin-right: 2px; padding: 2px 4p
 .board-viewport { display: flex; min-height: 0; padding: clamp(18px,3vw,40px); flex: 1; overflow: auto; align-items: center; justify-content: center; }
 .comparison-grid { display: grid; width: 100%; max-width: 1300px; align-items: center; grid-template-columns: 1fr; gap: 18px; }
 .comparison-grid.side-by-side { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.reference-frame { background: #fff; }
 .board-frame {
   position: relative;
   min-height: 180px;

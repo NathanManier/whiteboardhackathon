@@ -191,6 +191,8 @@ def analyze_whiteboard(
             "rejected_objects": vector_metrics.get("rejected_objects", 0),
             "proxy_width": vector_metrics.get("proxy_width", selected.width if selected else 0),
             "proxy_height": vector_metrics.get("proxy_height", selected.height if selected else 0),
+            "svg_bytes": svg_path.stat().st_size,
+            "elapsed_seconds": timings["vectorization"],
             "metrics": _jsonable(vector_metrics),
         },
         "svg_bytes": svg_path.stat().st_size,

@@ -41,9 +41,15 @@
     corrected: ["corrected", "corrected_url", "warped", "rectified"],
     enhanced: ["enhanced", "enhanced_url", "master", "master_url"],
     digitized: ["digitized", "digitized_url", "svg_raster", "rendered_svg"],
-    mask: ["mask", "mask_url", "ink_mask"],
-    confidence: ["confidence", "confidence_url", "confidence_map"],
-    comparison: ["comparison", "comparison_url", "overlay", "validation"]
+    professor_svg: ["svg", "professor_svg", "vectors"],
+    confidence: ["confidence", "confidence_url", "confidence_map", "detection"],
+    ink_mask: ["ink_mask", "mask", "mask_url", "combined_mask"],
+    black_mask: ["black_mask", "mask_black"],
+    red_mask: ["red_mask", "mask_red"],
+    blue_mask: ["blue_mask", "mask_blue"],
+    green_mask: ["green_mask", "mask_green"],
+    svg_raster: ["svg_raster", "digitized", "digitized_url", "rendered_svg"],
+    master_vs_svg: ["master_vs_svg", "comparison", "comparison_url", "overlay", "validation"]
   };
 
   function toast(message, isError = false) {
@@ -218,8 +224,8 @@
     const errorBox = $("#corner-error");
     const image = $("#corner-image");
     const pixels = state.corners.map(point => ({
-      x: Math.round(point.x * image.naturalWidth),
-      y: Math.round(point.y * image.naturalHeight)
+      x: clamp(Math.round(point.x * image.naturalWidth), 0, image.naturalWidth - 1),
+      y: clamp(Math.round(point.y * image.naturalHeight), 0, image.naturalHeight - 1)
     }));
     const payload = {
       corners: pixels,
@@ -302,6 +308,7 @@
     $("#stroke-size").addEventListener("input", event => { state.size = Number(event.target.value); });
     $("#professor-layer-toggle").addEventListener("change", event => {
       $("#professor-svg-layer").style.display = event.target.checked ? "" : "none";
+      updateLayout();
     });
     $("#user-layer-toggle").addEventListener("change", event => {
       $("#user-strokes").style.display = event.target.checked ? "" : "none";
@@ -516,7 +523,8 @@
     const inline = state.data.svg || state.data.svg_markup || state.data.professor_svg;
     let source = typeof inline === "string" && inline.trim().startsWith("<") ? inline : "";
     if (!source) {
-      const url = asUrl(state.data.svg_url) || (boardId ? `${route}/svg` : "");
+      const url = findAsset("professor_svg") || asUrl(state.data.svg_url) ||
+        (boardId ? `${route}/svg` : "");
       if (url) {
         try {
           const response = await fetch(url);
@@ -531,6 +539,9 @@
     safe.setAttribute("width", "100%");
     safe.setAttribute("height", "100%");
     $("#professor-svg-layer").replaceChildren(safe);
+    const referenceCopy = safe.cloneNode(true);
+    referenceCopy.setAttribute("aria-hidden", "true");
+    $("#reference-professor-layer").replaceChildren(referenceCopy);
     const objectCount = safe.querySelectorAll("path,line,polyline,polygon,circle,ellipse,rect,text").length;
     $("#object-count").textContent = `${objectCount} object${objectCount === 1 ? "" : "s"}`;
   }
@@ -541,6 +552,8 @@
     const svg = documentNode.documentElement;
     if (svg.nodeName.toLowerCase() !== "svg" || documentNode.querySelector("parsererror")) return null;
     svg.querySelectorAll("script,foreignObject,iframe,object,embed").forEach(node => node.remove());
+    svg.querySelectorAll('[id="user-ink"]').forEach(node => node.remove());
+    svg.querySelectorAll('[data-role="background"]').forEach(node => node.remove());
     svg.querySelectorAll("*").forEach(node => {
       [...node.attributes].forEach(attribute => {
         const value = attribute.value.trim().toLowerCase();
@@ -559,18 +572,17 @@
     $(".canvas-column").hidden = debug;
     if (debug) return;
     const image = $("#board-raster");
-    const professor = $("#professor-svg-layer");
     const source = findAsset(state.view);
     $("#primary-label").textContent = state.view === "enhanced" ? "Enhanced master" :
       state.view[0].toUpperCase() + state.view.slice(1);
     if (state.view === "digitized") {
-      image.src = findAsset("enhanced") || findAsset("corrected") || findAsset("original");
-      professor.style.display = $("#professor-layer-toggle").checked ? "" : "none";
+      image.src = findAsset("enhanced") || findAsset("corrected");
     } else {
       image.src = source;
-      professor.style.display = "none";
     }
-    $("#drawing-svg").style.pointerEvents = ["enhanced", "digitized"].includes(state.view) ? "" : "none";
+    const showsUserInk = ["enhanced", "digitized"].includes(state.view);
+    $("#drawing-svg").style.display = showsUserInk ? "" : "none";
+    $("#drawing-svg").style.pointerEvents = showsUserInk ? "" : "none";
     $("#canvas-empty").hidden = Boolean(image.src);
     image.onerror = () => { $("#canvas-empty").hidden = false; };
     image.onload = () => {
@@ -585,22 +597,41 @@
   }
 
   function updateLayout() {
-    const showReference = state.layout === "side" || state.layout === "overlay";
     const reference = $("#reference-frame");
     const primary = $("#primary-frame");
     const primaryImage = $("#board-raster");
-    $("#comparison-grid").classList.toggle("side-by-side", state.layout === "side");
-    reference.hidden = state.layout !== "side";
-    $("#reference-raster").src = findAsset("original");
-    primary.classList.toggle("overlay-reference", state.layout === "overlay");
-    if (state.layout === "overlay" && showReference && findAsset("original")) {
-      primary.style.backgroundImage = `linear-gradient(rgba(255,255,255,.62),rgba(255,255,255,.62)),url("${findAsset("original").replace(/"/g, "%22")}")`;
-      primary.style.backgroundSize = "100% 100%";
-      primaryImage.style.opacity = state.view === "original" ? "1" : ".68";
+    const professor = $("#professor-svg-layer");
+    const referenceProfessor = $("#reference-professor-layer");
+    const referenceRaster = $("#reference-raster");
+    const isDigitized = state.view === "digitized";
+    const sideBySide = isDigitized && state.layout === "side";
+    const rasterizedVectors = findAsset("svg_raster");
+    const professorVisible = $("#professor-layer-toggle").checked;
+
+    $("#comparison-grid").classList.toggle("side-by-side", sideBySide);
+    reference.hidden = !sideBySide;
+    primary.style.backgroundImage = "";
+    primary.style.backgroundSize = "";
+    primaryImage.style.opacity = "1";
+    primaryImage.src = isDigitized
+      ? (findAsset("enhanced") || findAsset("corrected"))
+      : findAsset(state.view);
+
+    professor.style.display = isDigitized && !sideBySide && professorVisible ? "" : "none";
+    professor.style.opacity = isDigitized && state.layout === "overlay" ? ".5" : "1";
+
+    if (!sideBySide) return;
+    $("#primary-label").textContent = "Enhanced master";
+    $("#reference-label").textContent = "Digitized vectors";
+    reference.style.aspectRatio = `${state.masterWidth} / ${state.masterHeight}`;
+    if (rasterizedVectors) {
+      referenceRaster.hidden = !professorVisible;
+      referenceRaster.src = rasterizedVectors;
+      referenceProfessor.style.display = "none";
     } else {
-      primary.style.backgroundImage = "";
-      primary.style.backgroundSize = "";
-      primaryImage.style.opacity = "1";
+      referenceRaster.hidden = true;
+      referenceRaster.removeAttribute("src");
+      referenceProfessor.style.display = professorVisible ? "" : "none";
     }
   }
 
@@ -614,9 +645,14 @@
       ["Original", "Camera input", findAsset("original")],
       ["Corrected", "Perspective transform", findAsset("corrected")],
       ["Enhanced master", "Cleaned board raster", findAsset("enhanced")],
-      ["Ink mask", "Detected writing pixels", findAsset("mask")],
-      ["SVG raster", "Vector output preview", findAsset("digitized")],
-      ["Comparison", "Source-to-output validation", findAsset("comparison")]
+      ["Confidence", "Board detection confidence", findAsset("confidence")],
+      ["Ink mask", "Combined detected writing", findAsset("ink_mask")],
+      ["Black mask", "Detected black marker", findAsset("black_mask")],
+      ["Red mask", "Detected red marker", findAsset("red_mask")],
+      ["Blue mask", "Detected blue marker", findAsset("blue_mask")],
+      ["Green mask", "Detected green marker", findAsset("green_mask")],
+      ["SVG raster", "Vectors rendered in master coordinates", findAsset("svg_raster")],
+      ["Master vs SVG", "Geometry-aligned visual comparison", findAsset("master_vs_svg")]
     ];
     $("#debug-gallery").replaceChildren(...cards.map(([name, detail, src]) => {
       const card = document.createElement("article");

@@ -82,7 +82,7 @@ def detect_ink(
     local_background = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma)
     local_darkness = np.clip((local_background - gray) / 0.28, 0.0, 1.0)
     absolute_darkness = np.clip((0.72 - value) / 0.55, 0.0, 1.0)
-    neutral_evidence = np.clip(1.0 - 1.15 * saturation, 0.0, 1.0)
+    neutral_evidence = np.clip(1.0 - 3.0 * saturation, 0.0, 1.0)
     black = np.maximum(
         0.65 * local_darkness * neutral_evidence,
         absolute_darkness * neutral_evidence,
@@ -108,7 +108,8 @@ def detect_ink(
     summaries: dict[str, float] = {}
     for index, color in enumerate(INK_COLORS):
         confidence = confidence_stack[:, :, index]
-        mask = ((winner == index) & (confidence >= confidence_threshold)).astype(np.uint8) * 255
+        threshold = confidence_threshold if color == "black" else min(confidence_threshold, 0.07)
+        mask = ((winner == index) & (confidence >= threshold)).astype(np.uint8) * 255
         filtered = _clean_mask(mask, minimum_contour_area)
         confidence = np.ascontiguousarray(confidence, dtype=np.float32)
         filtered = np.ascontiguousarray(filtered)

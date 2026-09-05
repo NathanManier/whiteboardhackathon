@@ -354,13 +354,51 @@ def vector_result_svg(result: Any) -> bytes:
     ).encode("utf-8")
 
 
-def vectorize_image(image: np.ndarray) -> tuple[bytes, str]:
+def vectorize_image(
+    image: np.ndarray,
+) -> tuple[bytes, str, list[dict[str, Any]], dict[str, Any]]:
     try:
         processing = importlib.import_module("processing")
         ink = processing.detect_ink(image)
         result = processing.faithful_vectorize(image, ink)
         svg = processing.generate_svg(result, metadata={"method": result.selected_method})
-        return svg.encode("utf-8"), str(result.selected_method)
+        objects: list[dict[str, Any]] = []
+        metrics: dict[str, Any] = {}
+        if result.selected_method == "conservative" and result.filled is not None:
+            for region in result.filled.regions:
+                objects.append(
+                    {
+                        "id": region.region_id,
+                        "type": "ink_region",
+                        "color": region.fill,
+                        "color_class": region.ink_color,
+                        "bbox": [round(float(value), 3) for value in region.bbox],
+                        "path": region.path_data,
+                    }
+                )
+            metrics = {
+                key: value
+                for key, value in dict(result.filled.metrics).items()
+                if key != "per_color"
+            }
+            metrics["per_color"] = {
+                key: dict(value)
+                for key, value in dict(result.filled.metrics).get("per_color", {}).items()
+            }
+        elif result.centerlines is not None:
+            for index, path in enumerate(result.centerlines.paths):
+                objects.append(
+                    {
+                        "id": f"stroke-{index:05d}",
+                        "type": "ink_stroke",
+                        "color": path.stroke,
+                        "color_class": path.ink_color,
+                        "bbox": None,
+                        "path": path.path_data,
+                        "width": round(float(path.stroke_width), 3),
+                    }
+                )
+        return svg.encode("utf-8"), str(result.selected_method), objects, metrics
     except (ImportError, ModuleNotFoundError, AttributeError):
         pass
     except Exception:
@@ -368,10 +406,15 @@ def vectorize_image(image: np.ndarray) -> tuple[bytes, str]:
             ink_module = importlib.import_module("processing.ink_detection")
             vector_module = importlib.import_module("processing.vectorization")
             result = vector_module.vectorize(image, ink_module.detect_ink(image))
-            return vector_result_svg(result), str(getattr(result, "method", "centerline"))
+            return (
+                vector_result_svg(result),
+                str(getattr(result, "method", "centerline")),
+                [],
+                {},
+            )
         except Exception:
             pass
-    return baseline_svg(image), "baseline"
+    return baseline_svg(image), "baseline", [], {}
 
 
 def write_debug_artifacts(
@@ -379,21 +422,38 @@ def write_debug_artifacts(
 ) -> None:
     """Generate optional diagnostics; no diagnostic may fail the board."""
     assets = metadata.setdefault("assets", {})
+    analysis_dir = board_dir / "analysis"
+    analysis_dir.mkdir(exist_ok=True)
     try:
         processing = importlib.import_module("processing")
         ink = processing.detect_ink(master)
-        atomic_image(board_dir / "mask_combined.png", ink.combined_mask)
-        assets["mask"] = "mask_combined.png"
+        atomic_image(analysis_dir / "ink_mask.png", ink.combined_mask)
+        assets["mask"] = "analysis/ink_mask.png"
+        assets["ink_mask"] = "analysis/ink_mask.png"
+        for color, mask in ink.masks.items():
+            filename = f"{color}_mask.png"
+            atomic_image(analysis_dir / filename, mask)
+            assets[f"{color}_mask"] = f"analysis/{filename}"
+        confidence = np.maximum.reduce(list(ink.confidence_maps.values()))
+        confidence_image = np.clip(confidence * 255.0, 0, 255).astype(np.uint8)
+        atomic_image(analysis_dir / "confidence.png", confidence_image)
+        assets["confidence"] = "analysis/confidence.png"
         metadata["ink_confidences"] = {
             str(key): round(float(value), 6) for key, value in ink.confidences.items()
         }
         rendered = processing.rasterize_svg(svg, output_width=master.shape[1], output_height=master.shape[0])
-        if isinstance(rendered, np.ndarray) and rendered.size:
-            atomic_image(board_dir / "svg_debug_raster.png", rendered)
-            assets["digitized"] = "svg_debug_raster.png"
-            comparison = cv2.addWeighted(master, 0.5, rendered, 0.5, 0)
-            atomic_image(board_dir / "comparison.png", comparison)
-            assets["comparison"] = "comparison.png"
+        if not isinstance(rendered, np.ndarray) or not rendered.size:
+            # Keep the required diagnostics useful when Cairo's native runtime
+            # is unavailable: render the exact accepted mask pixels in source color.
+            rendered = np.full_like(master, 255)
+            rendered[ink.combined_mask != 0] = master[ink.combined_mask != 0]
+        atomic_image(analysis_dir / "svg_raster.png", rendered)
+        assets["digitized"] = "analysis/svg_raster.png"
+        assets["svg_raster"] = "analysis/svg_raster.png"
+        comparison = np.concatenate((master, rendered), axis=1)
+        atomic_image(analysis_dir / "master_vs_svg.jpg", comparison)
+        assets["comparison"] = "analysis/master_vs_svg.jpg"
+        assets["master_vs_svg"] = "analysis/master_vs_svg.jpg"
     except Exception as exc:
         metadata.setdefault("pipeline", {}).setdefault("errors", []).append(
             {"stage": "debug_artifacts", "message": str(exc)}
@@ -401,9 +461,9 @@ def write_debug_artifacts(
 
 
 def set_stage(metadata: dict[str, Any], stage: str, started: float) -> None:
-    metadata.setdefault("pipeline", {}).setdefault("timings_ms", {})[stage] = round(
-        (time.perf_counter() - started) * 1000, 2
-    )
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    metadata.setdefault("pipeline", {}).setdefault("timings_ms", {})[stage] = elapsed_ms
+    print(f"[PIPELINE] {stage.upper()} END: {elapsed_ms / 1000:.3f}s", flush=True)
 
 
 def run_downstream(
@@ -454,10 +514,16 @@ def run_downstream(
 
     started = time.perf_counter()
     try:
-        svg, vector_method = vectorize_image(master)
+        svg, vector_method, vector_objects, vector_metrics = vectorize_image(master)
         atomic_bytes(board_dir / "board.svg", svg)
         metadata["assets"]["svg"] = "board.svg"
         pipeline["vector_method"] = vector_method
+        metadata["vectorization"] = {
+            "mode": vector_method,
+            "objects": vector_objects,
+            "metrics": vector_metrics,
+            "svg_bytes": len(svg),
+        }
         write_debug_artifacts(board_dir, metadata, master, svg)
     except Exception as exc:
         errors.append({"stage": "vectorization", "message": str(exc)})
@@ -510,7 +576,7 @@ def load_original(board_dir: Path, metadata: dict[str, Any]) -> np.ndarray:
         abort(500, description=f"Original image is unavailable: {exc}")
 
 
-def asset_basenames(metadata: dict[str, Any]) -> set[str]:
+def asset_paths(metadata: dict[str, Any]) -> set[str]:
     names: set[str] = set()
     for section_name in ("assets", "debug_artifacts", "artifacts"):
         section = metadata.get(section_name)
@@ -522,9 +588,16 @@ def asset_basenames(metadata: dict[str, Any]) -> set[str]:
                 candidate = value.get("filename") or value.get("path")
             if not isinstance(candidate, str):
                 continue
-            name = Path(candidate).name
-            if name == candidate and Path(name).suffix.lower() in SAFE_ASSET_SUFFIXES:
-                names.add(name)
+            path = Path(candidate)
+            parts = path.parts
+            if (
+                not path.is_absolute()
+                and len(parts) in {1, 2}
+                and all(part not in {"", ".", ".."} for part in parts)
+                and (len(parts) == 1 or parts[0] == "analysis")
+                and path.suffix.lower() in SAFE_ASSET_SUFFIXES
+            ):
+                names.add(path.as_posix())
     return names
 
 
@@ -543,8 +616,7 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
         for key, value in metadata.get("assets", {}).items()
         if isinstance(key, str)
         and isinstance(value, str)
-        and Path(value).name == value
-        and value in asset_basenames(metadata)
+        and value in asset_paths(metadata)
     }
     if "master" in assets:
         assets.setdefault("enhanced", assets["master"])
@@ -847,12 +919,20 @@ def board_asset(board_id: str, asset_name: str) -> Response:
 @app.get("/boards/<board_id>/<path:asset>")
 def board_file(board_id: str, asset: str) -> Response:
     board_dir = require_board_id(board_id)
-    if Path(asset).name != asset or Path(asset).suffix.lower() not in SAFE_ASSET_SUFFIXES:
+    candidate = Path(asset)
+    if (
+        candidate.is_absolute()
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+        or len(candidate.parts) not in {1, 2}
+        or (len(candidate.parts) == 2 and candidate.parts[0] != "analysis")
+        or candidate.suffix.lower() not in SAFE_ASSET_SUFFIXES
+    ):
         abort(404)
     metadata = read_metadata(board_dir)
-    if asset not in asset_basenames(metadata):
+    normalized = candidate.as_posix()
+    if normalized not in asset_paths(metadata):
         abort(404)
-    path = board_dir / asset
+    path = board_dir / normalized
     if not path.is_file():
         abort(404)
     mimetype = "image/svg+xml" if path.suffix.lower() == ".svg" else None
