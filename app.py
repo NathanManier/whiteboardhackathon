@@ -1278,9 +1278,15 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
 
 
 @app.errorhandler(RequestEntityTooLarge)
-def too_large(_: RequestEntityTooLarge) -> tuple[Response, int]:
+def too_large(_: RequestEntityTooLarge) -> tuple[str, int]:
     limit_mb = app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
-    return Response(f"Upload too large. Maximum: {limit_mb:.0f} MB.", mimetype="text/plain"), 413
+    return (
+        render_template(
+            "index.html",
+            upload_error=f"That photo is too large. Choose an image under {limit_mb:.0f} MB.",
+        ),
+        413,
+    )
 
 
 @app.get("/")
@@ -1298,13 +1304,17 @@ def upload() -> Response | tuple[str, int]:
     )
     uploaded = request.files.get("image")
     if uploaded is None or not uploaded.filename:
-        return "Select an image to upload.", 400
+        return render_template("index.html", upload_error="Choose a whiteboard photo to continue."), 400
     extension = Path(uploaded.filename).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
-        return "Unsupported file extension.", 415
+        return render_template(
+            "index.html", upload_error="We couldn't use that file. Choose a JPG, PNG, or WEBP image."
+        ), 415
     content_type = (uploaded.mimetype or "").lower()
     if content_type not in ALLOWED_MIME_TYPES:
-        return "Unsupported image content type.", 415
+        return render_template(
+            "index.html", upload_error="We couldn't read that image type. Choose a JPG, PNG, or WEBP photo."
+        ), 415
     data = uploaded.read(app.config["MAX_CONTENT_LENGTH"] + 1)
     LOGGER.info(
         "UPLOAD COMPLETE filename=%s bytes=%d elapsed=%.3fs",
@@ -1330,7 +1340,10 @@ def upload() -> Response | tuple[str, int]:
             time.perf_counter() - load_started,
         )
     except ValueError as exc:
-        return f"Invalid image: {exc}", 400
+        return render_template(
+            "index.html",
+            upload_error=f"We couldn't process that image. {exc} Try another photo.",
+        ), 400
 
     library = read_library()
     try:

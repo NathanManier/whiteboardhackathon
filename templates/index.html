@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f6f4ef">
-  <title>Boardlift · Your whiteboard library</title>
+  <meta name="theme-color" content="#f4f3ef">
+  <meta name="description" content="Turn a physical whiteboard photo into an editable digital board.">
+  <title>Digital Whiteboard</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <style>
     .home-main{width:min(1160px,calc(100% - 40px));margin:auto;padding:clamp(38px,6vw,76px) 0 60px}
@@ -39,99 +40,197 @@
     @media(max-width:560px){.home-main{width:min(100% - 24px,1160px)}.upload-fields,.library-grid{grid-template-columns:1fr}.library-toolbar{align-items:start;flex-direction:column}.upload-actions{align-items:stretch;flex-direction:column}.privacy-note{margin:0}}
   </style>
 </head>
-<body class="landing">
-  <header class="site-header">
-    <a class="brand" href="/" aria-label="Boardlift home">
-      <span class="brand-mark" aria-hidden="true">B</span>
-      <span>Boardlift</span>
+<body class="home-page">
+  <header class="app-header">
+    <a class="app-identity" href="/" aria-label="Digital Whiteboard home">
+      <span class="board-glyph" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span>Digital Whiteboard</span>
     </a>
-    <span class="header-note">Capture · organize · continue</span>
+    <details class="app-menu">
+      <summary aria-label="Open application information">
+        <span></span><span></span><span></span>
+      </summary>
+      <nav aria-label="Application information">
+        <a href="#privacy">Image storage</a>
+        <a href="https://github.com/NathanManier/whiteboardhackathon" target="_blank" rel="noreferrer">View source</a>
+      </nav>
+    </details>
   </header>
 
-  <main class="home-main">
-    <div class="home-hero">
-      <section class="hero" aria-labelledby="hero-title">
-        <p class="eyebrow">From camera roll to clean canvas</p>
-        <h1 id="hero-title">Keep the thinking.<br><em>Lose the glare.</em></h1>
-        <p class="hero-copy">Turn a physical whiteboard photo into a corrected, editable board, then keep every capture organized for later.</p>
-        <ol class="process-list" aria-label="How Boardlift works">
-          <li><span>01</span><strong>Upload</strong><small>Any board photo</small></li>
-          <li><span>02</span><strong>Correct</strong><small>Flatten perspective</small></li>
-          <li><span>03</span><strong>Continue</strong><small>Edit and export</small></li>
-        </ol>
-      </section>
+  <main class="home-shell">
+    <section class="capture-workspace" aria-labelledby="capture-title">
+      <header class="capture-intro">
+        <p class="tool-label">Physical board → editable SVG</p>
+        <h1 id="capture-title">Turn a whiteboard photo into an editable digital board.</h1>
+        <p>Handwriting, diagrams, arrows, and marker color are preserved as visual geometry—not replaced with typed text.</p>
+      </header>
 
-      <section class="upload-card" aria-labelledby="upload-title">
-        <div class="card-heading">
-          <div><p class="step-label">New board</p><h2 id="upload-title">Capture a board</h2></div>
-          <span class="file-hint">JPG · PNG · WEBP</span>
+      <form id="upload-form" class="capture-form" method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
+        {% if upload_error %}
+        <div class="upload-error" role="alert">
+          <strong>We couldn't open that whiteboard.</strong>
+          <span>{{ upload_error }}</span>
         </div>
-        <form id="upload-form" class="upload-form" method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
-          <label class="drop-zone" id="drop-zone" for="board-image">
-            <input id="board-image" name="image" type="file" accept="image/png,image/jpeg,image/webp" required>
-            <span class="upload-icon" aria-hidden="true"><svg viewBox="0 0 24 24" role="img"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg></span>
-            <strong id="file-title">Drop a board photo here</strong>
-            <span id="file-detail">or click to browse your device</span>
-            <img id="upload-preview" alt="" hidden>
+        {% endif %}
+        <div id="upload-idle">
+          <label class="capture-target" id="drop-zone" for="board-image">
+            <input id="board-image" name="image" type="file"
+                   accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" required>
+            <span class="capture-icon" aria-hidden="true">
+              <svg viewBox="0 0 32 32">
+                <path d="M5.5 9.5V5.5h4M22.5 5.5h4v4M26.5 22.5v4h-4M9.5 26.5h-4v-4"/>
+                <path d="M9 11.5h14v10H9zM11.5 19l3.2-3 2.4 2 2.2-2 2.2 2.5"/>
+              </svg>
+            </span>
+            <strong>Upload whiteboard</strong>
+            <span>Drop a photo here or choose one below</span>
           </label>
-          <div class="upload-fields">
-            <label class="field">Board name <input id="upload-name" name="name" maxlength="80" placeholder="e.g. Calculus review"></label>
-            <label class="field">Save in <select id="upload-folder" name="folder_id"><option value="">Root</option></select></label>
-          </div>
-          <div class="upload-actions">
-            <p class="privacy-note"><span aria-hidden="true">●</span> Stored locally on this server.</p>
-            <button class="button button-primary" id="upload-submit" type="submit"><span>Build my board</span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg></button>
-          </div>
-          <div class="processing" id="processing" role="status" aria-live="polite" hidden>
-            <span class="spinner" aria-hidden="true"></span><div><strong>Reading the whiteboard…</strong><span>Correcting perspective and tracing ink. This may take a moment.</span></div>
-          </div>
-        </form>
-      </section>
-    </div>
 
-    <section class="library" aria-labelledby="library-title">
-      <div class="library-toolbar">
-        <div><p class="step-label">Your workspace</p><h2 id="library-title">Board library</h2></div>
-        <div class="library-actions">
-          <button class="button button-ghost button-small" id="refresh-library" type="button">Refresh</button>
-          <button class="button button-dark button-small" id="create-folder" type="button">New folder</button>
+          <div class="capture-actions">
+            <label class="button button-primary" for="board-image">Choose photo</label>
+            <label class="button button-secondary" for="camera-image">Take photo</label>
+            <input id="camera-image" type="file" accept="image/*" capture="environment">
+          </div>
+          <p class="format-note">JPG, PNG, or WEBP · 16 MB maximum</p>
         </div>
-      </div>
-      <nav class="library-path" id="library-path" aria-label="Current folder"></nav>
-      <div id="library-status" class="library-message" role="status">Loading your boards…</div>
-      <div id="library-grid" class="library-grid" aria-live="polite" hidden></div>
+
+        <div class="selection-state" id="upload-selected" hidden>
+          <figure class="selection-preview">
+            <img id="upload-preview" alt="">
+            <figcaption>
+              <strong id="file-title"></strong>
+              <span id="file-detail"></span>
+            </figcaption>
+          </figure>
+          <div class="selection-actions">
+            <button class="text-action" id="cancel-selection" type="button">Cancel</button>
+            <button class="button button-secondary" id="replace-selection" type="button">Replace</button>
+            <button class="button button-primary" id="upload-submit" type="submit">Process board</button>
+          </div>
+        </div>
+
+        <div class="processing-state" id="processing" role="status" aria-live="polite" hidden>
+          <div class="processing-head">
+            <div>
+              <p class="tool-label">Processing on this server</p>
+              <h2>Building your digital board</h2>
+            </div>
+            <time id="processing-time">00:00</time>
+          </div>
+          <div class="activity-track" aria-hidden="true"><span></span></div>
+          <ol class="processing-sequence" aria-label="Processing pipeline order">
+            <li>Prepare image</li>
+            <li>Detect board</li>
+            <li>Correct perspective</li>
+            <li>Enhance board</li>
+            <li>Analyze ink</li>
+            <li>Build vector geometry</li>
+          </ol>
+          <p>The editor opens when processing finishes. If automatic detection is uncertain, you can place the board corners manually.</p>
+        </div>
+      </form>
+
+      <aside class="storage-note" id="privacy">
+        <strong>Image storage</strong>
+        <p>Uploads and generated files are stored on this server until its operator removes them. This prototype has no accounts; anyone with a board link may be able to open it. No external AI API is used.</p>
+      </aside>
     </section>
   </main>
 
-  <footer class="site-footer">
-    <span>Built for faster learning.</span>
-    <span>Cal Poly Hackathon · 2026</span>
+  <footer class="app-footer">
+    <span>Digital Whiteboard · Hackathon prototype</span>
+    <a href="https://github.com/NathanManier/whiteboardhackathon" target="_blank" rel="noreferrer">Source code</a>
   </footer>
 
-  <dialog id="name-dialog">
-    <form class="dialog-form" id="name-form">
-      <h2 id="name-dialog-title">Name item</h2>
-      <p id="name-dialog-help"></p>
-      <label class="field">Name <input id="name-dialog-input" maxlength="80" required autocomplete="off"></label>
-      <div class="dialog-actions">
-        <button class="button button-ghost button-small" value="cancel" formmethod="dialog" type="submit">Cancel</button>
-        <button class="button button-primary button-small" id="name-dialog-submit" type="submit">Save</button>
-      </div>
-    </form>
-  </dialog>
+  <script>
+    (() => {
+      const form = document.querySelector('#upload-form');
+      const standardInput = document.querySelector('#board-image');
+      const cameraInput = document.querySelector('#camera-image');
+      const idle = document.querySelector('#upload-idle');
+      const selected = document.querySelector('#upload-selected');
+      const processing = document.querySelector('#processing');
+      const preview = document.querySelector('#upload-preview');
+      const fileTitle = document.querySelector('#file-title');
+      const fileDetail = document.querySelector('#file-detail');
+      const dropZone = document.querySelector('#drop-zone');
+      let previewUrl;
 
-  <dialog id="move-dialog">
-    <form class="dialog-form" id="move-form">
-      <h2>Move board</h2>
-      <p>Choose where this board should appear.</p>
-      <label class="field">Destination <select id="move-folder"><option value="">Root</option></select></label>
-      <div class="dialog-actions">
-        <button class="button button-ghost button-small" value="cancel" formmethod="dialog" type="submit">Cancel</button>
-        <button class="button button-primary button-small" type="submit">Move</button>
-      </div>
-    </form>
-  </dialog>
-  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
-  <script src="{{ url_for('static', filename='library.js') }}" defer></script>
+      function setInputSource(input) {
+        standardInput.name = input === standardInput ? 'image' : '';
+        cameraInput.name = input === cameraInput ? 'image' : '';
+        standardInput.required = input === standardInput;
+        cameraInput.required = input === cameraInput;
+      }
+
+      function showSelection(file, input) {
+        if (!file || !file.type.startsWith('image/')) return;
+        setInputSource(input);
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        previewUrl = URL.createObjectURL(file);
+        preview.src = previewUrl;
+        preview.alt = `Selected whiteboard photo: ${file.name}`;
+        fileTitle.textContent = file.name;
+        fileDetail.textContent = `${(file.size / 1048576).toFixed(1)} MB`;
+        idle.hidden = true;
+        selected.hidden = false;
+        processing.hidden = true;
+      }
+
+      function clearSelection() {
+        standardInput.value = '';
+        cameraInput.value = '';
+        standardInput.name = 'image';
+        cameraInput.removeAttribute('name');
+        standardInput.required = true;
+        cameraInput.required = false;
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        previewUrl = undefined;
+        preview.removeAttribute('src');
+        selected.hidden = true;
+        idle.hidden = false;
+      }
+
+      standardInput.addEventListener('change', () => showSelection(standardInput.files[0], standardInput));
+      cameraInput.addEventListener('change', () => showSelection(cameraInput.files[0], cameraInput));
+      document.querySelector('#cancel-selection').addEventListener('click', clearSelection);
+      document.querySelector('#replace-selection').addEventListener('click', () => standardInput.click());
+
+      ['dragenter', 'dragover'].forEach(type => dropZone.addEventListener(type, event => {
+        event.preventDefault();
+        dropZone.classList.add('is-dragging');
+      }));
+      ['dragleave', 'drop'].forEach(type => dropZone.addEventListener(type, event => {
+        event.preventDefault();
+        dropZone.classList.remove('is-dragging');
+      }));
+      dropZone.addEventListener('drop', event => {
+        const file = event.dataTransfer.files[0];
+        if (!file || !file.type.startsWith('image/')) return;
+        const transfer = new DataTransfer();
+        transfer.items.add(file);
+        standardInput.files = transfer.files;
+        showSelection(file, standardInput);
+      });
+
+      form.addEventListener('submit', event => {
+        const activeInput = standardInput.name ? standardInput : cameraInput;
+        if (!activeInput.files.length) {
+          event.preventDefault();
+          clearSelection();
+          return;
+        }
+        selected.hidden = true;
+        processing.hidden = false;
+        form.setAttribute('aria-busy', 'true');
+        const started = Date.now();
+        const timer = document.querySelector('#processing-time');
+        window.setInterval(() => {
+          const seconds = Math.floor((Date.now() - started) / 1000);
+          timer.textContent = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+        }, 250);
+      });
+    })();
+  </script>
 </body>
 </html>
