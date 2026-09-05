@@ -446,3 +446,138 @@ kbd { display: inline-block; min-width: 18px; margin-right: 2px; padding: 2px 4p
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* Demo editor v2: controls recede so the processed board remains the focal point. */
+.workspace-page {
+  color: #e8edf5;
+  background: #0b1018;
+}
+.workspace-page .workspace-header {
+  border-color: #273143;
+  background: rgba(13, 19, 29, .96);
+}
+.workspace-page .brand,
+.workspace-page .board-title,
+.workspace-page .button-ghost {
+  color: #f4f7fb;
+}
+.workspace-page .button-ghost { border-color: #364156; }
+.workspace-page .save-status { color: #9ba8ba; border-color: #364156; }
+.editor-workspace.editor-v2 {
+  height: calc(100vh - 64px);
+  min-height: 560px;
+  grid-template-columns: 210px minmax(0, 1fr);
+  background: #111824;
+}
+.editor-v2 .editor-sidebar {
+  border-color: #273143;
+  background: #111824;
+}
+.editor-v2 .editor-sidebar h1,
+.editor-v2 .layer-row strong,
+.editor-v2 kbd { color: #f2f5fa; }
+.editor-v2 .layers-panel { border-color: #273143; }
+.editor-v2 .layer-row small,
+.editor-v2 .keyboard-help,
+.editor-v2 .section-label { color: #8f9db0; }
+.editor-v2 kbd { border-color: #364156; background: #192231; }
+.editor-v2 .canvas-column { min-height: 0; background: #080d14; }
+.editor-v2 .drawing-toolbar {
+  z-index: 3;
+  min-height: 62px;
+  flex-wrap: wrap;
+  border-color: #273143;
+  background: #151d2a;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .2);
+}
+.editor-v2 .tool-button,
+.editor-v2 .icon-button,
+.editor-v2 .text-button,
+.editor-v2 .size-control,
+.editor-v2 .zoom-label { color: #9ba8ba; }
+.editor-v2 .tool-button:hover,
+.editor-v2 .icon-button:hover { color: #fff; background: #232e3f; }
+.editor-v2 .tool-button.is-active {
+  color: #fff;
+  background: #2d3a4f;
+  box-shadow: inset 0 0 0 1px #41516b;
+}
+.editor-v2 .tool-divider { background: #344056; }
+.editor-v2 .color-chip { border-color: #151d2a; box-shadow: 0 0 0 1px #53617a; }
+.editor-v2 .color-chip.is-active { box-shadow: 0 0 0 2px #fff; }
+.editor-v2 .text-button.danger { color: #ff8872; }
+.editor-v2 .compact-select {
+  height: 32px;
+  border: 1px solid #3b485e;
+  border-radius: 7px;
+  color: #dce3ed;
+  background: #1c2635;
+  font-size: 10px;
+}
+.editor-v2 .zoom-label { min-width: 42px; font-size: 10px; text-align: center; }
+.editor-v2 .board-viewport {
+  position: relative;
+  min-height: 0;
+  padding: clamp(10px, 1.5vw, 20px);
+  overflow: hidden;
+  background:
+    radial-gradient(circle at center, rgba(67, 81, 105, .2), transparent 55%),
+    #080d14;
+}
+.editor-v2 .board-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
+  aspect-ratio: auto;
+  border: 1px solid #283347;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, .42);
+}
+#world-scene {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #fff;
+  touch-action: none;
+  user-select: none;
+}
+#world-scene[data-tool="pen"],
+#world-scene[data-tool="highlighter"] { cursor: crosshair; }
+#world-scene[data-tool="object-eraser"],
+#world-scene[data-tool="pixel-eraser"] { cursor: cell; }
+#world-scene.is-panning { cursor: grabbing; }
+#text-editor {
+  position: absolute;
+  z-index: 20;
+  min-width: 80px;
+  min-height: 42px;
+  padding: 5px;
+  border: 2px solid #3b82f6;
+  border-radius: 4px;
+  color: #17253a;
+  background: rgba(255, 255, 255, .96);
+  resize: none;
+  outline: none;
+  line-height: 1.2;
+}
+.editor-v2 .empty-state {
+  inset: auto 12px 12px;
+  padding: 10px;
+  color: #5f6d80;
+  background: rgba(255, 255, 255, .92);
+  box-shadow: 0 2px 12px rgba(22, 33, 47, .12);
+  pointer-events: none;
+}
+.editor-v2 .canvas-caption {
+  color: #8290a5;
+  border-color: #273143;
+  background: #111824;
+}
+
+@media (max-width: 760px) {
+  .editor-workspace.editor-v2 { grid-template-columns: 1fr; }
+  .editor-v2 .editor-sidebar { display: none; }
+  .editor-v2 .board-frame { min-height: 55vh; }
+  .editor-v2 .drawing-toolbar { align-content: center; overflow-x: auto; flex-wrap: nowrap; }
+}

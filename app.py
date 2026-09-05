@@ -10,6 +10,7 @@ import os
 
 import re
 import secrets
+import shutil
 import time
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -41,6 +42,7 @@ ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
 FORMAT_FOR_EXTENSION = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
 FORMAT_FOR_MIME = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
 BOARD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+FOLDER_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 ASSET_NAMES = {
     "original", "corrected", "master", "analysis", "mask", "digitized",
     "comparison", "detection", "confidence",
@@ -53,6 +55,11 @@ DETECTION_CONFIDENCE_THRESHOLD = 0.55
 MAX_USER_STROKES = 2_000
 MAX_POINTS_PER_STROKE = 10_000
 MAX_TOTAL_USER_POINTS = 200_000
+MAX_EDITOR_OBJECTS = 3_000
+MAX_EDITOR_POINTS = 300_000
+MAX_ERASURES_PER_STROKE = 500
+MAX_TEXT_LENGTH = 20_000
+MAX_WORLD_COORDINATE = 10_000_000.0
 MAX_DEBUG_RASTER_DIMENSION = 1600
 MAX_DEBUG_SVG_BYTES = 16 * 1024 * 1024
 MAX_DEBUG_SVG_PATHS = 2_500
@@ -126,6 +133,313 @@ def atomic_image(path: Path, image: np.ndarray) -> None:
 def update_metadata(board_dir: Path, metadata: dict[str, Any]) -> None:
     metadata["updated_at"] = time.time()
     atomic_json(metadata_path(board_dir), metadata)
+
+
+def validate_display_name(value: Any, label: str = "Name") -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} is required.")
+    name = " ".join(value.strip().split())
+    if not 1 <= len(name) <= 80:
+        raise ValueError(f"{label} must be between 1 and 80 characters.")
+    if any(ord(character) < 32 for character in name) or any(
+        character in "/\\:" for character in name
+    ):
+        raise ValueError(f"{label} contains invalid characters.")
+    return name
+
+
+def library_path() -> Path:
+    return BOARDS_DIR / "library.json"
+
+
+def read_library() -> dict[str, Any]:
+    try:
+        value = json.loads(library_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"schema_version": 1, "folders": [], "boards": {}}
+    except (OSError, json.JSONDecodeError):
+        abort(500, description="Board library is unavailable.")
+    if not isinstance(value, dict):
+        abort(500, description="Board library is invalid.")
+    return {
+        "schema_version": 1,
+        "folders": value.get("folders") if isinstance(value.get("folders"), list) else [],
+        "boards": value.get("boards") if isinstance(value.get("boards"), dict) else {},
+    }
+
+
+def write_library(value: dict[str, Any]) -> None:
+    atomic_json(library_path(), value)
+
+
+def folder_ids(library: dict[str, Any]) -> set[str]:
+    return {
+        folder["id"]
+        for folder in library.get("folders", [])
+        if isinstance(folder, dict)
+        and isinstance(folder.get("id"), str)
+        and FOLDER_ID_RE.fullmatch(folder["id"])
+    }
+
+
+def editor_path(board_dir: Path) -> Path:
+    return board_dir / "editor.json"
+
+
+def finite_number(
+    value: Any,
+    label: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a number.") from exc
+    if not np.isfinite(number):
+        raise ValueError(f"{label} must be finite.")
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{label} is too small.")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{label} is too large.")
+    return round(number, 4)
+
+
+def validate_world_point(value: Any, label: str) -> dict[str, float]:
+    if isinstance(value, dict):
+        x_value, y_value = value.get("x"), value.get("y")
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        x_value, y_value = value
+    else:
+        raise ValueError(f"{label} must contain x and y.")
+    return {
+        "x": finite_number(
+            x_value,
+            f"{label}.x",
+            minimum=-MAX_WORLD_COORDINATE,
+            maximum=MAX_WORLD_COORDINATE,
+        ),
+        "y": finite_number(
+            y_value,
+            f"{label}.y",
+            minimum=-MAX_WORLD_COORDINATE,
+            maximum=MAX_WORLD_COORDINATE,
+        ),
+    }
+
+
+def validate_point_list(value: Any, label: str, maximum: int) -> list[dict[str, float]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= maximum:
+        raise ValueError(f"{label} has an invalid point count.")
+    return [
+        validate_world_point(point, f"{label}[{index}]")
+        for index, point in enumerate(value)
+    ]
+
+
+def default_editor_state(metadata: dict[str, Any]) -> dict[str, Any]:
+    dimensions = metadata.get("dimensions", {})
+    width = max(
+        1, int(dimensions.get("width") or metadata.get("source", {}).get("width") or 1)
+    )
+    height = max(
+        1, int(dimensions.get("height") or metadata.get("source", {}).get("height") or 1)
+    )
+    objects = []
+    for index, stroke in enumerate(metadata.get("user_strokes", [])):
+        if not isinstance(stroke, dict) or not isinstance(stroke.get("points"), list):
+            continue
+        objects.append(
+            {
+                "id": str(stroke.get("id") or f"legacy-stroke-{index}"),
+                "type": "stroke",
+                "color": stroke.get("color", "#183153"),
+                "width": stroke.get("size", stroke.get("width", 4)),
+                "opacity": 1,
+                "points": stroke["points"],
+                "translation": {"x": 0, "y": 0},
+                "erasures": [],
+            }
+        )
+    return {
+        "schema_version": 2,
+        "revision": 0,
+        "updated_at": metadata.get("user_ink_updated_at"),
+        "viewport": {"x": 0, "y": 0, "width": width, "height": height},
+        "objects": objects,
+    }
+
+
+def read_editor_state(board_dir: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = json.loads(editor_path(board_dir).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default_editor_state(metadata)
+    except (OSError, json.JSONDecodeError):
+        abort(500, description="Editable board state is unavailable.")
+    if not isinstance(value, dict):
+        abort(500, description="Editable board state is invalid.")
+    return value
+
+
+def validate_editor_state(value: Any) -> dict[str, Any]:
+    """Validate the scene while allowing objects beyond the immutable master bounds."""
+    if not isinstance(value, dict):
+        raise ValueError("Editor state must be an object.")
+    if isinstance(value.get("editor"), dict):
+        value = value["editor"]
+    viewport = value.get("viewport")
+    if not isinstance(viewport, dict):
+        raise ValueError("viewport must be an object.")
+    clean_viewport = {
+        "x": finite_number(
+            viewport.get("x"),
+            "viewport.x",
+            minimum=-MAX_WORLD_COORDINATE,
+            maximum=MAX_WORLD_COORDINATE,
+        ),
+        "y": finite_number(
+            viewport.get("y"),
+            "viewport.y",
+            minimum=-MAX_WORLD_COORDINATE,
+            maximum=MAX_WORLD_COORDINATE,
+        ),
+        "width": finite_number(
+            viewport.get("width"), "viewport.width", minimum=1, maximum=MAX_WORLD_COORDINATE
+        ),
+        "height": finite_number(
+            viewport.get("height"), "viewport.height", minimum=1, maximum=MAX_WORLD_COORDINATE
+        ),
+    }
+    objects = value.get("objects")
+    if not isinstance(objects, list) or len(objects) > MAX_EDITOR_OBJECTS:
+        raise ValueError(f"objects must contain at most {MAX_EDITOR_OBJECTS} items.")
+    clean_objects: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    total_points = 0
+    for index, item in enumerate(objects):
+        if not isinstance(item, dict):
+            raise ValueError(f"Object {index} must be an object.")
+        object_id = item.get("id")
+        if not isinstance(object_id, str) or not STROKE_ID_RE.fullmatch(object_id):
+            raise ValueError(f"Object {index} has an invalid id.")
+        if object_id in seen_ids:
+            raise ValueError(f"Object id {object_id} is duplicated.")
+        seen_ids.add(object_id)
+        object_type = item.get("type")
+        if object_type not in {"stroke", "highlighter", "text"}:
+            raise ValueError(f"Object {index} has an invalid type.")
+        color = item.get("color")
+        if not isinstance(color, str) or not COLOR_RE.fullmatch(color):
+            raise ValueError(f"Object {index} has an invalid color.")
+        translation = validate_world_point(
+            item.get("translation", item.get("translate", {"x": 0, "y": 0})),
+            f"Object {index} translation",
+        )
+        if object_type == "text":
+            text = item.get("text", "")
+            if not isinstance(text, str) or len(text) > MAX_TEXT_LENGTH:
+                raise ValueError(f"Object {index} text is invalid.")
+            clean_objects.append(
+                {
+                    "id": object_id,
+                    "type": "text",
+                    "text": text,
+                    "x": finite_number(
+                        item.get("x"),
+                        f"Object {index}.x",
+                        minimum=-MAX_WORLD_COORDINATE,
+                        maximum=MAX_WORLD_COORDINATE,
+                    ),
+                    "y": finite_number(
+                        item.get("y"),
+                        f"Object {index}.y",
+                        minimum=-MAX_WORLD_COORDINATE,
+                        maximum=MAX_WORLD_COORDINATE,
+                    ),
+                    "width": finite_number(
+                        item.get("width"),
+                        f"Object {index}.width",
+                        minimum=10,
+                        maximum=MAX_WORLD_COORDINATE,
+                    ),
+                    "height": finite_number(
+                        item.get("height"),
+                        f"Object {index}.height",
+                        minimum=10,
+                        maximum=MAX_WORLD_COORDINATE,
+                    ),
+                    "font_size": finite_number(
+                        item.get("font_size", item.get("fontSize", 32)),
+                        f"Object {index}.font_size",
+                        minimum=6,
+                        maximum=500,
+                    ),
+                    "color": color.lower(),
+                    "translation": translation,
+                }
+            )
+            continue
+        points = validate_point_list(
+            item.get("points"), f"Object {index} points", MAX_POINTS_PER_STROKE
+        )
+        total_points += len(points)
+        width = finite_number(
+            item.get("width", item.get("size")),
+            f"Object {index}.width",
+            minimum=0.25,
+            maximum=500,
+        )
+        opacity = finite_number(
+            item.get("opacity", 0.28 if object_type == "highlighter" else 1),
+            f"Object {index}.opacity",
+            minimum=0.01,
+            maximum=1,
+        )
+        erasures_value = item.get("erasures", [])
+        if not isinstance(erasures_value, list) or len(erasures_value) > MAX_ERASURES_PER_STROKE:
+            raise ValueError(f"Object {index} has too many erasures.")
+        erasures = []
+        for erase_index, erasure in enumerate(erasures_value):
+            if not isinstance(erasure, dict):
+                raise ValueError(f"Object {index} erasure {erase_index} is invalid.")
+            erase_points = validate_point_list(
+                erasure.get("points"),
+                f"Object {index} erasure {erase_index}",
+                MAX_POINTS_PER_STROKE,
+            )
+            total_points += len(erase_points)
+            erasures.append(
+                {
+                    "points": erase_points,
+                    "width": finite_number(
+                        erasure.get("width", erasure.get("size", 24)),
+                        f"Object {index} erasure {erase_index}.width",
+                        minimum=1,
+                        maximum=1_000,
+                    ),
+                }
+            )
+        if total_points > MAX_EDITOR_POINTS:
+            raise ValueError(f"At most {MAX_EDITOR_POINTS} total points are allowed.")
+        clean_objects.append(
+            {
+                "id": object_id,
+                "type": object_type,
+                "color": color.lower(),
+                "width": width,
+                "opacity": opacity,
+                "points": points,
+                "translation": translation,
+                "erasures": erasures,
+            }
+        )
+    return {
+        "schema_version": 2,
+        "viewport": clean_viewport,
+        "objects": clean_objects,
+    }
 
 
 def decode_image(data: bytes) -> np.ndarray:
@@ -758,6 +1072,10 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
     data = {
         "id": board_id,
         "board_id": board_id,
+        "name": metadata.get("name") or Path(
+            str(metadata.get("source", {}).get("filename", "Untitled board"))
+        ).stem,
+        "folder_id": metadata.get("folder_id"),
         "status": status,
         "needs_corners": status == "needs_corners",
         "assets": assets,
@@ -847,21 +1165,114 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
         except (OSError, ET.ParseError):
             pass
     user = ET.SubElement(root, f"{{{namespace}}}g", {"id": "user-ink"})
-    for stroke in metadata.get("user_strokes", []):
-        points = stroke["points"]
+    editor = read_editor_state(board_dir, metadata)
+    objects = editor.get("objects", [])
+    if not objects:
+        objects = [
+            {
+                **stroke,
+                "type": "stroke",
+                "width": stroke.get("size"),
+                "opacity": 1,
+                "translation": {"x": 0, "y": 0},
+                "erasures": [],
+            }
+            for stroke in metadata.get("user_strokes", [])
+            if isinstance(stroke, dict)
+        ]
+    definitions = ET.SubElement(root, f"{{{namespace}}}defs")
+    for item in objects:
+        if not isinstance(item, dict):
+            continue
+        translation = item.get("translation", {})
+        transform = (
+            f'translate({float(translation.get("x", 0)):.4f} '
+            f'{float(translation.get("y", 0)):.4f})'
+        )
+        if item.get("type") == "text":
+            text = ET.SubElement(
+                user,
+                f"{{{namespace}}}text",
+                {
+                    "id": str(item.get("id", "")),
+                    "x": str(item.get("x", 0)),
+                    "y": str(float(item.get("y", 0)) + float(item.get("font_size", 32))),
+                    "fill": str(item.get("color", "#183153")),
+                    "font-size": str(item.get("font_size", 32)),
+                    "font-family": "Arial, sans-serif",
+                    "transform": transform,
+                },
+            )
+            lines = str(item.get("text", "")).splitlines() or [""]
+            for line_index, line in enumerate(lines):
+                span = ET.SubElement(
+                    text,
+                    f"{{{namespace}}}tspan",
+                    {
+                        "x": str(item.get("x", 0)),
+                        "dy": "0" if line_index == 0 else "1.2em",
+                    },
+                )
+                span.text = line
+            continue
+        points = item.get("points")
+        if not isinstance(points, list) or not points:
+            continue
         path_data = "M " + " L ".join(f'{point["x"]:.4f} {point["y"]:.4f}' for point in points)
+        attributes = {
+            "id": str(item.get("id", "")),
+            "d": path_data,
+            "fill": "none",
+            "stroke": str(item.get("color", "#183153")),
+            "stroke-width": str(item.get("width", item.get("size", 4))),
+            "stroke-opacity": str(item.get("opacity", 1)),
+            "stroke-linecap": "round",
+            "stroke-linejoin": "round",
+            "transform": transform,
+        }
+        erasures = item.get("erasures", [])
+        if isinstance(erasures, list) and erasures:
+            mask_id = f'erase-{item.get("id", secrets.token_hex(4))}'
+            mask = ET.SubElement(
+                definitions,
+                f"{{{namespace}}}mask",
+                {"id": mask_id, "maskUnits": "userSpaceOnUse"},
+            )
+            ET.SubElement(
+                mask,
+                f"{{{namespace}}}rect",
+                {
+                    "x": str(-MAX_WORLD_COORDINATE),
+                    "y": str(-MAX_WORLD_COORDINATE),
+                    "width": str(MAX_WORLD_COORDINATE * 2),
+                    "height": str(MAX_WORLD_COORDINATE * 2),
+                    "fill": "white",
+                },
+            )
+            for erasure in erasures:
+                erase_points = erasure.get("points", [])
+                if not erase_points:
+                    continue
+                erase_path = "M " + " L ".join(
+                    f'{point["x"]:.4f} {point["y"]:.4f}' for point in erase_points
+                )
+                ET.SubElement(
+                    mask,
+                    f"{{{namespace}}}path",
+                    {
+                        "d": erase_path,
+                        "fill": "none",
+                        "stroke": "black",
+                        "stroke-width": str(erasure.get("width", 24)),
+                        "stroke-linecap": "round",
+                        "stroke-linejoin": "round",
+                    },
+                )
+            attributes["mask"] = f"url(#{mask_id})"
         ET.SubElement(
             user,
             f"{{{namespace}}}path",
-            {
-                "id": stroke["id"],
-                "d": path_data,
-                "fill": "none",
-                "stroke": stroke["color"],
-                "stroke-width": str(stroke["size"]),
-                "stroke-linecap": "round",
-                "stroke-linejoin": "round",
-            },
+            attributes,
         )
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
@@ -921,6 +1332,19 @@ def upload() -> Response | tuple[str, int]:
     except ValueError as exc:
         return f"Invalid image: {exc}", 400
 
+    library = read_library()
+    try:
+        requested_name = request.form.get("name")
+        board_name = validate_display_name(
+            requested_name if requested_name and requested_name.strip() else Path(uploaded.filename).stem,
+            "Board name",
+        )
+    except ValueError as exc:
+        return str(exc), 400
+    requested_folder = request.form.get("folder_id", "").strip() or None
+    if requested_folder is not None and requested_folder not in folder_ids(library):
+        return "The selected folder does not exist.", 400
+
     board_id = secrets.token_hex(16)
     board_dir = BOARDS_DIR / board_id
     board_dir.mkdir(mode=0o700)
@@ -929,6 +1353,8 @@ def upload() -> Response | tuple[str, int]:
     metadata: dict[str, Any] = {
         "schema_version": 1,
         "id": board_id,
+        "name": board_name,
+        "folder_id": requested_folder,
         "created_at": time.time(),
         "updated_at": time.time(),
         "source": {
@@ -942,6 +1368,13 @@ def upload() -> Response | tuple[str, int]:
         "pipeline": {"status": "detecting", "timings_ms": {}, "errors": []},
     }
     update_metadata(board_dir, metadata)
+    library["boards"][board_id] = {
+        "name": board_name,
+        "folder_id": requested_folder,
+        "created_at": metadata["created_at"],
+        "updated_at": metadata["updated_at"],
+    }
+    write_library(library)
 
     started = time.perf_counter()
     LOGGER.info(
@@ -1076,6 +1509,232 @@ def save_board(board_id: str) -> Response | tuple[Response, int]:
     metadata["user_ink_updated_at"] = time.time()
     update_metadata(board_dir, metadata)
     return jsonify(id=board_id, status="saved", user_strokes=strokes)
+
+
+@app.route("/api/boards/<board_id>/editor", methods=["GET", "PUT", "POST"])
+def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    current = read_editor_state(board_dir, metadata)
+    if request.method == "GET":
+        return jsonify(editor=current)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    raw_state = payload.get("editor") if isinstance(payload.get("editor"), dict) else payload
+    try:
+        client_revision = int(raw_state.get("revision", current.get("revision", 0)))
+        current_revision = int(current.get("revision", 0))
+        if client_revision != current_revision:
+            return jsonify(
+                error="This board was changed in another tab.",
+                editor=current,
+            ), 409
+        clean = validate_editor_state(raw_state)
+    except (TypeError, ValueError) as exc:
+        return jsonify(error=str(exc)), 400
+    clean["revision"] = current_revision + 1
+    clean["updated_at"] = time.time()
+    atomic_json(editor_path(board_dir), clean)
+    metadata["editor_schema_version"] = 2
+    metadata["editor_updated_at"] = clean["updated_at"]
+    update_metadata(board_dir, metadata)
+    return jsonify(id=board_id, status="saved", editor=clean)
+
+
+@app.get("/api/library")
+def get_library() -> Response:
+    library = read_library()
+    known_folders = folder_ids(library)
+    board_entries = library["boards"]
+    boards = []
+    for board_dir in sorted(BOARDS_DIR.iterdir()):
+        if not board_dir.is_dir() or not BOARD_ID_RE.fullmatch(board_dir.name):
+            continue
+        try:
+            metadata = json.loads(metadata_path(board_dir).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        board_id = board_dir.name
+        catalog = board_entries.get(board_id)
+        if not isinstance(catalog, dict):
+            catalog = {}
+        source = metadata.get("source", {})
+        source_name = source.get("filename") if isinstance(source, dict) else None
+        name = catalog.get("name") or metadata.get("name") or Path(
+            str(source_name or f"Board {board_id[:8]}")
+        ).stem
+        folder_id = catalog.get("folder_id", metadata.get("folder_id"))
+        if folder_id not in known_folders:
+            folder_id = None
+        dimensions = metadata.get("dimensions", {})
+        assets = metadata.get("assets", {})
+        master = assets.get("master") if isinstance(assets, dict) else None
+        boards.append(
+            {
+                "id": board_id,
+                "name": name,
+                "folder_id": folder_id,
+                "status": metadata.get("pipeline", {}).get("status", "unknown"),
+                "created_at": metadata.get("created_at"),
+                "updated_at": metadata.get("updated_at"),
+                "width": dimensions.get("width") if isinstance(dimensions, dict) else None,
+                "height": dimensions.get("height") if isinstance(dimensions, dict) else None,
+                "thumbnail_url": (
+                    url_for("board_file", board_id=board_id, asset=master)
+                    if isinstance(master, str) and master in asset_paths(metadata)
+                    else None
+                ),
+                "url": url_for("board", board_id=board_id),
+            }
+        )
+    folders = [
+        folder
+        for folder in library["folders"]
+        if isinstance(folder, dict)
+        and isinstance(folder.get("id"), str)
+        and FOLDER_ID_RE.fullmatch(folder["id"])
+        and isinstance(folder.get("name"), str)
+    ]
+    return jsonify(schema_version=1, folders=folders, boards=boards)
+
+
+@app.post("/api/folders")
+def create_folder() -> Response | tuple[Response, int]:
+    payload = request.get_json(silent=True)
+    try:
+        name = validate_display_name(payload.get("name") if isinstance(payload, dict) else None)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    library = read_library()
+    if any(
+        isinstance(folder, dict) and str(folder.get("name", "")).casefold() == name.casefold()
+        for folder in library["folders"]
+    ):
+        return jsonify(error="A folder with that name already exists."), 409
+    folder = {"id": secrets.token_hex(8), "name": name, "created_at": time.time()}
+    library["folders"].append(folder)
+    write_library(library)
+    return jsonify(folder=folder), 201
+
+
+@app.patch("/api/folders/<folder_id>")
+def rename_folder(folder_id: str) -> Response | tuple[Response, int]:
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    payload = request.get_json(silent=True)
+    try:
+        name = validate_display_name(payload.get("name") if isinstance(payload, dict) else None)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    library = read_library()
+    target = next(
+        (
+            folder
+            for folder in library["folders"]
+            if isinstance(folder, dict) and folder.get("id") == folder_id
+        ),
+        None,
+    )
+    if target is None:
+        abort(404)
+    if any(
+        isinstance(folder, dict)
+        and folder.get("id") != folder_id
+        and str(folder.get("name", "")).casefold() == name.casefold()
+        for folder in library["folders"]
+    ):
+        return jsonify(error="A folder with that name already exists."), 409
+    target["name"] = name
+    target["updated_at"] = time.time()
+    write_library(library)
+    return jsonify(folder=target)
+
+
+@app.delete("/api/folders/<folder_id>")
+def delete_folder(folder_id: str) -> Response | tuple[Response, int]:
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    library = read_library()
+    if folder_id not in folder_ids(library):
+        abort(404)
+    board_ids = [
+        board_id
+        for board_id, entry in library["boards"].items()
+        if isinstance(entry, dict) and entry.get("folder_id") == folder_id
+    ]
+    recursive = request.args.get("recursive", "").lower() in {"1", "true", "yes"}
+    if board_ids and not recursive:
+        return jsonify(
+            error="The folder is not empty.",
+            board_count=len(board_ids),
+            requires_recursive=True,
+        ), 409
+    if recursive:
+        for board_id in board_ids:
+            if BOARD_ID_RE.fullmatch(board_id):
+                board_dir = BOARDS_DIR / board_id
+                if board_dir.is_dir():
+                    shutil.rmtree(board_dir)
+            library["boards"].pop(board_id, None)
+    library["folders"] = [
+        folder
+        for folder in library["folders"]
+        if not isinstance(folder, dict) or folder.get("id") != folder_id
+    ]
+    write_library(library)
+    return jsonify(status="deleted", id=folder_id, deleted_boards=len(board_ids))
+
+
+@app.patch("/api/boards/<board_id>")
+def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
+    board_dir = require_board_id(board_id)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    library = read_library()
+    entry = library["boards"].get(board_id)
+    if not isinstance(entry, dict):
+        metadata = read_metadata(board_dir)
+        entry = {
+            "name": metadata.get("name")
+            or Path(str(metadata.get("source", {}).get("filename", "Untitled board"))).stem,
+            "folder_id": metadata.get("folder_id"),
+            "created_at": metadata.get("created_at"),
+        }
+    try:
+        if "name" in payload:
+            entry["name"] = validate_display_name(payload["name"], "Board name")
+        if "folder_id" in payload:
+            selected = payload["folder_id"]
+            if selected in {"", None}:
+                entry["folder_id"] = None
+            elif not isinstance(selected, str) or selected not in folder_ids(library):
+                raise ValueError("The selected folder does not exist.")
+            else:
+                entry["folder_id"] = selected
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    entry["updated_at"] = time.time()
+    library["boards"][board_id] = entry
+    write_library(library)
+    metadata = read_metadata(board_dir)
+    metadata["name"] = entry["name"]
+    metadata["folder_id"] = entry.get("folder_id")
+    update_metadata(board_dir, metadata)
+    return jsonify(board={"id": board_id, **entry})
+
+
+@app.delete("/api/boards/<board_id>")
+def delete_board(board_id: str) -> Response:
+    board_dir = require_board_id(board_id)
+    library = read_library()
+    shutil.rmtree(board_dir)
+    library["boards"].pop(board_id, None)
+    write_library(library)
+    return jsonify(status="deleted", id=board_id)
 
 
 @app.get("/board/<board_id>/asset/<asset_name>")

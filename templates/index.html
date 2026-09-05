@@ -4,8 +4,40 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f6f4ef">
-  <title>Boardlift · Turn board photos into working canvases</title>
+  <title>Boardlift · Your whiteboard library</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    .home-main{width:min(1160px,calc(100% - 40px));margin:auto;padding:clamp(38px,6vw,76px) 0 60px}
+    .home-hero{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(330px,.85fr);gap:clamp(32px,6vw,72px);align-items:start}
+    .home-hero h1{margin:0;font-size:clamp(45px,6vw,76px);line-height:1;letter-spacing:-.06em}
+    .home-hero h1 em{color:var(--accent);font-family:"Fraunces",serif;font-weight:600}
+    .hero-copy{margin-bottom:0}.upload-card{padding:clamp(20px,3vw,30px)}
+    .drop-zone{min-height:190px;margin:20px 0 16px;padding:24px}
+    .upload-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+    .field{display:grid;gap:6px;color:var(--muted);font-size:12px;font-weight:600}
+    .field input,.field select,.dialog-form input{width:100%;min-height:43px;padding:0 12px;border:1px solid var(--line);border-radius:9px;color:var(--ink);background:var(--surface);font:inherit}
+    .library{margin-top:clamp(58px,8vw,90px)}
+    .library-toolbar{display:flex;align-items:end;justify-content:space-between;gap:20px;padding-bottom:18px;border-bottom:1px solid var(--line)}
+    .library-toolbar h2{margin:4px 0 0;font-size:clamp(27px,3vw,38px);letter-spacing:-.04em}
+    .library-actions{display:flex;gap:8px;flex-wrap:wrap}
+    .library-path{display:flex;align-items:center;gap:8px;min-height:44px;margin:18px 0 8px;color:var(--muted);font-size:13px}
+    .path-button{padding:0;border:0;color:var(--ink);background:none;cursor:pointer;font-weight:700}
+    .library-message{padding:36px 20px;border:1px dashed var(--line);border-radius:14px;text-align:center;color:var(--muted)}
+    .library-message[role=alert]{color:#9b321f;background:#fae9e4;border-style:solid}
+    .library-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:14px}
+    .library-card{display:flex;min-height:145px;padding:18px;flex-direction:column;border:1px solid var(--line);border-radius:15px;background:rgba(255,254,250,.9);box-shadow:0 7px 25px rgba(28,39,53,.05)}
+    .library-card.folder-card{min-height:105px;background:#f0ede6}.card-icon{font-size:23px}.library-card h3{margin:12px 0 3px;font-size:16px;overflow-wrap:anywhere}
+    .library-card p{margin:0;color:var(--muted);font-size:12px}.card-spacer{flex:1}
+    .card-actions{display:flex;gap:6px;margin-top:16px;flex-wrap:wrap}
+    .card-actions button,.card-actions a{min-height:32px;padding:0 10px;border:1px solid var(--line);border-radius:7px;color:var(--ink);background:transparent;cursor:pointer;font-size:12px;font-weight:600;text-decoration:none}
+    .card-actions .open-action{color:#fff;border-color:var(--ink);background:var(--ink)}.card-actions .danger-action{color:#a43b26}
+    dialog{width:min(420px,calc(100% - 32px));padding:0;border:0;border-radius:16px;color:var(--ink);background:var(--surface);box-shadow:var(--shadow)}
+    dialog::backdrop{background:rgba(10,19,31,.54)}.dialog-form{display:grid;gap:18px;padding:25px}.dialog-form h2{margin:0;font-size:23px}
+    .dialog-form p{margin:-10px 0 0;color:var(--muted);font-size:13px}.dialog-actions{display:flex;justify-content:flex-end;gap:8px}
+    .toast{position:fixed;z-index:100;right:20px;bottom:20px;max-width:360px;padding:13px 16px;border-radius:10px;color:#fff;background:var(--ink);box-shadow:var(--shadow);font-size:13px}
+    @media(max-width:800px){.home-hero{grid-template-columns:1fr}.library-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:560px){.home-main{width:min(100% - 24px,1160px)}.upload-fields,.library-grid{grid-template-columns:1fr}.library-toolbar{align-items:start;flex-direction:column}.upload-actions{align-items:stretch;flex-direction:column}.privacy-note{margin:0}}
+  </style>
 </head>
 <body class="landing">
   <header class="site-header">
@@ -13,64 +45,62 @@
       <span class="brand-mark" aria-hidden="true">B</span>
       <span>Boardlift</span>
     </a>
-    <span class="header-note">Digital whiteboard capture</span>
+    <span class="header-note">Capture · organize · continue</span>
   </header>
 
-  <main class="landing-main">
-    <section class="hero" aria-labelledby="hero-title">
-      <p class="eyebrow">From camera roll to clean canvas</p>
-      <h1 id="hero-title">Keep the thinking.<br><em>Lose the glare.</em></h1>
-      <p class="hero-copy">
-        Upload a classroom whiteboard photo. Boardlift corrects perspective,
-        separates the professor's writing, and gives you a canvas you can keep working on.
-      </p>
-    </section>
+  <main class="home-main">
+    <div class="home-hero">
+      <section class="hero" aria-labelledby="hero-title">
+        <p class="eyebrow">From camera roll to clean canvas</p>
+        <h1 id="hero-title">Keep the thinking.<br><em>Lose the glare.</em></h1>
+        <p class="hero-copy">Turn a physical whiteboard photo into a corrected, editable board, then keep every capture organized for later.</p>
+        <ol class="process-list" aria-label="How Boardlift works">
+          <li><span>01</span><strong>Upload</strong><small>Any board photo</small></li>
+          <li><span>02</span><strong>Correct</strong><small>Flatten perspective</small></li>
+          <li><span>03</span><strong>Continue</strong><small>Edit and export</small></li>
+        </ol>
+      </section>
 
-    <section class="upload-card" aria-labelledby="upload-title">
-      <div class="card-heading">
-        <div>
-          <p class="step-label">01 · Add a photo</p>
-          <h2 id="upload-title">Capture your board</h2>
+      <section class="upload-card" aria-labelledby="upload-title">
+        <div class="card-heading">
+          <div><p class="step-label">New board</p><h2 id="upload-title">Capture a board</h2></div>
+          <span class="file-hint">JPG · PNG · WEBP</span>
         </div>
-        <span class="file-hint">JPG · PNG · WEBP</span>
-      </div>
-
-      <form id="upload-form" class="upload-form" method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
-        <label class="drop-zone" id="drop-zone" for="board-image">
-          <input id="board-image" name="image" type="file" accept="image/*" required>
-          <span class="upload-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" role="img"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>
-          </span>
-          <strong id="file-title">Drop a board photo here</strong>
-          <span id="file-detail">or click to browse your device</span>
-          <img id="upload-preview" alt="" hidden>
-        </label>
-
-        <div class="upload-actions">
-          <p class="privacy-note">
-            <span aria-hidden="true">●</span> Your image is used only to build this board.
-          </p>
-          <button class="button button-primary" id="upload-submit" type="submit">
-            <span>Build my board</span>
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>
-          </button>
-        </div>
-
-        <div class="processing" id="processing" role="status" aria-live="polite" hidden>
-          <span class="spinner" aria-hidden="true"></span>
-          <div>
-            <strong>Reading the whiteboard…</strong>
-            <span>Correcting perspective and tracing ink. This may take a moment.</span>
+        <form id="upload-form" class="upload-form" method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
+          <label class="drop-zone" id="drop-zone" for="board-image">
+            <input id="board-image" name="image" type="file" accept="image/png,image/jpeg,image/webp" required>
+            <span class="upload-icon" aria-hidden="true"><svg viewBox="0 0 24 24" role="img"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg></span>
+            <strong id="file-title">Drop a board photo here</strong>
+            <span id="file-detail">or click to browse your device</span>
+            <img id="upload-preview" alt="" hidden>
+          </label>
+          <div class="upload-fields">
+            <label class="field">Board name <input id="upload-name" name="name" maxlength="80" placeholder="e.g. Calculus review"></label>
+            <label class="field">Save in <select id="upload-folder" name="folder_id"><option value="">Root</option></select></label>
           </div>
-        </div>
-      </form>
-    </section>
+          <div class="upload-actions">
+            <p class="privacy-note"><span aria-hidden="true">●</span> Stored locally on this server.</p>
+            <button class="button button-primary" id="upload-submit" type="submit"><span>Build my board</span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg></button>
+          </div>
+          <div class="processing" id="processing" role="status" aria-live="polite" hidden>
+            <span class="spinner" aria-hidden="true"></span><div><strong>Reading the whiteboard…</strong><span>Correcting perspective and tracing ink. This may take a moment.</span></div>
+          </div>
+        </form>
+      </section>
+    </div>
 
-    <ol class="process-list" aria-label="How Boardlift works">
-      <li><span>01</span><strong>Upload</strong><small>Any board photo</small></li>
-      <li><span>02</span><strong>Correct</strong><small>Flatten the perspective</small></li>
-      <li><span>03</span><strong>Continue</strong><small>Draw, save, and export</small></li>
-    </ol>
+    <section class="library" aria-labelledby="library-title">
+      <div class="library-toolbar">
+        <div><p class="step-label">Your workspace</p><h2 id="library-title">Board library</h2></div>
+        <div class="library-actions">
+          <button class="button button-ghost button-small" id="refresh-library" type="button">Refresh</button>
+          <button class="button button-dark button-small" id="create-folder" type="button">New folder</button>
+        </div>
+      </div>
+      <nav class="library-path" id="library-path" aria-label="Current folder"></nav>
+      <div id="library-status" class="library-message" role="status">Loading your boards…</div>
+      <div id="library-grid" class="library-grid" aria-live="polite" hidden></div>
+    </section>
   </main>
 
   <footer class="site-footer">
@@ -78,50 +108,30 @@
     <span>Cal Poly Hackathon · 2026</span>
   </footer>
 
-  <script>
-    (() => {
-      const form = document.querySelector('#upload-form');
-      const input = document.querySelector('#board-image');
-      const zone = document.querySelector('#drop-zone');
-      const title = document.querySelector('#file-title');
-      const detail = document.querySelector('#file-detail');
-      const preview = document.querySelector('#upload-preview');
-      const processing = document.querySelector('#processing');
-      const submit = document.querySelector('#upload-submit');
+  <dialog id="name-dialog">
+    <form class="dialog-form" id="name-form">
+      <h2 id="name-dialog-title">Name item</h2>
+      <p id="name-dialog-help"></p>
+      <label class="field">Name <input id="name-dialog-input" maxlength="80" required autocomplete="off"></label>
+      <div class="dialog-actions">
+        <button class="button button-ghost button-small" value="cancel" formmethod="dialog" type="submit">Cancel</button>
+        <button class="button button-primary button-small" id="name-dialog-submit" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
 
-      function showFile(file) {
-        if (!file || !file.type.startsWith('image/')) return;
-        title.textContent = file.name;
-        detail.textContent = `${(file.size / 1048576).toFixed(1)} MB · Ready to process`;
-        preview.src = URL.createObjectURL(file);
-        preview.hidden = false;
-        zone.classList.add('has-file');
-      }
-
-      input.addEventListener('change', () => showFile(input.files[0]));
-      ['dragenter', 'dragover'].forEach(type => zone.addEventListener(type, event => {
-        event.preventDefault();
-        zone.classList.add('is-dragging');
-      }));
-      ['dragleave', 'drop'].forEach(type => zone.addEventListener(type, event => {
-        event.preventDefault();
-        zone.classList.remove('is-dragging');
-      }));
-      zone.addEventListener('drop', event => {
-        const file = event.dataTransfer.files[0];
-        if (!file || !file.type.startsWith('image/')) return;
-        const transfer = new DataTransfer();
-        transfer.items.add(file);
-        input.files = transfer.files;
-        showFile(file);
-      });
-      form.addEventListener('submit', () => {
-        processing.hidden = false;
-        submit.disabled = true;
-        submit.querySelector('span').textContent = 'Processing…';
-        zone.setAttribute('aria-busy', 'true');
-      });
-    })();
-  </script>
+  <dialog id="move-dialog">
+    <form class="dialog-form" id="move-form">
+      <h2>Move board</h2>
+      <p>Choose where this board should appear.</p>
+      <label class="field">Destination <select id="move-folder"><option value="">Root</option></select></label>
+      <div class="dialog-actions">
+        <button class="button button-ghost button-small" value="cancel" formmethod="dialog" type="submit">Cancel</button>
+        <button class="button button-primary button-small" type="submit">Move</button>
+      </div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script src="{{ url_for('static', filename='library.js') }}" defer></script>
 </body>
 </html>
