@@ -435,10 +435,78 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
                 "erasures": erasures,
             }
         )
+    groups = value.get("groups", [])
+    if not isinstance(groups, list) or len(groups) > MAX_EDITOR_OBJECTS:
+        raise ValueError(f"groups must contain at most {MAX_EDITOR_OBJECTS} items.")
+    clean_groups: list[dict[str, Any]] = []
+    seen_group_ids: set[str] = set()
+    known_ids = set(seen_ids)
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            raise ValueError(f"Group {index} must be an object.")
+        group_id = group.get("id")
+        if (
+            not isinstance(group_id, str)
+            or not STROKE_ID_RE.fullmatch(group_id)
+            or group_id in seen_group_ids
+            or group_id in known_ids
+        ):
+            raise ValueError(f"Group {index} has an invalid or duplicated id.")
+        children = group.get("children")
+        if not isinstance(children, list) or not children:
+            raise ValueError(f"Group {index} must contain children.")
+        clean_children = []
+        for child in children:
+            if not isinstance(child, str) or not STROKE_ID_RE.fullmatch(child):
+                raise ValueError(f"Group {index} has an invalid child id.")
+            clean_children.append(child)
+        transform = group.get("transform", {})
+        if not isinstance(transform, dict):
+            raise ValueError(f"Group {index} transform must be an object.")
+        clean_groups.append({
+            "id": group_id,
+            "type": "group",
+            "children": clean_children,
+            "transform": {
+                "x": finite_number(transform.get("x", 0), f"Group {index}.transform.x",
+                                  minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
+                "y": finite_number(transform.get("y", 0), f"Group {index}.transform.y",
+                                  minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
+                "scaleX": finite_number(transform.get("scaleX", 1), f"Group {index}.transform.scaleX",
+                                        minimum=0.01, maximum=100),
+                "scaleY": finite_number(transform.get("scaleY", 1), f"Group {index}.transform.scaleY",
+                                        minimum=0.01, maximum=100),
+                "rotation": finite_number(transform.get("rotation", 0), f"Group {index}.transform.rotation",
+                                          minimum=-360, maximum=360),
+            },
+        })
+        seen_group_ids.add(group_id)
+        known_ids.add(group_id)
+    imported_transforms = value.get("imported_transforms", {})
+    if not isinstance(imported_transforms, dict) or len(imported_transforms) > MAX_EDITOR_OBJECTS:
+        raise ValueError("imported_transforms must be an object.")
+    clean_imported_transforms: dict[str, dict[str, float]] = {}
+    for object_id, transform in imported_transforms.items():
+        if not isinstance(object_id, str) or not STROKE_ID_RE.fullmatch(object_id):
+            raise ValueError("Imported object transform id is invalid.")
+        if not isinstance(transform, dict):
+            raise ValueError("Imported object transform must be an object.")
+        clean_imported_transforms[object_id] = {
+            "x": finite_number(transform.get("x", 0), "imported transform x",
+                              minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
+            "y": finite_number(transform.get("y", 0), "imported transform y",
+                              minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
+            "scaleX": finite_number(transform.get("scaleX", 1), "imported transform scaleX",
+                                    minimum=0.01, maximum=100),
+            "scaleY": finite_number(transform.get("scaleY", 1), "imported transform scaleY",
+                                    minimum=0.01, maximum=100),
+        }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "viewport": clean_viewport,
         "objects": clean_objects,
+        "groups": clean_groups,
+        "imported_transforms": clean_imported_transforms,
     }
 
 
@@ -667,7 +735,7 @@ def vector_result_svg(result: Any) -> bytes:
         stroke_width = float(getattr(item, "stroke_width", 0.0))
         fill_rule = getattr(item, "fill_rule", "nonzero")
         paths.append(
-            f'<path d="{path_data}" fill="{fill}" fill-rule="{fill_rule}" '
+            f'<path id="ink-region-{len(paths):05d}" d="{path_data}" fill="{fill}" fill-rule="{fill_rule}" '
             f'stroke="{stroke}" stroke-width="{stroke_width:.2f}" '
             'stroke-linecap="round" stroke-linejoin="round"/>'
         )

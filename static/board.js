@@ -19,6 +19,11 @@
   const HISTORY_LIMIT = 80;
   const MIN_ZOOM = 0.08;
   const MAX_ZOOM = 24;
+  const SPREAD_RADIUS = 400;
+  const BUBBLE_GAP = 100;
+  const TARGET_GAP = 150;
+  const MAX_SPREAD_ITERATIONS = 20;
+  const MAX_SINGLE_SPREAD_DISPLACEMENT = 500;
 
   const assetAliases = {
     original: ["original", "original_url", "input", "source"],
@@ -43,6 +48,9 @@
     revision: 0,
     camera: { x: 0, y: 0, width: 1600, height: 900 },
     objects: [],
+    groups: [],
+    importedObjects: [],
+    importedTransforms: {},
     selected: new Set(),
     tool: "select",
     color: "#183153",
@@ -186,11 +194,31 @@
     const camera = source.viewport || source.camera;
     state.revision = Math.max(0, Number(source.revision) || 0);
     state.objects = objects.map(normalizeObject).filter(Boolean);
+    state.groups = Array.isArray(source.groups) ? source.groups.map(normalizeGroup).filter(Boolean) : [];
+    state.importedTransforms = source.imported_transforms && typeof source.imported_transforms === "object"
+      ? source.imported_transforms : {};
     state.camera = validCamera(camera) ? {
       x: Number(camera.x), y: Number(camera.y),
       width: Number(camera.width), height: Number(camera.height)
     } : { x: 0, y: 0, width: state.width, height: state.height };
     if (needsMigration && state.objects.length) markChanged();
+  }
+
+  function normalizeGroup(group) {
+    if (!group || typeof group !== "object" || !group.id || !Array.isArray(group.children)) return null;
+    const transform = group.transform || {};
+    return {
+      id: String(group.id),
+      type: "group",
+      children: group.children.map(String),
+      transform: {
+        x: Number(transform.x) || 0,
+        y: Number(transform.y) || 0,
+        scaleX: Number(transform.scaleX) || 1,
+        scaleY: Number(transform.scaleY) || 1,
+        rotation: Number(transform.rotation) || 0
+      }
+    };
   }
 
   function validCamera(camera) {
@@ -398,6 +426,19 @@
     safe.setAttribute("aria-hidden", "true");
     state.importedMarkup = safe.outerHTML;
     $("#imported-layer").replaceChildren(safe);
+    state.importedObjects = [...safe.querySelectorAll("path")].map((path, index) => {
+      const id = /^[A-Za-z0-9_.-]{1,64}$/.test(path.id || "")
+        ? path.id : `ink-region-${String(index).padStart(5, "0")}`;
+      path.id = id;
+      path.dataset.objectId = id;
+      path.style.pointerEvents = "all";
+      let box = { x: 0, y: 0, width: 0, height: 0 };
+      try { box = path.getBBox(); } catch (_) {}
+      const saved = state.importedTransforms?.[id] || {};
+      return { id, type: "imported", bbox: box, tx: Number(saved.x) || 0, ty: Number(saved.y) || 0,
+        sx: Number(saved.scaleX) || 1, sy: Number(saved.scaleY) || 1,
+        node: path, locked: false };
+    });
   }
 
   function applyCamera() {
@@ -450,12 +491,31 @@
   }
 
   function snapshot() {
-    return clone(state.objects);
+    return {
+      objects: clone(state.objects),
+      groups: clone(state.groups),
+      importedTransforms: Object.fromEntries(state.importedObjects.map(object => [object.id, {
+        x: object.tx || 0, y: object.ty || 0, scaleX: object.sx || 1, scaleY: object.sy || 1
+      }]))
+    };
+  }
+
+  function restore(snapshotValue) {
+    state.objects = clone(snapshotValue?.objects || []);
+    state.groups = clone(snapshotValue?.groups || []);
+    const transforms = snapshotValue?.importedTransforms || {};
+    state.importedObjects.forEach(object => {
+      const transform = transforms[object.id] || {};
+      object.tx = Number(transform.x) || 0;
+      object.ty = Number(transform.y) || 0;
+      object.sx = Number(transform.scaleX) || 1;
+      object.sy = Number(transform.scaleY) || 1;
+    });
   }
 
   /* History stores bounded before-action snapshots, not individual pointer samples. */
   function commitLogicalAction(before) {
-    if (JSON.stringify(before) === JSON.stringify(state.objects)) return false;
+    if (JSON.stringify(before) === JSON.stringify(snapshot())) return false;
     state.history.push(before);
     if (state.history.length > HISTORY_LIMIT) state.history.shift();
     state.future = [];
@@ -468,7 +528,7 @@
     if (!state.history.length) return;
     closeTextEditor(true);
     state.future.push(snapshot());
-    state.objects = state.history.pop();
+    restore(state.history.pop());
     state.selected.clear();
     markChanged();
     renderScene();
@@ -478,7 +538,7 @@
     if (!state.future.length) return;
     closeTextEditor(true);
     state.history.push(snapshot());
-    state.objects = state.future.pop();
+    restore(state.future.pop());
     state.selected.clear();
     markChanged();
     renderScene();
@@ -517,10 +577,14 @@
       };
     });
     return {
-      schema_version: 2,
+      schema_version: 3,
       revision: state.revision,
       viewport: clone(state.camera),
-      objects
+      objects,
+      groups: clone(state.groups),
+      imported_transforms: Object.fromEntries(state.importedObjects.map(object =>
+        [object.id, { x: object.tx || 0, y: object.ty || 0,
+          scaleX: object.sx || 1, scaleY: object.sy || 1 }]))
     };
   }
 
@@ -587,31 +651,91 @@
   }
 
   function objectBounds(object) {
+    if (object?.type === "group") return groupBounds(object);
+    if (object?.type === "imported") {
+      return transformedBounds({
+        x: object.bbox.x + (object.tx || 0), y: object.bbox.y + (object.ty || 0),
+        width: object.bbox.width * (object.sx || 1), height: object.bbox.height * (object.sy || 1)
+      }, object.id);
+    }
     if (object.type === "text") {
-      return { x: object.x, y: object.y, width: object.width, height: object.height };
+      return transformedBounds({ x: object.x, y: object.y, width: object.width, height: object.height }, object.id);
     }
     const points = object.points || [];
     if (points.length) {
       const xs = points.map(point => point.x);
       const ys = points.map(point => point.y);
       const pad = object.width / 2;
-      return {
+      return transformedBounds({
         x: Math.min(...xs) - pad, y: Math.min(...ys) - pad,
         width: Math.max(...xs) - Math.min(...xs) + pad * 2,
         height: Math.max(...ys) - Math.min(...ys) + pad * 2
-      };
+      }, object.id);
     }
     const rendered = $(`[data-object-id="${CSS.escape(object.id)}"]`);
     if (rendered) {
       try {
         const box = rendered.getBBox();
-        return {
+        return transformedBounds({
           x: box.x + (object.tx || 0), y: box.y + (object.ty || 0),
           width: box.width, height: box.height
-        };
+        }, object.id);
       } catch (_) { /* Detached SVG nodes have no box. */ }
     }
     return { x: 0, y: 0, width: 0, height: 0 };
+  }
+
+  function allObjects() {
+    return [...state.objects, ...state.importedObjects];
+  }
+
+  function findObject(id) {
+    return allObjects().find(object => object.id === id) || state.groups.find(group => group.id === id);
+  }
+
+  function parentGroup(id) {
+    return state.groups.find(group => group.children.includes(id));
+  }
+
+  function groupTransform(group) {
+    const transform = group?.transform || {};
+    return {
+      x: Number(transform.x) || 0, y: Number(transform.y) || 0,
+      scaleX: Number(transform.scaleX) || 1, scaleY: Number(transform.scaleY) || 1
+    };
+  }
+
+  function transformedBounds(bounds, id) {
+    let result = { ...bounds };
+    let parent = parentGroup(id);
+    while (parent) {
+      const transform = groupTransform(parent);
+      result = {
+        x: result.x * transform.scaleX + transform.x,
+        y: result.y * transform.scaleY + transform.y,
+        width: result.width * Math.abs(transform.scaleX),
+        height: result.height * Math.abs(transform.scaleY)
+      };
+      parent = parentGroup(parent.id);
+    }
+    return result;
+  }
+
+  function groupBounds(group) {
+    const children = group.children.map(findObject).filter(Boolean);
+    if (!children.length) return { x: 0, y: 0, width: 0, height: 0 };
+    const bounds = children.map(objectBounds);
+    const left = Math.min(...bounds.map(box => box.x));
+    const top = Math.min(...bounds.map(box => box.y));
+    const right = Math.max(...bounds.map(box => box.x + box.width));
+    const bottom = Math.max(...bounds.map(box => box.y + box.height));
+    return { x: left, y: top, width: right - left, height: bottom - top };
+  }
+
+  function topLevelItems() {
+    const nested = new Set(state.groups.flatMap(group => group.children));
+    return [...state.groups.filter(group => !nested.has(group.id)),
+      ...allObjects().filter(object => !nested.has(object.id))];
   }
 
   function intersects(a, b) {
@@ -636,7 +760,7 @@
     const bounds = objectBounds(object);
     const lassoBounds = unionBounds([{ type: "stroke", points: polygon, width: 0 }]);
     if (!intersects(bounds, lassoBounds)) return false;
-    const samples = object.type === "text"
+    const samples = ["text", "imported", "group"].includes(object.type)
       ? [
           { x: bounds.x, y: bounds.y },
           { x: bounds.x + bounds.width, y: bounds.y },
@@ -647,11 +771,8 @@
       : (object.points || []).map(point => ({
           x: point.x + (object.tx || 0), y: point.y + (object.ty || 0)
         }));
-    return samples.some(point => pointInPolygon(point, polygon)) ||
-      polygon.some(point =>
-        point.x >= bounds.x && point.x <= bounds.x + bounds.width &&
-        point.y >= bounds.y && point.y <= bounds.y + bounds.height
-      );
+    const contained = samples.filter(point => pointInPolygon(point, polygon)).length;
+    return contained >= Math.max(1, Math.ceil(samples.length * .65));
   }
 
   function unionBounds(objects) {
@@ -740,7 +861,8 @@
 
   function renderSelection() {
     const layer = $("#interaction-layer");
-    const selectedObjects = state.objects.filter(object => state.selected.has(object.id));
+    const selectedObjects = [...state.groups, ...allObjects()]
+      .filter(object => state.selected.has(object.id));
     selectedObjects.forEach(object => {
       const box = objectBounds(object);
       layer.append(svgEl("rect", {
@@ -750,9 +872,10 @@
         "stroke-dasharray": `${state.camera.width / 300} ${state.camera.width / 450}`,
         "pointer-events": "none"
       }));
-      if (selectedObjects.length === 1 && object.type === "text") {
+      if (selectedObjects.length === 1) {
+        const box = objectBounds(object);
         layer.append(svgEl("circle", {
-          cx: object.x + object.width, cy: object.y + object.height,
+          cx: box.x + box.width, cy: box.y + box.height,
           r: Math.max(6, state.camera.width / 150),
           fill: "#fff", stroke: "#3977d5",
           "stroke-width": Math.max(1, state.camera.width / 900),
@@ -769,9 +892,10 @@
     defs.replaceChildren();
     user.replaceChildren();
     interaction.replaceChildren();
-    state.objects.forEach(object => user.append(
-      object.type === "text" ? renderText(object) : renderStroke(object)
-    ));
+    const childIds = new Set(state.groups.flatMap(group => group.children));
+    state.objects.filter(object => !childIds.has(object.id)).forEach(object => user.append(renderNode(object.id)));
+    state.groups.filter(group => !childIds.has(group.id)).forEach(group => user.append(renderNode(group.id)));
+    renderImportedTransforms();
     if (state.interaction?.kind === "draw" || state.interaction?.kind === "pixel") {
       const active = state.interaction;
       interaction.append(svgEl("path", {
@@ -793,6 +917,155 @@
     renderSelection();
     $("#object-count").textContent = `${state.objects.length} object${state.objects.length === 1 ? "" : "s"}`;
     updateHistoryButtons();
+    updateSelectionActions();
+  }
+
+  function updateSelectionActions() {
+    const selected = [...state.selected].map(findObject).filter(Boolean);
+    $("#group-button").disabled = selected.length < 2;
+    $("#ungroup-button").disabled = !selected.some(item => item.type === "group");
+  }
+
+  function groupSelection() {
+    const ids = [...state.selected].filter(id => findObject(id));
+    if (ids.length < 2) return;
+    const before = snapshot();
+    const nested = new Set(ids.flatMap(id => {
+      const group = state.groups.find(item => item.id === id);
+      return group ? group.children : [];
+    }));
+    const children = ids.filter(id => !nested.has(id));
+    const group = {
+      id: uid("group"), type: "group", children,
+      transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 }
+    };
+    state.groups.push(group);
+    state.selected = new Set([group.id]);
+    commitLogicalAction(before);
+    renderScene();
+  }
+
+  function bakeGroupTransform(group) {
+    const transform = groupTransform(group);
+    group.children.map(findObject).filter(Boolean).forEach(object => {
+      if (object.type === "group") {
+        object.transform.x = (object.transform.x || 0) * transform.scaleX + transform.x;
+        object.transform.y = (object.transform.y || 0) * transform.scaleY + transform.y;
+        object.transform.scaleX = (object.transform.scaleX || 1) * transform.scaleX;
+        object.transform.scaleY = (object.transform.scaleY || 1) * transform.scaleY;
+        object.transform.rotation = (object.transform.rotation || 0) + (group.transform.rotation || 0);
+      } else if (object.type === "text") {
+        object.x = object.x * transform.scaleX + transform.x;
+        object.y = object.y * transform.scaleY + transform.y;
+        object.width *= transform.scaleX;
+        object.height *= transform.scaleY;
+      } else if (object.type === "stroke" || object.type === "highlighter") {
+        object.points.forEach(point => {
+          point.x = point.x * transform.scaleX + transform.x;
+          point.y = point.y * transform.scaleY + transform.y;
+        });
+      } else if (object.type === "imported") {
+        object.tx = (object.tx || 0) * transform.scaleX + transform.x;
+        object.ty = (object.ty || 0) * transform.scaleY + transform.y;
+        object.sx = (object.sx || 1) * transform.scaleX;
+        object.sy = (object.sy || 1) * transform.scaleY;
+      }
+    });
+  }
+
+  function ungroupSelection() {
+    const selectedGroups = state.groups.filter(group => state.selected.has(group.id));
+    if (!selectedGroups.length) return;
+    const before = snapshot();
+    selectedGroups.forEach(group => {
+      bakeGroupTransform(group);
+      state.groups = state.groups.filter(item => item.id !== group.id);
+    });
+    state.selected = new Set(selectedGroups.flatMap(group => group.children));
+    commitLogicalAction(before);
+    renderScene();
+  }
+
+  function bboxGap(a, b) {
+    const dx = Math.max(0, Math.max(a.x - (b.x + b.width), b.x - (a.x + a.width)));
+    const dy = Math.max(0, Math.max(a.y - (b.y + b.height), b.y - (a.y + a.height)));
+    return Math.hypot(dx, dy);
+  }
+
+  function spreadAt(point) {
+    const candidates = topLevelItems().filter(item => {
+      const box = objectBounds(item);
+      const dx = Math.max(0, Math.max(box.x - point.x, point.x - (box.x + box.width)));
+      const dy = Math.max(0, Math.max(box.y - point.y, point.y - (box.y + box.height)));
+      return Math.hypot(dx, dy) <= SPREAD_RADIUS;
+    });
+    if (candidates.length < 2) return;
+    const before = snapshot();
+    const selected = candidates.filter(item => bboxGap(objectBounds(item), objectBounds({
+      type: "text", x: point.x, y: point.y, width: 0, height: 0
+    })) <= SPREAD_RADIUS);
+    if (selected.length < 2) return;
+    for (let iteration = 0; iteration < MAX_SPREAD_ITERATIONS; iteration++) {
+      let changed = false;
+      for (let i = 0; i < selected.length; i++) for (let j = i + 1; j < selected.length; j++) {
+        const a = selected[i], b = selected[j];
+        const ab = objectBounds(a), bb = objectBounds(b);
+        const overlapX = Math.min(ab.x + ab.width, bb.x + bb.width) - Math.max(ab.x, bb.x);
+        const overlapY = Math.min(ab.y + ab.height, bb.y + bb.height) - Math.max(ab.y, bb.y);
+        const gap = bboxGap(ab, bb);
+        if (overlapX <= 0 && overlapY <= 0 && gap >= TARGET_GAP) continue;
+        const horizontal = Math.abs((ab.x + ab.width / 2) - (bb.x + bb.width / 2)) >=
+          Math.abs((ab.y + ab.height / 2) - (bb.y + bb.height / 2));
+        const amount = Math.min(MAX_SINGLE_SPREAD_DISPLACEMENT, TARGET_GAP - gap + Math.max(0, Math.min(overlapX, overlapY)));
+        const direction = horizontal
+          ? ((ab.x + ab.width / 2) <= (bb.x + bb.width / 2) ? -1 : 1)
+          : ((ab.y + ab.height / 2) <= (bb.y + bb.height / 2) ? -1 : 1);
+        moveObject(a, horizontal ? direction * amount / 2 : 0, horizontal ? 0 : direction * amount / 2);
+        moveObject(b, horizontal ? -direction * amount / 2 : 0, horizontal ? 0 : -direction * amount / 2);
+        changed = true;
+      }
+      if (!changed) break;
+    }
+    if (commitLogicalAction(before)) {
+      state.selected = new Set(selected.map(item => item.id));
+      renderScene();
+    }
+  }
+
+  function renderNode(id) {
+    const group = state.groups.find(item => item.id === id);
+    if (group) {
+      const transform = group.transform || {};
+      const node = svgEl("g", {
+        "data-group-id": group.id,
+        transform: `translate(${transform.x || 0} ${transform.y || 0}) scale(${transform.scaleX || 1} ${transform.scaleY || 1}) rotate(${transform.rotation || 0})`
+      });
+      group.children.forEach(childId => {
+        const child = findObject(childId);
+        if (child && child.type !== "imported") node.append(renderNode(childId));
+      });
+      return node;
+    }
+    const object = findObject(id);
+    if (!object || object.type === "imported") return svgEl("g");
+    return object.type === "text" ? renderText(object) : renderStroke(object);
+  }
+
+  function renderImportedTransforms() {
+    state.importedObjects.forEach(object => {
+      const path = object.node;
+      if (!path) return;
+      const transforms = [];
+      if (object.tx || object.ty) transforms.push(`translate(${object.tx || 0} ${object.ty || 0})`);
+      if (object.sx !== 1 || object.sy !== 1) transforms.push(`scale(${object.sx || 1} ${object.sy || 1})`);
+      let parent = parentGroup(object.id);
+      while (parent) {
+        const transform = parent.transform || {};
+        transforms.unshift(`translate(${transform.x || 0} ${transform.y || 0}) scale(${transform.scaleX || 1} ${transform.scaleY || 1}) rotate(${transform.rotation || 0})`);
+        parent = parentGroup(parent.id);
+      }
+      path.setAttribute("transform", transforms.join(" ") || "");
+    });
   }
 
   function setTool(tool) {
@@ -838,7 +1111,8 @@
   }
 
   function hitObject(event) {
-    return event.target.closest?.("[data-object-id]")?.dataset.objectId || "";
+    const target = event.target.closest?.("[data-group-id],[data-object-id]");
+    return target?.dataset.groupId || target?.dataset.objectId || "";
   }
 
   function pointerDown(event) {
@@ -861,9 +1135,10 @@
     const hit = hitObject(event);
     const resizeId = event.target.dataset?.resizeId;
     if (resizeId) {
-      const object = state.objects.find(item => item.id === resizeId);
+      const object = findObject(resizeId);
+      if (!object) return;
       state.interaction = { kind: "resize", pointerId: event.pointerId, object, start: point, before: snapshot(),
-        original: { width: object.width, height: object.height } };
+        original: { bounds: objectBounds(object), transform: clone(object.transform || {}) } };
       return;
     }
     if (state.tool === "pen" || state.tool === "highlighter") {
@@ -904,12 +1179,18 @@
       renderScene();
       return;
     }
+    if (state.tool === "make-space") {
+      state.interaction = { kind: "make-space", pointerId: event.pointerId, point };
+      return;
+    }
     if (state.tool === "select") {
       if (hit) {
+        const hitGroup = state.groups.find(group => group.id === hit);
+        const selectableId = hitGroup ? hitGroup.id : (parentGroup(hit)?.id || hit);
         if (event.shiftKey) {
-          if (state.selected.has(hit)) state.selected.delete(hit);
-          else state.selected.add(hit);
-        } else if (!state.selected.has(hit)) state.selected = new Set([hit]);
+          if (state.selected.has(selectableId)) state.selected.delete(selectableId);
+          else state.selected.add(selectableId);
+        } else if (!state.selected.has(selectableId)) state.selected = new Set([selectableId]);
         state.interaction = {
           kind: "move", pointerId: event.pointerId, start: point,
           before: snapshot(), moved: false
@@ -966,13 +1247,22 @@
     } else if (interaction.kind === "move") {
       const dx = point.x - interaction.start.x;
       const dy = point.y - interaction.start.y;
-      state.objects = clone(interaction.before);
-      state.objects.filter(object => state.selected.has(object.id)).forEach(object => moveObject(object, dx, dy));
+      restore(interaction.before);
+      [...state.selected].map(findObject).filter(Boolean).forEach(object => moveObject(object, dx, dy));
       interaction.moved = Math.hypot(dx, dy) > state.camera.width / 1000;
       renderScene();
     } else if (interaction.kind === "resize") {
-      interaction.object.width = Math.max(40, interaction.original.width + point.x - interaction.start.x);
-      interaction.object.height = Math.max(30, interaction.original.height + point.y - interaction.start.y);
+      const object = interaction.object;
+      if (object.type === "group") {
+        const original = interaction.original.bounds;
+        const factorX = (original.width + point.x - interaction.start.x) / Math.max(1, original.width);
+        const factorY = (original.height + point.y - interaction.start.y) / Math.max(1, original.height);
+        object.transform.scaleX = clamp(interaction.original.transform.scaleX * factorX, .05, 20);
+        object.transform.scaleY = clamp(interaction.original.transform.scaleY * factorY, .05, 20);
+      } else if (object.type === "text") {
+        object.width = Math.max(40, interaction.original.bounds.width + point.x - interaction.start.x);
+        object.height = Math.max(30, interaction.original.bounds.height + point.y - interaction.start.y);
+      }
       renderScene();
     } else if (interaction.kind === "object-erase") {
       eraseWholeObject(hitObject(event));
@@ -980,6 +1270,16 @@
   }
 
   function moveObject(object, dx, dy) {
+    if (object.type === "group") {
+      object.transform.x = (object.transform.x || 0) + dx;
+      object.transform.y = (object.transform.y || 0) + dy;
+      return;
+    }
+    if (object.type === "imported") {
+      object.tx = (object.tx || 0) + dx;
+      object.ty = (object.ty || 0) + dy;
+      return;
+    }
     if (object.type === "text") {
       object.x += dx;
       object.y += dy;
@@ -1056,8 +1356,10 @@
     } else if (interaction.kind === "object-erase" || interaction.kind === "resize" ||
       (interaction.kind === "move" && interaction.moved)) {
       commitLogicalAction(interaction.before);
+    } else if (interaction.kind === "make-space") {
+      spreadAt(interaction.point);
     } else if (interaction.kind === "lasso") {
-      state.objects.filter(object => lassoSelectsObject(object, interaction.points))
+      topLevelItems().filter(object => lassoSelectsObject(object, interaction.points))
         .forEach(object => state.selected.add(object.id));
     }
     state.interaction = null;
@@ -1069,7 +1371,7 @@
   function pointerCancel(event) {
     state.pointers.delete(event.pointerId);
     const interaction = state.interaction;
-    if (interaction?.before) state.objects = interaction.before;
+    if (interaction?.before) restore(interaction.before);
     state.interaction = null;
     $("#world-scene").classList.remove("is-panning");
     renderScene();
@@ -1194,6 +1496,8 @@
     });
     $("#undo-button").addEventListener("click", undo);
     $("#redo-button").addEventListener("click", redo);
+    $("#group-button").addEventListener("click", groupSelection);
+    $("#ungroup-button").addEventListener("click", ungroupSelection);
     $("#save-button").addEventListener("click", () => saveEditor(true));
     $("#clear-button").addEventListener("click", () => {
       if (!state.objects.length || !confirm("Clear all editable user objects?")) return;
@@ -1261,6 +1565,16 @@
     return `${mask}${path}`;
   }
 
+  function exportNode(id) {
+    const group = state.groups.find(item => item.id === id);
+    if (group) {
+      const transform = group.transform || {};
+      return `<g id="${escapeXML(group.id)}" transform="translate(${Number(transform.x) || 0} ${Number(transform.y) || 0}) scale(${Number(transform.scaleX) || 1} ${Number(transform.scaleY) || 1}) rotate(${Number(transform.rotation) || 0})">${group.children.map(exportNode).join("")}</g>`;
+    }
+    const object = state.objects.find(item => item.id === id);
+    return object ? exportObject(object) : "";
+  }
+
   async function imageDataUrl(url) {
     if (!url) return "";
     if (url.startsWith("data:")) return url;
@@ -1280,8 +1594,10 @@
     const bounds = scope === "content" ? unionBounds(state.objects) :
       { x: 0, y: 0, width: state.width, height: state.height };
     const master = await imageDataUrl(state.masterUrl);
-    const imported = state.importedMarkup || "";
-    const objects = state.objects.map(exportObject).join("");
+    const imported = $("#imported-layer")?.innerHTML || state.importedMarkup || "";
+    const nested = new Set(state.groups.flatMap(group => group.children));
+    const objects = state.objects.filter(object => !nested.has(object.id)).map(object => exportNode(object.id)).join("") +
+      state.groups.filter(group => !nested.has(group.id)).map(group => exportNode(group.id)).join("");
     return `<svg xmlns="${NS}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" width="${Math.ceil(bounds.width)}" height="${Math.ceil(bounds.height)}"><rect x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="white"/>${master ? `<image href="${escapeXML(master)}" x="0" y="0" width="${state.width}" height="${state.height}" preserveAspectRatio="none"/>` : ""}<g id="imported-vectors">${imported}</g><g id="user-objects">${objects}</g></svg>`;
   }
 

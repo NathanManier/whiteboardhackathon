@@ -98,7 +98,7 @@
         <div class="drawing-toolbar" aria-label="Drawing tools">
           <div class="tool-group">
             <button class="tool-button is-active" data-tool="select" type="button" aria-pressed="true" title="Select or lasso">
-              <span>Select</span>
+              <span>Lasso</span>
             </button>
             <button class="tool-button" data-tool="pen" type="button" aria-pressed="false" title="Pen">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Zm10-12 3 3"/></svg>
@@ -108,6 +108,9 @@
             <button class="tool-button" data-tool="text" type="button" aria-pressed="false" title="Text box"><span>Text</span></button>
             <button class="tool-button" data-tool="object-eraser" type="button" aria-pressed="false" title="Delete whole objects"><span>Object erase</span></button>
             <button class="tool-button" data-tool="pixel-eraser" type="button" aria-pressed="false" title="Erase parts of user strokes"><span>Pixel erase</span></button>
+            <button class="text-button selection-action" id="group-button" type="button" disabled>Group</button>
+            <button class="text-button selection-action" id="ungroup-button" type="button" disabled>Ungroup</button>
+            <button class="tool-button" data-tool="make-space" type="button" aria-pressed="false" title="Spread nearby content"><span>Make space</span></button>
           </div>
           <div class="tool-divider"></div>
           <div class="color-tools" aria-label="Ink color">
