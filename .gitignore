@@ -12,11 +12,3 @@ uploads/*
 !uploads/.gitkeep
 boards/*
 !boards/.gitkeep
-.venv/
-__pycache__/
-*.pyc
-.DS_Store
-uploads/*
-!uploads/.gitkeep
-boards/*
-!boards/.gitkeep

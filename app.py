@@ -39,7 +39,10 @@ ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
 FORMAT_FOR_EXTENSION = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
 FORMAT_FOR_MIME = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
 BOARD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-ASSET_NAMES = {"original", "corrected", "master", "analysis", "mask", "digitized", "comparison", "detection"}
+ASSET_NAMES = {
+    "original", "corrected", "master", "analysis", "mask", "digitized",
+    "comparison", "detection", "confidence",
+}
 SAFE_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".json"}
 STROKE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
@@ -353,11 +356,11 @@ def vector_result_svg(result: Any) -> bytes:
 
 def vectorize_image(image: np.ndarray) -> tuple[bytes, str]:
     try:
-        ink_module = importlib.import_module("processing.ink_detection")
-        vector_module = importlib.import_module("processing.conservative_vectorization")
-        ink = ink_module.detect_ink(image)
-        result = vector_module.conservative_vectorize(image, ink)
-        return vector_result_svg(result), str(getattr(result, "method", "processing"))
+        processing = importlib.import_module("processing")
+        ink = processing.detect_ink(image)
+        result = processing.faithful_vectorize(image, ink)
+        svg = processing.generate_svg(result, metadata={"method": result.selected_method})
+        return svg.encode("utf-8"), str(result.selected_method)
     except (ImportError, ModuleNotFoundError, AttributeError):
         pass
     except Exception:
@@ -369,6 +372,32 @@ def vectorize_image(image: np.ndarray) -> tuple[bytes, str]:
         except Exception:
             pass
     return baseline_svg(image), "baseline"
+
+
+def write_debug_artifacts(
+    board_dir: Path, metadata: dict[str, Any], master: np.ndarray, svg: bytes
+) -> None:
+    """Generate optional diagnostics; no diagnostic may fail the board."""
+    assets = metadata.setdefault("assets", {})
+    try:
+        processing = importlib.import_module("processing")
+        ink = processing.detect_ink(master)
+        atomic_image(board_dir / "mask_combined.png", ink.combined_mask)
+        assets["mask"] = "mask_combined.png"
+        metadata["ink_confidences"] = {
+            str(key): round(float(value), 6) for key, value in ink.confidences.items()
+        }
+        rendered = processing.rasterize_svg(svg, output_width=master.shape[1], output_height=master.shape[0])
+        if isinstance(rendered, np.ndarray) and rendered.size:
+            atomic_image(board_dir / "svg_debug_raster.png", rendered)
+            assets["digitized"] = "svg_debug_raster.png"
+            comparison = cv2.addWeighted(master, 0.5, rendered, 0.5, 0)
+            atomic_image(board_dir / "comparison.png", comparison)
+            assets["comparison"] = "comparison.png"
+    except Exception as exc:
+        metadata.setdefault("pipeline", {}).setdefault("errors", []).append(
+            {"stage": "debug_artifacts", "message": str(exc)}
+        )
 
 
 def set_stage(metadata: dict[str, Any], stage: str, started: float) -> None:
@@ -407,6 +436,10 @@ def run_downstream(
         # Master is written even when every optional processing stage fails.
         atomic_image(board_dir / "master.png", master)
         metadata["assets"]["master"] = "master.png"
+        metadata["dimensions"] = {
+            "width": int(master.shape[1]),
+            "height": int(master.shape[0]),
+        }
     set_stage(metadata, "enhancement", started)
 
     started = time.perf_counter()
@@ -425,6 +458,7 @@ def run_downstream(
         atomic_bytes(board_dir / "board.svg", svg)
         metadata["assets"]["svg"] = "board.svg"
         pipeline["vector_method"] = vector_method
+        write_debug_artifacts(board_dir, metadata, master, svg)
     except Exception as exc:
         errors.append({"stage": "vectorization", "message": str(exc)})
         try:
@@ -444,6 +478,11 @@ def validate_corners(value: Any, image: np.ndarray) -> np.ndarray:
             value = json.loads(value)
         except json.JSONDecodeError as exc:
             raise ValueError("Corners must be valid JSON.") from exc
+    if isinstance(value, list) and all(isinstance(point, dict) for point in value):
+        try:
+            value = [[point["x"], point["y"]] for point in value]
+        except KeyError as exc:
+            raise ValueError("Each corner requires x and y coordinates.") from exc
     points = np.asarray(value, dtype=np.float32)
     if points.shape != (4, 2) or not np.isfinite(points).all():
         raise ValueError("Exactly four finite [x, y] corner points are required.")
@@ -471,38 +510,182 @@ def load_original(board_dir: Path, metadata: dict[str, Any]) -> np.ndarray:
         abort(500, description=f"Original image is unavailable: {exc}")
 
 
+def asset_basenames(metadata: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for section_name in ("assets", "debug_artifacts", "artifacts"):
+        section = metadata.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for value in section.values():
+            candidate = value
+            if isinstance(value, dict):
+                candidate = value.get("filename") or value.get("path")
+            if not isinstance(candidate, str):
+                continue
+            name = Path(candidate).name
+            if name == candidate and Path(name).suffix.lower() in SAFE_ASSET_SUFFIXES:
+                names.add(name)
+    return names
+
+
+def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    status = str(metadata.get("pipeline", {}).get("status", "unknown"))
+    dimensions = metadata.get("dimensions")
+    if not isinstance(dimensions, dict):
+        dimensions = {
+            "width": metadata.get("source", {}).get("width", 0),
+            "height": metadata.get("source", {}).get("height", 0),
+        }
+    width = int(dimensions.get("width") or 0)
+    height = int(dimensions.get("height") or 0)
+    assets = {
+        key: value
+        for key, value in metadata.get("assets", {}).items()
+        if isinstance(key, str)
+        and isinstance(value, str)
+        and Path(value).name == value
+        and value in asset_basenames(metadata)
+    }
+    if "master" in assets:
+        assets.setdefault("enhanced", assets["master"])
+    detection = metadata.get("detection", {})
+    confidence = detection.get("confidence") if isinstance(detection, dict) else None
+    strokes = metadata.get("user_strokes", [])
+    if not isinstance(strokes, list):
+        strokes = []
+    data = {
+        "id": board_id,
+        "board_id": board_id,
+        "status": status,
+        "needs_corners": status == "needs_corners",
+        "assets": assets,
+        "dimensions": {"width": width, "height": height},
+        "master_width": width,
+        "master_height": height,
+        "svg_url": url_for("board_svg", board_id=board_id),
+        "confidence": confidence,
+        "detection_confidence": confidence,
+        "user_strokes": strokes,
+        "user_ink": strokes,
+        "pipeline": metadata.get("pipeline", {}),
+    }
+    if isinstance(metadata.get("normalized_corners"), list):
+        data["normalized_corners"] = metadata["normalized_corners"]
+    return data
+
+
+def validate_user_strokes(value: Any, width: int, height: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("user_strokes must be an array.")
+    if len(value) > MAX_USER_STROKES:
+        raise ValueError(f"At most {MAX_USER_STROKES} strokes are allowed.")
+    validated: list[dict[str, Any]] = []
+    total_points = 0
+    for index, stroke in enumerate(value):
+        if not isinstance(stroke, dict):
+            raise ValueError(f"Stroke {index} must be an object.")
+        stroke_id = stroke.get("id", f"stroke-{index}")
+        if not isinstance(stroke_id, str) or not STROKE_ID_RE.fullmatch(stroke_id):
+            raise ValueError(f"Stroke {index} has an invalid id.")
+        color = stroke.get("color")
+        if not isinstance(color, str) or not COLOR_RE.fullmatch(color):
+            raise ValueError(f"Stroke {index} has an invalid color.")
+        try:
+            size = float(stroke.get("size", stroke.get("width")))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Stroke {index} has an invalid width.") from exc
+        if not np.isfinite(size) or not 0.25 <= size <= 100:
+            raise ValueError(f"Stroke {index} width must be between 0.25 and 100.")
+        points = stroke.get("points")
+        if not isinstance(points, list) or not 1 <= len(points) <= MAX_POINTS_PER_STROKE:
+            raise ValueError(f"Stroke {index} has an invalid point count.")
+        total_points += len(points)
+        if total_points > MAX_TOTAL_USER_POINTS:
+            raise ValueError(f"At most {MAX_TOTAL_USER_POINTS} total points are allowed.")
+        clean_points = []
+        for point_index, point in enumerate(points):
+            try:
+                if isinstance(point, dict):
+                    x, y = float(point["x"]), float(point["y"])
+                elif isinstance(point, (list, tuple)) and len(point) == 2:
+                    x, y = float(point[0]), float(point[1])
+                else:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Stroke {index} point {point_index} is invalid."
+                ) from exc
+            if not np.isfinite(x) or not np.isfinite(y) or not (0 <= x <= width and 0 <= y <= height):
+                raise ValueError(f"Stroke {index} point {point_index} is outside the board.")
+            clean_points.append({"x": round(x, 4), "y": round(y, 4)})
+        validated.append(
+            {"id": stroke_id, "color": color.lower(), "size": round(size, 4), "points": clean_points}
+        )
+    return validated
+
+
+def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
+    dimensions = metadata.get("dimensions", {})
+    width = int(dimensions.get("width") or metadata.get("source", {}).get("width") or 1)
+    height = int(dimensions.get("height") or metadata.get("source", {}).get("height") or 1)
+    namespace = "http://www.w3.org/2000/svg"
+    ET.register_namespace("", namespace)
+    root = ET.Element(
+        f"{{{namespace}}}svg",
+        {"width": str(width), "height": str(height), "viewBox": f"0 0 {width} {height}"},
+    )
+    professor = ET.SubElement(root, f"{{{namespace}}}g", {"id": "professor-ink"})
+    svg_name = metadata.get("assets", {}).get("svg")
+    if isinstance(svg_name, str) and Path(svg_name).name == svg_name:
+        try:
+            source = ET.fromstring((board_dir / svg_name).read_bytes())
+            for child in source:
+                if child.tag.rsplit("}", 1)[-1] not in {"script", "foreignObject"}:
+                    professor.append(deepcopy(child))
+        except (OSError, ET.ParseError):
+            pass
+    user = ET.SubElement(root, f"{{{namespace}}}g", {"id": "user-ink"})
+    for stroke in metadata.get("user_strokes", []):
+        points = stroke["points"]
+        path_data = "M " + " L ".join(f'{point["x"]:.4f} {point["y"]:.4f}' for point in points)
+        ET.SubElement(
+            user,
+            f"{{{namespace}}}path",
+            {
+                "id": stroke["id"],
+                "d": path_data,
+                "fill": "none",
+                "stroke": stroke["color"],
+                "stroke-width": str(stroke["size"]),
+                "stroke-linecap": "round",
+                "stroke-linejoin": "round",
+            },
+        )
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
 @app.errorhandler(RequestEntityTooLarge)
-def too_large(_: RequestEntityTooLarge) -> tuple[str, int]:
+def too_large(_: RequestEntityTooLarge) -> tuple[Response, int]:
     limit_mb = app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
-    return render_page("Upload too large", f"<h1>Upload too large</h1><p>Maximum: {limit_mb:.0f} MB.</p>"), 413
+    return Response(f"Upload too large. Maximum: {limit_mb:.0f} MB.", mimetype="text/plain"), 413
 
 
 @app.get("/")
 def index() -> str:
-    return render_page(
-        "Digital Whiteboard",
-        """
-        <h1>Digital Whiteboard</h1>
-        <p>Upload a clear photo containing the full whiteboard.</p>
-        <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
-          <input type="file" name="image" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" required>
-          <button type="submit">Create board</button>
-        </form>
-        """,
-    )
+    return render_template("index.html")
 
 
 @app.post("/upload")
 def upload() -> Response | tuple[str, int]:
     uploaded = request.files.get("image")
     if uploaded is None or not uploaded.filename:
-        return render_page("Invalid upload", "<h1>Select an image to upload.</h1>"), 400
+        return "Select an image to upload.", 400
     extension = Path(uploaded.filename).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
-        return render_page("Invalid upload", "<h1>Unsupported file extension.</h1>"), 415
+        return "Unsupported file extension.", 415
     content_type = (uploaded.mimetype or "").lower()
     if content_type not in ALLOWED_MIME_TYPES:
-        return render_page("Invalid upload", "<h1>Unsupported image content type.</h1>"), 415
+        return "Unsupported image content type.", 415
     data = uploaded.read(app.config["MAX_CONTENT_LENGTH"] + 1)
     if len(data) > app.config["MAX_CONTENT_LENGTH"]:
         raise RequestEntityTooLarge()
@@ -512,7 +695,7 @@ def upload() -> Response | tuple[str, int]:
             raise ValueError("The filename, content type, and image encoding do not match.")
         image = decode_image(data)
     except ValueError as exc:
-        return render_page("Invalid upload", f"<h1>Invalid image</h1><p>{exc}</p>"), 400
+        return f"Invalid image: {exc}", 400
 
     board_id = secrets.token_hex(16)
     board_dir = BOARDS_DIR / board_id
@@ -544,11 +727,24 @@ def upload() -> Response | tuple[str, int]:
         "threshold": DETECTION_CONFIDENCE_THRESHOLD,
         "corners": corners.tolist() if corners is not None else None,
     }
+    detection_overlay = image.copy()
+    if corners is not None:
+        cv2.polylines(
+            detection_overlay,
+            [np.rint(corners).astype(np.int32)],
+            True,
+            (0, 180, 255),
+            max(2, round(min(image.shape[:2]) / 250)),
+        )
+    atomic_image(board_dir / "board_detection.jpg", detection_overlay)
+    metadata["assets"]["detection"] = "board_detection.jpg"
+    metadata["assets"]["confidence"] = "board_detection.jpg"
     if corners is None or confidence < DETECTION_CONFIDENCE_THRESHOLD:
         metadata["pipeline"]["status"] = "needs_corners"
         # A usable master exists even before the user supplies corners.
         atomic_image(board_dir / "master.png", image)
         metadata["assets"]["master"] = "master.png"
+        metadata["dimensions"] = {"width": int(image.shape[1]), "height": int(image.shape[0])}
         update_metadata(board_dir, metadata)
         return redirect(url_for("board", board_id=board_id))
 
@@ -557,78 +753,14 @@ def upload() -> Response | tuple[str, int]:
 
 
 @app.get("/board/<board_id>")
-def board(board_id: str) -> str:
+def board(board_id: str) -> str | Response:
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
-    if metadata.get("pipeline", {}).get("status") == "needs_corners":
-        return render_page(
-            "Select corners",
-            """
-            <h1>Select the four board corners</h1>
-            <p>Click top-left, top-right, bottom-right, then bottom-left. Click again to reset.</p>
-            <canvas id="picker"></canvas>
-            <form action="{{ url_for('set_corners', board_id=board_id) }}" method="post">
-              <input id="corners" name="corners" type="hidden" required>
-              <button id="submit" disabled>Process selected area</button>
-            </form>
-            <script>
-            const canvas = document.getElementById("picker");
-            const context = canvas.getContext("2d");
-            const image = new Image();
-            let points = [];
-            image.onload = () => {
-              canvas.width = image.naturalWidth; canvas.height = image.naturalHeight; draw();
-            };
-            image.src = {{ image_url|tojson }};
-            function draw() {
-              context.drawImage(image, 0, 0);
-              context.fillStyle = "#e74c3c";
-              points.forEach(p => { context.beginPath(); context.arc(p[0], p[1], 10, 0, Math.PI*2); context.fill(); });
-              if (points.length > 1) {
-                context.strokeStyle = "#e74c3c"; context.lineWidth = 5; context.beginPath();
-                context.moveTo(points[0][0], points[0][1]);
-                points.slice(1).forEach(p => context.lineTo(p[0], p[1]));
-                if (points.length === 4) context.closePath(); context.stroke();
-              }
-            }
-            canvas.addEventListener("click", event => {
-              if (points.length === 4) points = [];
-              const rect = canvas.getBoundingClientRect();
-              points.push([(event.clientX-rect.left)*canvas.width/rect.width, (event.clientY-rect.top)*canvas.height/rect.height]);
-              document.getElementById("corners").value = JSON.stringify(points);
-              document.getElementById("submit").disabled = points.length !== 4;
-              draw();
-            });
-            </script>
-            """,
-            board_id=board_id,
-            image_url=url_for("board_asset", board_id=board_id, asset_name="original"),
-        )
-
-    errors = metadata.get("pipeline", {}).get("errors", [])
-    return render_page(
-        "Whiteboard",
-        """
-        <h1>Whiteboard</h1>
-        <p class="muted">Status: {{ status }}</p>
-        <img src="{{ url_for('board_asset', board_id=board_id, asset_name='master') }}" alt="Processed whiteboard">
-        <p>
-          <a href="{{ url_for('board_svg', board_id=board_id) }}">Download SVG</a> ·
-          <a href="{{ url_for('board_asset', board_id=board_id, asset_name='original') }}">Original</a> ·
-          <a href="{{ url_for('board_asset', board_id=board_id, asset_name='analysis') }}">Analysis</a>
-        </p>
-        <form action="{{ url_for('save_board', board_id=board_id) }}" method="post" enctype="multipart/form-data">
-          <label>Replace master with edited PNG/JPEG/WebP:
-            <input type="file" name="image" accept="image/png,image/jpeg,image/webp">
-          </label>
-          <button>Save</button>
-        </form>
-        {% if errors %}<details><summary>Pipeline warnings</summary><pre>{{ errors|tojson(indent=2) }}</pre></details>{% endif %}
-        """,
-        board_id=board_id,
-        status=metadata.get("pipeline", {}).get("status", "unknown"),
-        errors=errors,
-    )
+    board_data = frontend_board_data(board_id, metadata)
+    accepts = request.accept_mimetypes
+    if accepts["application/json"] > accepts["text/html"]:
+        return jsonify(board_data)
+    return render_template("board.html", board_id=board_id, board_data=board_data)
 
 
 @app.post("/board/<board_id>/corners")
@@ -643,9 +775,26 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
     except (ValueError, TypeError) as exc:
         if request.is_json:
             return jsonify(error=str(exc)), 400
-        flash(str(exc))
-        return redirect(url_for("board", board_id=board_id))
+        return str(exc), 400
     metadata["manual_corners"] = corners.tolist()
+    if isinstance(payload, dict) and isinstance(payload.get("normalized_corners"), list):
+        normalized = payload["normalized_corners"]
+        try:
+            values = [
+                {"x": float(point["x"]), "y": float(point["y"])}
+                for point in normalized
+                if isinstance(point, dict)
+            ]
+            if len(values) == 4 and all(
+                np.isfinite(point["x"])
+                and np.isfinite(point["y"])
+                and 0 <= point["x"] <= 1
+                and 0 <= point["y"] <= 1
+                for point in values
+            ):
+                metadata["normalized_corners"] = values
+        except (KeyError, TypeError, ValueError):
+            pass
     metadata.setdefault("pipeline", {})["status"] = "processing"
     update_metadata(board_dir, metadata)
     run_downstream(board_dir, metadata, image, corners)
@@ -658,57 +807,24 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
 def save_board(board_id: str) -> Response | tuple[Response, int]:
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
-    uploaded = request.files.get("image")
-    data: bytes | None = None
-    expected_format: str | None = None
-    if uploaded and uploaded.filename:
-        upload_mime = (uploaded.mimetype or "").lower()
-        if upload_mime not in ALLOWED_MIME_TYPES:
-            return jsonify(error="Unsupported image content type."), 415
-        expected_format = FORMAT_FOR_MIME[upload_mime]
-        data = uploaded.read(app.config["MAX_CONTENT_LENGTH"] + 1)
-    elif request.is_json:
-        data_url = (request.get_json(silent=True) or {}).get("image")
-        if isinstance(data_url, str):
-            match = re.fullmatch(
-                r"data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=\s]+)", data_url
-            )
-            if match:
-                expected_format = {"png": "PNG", "jpeg": "JPEG", "webp": "WEBP"}[match.group(1)]
-                try:
-                    data = base64.b64decode(match.group(2), validate=True)
-                except ValueError:
-                    data = None
-    if not data:
-        return jsonify(error="A PNG, JPEG, or WebP image is required."), 400
-    if len(data) > app.config["MAX_CONTENT_LENGTH"]:
-        raise RequestEntityTooLarge()
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    dimensions = metadata.get("dimensions", {})
     try:
-        image_format = inspect_image_content(data)
-        if expected_format is not None and image_format != expected_format:
-            raise ValueError("The declared content type does not match the image encoding.")
-        image = decode_image(data)
+        width = int(dimensions["width"])
+        height = int(dimensions["height"])
+        strokes = validate_user_strokes(
+            payload.get("user_strokes", payload.get("strokes")), width, height
+        )
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
-    atomic_image(board_dir / "master.png", image)
-    metadata.setdefault("assets", {})["master"] = "master.png"
-    metadata.setdefault("edits", []).append({"saved_at": time.time()})
-    metadata.setdefault("pipeline", {})["status"] = "ready"
-    try:
-        analysis = analyze_image(image)
-        atomic_json(board_dir / "analysis.json", analysis)
-        svg, method = vectorize_image(image)
-        atomic_bytes(board_dir / "board.svg", svg)
-        metadata["assets"].update({"analysis": "analysis.json", "svg": "board.svg"})
-        metadata["pipeline"]["vector_method"] = method
-    except Exception as exc:
-        metadata["pipeline"].setdefault("errors", []).append(
-            {"stage": "save_derivatives", "message": str(exc)}
-        )
+    except (KeyError, TypeError):
+        return jsonify(error="Board dimensions are unavailable."), 409
+    metadata["user_strokes"] = strokes
+    metadata["user_ink_updated_at"] = time.time()
     update_metadata(board_dir, metadata)
-    if request.is_json:
-        return jsonify(id=board_id, status="saved")
-    return redirect(url_for("board", board_id=board_id))
+    return jsonify(id=board_id, status="saved", user_strokes=strokes)
 
 
 @app.get("/board/<board_id>/asset/<asset_name>")
@@ -728,22 +844,35 @@ def board_asset(board_id: str, asset_name: str) -> Response:
     return send_file(path, conditional=True)
 
 
+@app.get("/boards/<board_id>/<path:asset>")
+def board_file(board_id: str, asset: str) -> Response:
+    board_dir = require_board_id(board_id)
+    if Path(asset).name != asset or Path(asset).suffix.lower() not in SAFE_ASSET_SUFFIXES:
+        abort(404)
+    metadata = read_metadata(board_dir)
+    if asset not in asset_basenames(metadata):
+        abort(404)
+    path = board_dir / asset
+    if not path.is_file():
+        abort(404)
+    mimetype = "image/svg+xml" if path.suffix.lower() == ".svg" else None
+    if path.suffix.lower() == ".json":
+        mimetype = "application/json"
+    return send_file(path, mimetype=mimetype, conditional=True)
+
+
 @app.get("/board/<board_id>/svg")
 def board_svg(board_id: str) -> Response:
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
-    filename = metadata.get("assets", {}).get("svg")
-    if not isinstance(filename, str) or Path(filename).name != filename:
-        abort(404)
-    path = board_dir / filename
-    if not path.is_file():
-        abort(404)
-    return send_file(
-        path,
+    svg = combined_svg(metadata, board_dir)
+    return Response(
+        svg,
         mimetype="image/svg+xml",
-        as_attachment=True,
-        download_name=f"whiteboard-{board_id}.svg",
-        conditional=True,
+        headers={
+            "Content-Disposition": f'attachment; filename="whiteboard-{board_id}.svg"',
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

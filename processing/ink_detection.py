@@ -30,17 +30,35 @@ def _hue_membership(hue: np.ndarray, center: float, half_width: float) -> np.nda
     return np.clip(1.0 - distance / half_width, 0.0, 1.0)
 
 
-def _clean_mask(mask: np.ndarray, scale: float) -> np.ndarray:
-    radius = max(1, min(3, int(round(scale))))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
-    cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
-    return cleaned
+def _clean_mask(mask: np.ndarray, minimum_contour_area: float) -> np.ndarray:
+    """Close one-pixel gaps without widening scale or erasing fine handwriting."""
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(closed, 8)
+    filtered = np.zeros_like(closed)
+    for label in range(1, count):
+        component = (labels == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_area = max((abs(cv2.contourArea(contour)) for contour in contours), default=0.0)
+        pixel_area = int(stats[label, cv2.CC_STAT_AREA])
+        box_width = int(stats[label, cv2.CC_STAT_WIDTH])
+        box_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        # A degenerate but long one-pixel stroke has zero contour area and is
+        # still meaningful. Only reject truly point-like sensor noise.
+        extremely_tiny = (
+            contour_area < minimum_contour_area
+            and pixel_area < 3
+            and box_width <= 2
+            and box_height <= 2
+        )
+        if not extremely_tiny:
+            filtered[labels == label] = 255
+    return filtered
 
 
 def detect_ink(
     master: MasterRaster | np.ndarray,
-    confidence_threshold: float = 0.34,
+    confidence_threshold: float = 0.30,
     minimum_component_area: int | None = None,
 ) -> InkDetectionResult:
     """Segment black, red, blue, and green marker strokes from a BGR master.
@@ -73,7 +91,7 @@ def detect_ink(
     saturation_evidence = np.clip((saturation - 0.10) / 0.50, 0.0, 1.0)
     chroma_evidence = np.clip((chroma - 0.08) / 0.45, 0.0, 1.0)
     color_strength = np.maximum(saturation_evidence, 0.8 * chroma_evidence)
-    color_visibility = np.clip((1.15 - value) / 0.50, 0.45, 1.0)
+    color_visibility = np.clip((1.15 - value) / 0.50, 0.65, 1.0)
     color_strength *= color_visibility
     raw = {
         "black": black,
@@ -84,20 +102,14 @@ def detect_ink(
 
     confidence_stack = np.stack([raw[color] for color in INK_COLORS], axis=-1).astype(np.float32)
     winner = np.argmax(confidence_stack, axis=-1)
-    scale = max(1.0, min(image.shape[:2]) / 1200.0)
-    component_area = minimum_component_area or max(3, int(round(scale * scale * 3)))
+    minimum_contour_area = float(2 if minimum_component_area is None else minimum_component_area)
     masks: dict[str, np.ndarray] = {}
     maps: dict[str, np.ndarray] = {}
     summaries: dict[str, float] = {}
     for index, color in enumerate(INK_COLORS):
         confidence = confidence_stack[:, :, index]
         mask = ((winner == index) & (confidence >= confidence_threshold)).astype(np.uint8) * 255
-        mask = _clean_mask(mask, scale)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-        filtered = np.zeros_like(mask)
-        for label in range(1, count):
-            if stats[label, cv2.CC_STAT_AREA] >= component_area:
-                filtered[labels == label] = 255
+        filtered = _clean_mask(mask, minimum_contour_area)
         confidence = np.ascontiguousarray(confidence, dtype=np.float32)
         filtered = np.ascontiguousarray(filtered)
         confidence.setflags(write=False)

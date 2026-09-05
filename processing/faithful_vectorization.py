@@ -52,6 +52,13 @@ def faithful_vectorize(
         filled = conservative_vectorize(master, ink, options)
         has_ink = bool(np.count_nonzero(ink.combined_mask))
         if has_ink and not filled.regions:
+            per_color = filled.metrics.get("per_color", {})
+            giant_rejections = sum(
+                int(metrics.get("rejected_giant", 0))
+                for metrics in per_color.values()
+            )
+            if giant_rejections:
+                return FaithfulVectorizationResult("conservative", filled, None, None)
             fallback_reason = "filled vectorization produced no regions"
         elif filled.truncated and fallback_on_truncation:
             fallback_reason = "filled vectorization reached a safety limit"
@@ -61,6 +68,6 @@ def faithful_vectorize(
         fallback_reason = f"{type(error).__name__}: {error}"
 
     timeout = options.timeout_seconds if options else 10.0
-    maximum = options.max_regions if options else 6000
+    maximum = options.max_regions if options else ConservativeOptions().max_regions
     centerlines = vectorize_centerlines(master, ink, max_strokes=maximum, timeout_seconds=timeout)
     return FaithfulVectorizationResult("centerline", filled, centerlines, fallback_reason)

@@ -4,6 +4,10 @@ from .analysis import AnalysisResult, analyze_whiteboard, process_whiteboard
 from .board_detection import BoardDetection, detect_board, order_corners
 from .conservative_vectorization import (
     ConservativeOptions,
+    MAX_CONTOURS,
+    MAX_POINTS_PER_CONTOUR,
+    MAX_VECTOR_DIMENSION,
+    MAX_VECTOR_OBJECTS,
     VectorRegion,
     VectorizationResult,
     conservative_vectorize,
@@ -36,6 +40,10 @@ __all__ = [
     "FaithfulVectorizationResult",
     "INK_COLORS",
     "InkDetectionResult",
+    "MAX_CONTOURS",
+    "MAX_POINTS_PER_CONTOUR",
+    "MAX_VECTOR_DIMENSION",
+    "MAX_VECTOR_OBJECTS",
     "MasterRaster",
     "PerspectiveResult",
     "RasterComparison",
