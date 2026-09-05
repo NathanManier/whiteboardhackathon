@@ -206,7 +206,7 @@ The gallery always renders a stable set of cards and shows “Artifact unavailab
 - `svg_raster` / `digitized` / `rendered_svg`
 - `master_vs_svg` / `comparison` / `overlay`
 
-The current integrated pipeline emits a detection-confidence image, combined ink mask, SVG raster, and master/SVG comparison when available. Per-color masks and confidence maps are supported by the UI when future pipeline output exposes them.
+The integrated pipeline emits the confidence image, combined and per-color masks, SVG raster, and master/SVG comparison. If CairoSVG's native runtime is unavailable, the SVG-raster diagnostic falls back to a color rendering of the accepted ink-mask pixels so the board remains inspectable.
 
 ## Board storage
 
@@ -222,9 +222,15 @@ boards/
     master.png
     analysis.json
     board.svg
-    mask_combined.png
-    svg_debug_raster.png
-    comparison.png
+    analysis/
+      confidence.png
+      ink_mask.png
+      black_mask.png
+      red_mask.png
+      blue_mask.png
+      green_mask.png
+      svg_raster.png
+      master_vs_svg.jpg
 ```
 
 Exact optional files depend on pipeline success. `board.json` is the source of truth for status, source metadata, dimensions, asset allowlisting, detection data, stage timings/errors, vectorization method, and user strokes. JSON and generated files are written with temporary files followed by atomic replacement to reduce partial writes.
