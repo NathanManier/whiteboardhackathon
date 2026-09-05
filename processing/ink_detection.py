@@ -25,6 +25,7 @@ class InkDetectionResult:
     confidence_maps: Mapping[str, np.ndarray]
     confidences: Mapping[str, float]
     combined_mask: np.ndarray
+    metrics: Mapping[str, object] = MappingProxyType({})
 
 
 def _hue_membership(hue: np.ndarray, center: float, half_width: float) -> np.ndarray:
@@ -67,10 +68,111 @@ def _clean_mask(mask: np.ndarray, minimum_contour_area: float) -> np.ndarray:
     return filtered
 
 
+def _suppress_reflection_components(
+    mask: np.ndarray,
+    gray: np.ndarray,
+    saturation: np.ndarray,
+    chroma: np.ndarray,
+    local_background: np.ndarray,
+    edges: np.ndarray,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Remove only broad, smooth, neutral components that resemble reflection.
+
+    This intentionally operates after ink scoring and only considers components
+    with several independent background-like signals. Ambiguous components are
+    retained so that a large handwritten shape is not mistaken for a reflection.
+    """
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    height, width = mask.shape[:2]
+    image_area = float(height * width)
+    filtered = mask.copy()
+    rejected = 0
+    candidates = 0
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        box_width = int(stats[label, cv2.CC_STAT_WIDTH])
+        box_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        box_area = max(1, box_width * box_height)
+        area_fraction = area / image_area
+        box_fraction = box_area / image_area
+        fill_ratio = area / box_area
+        # Reflection candidates must be genuinely broad. This deliberately
+        # excludes normal handwriting, punctuation, and thin long strokes.
+        broad = (
+            area_fraction >= 0.01
+            and box_fraction >= 0.025
+            and max(box_width / max(width, 1), box_height / max(height, 1)) >= 0.08
+            and fill_ratio >= 0.45
+        )
+        if not broad:
+            continue
+        candidates += 1
+        component = labels == label
+        component_gray = gray[component]
+        component_background = local_background[component]
+        component_saturation = saturation[component]
+        component_chroma = chroma[component]
+        component_edges = edges[component] != 0
+        component_residual = np.abs(component_background - component_gray)
+        local_contrast = float(
+            np.mean(component_residual)
+        )
+        residual_variation = float(
+            np.std(component_gray - component_background)
+        )
+        edge_density = float(np.mean(component_edges))
+        structured_fraction = float(np.mean(component_residual >= 0.12))
+        neutral = float(
+            np.clip(
+                1.0
+                - 2.0 * np.mean(component_saturation)
+                - 0.75 * np.mean(component_chroma),
+                0.0,
+                1.0,
+            )
+        )
+        # All tests must agree. A broad dark handwritten diagram normally has
+        # stronger edges, higher residual variation, or a less solid bbox.
+        reflection_like = (
+            neutral >= 0.72
+            and local_contrast <= 0.075
+            and residual_variation <= 0.085
+            and edge_density <= 0.10
+            # A clean rectangle still has a narrow high-contrast perimeter;
+            # allow that border, but not a meaningful amount of localized
+            # handwriting structure.
+            and structured_fraction <= 0.025
+        )
+        if reflection_like:
+            filtered[component] = 0
+            rejected += 1
+            LOGGER.info(
+                "REFLECTION COMPONENT REJECTED label=%d area=%d bbox=%dx%d "
+                "fill=%.3f neutral=%.3f contrast=%.4f variation=%.4f "
+                "edges=%.4f structured=%.4f",
+                label,
+                area,
+                box_width,
+                box_height,
+                fill_ratio,
+                neutral,
+                local_contrast,
+                residual_variation,
+                edge_density,
+                structured_fraction,
+            )
+    return filtered, {
+        "components": max(0, count - 1),
+        "broad_candidates": candidates,
+        "rejected_reflections": rejected,
+    }
+
+
 def detect_ink(
     master: MasterRaster | np.ndarray,
     confidence_threshold: float = 0.30,
     minimum_component_area: int | None = None,
+    suppress_reflections: bool = True,
 ) -> InkDetectionResult:
     """Segment black, red, blue, and green marker strokes from a BGR master.
 
@@ -100,7 +202,9 @@ def detect_ink(
     local_background = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma)
     local_darkness = np.clip((local_background - gray) / 0.28, 0.0, 1.0)
     absolute_darkness = np.clip((0.72 - value) / 0.55, 0.0, 1.0)
-    neutral_evidence = np.clip(1.0 - 3.0 * saturation, 0.0, 1.0)
+    # Keep the historical permissive neutral evidence. Saturation is useful
+    # for separating colored ink, but black handwriting is often unsaturated.
+    neutral_evidence = np.clip(1.0 - 1.15 * saturation, 0.0, 1.0)
     black = np.maximum(
         0.65 * local_darkness * neutral_evidence,
         absolute_darkness * neutral_evidence,
@@ -124,12 +228,36 @@ def detect_ink(
     masks: dict[str, np.ndarray] = {}
     maps: dict[str, np.ndarray] = {}
     summaries: dict[str, float] = {}
+    component_metrics: dict[str, dict[str, int]] = {}
+    edges = cv2.Canny(np.clip(gray * 255.0, 0, 255).astype(np.uint8), 45, 140)
     for index, color in enumerate(INK_COLORS):
         color_started = time.monotonic()
         confidence = confidence_stack[:, :, index]
         threshold = confidence_threshold if color == "black" else min(confidence_threshold, 0.07)
         mask = ((winner == index) & (confidence >= threshold)).astype(np.uint8) * 255
+        raw_foreground_pixels = int(np.count_nonzero(mask))
         filtered = _clean_mask(mask, minimum_contour_area)
+        if suppress_reflections:
+            filtered, reflection_metrics = _suppress_reflection_components(
+                filtered,
+                gray,
+                saturation,
+                chroma,
+                local_background,
+                edges,
+            )
+        else:
+            component_count = cv2.connectedComponentsWithStats(filtered, 8)[0] - 1
+            reflection_metrics = {
+                "components": int(component_count),
+                "broad_candidates": 0,
+                "rejected_reflections": 0,
+            }
+        reflection_metrics["raw_foreground_pixels"] = raw_foreground_pixels
+        reflection_metrics["retained_components"] = int(
+            cv2.connectedComponentsWithStats(filtered, 8)[0] - 1
+        )
+        component_metrics[color] = reflection_metrics
         confidence = np.ascontiguousarray(confidence, dtype=np.float32)
         filtered = np.ascontiguousarray(filtered)
         confidence.setflags(write=False)
@@ -159,4 +287,11 @@ def detect_ink(
         MappingProxyType(maps),
         MappingProxyType(summaries),
         combined,
+        MappingProxyType(
+            {
+                "reflection_suppression": bool(suppress_reflections),
+                "per_color": component_metrics,
+                "foreground_pixels": int(np.count_nonzero(combined)),
+            }
+        ),
     )

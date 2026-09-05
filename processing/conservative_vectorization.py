@@ -60,7 +60,7 @@ class ConservativeOptions:
     max_regions: int = MAX_VECTOR_OBJECTS
     max_points_per_region: int = MAX_POINTS_PER_CONTOUR
     max_work_pixels: int = MAX_VECTOR_DIMENSION * MAX_VECTOR_DIMENSION
-    timeout_seconds: float = 12.0
+    timeout_seconds: float = 30.0
     minimum_area: float = 2.0
     max_vector_dimension: int = MAX_VECTOR_DIMENSION
     max_contours: int = MAX_CONTOURS
@@ -102,10 +102,33 @@ def _closed_bezier(points: np.ndarray, tension: float) -> str:
 def _simplify(contour: np.ndarray, options: ConservativeOptions, inverse_scale: float) -> np.ndarray:
     perimeter = cv2.arcLength(contour, True)
     area = max(abs(cv2.contourArea(contour)), 1.0)
-    # Small glyphs retain nearly all source samples; large regions can tolerate
-    # proportionally more simplification while remaining scale-aware.
+    points = contour.reshape(-1, 2).astype(np.float64)
+    curvature_factor = 1.0
+    if len(points) >= 5:
+        previous = np.roll(points, 1, axis=0)
+        following = np.roll(points, -1, axis=0)
+        first = previous - points
+        second = following - points
+        denominator = np.linalg.norm(first, axis=1) * np.linalg.norm(second, axis=1)
+        valid = denominator > 1e-6
+        cosine = np.ones(len(points), dtype=np.float64)
+        cosine[valid] = np.clip(
+            np.sum(first[valid] * second[valid], axis=1) / denominator[valid],
+            -1.0,
+            1.0,
+        )
+        turning = np.arccos(cosine)
+        high_curvature = float(np.mean(turning > 0.35))
+        # Curved/irregular handwriting gets a smaller epsilon. Straight,
+        # low-curvature runs can still lose redundant samples.
+        curvature_factor = float(np.clip(1.0 - 0.65 * high_curvature, 0.28, 1.0))
+    # Small glyphs and high-curvature contours retain nearly all source
+    # samples; large/simple regions can tolerate more simplification.
     scale_adjustment = np.clip(np.sqrt(area) / 250.0, 0.12, 1.5)
-    epsilon = max(0.10, perimeter * options.simplification * scale_adjustment)
+    epsilon = max(
+        0.10,
+        perimeter * options.simplification * scale_adjustment * curvature_factor,
+    )
     simplified = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
     if len(simplified) < 3 and len(contour) >= 3:
         center, size, angle = cv2.minAreaRect(contour)

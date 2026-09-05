@@ -65,6 +65,61 @@ def _jsonable(value: object) -> object:
     return value
 
 
+def _write_ink_variant(
+    directory: Path,
+    label: str,
+    master: MasterRaster,
+    ink: InkDetectionResult,
+    vector_options: ConservativeOptions | None,
+    debug_raster: bool,
+) -> dict[str, object]:
+    """Write comparable A/B masks, vectors, and raster diagnostics."""
+    variant_directory = directory / "ab" / label
+    variant_directory.mkdir(parents=True, exist_ok=True)
+    for color, mask in ink.masks.items():
+        _write_image(variant_directory / f"{color}_mask.png", mask)
+    _write_image(variant_directory / "ink_mask.png", ink.combined_mask)
+    vectors = faithful_vectorize(master, ink, vector_options)
+    svg_path = write_svg(
+        vectors,
+        variant_directory / "whiteboard.svg",
+        metadata={"method": vectors.selected_method, "variant": label},
+    )
+    rendered = None
+    comparison = None
+    if debug_raster:
+        raster_path = variant_directory / "svg_raster.png"
+        comparison = compare_svg_to_raster(svg_path, master.image, raster_path)
+        if comparison.available:
+            rendered = cv2.imread(str(raster_path), cv2.IMREAD_COLOR)
+        if rendered is None:
+            # Keep A/B diagnostics usable when CairoSVG is unavailable. This
+            # is mask-derived, not presented as an SVG fidelity score.
+            rendered = np.full_like(master.image, 255)
+            rendered[ink.combined_mask != 0] = master.image[ink.combined_mask != 0]
+            _write_image(raster_path, rendered)
+        if rendered is not None:
+            _write_image(
+                variant_directory / "master_vs_svg.jpg",
+                np.concatenate((master.image, rendered), axis=1),
+            )
+            overlay = cv2.addWeighted(master.image, 0.5, rendered, 0.5, 0)
+            _write_image(variant_directory / "master_svg_overlay.jpg", overlay)
+    filled = vectors.filled
+    metrics = dict(filled.metrics) if filled is not None else {}
+    return {
+        "method": vectors.selected_method,
+        "path_count": int(svg_path.read_text(encoding="utf-8").count("<path")),
+        "region_count": len(filled.regions) if filled is not None else 0,
+        "raw_contours": int(metrics.get("raw_contours", 0)),
+        "rejected_objects": int(metrics.get("rejected_objects", 0)),
+        "foreground_pixels": int(np.count_nonzero(ink.combined_mask)),
+        "ink_metrics": _jsonable(dict(ink.metrics)),
+        "vector_metrics": _jsonable(metrics),
+        "raster_comparison": _jsonable(asdict(comparison)) if comparison else None,
+    }
+
+
 def analyze_whiteboard(
     image: np.ndarray | str | Path,
     analysis_directory: str | Path,
@@ -73,6 +128,7 @@ def analyze_whiteboard(
     enhancement_strength: float = 0.72,
     vector_options: ConservativeOptions | None = None,
     debug_raster: bool = True,
+    compare_reflection_suppression: bool = False,
 ) -> AnalysisResult:
     """Run the complete pipeline and write artifacts under a supplied directory.
 
@@ -105,7 +161,12 @@ def analyze_whiteboard(
     artifacts["master"] = _write_image(directory / "master_raster.png", master.image)
 
     stage = time.monotonic()
-    ink = detect_ink(master)
+    baseline_ink = (
+        detect_ink(master, suppress_reflections=False)
+        if compare_reflection_suppression
+        else None
+    )
+    ink = detect_ink(master, suppress_reflections=True)
     timings["ink_detection"] = time.monotonic() - stage
     for color, mask in ink.masks.items():
         mask_path = _write_image(directory / f"{color}_mask.png", mask)
@@ -186,6 +247,7 @@ def analyze_whiteboard(
         },
         "dimensions": {"width": master.width, "height": master.height},
         "ink_confidences": dict(ink.confidences),
+        "ink_analysis": _jsonable(dict(ink.metrics)),
         "vectorization": {
             "method": vectors.selected_method,
             "fallback_reason": vectors.fallback_reason,
@@ -205,6 +267,27 @@ def analyze_whiteboard(
         "timings_seconds": timings,
         "raster_comparison": asdict(comparison) if comparison else None,
     }
+    if compare_reflection_suppression and baseline_ink is not None:
+        ab_stage = time.monotonic()
+        metadata["ab_comparison"] = {
+            "baseline": _write_ink_variant(
+                directory,
+                "baseline",
+                master,
+                baseline_ink,
+                vector_options,
+                debug_raster,
+            ),
+            "suppressed": _write_ink_variant(
+                directory,
+                "suppressed",
+                master,
+                ink,
+                vector_options,
+                debug_raster,
+            ),
+        }
+        timings["ab_comparison"] = time.monotonic() - ab_stage
     if comparison and comparison.raster_path is not None:
         metadata["raster_comparison"]["raster_path"] = str(comparison.raster_path)
     metadata_path = directory / "analysis.json"
