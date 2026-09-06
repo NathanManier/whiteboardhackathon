@@ -52,12 +52,17 @@ Do not invent labels, equations, or symbols that cannot be seen.
 """
 
 LATEX_NOTATION_RULES = """
-LaTeX MUST render. Every formula, root, fraction, exponent, matrix, or complex number belongs in $...$, $$...$$, \\(...\\), or \\[...\\].
+Notation MUST render. Put every mathematical or chemical expression in $...$, $$...$$, \\(...\\), or \\[...\\]. Never leave intended notation as bare LaTeX in prose.
 - Square/nth roots: $\\sqrt{x+1}$ or $\\sqrt[n]{x}$. Never write the √ character, sqrt(), or \\sqrt without braces.
 - Fractions: $\\frac{a}{b}$. Never a/b when the problem is algebraic.
 - Exponents/subscripts: $x^{2}$, $a_{n}$. Always use braces for multi-character scripts.
 - Complex numbers: $a+bi$, $re^{i\\theta}$, or $\\mathbb{C}$.
-- After JSON parse, LaTeX commands use a single backslash: $\\sqrt{x}$ not \\\\sqrt{x}.
+- Use chemistry-aware mhchem notation inside math delimiters for chemical formulas, ions, reactions, states, hydrates, isotopes, and bonds.
+- Chemistry examples: $\\ce{H2O}$, $\\ce{SO4^2-}$, $\\ce{Ca^2+}$, $\\ce{2H2 + O2 -> 2H2O}$, $\\ce{N2 + 3H2 <=> 2NH3}$, $\\ce{NaCl(aq)}$, $\\ce{CuSO4 * 5H2O}$, and $\\ce{^{14}C}$.
+- In mhchem, formula numbers are subscripts and ionic charges follow ^. Never write ambiguous chemistry such as SO4^2- outside delimiters.
+- For ordinary math use standard LaTeX, for example $pH=-\\log[H^+]$ and $K_a=\\frac{[H^+][A^-]}{[HA]}$.
+- Do not put prose inside math delimiters. Do not use Markdown code fences around notation.
+- JSON transport may escape backslashes, but after JSON parse every command must contain one backslash: $\\sqrt{x}$ and $\\ce{H2O}$, not doubled-backslash text.
 """
 
 SYSTEM_PROMPT = """You are a study assistant helping a student understand professor notes captured from a physical whiteboard.
@@ -200,6 +205,9 @@ Use the rendered selection image as the student's handwriting/diagrams. Known pr
 
 If handwriting is ambiguous, say so. Do not hallucinate hidden work.
 
+Write mathematics and chemistry using the notation rules below, and write prose in Markdown.
+""" + LATEX_NOTATION_RULES + """
+
 Return JSON only:
 {
   "title": "Check my work",
@@ -233,6 +241,9 @@ Search only whiteboards in the current folder, in board order. The selection is 
 If you can see where it was introduced or developed, say which whiteboard and what happened there.
 If confidence is low, say you could not confidently find where this was introduced.
 Never fabricate a source board.
+
+Write mathematics and chemistry using the notation rules below, and write prose in Markdown.
+""" + LATEX_NOTATION_RULES + """
 
 Return JSON only:
 {
@@ -764,6 +775,7 @@ def unescape_study_newlines(text: str) -> str:
     value = re.sub(r"\$\n([A-Z][^$\n]{0,80})\$", r"\n\1", value)
     value = re.sub(r"(?<!\$)\$(?:\n+)(?!\$)", "\n", value)
     value = re.sub(r"(?<!\\)\\n(?![A-Za-z])", "\n", value)
+    value = re.sub(r"(?<!\\)\\n(?=[A-Z])", "\n", value)
     value = re.sub(r"(?<!\\)\\t(?![A-Za-z])", "\t", value)
     value = re.sub(r"(?<!\\)\\r(?![A-Za-z])", "\n", value)
     value = re.sub(r"\$(\s*#{1,4}\s)", r"\1", value)
@@ -841,7 +853,7 @@ def parse_study_guide(raw: str) -> dict[str, Any]:
 
 def _parse_model_json(raw: str) -> dict[str, str]:
     value = _load_json_object(raw)
-    answer = str(value.get("answer") or raw or "").strip()
+    answer = unescape_study_newlines(str(value.get("answer") or raw or "").strip())
     title = str(value.get("title") or "Explanation").strip()[:120]
     confidence = str(value.get("confidence") or "medium").strip().lower()
     if confidence not in {"high", "medium", "low"}:
@@ -860,7 +872,7 @@ SOLUTION_SPLIT_RE = re.compile(
     re.IGNORECASE,
 )
 def clean_practice_problem_text(text: str) -> str:
-    cleaned = str(text or "").strip()
+    cleaned = unescape_study_newlines(str(text or "")).strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z0-9]*\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)

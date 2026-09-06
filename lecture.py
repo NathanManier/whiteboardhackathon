@@ -116,6 +116,7 @@ def unescape_study_newlines(text: str) -> str:
     value = re.sub(r"\$\n([A-Z][^$\n]{0,80})\$", r"\n\1", value)
     value = re.sub(r"(?<!\$)\$(?:\n+)(?!\$)", "\n", value)
     value = re.sub(r"(?<!\\)\\n(?![A-Za-z])", "\n", value)
+    value = re.sub(r"(?<!\\)\\n(?=[A-Z])", "\n", value)
     value = re.sub(r"(?<!\\)\\t(?![A-Za-z])", "\t", value)
     value = re.sub(r"(?<!\\)\\r(?![A-Za-z])", "\n", value)
     value = re.sub(r"\$(\s*#{1,4}\s)", r"\1", value)

@@ -87,16 +87,20 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertTrue((board_dir / metadata["assets"]["original"]).is_file())
         self.assertEqual(metadata["pipeline"]["status"], "needs_corners")
 
-    def test_confident_detection_continues_canonical_processing(self):
+    def test_confident_detection_waits_for_user_confirmation(self):
         with patch("app.detect_corners", return_value=(self.corners, 0.9)), patch(
             "app.run_downstream", side_effect=self.fake_downstream
         ) as downstream:
             response = self.upload()
         self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
-        self.assertEqual(response.get_json()["status"], "ready")
-        downstream.assert_called_once()
+        self.assertEqual(response.get_json()["status"], "needs_corners")
+        downstream.assert_not_called()
+        metadata = board_app.read_metadata(
+            board_app.BOARDS_DIR / response.get_json()["id"]
+        )
+        self.assertEqual(len(metadata["suggested_corners"]), 4)
 
-    def test_manual_corners_persist_and_resume_processing(self):
+    def test_confirmed_corners_persist_and_resume_processing(self):
         with patch("app.detect_corners", return_value=(self.corners, 0.0)):
             created = self.upload().get_json()
         with patch("app.run_downstream", side_effect=self.fake_downstream):
@@ -108,7 +112,8 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         metadata = board_app.read_metadata(board_app.BOARDS_DIR / created["id"])
         self.assertEqual(metadata["pipeline"]["status"], "ready")
-        self.assertEqual(len(metadata["manual_corners"]), 4)
+        self.assertEqual(len(metadata["confirmed_corners"]), 4)
+        self.assertIn("corners_confirmed_at", metadata)
 
     def test_deleted_board_returns_404_without_recreating_directory(self):
         with patch("app.detect_corners", return_value=(self.corners, 0.0)):

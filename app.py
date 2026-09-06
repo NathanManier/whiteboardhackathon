@@ -524,46 +524,49 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
             f"Object {index} translation",
         )
         if object_type == "text":
-            text = item.get("text", "")
+            text = item.get(
+                "text", item.get("source_markdown", item.get("sourceMarkdown", ""))
+            )
             if not isinstance(text, str) or len(text) > MAX_TEXT_LENGTH:
                 raise ValueError(f"Object {index} text is invalid.")
             clean_text: dict[str, Any] = {
-                    "id": object_id,
-                    "type": "text",
-                    "text": text,
-                    "x": finite_number(
-                        item.get("x"),
-                        f"Object {index}.x",
-                        minimum=-MAX_WORLD_COORDINATE,
-                        maximum=MAX_WORLD_COORDINATE,
-                    ),
-                    "y": finite_number(
-                        item.get("y"),
-                        f"Object {index}.y",
-                        minimum=-MAX_WORLD_COORDINATE,
-                        maximum=MAX_WORLD_COORDINATE,
-                    ),
-                    "width": finite_number(
-                        item.get("width"),
-                        f"Object {index}.width",
-                        minimum=4,
-                        maximum=MAX_WORLD_COORDINATE,
-                    ),
-                    "height": finite_number(
-                        item.get("height"),
-                        f"Object {index}.height",
-                        minimum=4,
-                        maximum=MAX_WORLD_COORDINATE,
-                    ),
-                    "font_size": finite_number(
-                        item.get("font_size", item.get("fontSize", 32)),
-                        f"Object {index}.font_size",
-                        minimum=6,
-                        maximum=500,
-                    ),
-                    "color": color.lower(),
-                    "translation": translation,
-                }
+                "id": object_id,
+                "type": "text",
+                "text": text,
+                "source_markdown": text,
+                "x": finite_number(
+                    item.get("x"),
+                    f"Object {index}.x",
+                    minimum=-MAX_WORLD_COORDINATE,
+                    maximum=MAX_WORLD_COORDINATE,
+                ),
+                "y": finite_number(
+                    item.get("y"),
+                    f"Object {index}.y",
+                    minimum=-MAX_WORLD_COORDINATE,
+                    maximum=MAX_WORLD_COORDINATE,
+                ),
+                "width": finite_number(
+                    item.get("width"),
+                    f"Object {index}.width",
+                    minimum=4,
+                    maximum=MAX_WORLD_COORDINATE,
+                ),
+                "height": finite_number(
+                    item.get("height"),
+                    f"Object {index}.height",
+                    minimum=4,
+                    maximum=MAX_WORLD_COORDINATE,
+                ),
+                "font_size": finite_number(
+                    item.get("font_size", item.get("fontSize", 32)),
+                    f"Object {index}.font_size",
+                    minimum=6,
+                    maximum=500,
+                ),
+                "color": color.lower(),
+                "translation": translation,
+            }
             role = item.get("role") or item.get("kind")
             if role in {"ai_practice_problem", "practice_problem"}:
                 clean_text["role"] = "ai_practice_problem"
@@ -916,8 +919,6 @@ def detect_corners(image: np.ndarray) -> tuple[np.ndarray | None, float]:
                 points = result.get("points")
             confidence = float(result.get("confidence", 0.0))
         elif hasattr(result, "corners") and hasattr(result, "confidence"):
-            if hasattr(result, "found") and not result.found:
-                return None, float(result.confidence)
             points, confidence = result.corners, float(result.confidence)
         elif isinstance(result, tuple) and len(result) >= 2:
             points, confidence = result[0], float(result[1])
@@ -2368,27 +2369,7 @@ def upload() -> Response | tuple[str, int]:
             for point in corners
         ]
     metadata["pipeline"]["status"] = "needs_corners"
-    if corners is not None and confidence >= DETECTION_CONFIDENCE_THRESHOLD:
-        LOGGER.info("BOARD PROCESSING RESUME board=%s manual=false", board_id)
-        try:
-            run_downstream(board_dir, metadata, image, corners)
-        except Exception:
-            LOGGER.exception("BOARD CREATE FAILED board=%s stage=processing", board_id)
-            metadata.setdefault("pipeline", {})["status"] = "failed"
-            update_metadata(board_dir, metadata)
-            return upload_failure(
-                "We couldn't finish processing that whiteboard. Your original photo is still saved.",
-                500,
-            )
-        LOGGER.info(
-            "BOARD CREATE COMPLETE board=%s lecture=%s state=ready elapsed=%.3fs",
-            board_id,
-            requested_folder or "none",
-            time.perf_counter() - upload_started,
-        )
-        return upload_success(board_id, metadata, status="ready")
-
-    # A usable preview exists while the user supplies manual corners.
+    # Always show the automatic detection for confirmation before correction.
     atomic_image(board_dir / "master.png", image)
     metadata["assets"]["master"] = "master.png"
     metadata["dimensions"] = {"width": int(width), "height": int(height)}
@@ -2441,7 +2422,8 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
         if request.is_json:
             return jsonify(error=str(exc)), 400
         return str(exc), 400
-    metadata["manual_corners"] = corners.tolist()
+    metadata["confirmed_corners"] = corners.tolist()
+    metadata["corners_confirmed_at"] = time.time()
     if isinstance(payload, dict) and isinstance(payload.get("normalized_corners"), list):
         normalized = payload["normalized_corners"]
         try:

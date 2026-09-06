@@ -97,6 +97,7 @@ class EditorApiTests(unittest.TestCase):
         saved = response.get_json()["editor"]
         self.assertEqual(saved["revision"], 1)
         self.assertEqual(saved["objects"][1]["text"], "Editable text")
+        self.assertEqual(saved["objects"][1]["source_markdown"], "Editable text")
         self.assertEqual(saved["objects"][1]["role"], "ai_practice_problem")
         self.assertEqual(saved["objects"][1]["practice_problem_id"], "prob-one")
         self.assertEqual(saved["objects"][0]["scaleX"], 1.5)

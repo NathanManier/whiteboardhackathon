@@ -290,6 +290,9 @@
     if (object.type === "text") {
       const role = object.role === "ai_practice_problem" || object.role === "practice_problem"
         ? "ai_practice_problem" : "";
+      const sourceMarkdown = String(
+        object.text ?? object.sourceMarkdown ?? object.source_markdown ?? ""
+      );
       return {
         id: object.id || uid("text"),
         type: "text",
@@ -297,7 +300,8 @@
         y: Number(object.y) || 0,
         width: Math.max(4, Number(object.width) || 40),
         height: Math.max(4, Number(object.height) || 20),
-        text: String(object.text || ""),
+        text: sourceMarkdown,
+        sourceMarkdown,
         color: object.color || "#183153",
         fontSize: clamp(Number(object.fontSize || object.font_size || 28), 8, 240),
         wrapWidth: Number(object.wrapWidth || object.wrap_width) || 0,
@@ -471,14 +475,14 @@
     adaptEditor(saved || {});
   }
 
-  /* Existing manual corner-selection contract and normalized coordinates are preserved. */
+  /* Automatic corner suggestions remain editable until the user confirms them. */
   function initCorners() {
     $("#corner-workspace").hidden = false;
     $("#editor-workspace").hidden = true;
     applyLectureData(state.data);
     const title = state.lecture.folderName || state.data.title || state.data.name || "Whiteboard";
     $("#board-name").textContent = title;
-    document.title = `Place corners · ${title}`;
+    document.title = `Confirm corners · ${title}`;
     ["#import-whiteboard", "#toolbar-new-board", "#menu-import"].forEach(selector => {
       const control = $(selector);
       if (control) control.disabled = true;
@@ -491,12 +495,13 @@
       return;
     }
     const saved = state.data.normalized_corners || state.data.corners_normalized;
-    state.corners = Array.isArray(saved) && saved.length === 4
+    state.detectedCorners = Array.isArray(saved) && saved.length === 4
       ? saved.map(point => ({
         x: clamp(Number(point.x ?? point[0]), 0, 1),
         y: clamp(Number(point.y ?? point[1]), 0, 1)
       }))
       : [{x:.08,y:.10},{x:.92,y:.10},{x:.92,y:.90},{x:.08,y:.90}];
+    state.corners = state.detectedCorners.map(point => ({ ...point }));
     image.addEventListener("load", () => {
       $("#corner-overlay").setAttribute("viewBox", `0 0 ${image.naturalWidth} ${image.naturalHeight}`);
       renderCorners();
@@ -531,7 +536,7 @@
       });
     });
     $("#reset-corners").addEventListener("click", () => {
-      state.corners = [{x:.08,y:.10},{x:.92,y:.10},{x:.92,y:.90},{x:.08,y:.90}];
+      state.corners = state.detectedCorners.map(point => ({ ...point }));
       renderCorners();
     });
     $("#submit-corners").addEventListener("click", submitCorners);
@@ -566,7 +571,7 @@
       image_height: image.naturalHeight
     };
     button.disabled = true;
-    button.textContent = "Correcting…";
+    button.textContent = "Processing…";
     errorBox.hidden = true;
     try {
       const response = await fetch(`${boardRoute}/corners`, {
@@ -591,7 +596,7 @@
       errorBox.hidden = false;
     }
     button.disabled = false;
-    button.textContent = "Correct board";
+    button.textContent = "Confirm & process";
   }
 
   function pathFromPoints(points) {
@@ -1150,7 +1155,8 @@
     const objects = state.objects.map(object => {
       if (object.type === "text") {
         return {
-          id: object.id, type: "text", text: object.text,
+          id: object.id, type: "text", text: textObjectSource(object),
+          source_markdown: textObjectSource(object),
           x: object.x, y: object.y, width: object.width, height: object.height,
           font_size: object.fontSize, color: object.color,
           wrap_width: object.wrapWidth || undefined,
@@ -1880,11 +1886,15 @@
   }
 
   function textUsesRichRender(object) {
-    const text = String(object?.text || "");
+    const text = textObjectSource(object);
     if (object?.role === "ai_practice_problem") return true;
     return typeof globalThis.hasRichMarkup === "function"
       ? globalThis.hasRichMarkup(text)
       : /\$\$|\\\(|\\\[|(^|[^\\])\$/.test(text);
+  }
+
+  function textObjectSource(object) {
+    return String(object?.sourceMarkdown ?? object?.text ?? "");
   }
 
   function textMeasureHost() {
@@ -1981,7 +1991,7 @@
       el.dataset.objectId = object.id;
       world.append(el);
     }
-    el.replaceChildren(canvasRichMarkdown(object.text));
+    el.replaceChildren(canvasRichMarkdown(textObjectSource(object)));
     applyHtmlOverlayBox(el, object);
     const editing = $("#text-editor-overlay")?.dataset.objectId;
     el.hidden = editing === object.id;
@@ -2041,12 +2051,12 @@
     let height;
     if (textUsesRichRender(object)) {
       const measured = measureRichText(
-        object.text, fontSize, intendedWrapWidth(object), object.color
+        textObjectSource(object), fontSize, intendedWrapWidth(object), object.color
       );
       width = measured.width;
       height = measured.height;
     } else {
-      const measured = wrapPlainLines(object.text, fontSize, intendedWrapWidth(object));
+      const measured = wrapPlainLines(textObjectSource(object), fontSize, intendedWrapWidth(object));
       width = measured.width;
       height = measured.height;
     }
@@ -2103,7 +2113,7 @@
       /* HTML overlay renders KaTeX; SVG foreignObject leaks positioned math to the page. */
       return group;
     }
-    const wrapped = wrapPlainLines(object.text, object.fontSize, intendedWrapWidth(object));
+    const wrapped = wrapPlainLines(textObjectSource(object), object.fontSize, intendedWrapWidth(object));
     const text = svgEl("text", {
       x: contentX,
       y: contentY + object.fontSize,
@@ -5502,6 +5512,7 @@
         width: 40,
         height: 20,
         text,
+        sourceMarkdown: text,
         color: "#183153",
         fontSize,
         wrapWidth: Math.max(live?.width || 0, fontSize * 22),
@@ -5536,9 +5547,10 @@
       if (overlay) overlay.hidden = false;
     }
     if (!save || !object || object.type !== "text") return;
-    if (object.text === nextText) return;
+    if (textObjectSource(object) === nextText) return;
     const before = snapshot();
     object.text = nextText;
+    object.sourceMarkdown = nextText;
     fitTextObject(object);
     commitLogicalAction(before);
     renderScene();
@@ -5558,7 +5570,7 @@
     editor.id = "text-editor-overlay";
     editor.className = "text-editor-overlay";
     editor.dataset.objectId = object.id;
-    editor.value = object.text;
+    editor.value = textObjectSource(object);
     editor.style.left = `${Math.max(8, topLeft.x - frameBox.left)}px`;
     editor.style.top = `${Math.max(8, topLeft.y - frameBox.top)}px`;
     editor.style.width = `${Math.max(120, bottomRight.x - topLeft.x)}px`;
@@ -6386,7 +6398,23 @@
       return `<path id="${escapeXML(object.id)}" d="${escapeXML(object.d || object.sourceD || "")}" fill="${escapeXML(object.fill || object.color)}" fill-opacity="${Number(object.opacity ?? 1)}"${transform}/>`;
     }
     if (object.type === "text") {
-      const wrapped = wrapPlainLines(object.text, object.fontSize, intendedWrapWidth(object));
+      if (textUsesRichRender(object) && typeof globalThis.renderStudyMarkdown === "function") {
+        const local = richTextContentOffset(object);
+        const rendered = globalThis.renderStudyMarkdown(
+          textObjectSource(object),
+          { mathOutput: "mathml" }
+        );
+        const x = object.x + local.x;
+        const y = object.y + local.y;
+        const style = [
+          `font:${object.fontSize}px/1.28 system-ui,-apple-system,sans-serif`,
+          `color:${object.color}`,
+          `width:${local.width}px`,
+          "overflow:hidden"
+        ].join(";");
+        return `<foreignObject id="${escapeXML(object.id)}" x="${x}" y="${y}" width="${local.width}" height="${Math.max(local.height, object.height)}"><div xmlns="http://www.w3.org/1999/xhtml" style="${escapeXML(style)}">${rendered.innerHTML}</div></foreignObject>`;
+      }
+      const wrapped = wrapPlainLines(textObjectSource(object), object.fontSize, intendedWrapWidth(object));
       const tspans = wrapped.lines.map((line, index) =>
         `<tspan x="${object.x + 5}" dy="${index ? object.fontSize * 1.2 : 0}">${escapeXML(line)}</tspan>`
       ).join("");

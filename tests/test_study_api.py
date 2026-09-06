@@ -254,7 +254,7 @@ class StudyApiTests(unittest.TestCase):
         self.assertNotIn("Solution", two["problems"][1]["problem"])
 
     def test_ai_parsers_preserve_source_markdown_and_latex(self):
-        from study.ai import _parse_model_json, parse_practice_problem
+        from study.ai import LATEX_NOTATION_RULES, _parse_model_json, parse_practice_problem
 
         explanation = r"Use **energy** $E=\frac{1}{2}mv^2$ and keep \$5 as prose."
         parsed = _parse_model_json(json.dumps({
@@ -267,6 +267,27 @@ class StudyApiTests(unittest.TestCase):
         problem = r"Calculate the magnitude of \(\vec{F}=(3,4)\)."
         parsed_problem = parse_practice_problem(json.dumps({"problem": problem}))
         self.assertEqual(parsed_problem["problem"], problem)
+
+        chemistry = r"Balance $\ce{H2SO4 -> 2H+ + SO4^2-}$."
+        parsed_chemistry = parse_practice_problem(json.dumps({"problem": chemistry}))
+        self.assertEqual(parsed_chemistry["problem"], chemistry)
+        self.assertIn(r"\ce{SO4^2-}", LATEX_NOTATION_RULES)
+        self.assertIn("Do not use Markdown code fences", LATEX_NOTATION_RULES)
+
+        transported = r"## Result\n\nUse $\nabla f \neq 0$.\n\nDone."
+        recovered = _parse_model_json(json.dumps({"answer": transported}))
+        self.assertIn("\n\nUse", recovered["answer"])
+        self.assertIn(r"\nabla", recovered["answer"])
+        self.assertIn(r"\neq", recovered["answer"])
+
+        transported_problem = r"Balance $\ce{H2 + O2 -> H2O}$.\n\nShow coefficients."
+        recovered_problem = parse_practice_problem(json.dumps({"problem": transported_problem}))
+        self.assertIn("\n\nShow", recovered_problem["problem"])
+        self.assertIn(r"\ce{H2 + O2 -> H2O}", recovered_problem["problem"])
+        stripped_transport_solution = parse_practice_problem(
+            json.dumps({"problem": r"Balance $\ce{H2 + O2 -> H2O}$.\nSolution: 2, 1, 2"})
+        )
+        self.assertNotIn("Solution", stripped_transport_solution["problem"])
 
     def test_parse_study_guide_uses_content_not_raw_json(self):
         from study.ai import parse_study_guide

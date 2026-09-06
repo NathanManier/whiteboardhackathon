@@ -61,6 +61,8 @@ class EditorCanvasContractTests(unittest.TestCase):
         self.assertIn("function renderStudyInline", render)
         self.assertIn("setStudyHeading", board)
         self.assertIn("fillStudyRichText", board)
+        self.assertIn("source_markdown: textObjectSource(object)", board)
+        self.assertIn('{ mathOutput: "mathml" }', board)
 
     def test_library_toast_does_not_leak_study_guide_source(self):
         source = (ROOT / "static" / "library.js").read_text(encoding="utf-8")
@@ -86,6 +88,9 @@ class EditorCanvasContractTests(unittest.TestCase):
         self.assertIn("vendor/markdown-it-texmath/texmath.js", html)
         self.assertIn("vendor/dompurify/purify.min.js", html)
         self.assertIn("mhchem.min.js", html)
+        self.assertTrue(
+            (ROOT / "static/vendor/katex/fonts/KaTeX_Main-Regular.woff2").is_file()
+        )
 
     def test_study_render_keeps_chemistry_trig_and_headings(self):
         result = subprocess.run(

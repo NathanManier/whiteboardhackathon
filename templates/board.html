@@ -58,9 +58,9 @@
   <main id="board-app" class="board-app" data-board-id="{{ board_id|default('', true) }}">
     <section id="corner-workspace" class="corner-workspace" hidden aria-labelledby="corner-title">
       <div class="instruction-panel">
-        <p class="step-label">Manual correction</p>
-        <h1 id="corner-title">Mark the four board corners</h1>
-        <p>Suggested corners are only a starting point. Drag each numbered handle onto the real board corner before processing. You have the final say on all four corners.</p>
+        <p class="step-label">Automatic detection</p>
+        <h1 id="corner-title">Confirm the four board corners</h1>
+        <p>We placed the handles automatically. Check that each one is on the real board corner, drag any that need adjustment, then confirm.</p>
         <ol class="corner-order">
           <li><span>1</span>Top left</li>
           <li><span>2</span>Top right</li>
@@ -68,15 +68,15 @@
           <li><span>4</span>Bottom left</li>
         </ol>
         <div class="panel-actions">
-          <button class="button button-ghost" id="reset-corners" type="button">Reset</button>
+          <button class="button button-ghost" id="reset-corners" type="button">Use detected</button>
           <button class="button button-primary" id="submit-corners" type="button">
-            Correct board
+            Confirm &amp; process
           </button>
         </div>
         <p class="inline-error" id="corner-error" role="alert" hidden></p>
       </div>
       <div class="corner-stage-wrap">
-        <div class="corner-stage" id="corner-stage" aria-label="Place four corners on the board image">
+        <div class="corner-stage" id="corner-stage" aria-label="Confirm four corners on the board image">
           <img id="corner-image" alt="Original board photo for corner selection" draggable="false">
           <svg id="corner-overlay" viewBox="0 0 1000 700" preserveAspectRatio="none" aria-hidden="true">
             <polygon id="corner-polygon" points=""></polygon>
