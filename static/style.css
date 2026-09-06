@@ -1813,10 +1813,6 @@ dialog::backdrop { background: rgba(10, 19, 31, .54); }
   resize: vertical;
 }
 .source-board-label { user-select: none; }
-.source-board-paper.is-active {
-  stroke: #6aa8e6;
-}
-
 #perf-overlay {
   position: fixed;
   left: 12px;

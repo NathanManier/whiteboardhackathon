@@ -51,9 +51,7 @@ from lecture import (
     normalize_folder,
     public_lecture_context,
     public_study_guide,
-    reconcile_folder_canvas as reconcile_folder_canvas_state,
     sync_folder_board_order,
-    validate_folder_canvas,
     validate_source_boards,
 )
 
@@ -105,8 +103,6 @@ BOARDS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 _BOARD_THREAD_LOCKS: dict[str, threading.RLock] = {}
 _BOARD_THREAD_LOCKS_GUARD = threading.Lock()
-_FOLDER_THREAD_LOCKS: dict[str, threading.RLock] = {}
-_FOLDER_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 def load_dotenv() -> None:
@@ -181,36 +177,6 @@ def locked_board_operation(handler):
     def wrapped(board_id: str, *args, **kwargs):
         with board_operation_lock(board_id):
             return handler(board_id, *args, **kwargs)
-
-    return wrapped
-
-
-@contextmanager
-def folder_operation_lock(folder_id: str):
-    if not FOLDER_ID_RE.fullmatch(folder_id):
-        abort(404)
-    key = str((BOARDS_DIR / f"folder-{folder_id}").resolve(strict=False))
-    with _FOLDER_THREAD_LOCKS_GUARD:
-        thread_lock = _FOLDER_THREAD_LOCKS.setdefault(key, threading.RLock())
-    with thread_lock:
-        lock_dir = BOARDS_DIR / ".locks"
-        lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_dir / f"folder-{folder_id}.lock"
-        with lock_path.open("a+b") as lock_file:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def locked_folder_operation(handler):
-    @wraps(handler)
-    def wrapped(folder_id: str, *args, **kwargs):
-        with folder_operation_lock(folder_id):
-            return handler(folder_id, *args, **kwargs)
 
     return wrapped
 
@@ -1628,42 +1594,6 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
     return data
 
 
-def ensure_folder_canvas(
-    library: dict[str, Any],
-    folder_id: str,
-    *,
-    persist: bool = False,
-) -> dict[str, Any]:
-    """Return a validated composition reconciled to current board membership."""
-    folder = folder_by_id(library, folder_id)
-    if folder is None:
-        raise KeyError(folder_id)
-    ordered_ids = folder_board_ids(library, folder_id)
-    metadata_by_id: dict[str, dict[str, Any]] = {}
-    for member_id in ordered_ids:
-        member_dir = BOARDS_DIR / member_id
-        if not member_dir.is_dir() or member_dir.is_symlink():
-            continue
-        try:
-            metadata_by_id[member_id] = read_metadata(member_dir)
-        except Exception:
-            continue
-    current = folder.get("canvas")
-    canvas, changed = reconcile_folder_canvas_state(
-        current,
-        ordered_ids,
-        metadata_by_id,
-    )
-    if changed:
-        canvas["revision"] = int(canvas.get("revision") or 0) + 1
-        canvas["updated_at"] = time.time()
-        folder["updated_at"] = canvas["updated_at"]
-    folder["canvas"] = canvas
-    if persist and changed:
-        write_library(library)
-    return canvas
-
-
 def lecture_payload_for_board(
     board_id: str,
     metadata: dict[str, Any],
@@ -1682,11 +1612,6 @@ def lecture_payload_for_board(
     if folder is None:
         return {}
     ordered_ids = folder_board_ids(library, folder_id)
-    canvas = ensure_folder_canvas(library, folder_id, persist=True)
-    placements = {
-        item["board_id"]: item
-        for item in canvas["source_boards"]
-    }
     members = []
     for index, member_id in enumerate(ordered_ids, start=1):
         member_dir = BOARDS_DIR / member_id
@@ -1707,9 +1632,9 @@ def lecture_payload_for_board(
             svg_url = url_for("board_file", board_id=member_id, asset=svg_name)
         else:
             svg_url = url_for("board_svg", board_id=member_id)
-        placement = placements.get(member_id) or default_source_board(member_id, member_meta)
+        placement = default_source_board(member_id, member_meta)
         placement["board_order"] = index
-        placement["label"] = placement.get("label") or f"Whiteboard {index}"
+        placement["label"] = f"Whiteboard {index}"
         members.append(
             lecture_member_payload(
                 board_id=member_id,
@@ -1730,8 +1655,7 @@ def lecture_payload_for_board(
         "is_lecture": True,
         "is_workspace": True,
         "lecture_boards": members,
-        "source_boards": canvas["source_boards"],
-        "canvas": canvas,
+        "source_boards": [default_source_board(board_id, metadata)],
         "lecture_context": public_lecture_context(folder.get("lecture_context")),
         "study_guide": guide,
         "study_guide_stale": bool(guide and guide.get("stale")),
@@ -1804,7 +1728,6 @@ def attach_imported_board(workspace_id: str, new_board_id: str) -> str:
         folder = folder_by_id(library, folder_id)
         if folder:
             sync_folder_board_order(library, folder_id)
-            ensure_folder_canvas(library, folder_id)
             mark_study_guide_stale(folder)
             folder["lecture_context"] = None
         write_library(library)
@@ -2108,17 +2031,7 @@ def upload_failure(message: str, status: int) -> tuple[str, int] | tuple[Respons
 
 
 def board_destination(board_id: str, metadata: dict[str, Any]) -> tuple[str, str]:
-    workspace_id = metadata.get("workspace_board_id")
-    folder_id = metadata.get("folder_id")
-    if (
-        isinstance(folder_id, str)
-        and FOLDER_ID_RE.fullmatch(folder_id)
-        and isinstance(workspace_id, str)
-        and BOARD_ID_RE.fullmatch(workspace_id)
-        and workspace_id != board_id
-        and (BOARDS_DIR / workspace_id).is_dir()
-    ):
-        return workspace_id, url_for("board", board_id=workspace_id, focus=board_id)
+    # The lecture is metadata only. A completed import opens its own scene.
     return board_id, url_for("board", board_id=board_id)
 
 
@@ -2417,15 +2330,6 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
         if request.is_json:
             return jsonify(error="Whiteboard processing failed."), 500
         return "Whiteboard processing failed.", 500
-    library = read_library()
-    catalog = library.get("boards", {}).get(board_id)
-    folder_id = (
-        catalog.get("folder_id")
-        if isinstance(catalog, dict)
-        else metadata.get("folder_id")
-    )
-    if isinstance(folder_id, str) and folder_id in folder_ids(library):
-        ensure_folder_canvas(library, folder_id, persist=True)
     LOGGER.info(
         "TOTAL COMPLETE board=%s state=ready manual=true elapsed=%.3fs",
         board_id,
@@ -2728,59 +2632,6 @@ def get_lecture(folder_id: str) -> Response | tuple[Response, int]:
     )
 
 
-@app.route("/api/folders/<folder_id>/canvas", methods=["GET", "PUT"])
-@locked_folder_operation
-def folder_canvas_state(folder_id: str) -> Response | tuple[Response, int]:
-    if not FOLDER_ID_RE.fullmatch(folder_id):
-        abort(404)
-    library = read_library()
-    folder = folder_by_id(library, folder_id)
-    if folder is None:
-        abort(404)
-    try:
-        current = ensure_folder_canvas(library, folder_id, persist=True)
-    except ValueError as exc:
-        LOGGER.error("LECTURE CANVAS INVALID folder=%s error=%s", folder_id, exc)
-        abort(500, description="Lecture canvas state is invalid.")
-    if request.method == "GET":
-        return jsonify(canvas=current)
-
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify(error="A JSON request body is required."), 415
-    raw_canvas = payload.get("canvas") if isinstance(payload.get("canvas"), dict) else payload
-    try:
-        client_revision = int(raw_canvas.get("revision"))
-    except (TypeError, ValueError):
-        return jsonify(error="canvas.revision is required."), 400
-    current_revision = int(current.get("revision") or 0)
-    if client_revision != current_revision:
-        return jsonify(
-            error="This lecture canvas was changed in another tab.",
-            canvas=current,
-        ), 409
-    try:
-        clean = validate_folder_canvas(raw_canvas)
-        clean, _ = reconcile_folder_canvas_state(
-            clean,
-            folder_board_ids(library, folder_id),
-            {
-                board_id: read_metadata(BOARDS_DIR / board_id)
-                for board_id in folder_board_ids(library, folder_id)
-                if (BOARDS_DIR / board_id).is_dir()
-                and not (BOARDS_DIR / board_id).is_symlink()
-            },
-        )
-    except (OSError, TypeError, ValueError) as exc:
-        return jsonify(error=str(exc)), 400
-    clean["revision"] = current_revision + 1
-    clean["updated_at"] = time.time()
-    folder["canvas"] = clean
-    folder["updated_at"] = clean["updated_at"]
-    write_library(library)
-    return jsonify(status="saved", canvas=clean)
-
-
 @app.post("/api/folders/<folder_id>/analyze")
 def analyze_lecture_route(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
@@ -2930,7 +2781,6 @@ def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
     for folder_id in affected_folders:
         folder = folder_by_id(library, folder_id)
         sync_folder_board_order(library, folder_id)
-        ensure_folder_canvas(library, folder_id)
         mark_study_guide_stale(folder)
         if folder:
             folder["lecture_context"] = None
@@ -2954,7 +2804,6 @@ def delete_board(board_id: str) -> Response:
     if isinstance(folder_id, str) and folder_id in folder_ids(library):
         folder = folder_by_id(library, folder_id)
         sync_folder_board_order(library, folder_id)
-        ensure_folder_canvas(library, folder_id)
         mark_study_guide_stale(folder)
         if folder:
             folder["lecture_context"] = None

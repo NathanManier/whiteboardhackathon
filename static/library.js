@@ -99,11 +99,7 @@
     card.className = "board-card";
     const thumb = document.createElement("a");
     thumb.className = "board-thumb";
-    const workspaceId = board.workspace_board_id || board.workspaceBoardId;
-    const focusUrl = itemFolderId(board) && workspaceId
-      ? `/board/${encodeURIComponent(workspaceId)}?focus=${encodeURIComponent(board.id)}`
-      : (board.url || `/board/${encodeURIComponent(board.id)}`);
-    thumb.href = focusUrl;
+    thumb.href = board.url || `/board/${encodeURIComponent(board.id)}`;
     thumb.setAttribute("aria-label", `Open ${itemName(board, "board")}`);
     if (board.thumbnail_url) {
       const img = document.createElement("img");
@@ -130,7 +126,7 @@
     actions.className = "card-actions";
     const open = document.createElement("a");
     open.className = "open-action";
-    open.href = focusUrl;
+    open.href = board.url || `/board/${encodeURIComponent(board.id)}`;
     open.textContent = "Open";
     actions.append(
       open,
