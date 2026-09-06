@@ -1343,6 +1343,10 @@ dialog::backdrop { background: rgba(10, 19, 31, .54); }
   box-sizing: border-box;
   transform-origin: 0 0;
 }
+.canvas-html-text.practice-card-content {
+  font-weight: 560;
+  line-height: 1.36;
+}
 .canvas-rich-text {
   margin: 0;
   padding: 0;
@@ -1388,6 +1392,12 @@ dialog::backdrop { background: rgba(10, 19, 31, .54); }
   fill: #6aa8e6;
   font-family: "Times New Roman", serif;
   font-weight: 700;
+}
+.practice-card-surface {
+  filter: drop-shadow(0 12px 18px rgba(12, 25, 42, .16));
+}
+.practice-card-label {
+  user-select: none;
 }
 .study-sheet, .study-drawer {
   position: fixed;
@@ -1656,6 +1666,17 @@ dialog::backdrop { background: rgba(10, 19, 31, .54); }
 }
 .study-action:disabled { opacity: .55; }
 .study-sheet.is-fresh #study-title { color: #8fd3ff; }
+.study-confidence {
+  width: fit-content;
+  margin: 5px 0 0;
+  padding: 3px 8px;
+  border: 1px solid #3b485e;
+  border-radius: 999px;
+  color: #9ba8ba;
+  font-size: 11px;
+  line-height: 1.3;
+  font-weight: 650;
+}
 .study-followup {
   display: flex;
   gap: 8px;
@@ -1792,6 +1813,9 @@ dialog::backdrop { background: rgba(10, 19, 31, .54); }
   resize: vertical;
 }
 .source-board-label { user-select: none; }
+.source-board-paper.is-active {
+  stroke: #6aa8e6;
+}
 
 #perf-overlay {
   position: fixed;

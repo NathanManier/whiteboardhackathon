@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -10,8 +11,13 @@ from typing import Any, Callable
 
 BOARD_ID_LEN = 32
 FOLDER_ID_LEN = 16
-BOARD_GAP = 96.0
+BOARD_GAP = 120.0
 MAX_SOURCE_BOARDS = 24
+MAX_LECTURE_OBJECTS = 128
+MAX_CANVAS_TEXT_LENGTH = 20_000
+MAX_WORLD_COORDINATE = 10_000_000.0
+OBJECT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
 def imported_id_prefix(board_id: str, host_id: str | None) -> str:
@@ -203,6 +209,8 @@ def normalize_folder(folder: dict[str, Any]) -> dict[str, Any]:
         folder["workspace_board_id"] = None
     if "board_order" not in folder or not isinstance(folder.get("board_order"), list):
         folder["board_order"] = []
+    if "canvas" not in folder or not isinstance(folder.get("canvas"), dict):
+        folder["canvas"] = empty_folder_canvas()
     return folder
 
 
@@ -333,19 +341,276 @@ def validate_source_boards(value: Any) -> list[dict[str, Any]]:
             board_order = int(order)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"source_boards[{index}] has an invalid board_order.") from exc
+        if board_order < 1 or board_order > MAX_SOURCE_BOARDS:
+            raise ValueError(f"source_boards[{index}] has an invalid board_order.")
+        try:
+            x = float(item.get("x") or 0)
+            y = float(item.get("y") or 0)
+            width = float(item.get("width") or 1)
+            height = float(item.get("height") or 1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"source_boards[{index}] has invalid dimensions.") from exc
+        if (
+            not all(math.isfinite(number) for number in (x, y, width, height))
+            or abs(x) > MAX_WORLD_COORDINATE
+            or abs(y) > MAX_WORLD_COORDINATE
+            or not 1 <= width <= MAX_WORLD_COORDINATE
+            or not 1 <= height <= MAX_WORLD_COORDINATE
+        ):
+            raise ValueError(f"source_boards[{index}] has invalid dimensions.")
         clean.append(
             {
                 "board_id": board_id,
-                "board_order": max(1, board_order),
-                "x": float(item.get("x") or 0),
-                "y": float(item.get("y") or 0),
-                "width": max(1.0, float(item.get("width") or 1)),
-                "height": max(1.0, float(item.get("height") or 1)),
-                "label": str(item.get("label") or f"Whiteboard {max(1, board_order)}")[:80],
+                "board_order": board_order,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "label": str(item.get("label") or f"Whiteboard {board_order}")[:80],
             }
         )
     clean.sort(key=lambda item: (item["board_order"], item["x"]))
     return clean
+
+
+def _canvas_number(
+    value: Any,
+    label: str,
+    *,
+    minimum: float = -MAX_WORLD_COORDINATE,
+    maximum: float = MAX_WORLD_COORDINATE,
+) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a number.") from exc
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        raise ValueError(f"{label} is outside the supported canvas range.")
+    return number
+
+
+def empty_folder_canvas(*, width: float = 1.0, height: float = 1.0) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "revision": 0,
+        "updated_at": None,
+        "viewport": {
+            "x": 0.0,
+            "y": 0.0,
+            "width": max(1.0, float(width)),
+            "height": max(1.0, float(height)),
+        },
+        "source_boards": [],
+        "objects": [],
+    }
+
+
+def validate_folder_canvas(value: Any) -> dict[str, Any]:
+    """Validate the small folder-owned composition document.
+
+    Board-owned strokes and text never belong here. Only placements, the shared
+    viewport, and boardless practice cards are accepted.
+    """
+    if value is None:
+        value = empty_folder_canvas()
+    if not isinstance(value, dict):
+        raise ValueError("canvas must be an object.")
+    if isinstance(value.get("canvas"), dict):
+        value = value["canvas"]
+
+    try:
+        revision = int(value.get("revision", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("canvas.revision must be a non-negative integer.") from exc
+    if revision < 0 or revision > 2_147_483_647:
+        raise ValueError("canvas.revision must be a non-negative integer.")
+
+    viewport = value.get("viewport")
+    if not isinstance(viewport, dict):
+        raise ValueError("canvas.viewport must be an object.")
+    clean_viewport = {
+        "x": _canvas_number(viewport.get("x"), "canvas.viewport.x"),
+        "y": _canvas_number(viewport.get("y"), "canvas.viewport.y"),
+        "width": _canvas_number(
+            viewport.get("width"),
+            "canvas.viewport.width",
+            minimum=1,
+        ),
+        "height": _canvas_number(
+            viewport.get("height"),
+            "canvas.viewport.height",
+            minimum=1,
+        ),
+    }
+
+    objects = value.get("objects", [])
+    if not isinstance(objects, list) or len(objects) > MAX_LECTURE_OBJECTS:
+        raise ValueError(
+            f"canvas.objects must contain at most {MAX_LECTURE_OBJECTS} items."
+        )
+    clean_objects: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(objects):
+        if not isinstance(item, dict):
+            raise ValueError(f"canvas.objects[{index}] must be an object.")
+        object_id = item.get("id")
+        if (
+            not isinstance(object_id, str)
+            or not OBJECT_ID_RE.fullmatch(object_id)
+            or object_id in seen_ids
+        ):
+            raise ValueError(f"canvas.objects[{index}] has an invalid or duplicated id.")
+        if item.get("type") != "text":
+            raise ValueError(f"canvas.objects[{index}] must be a practice text object.")
+        role = item.get("role") or item.get("kind")
+        if role not in {"ai_practice_problem", "practice_problem"}:
+            raise ValueError(f"canvas.objects[{index}] must be a practice text object.")
+        text = item.get("text", item.get("source_markdown", item.get("sourceMarkdown")))
+        source_markdown = item.get("source_markdown", item.get("sourceMarkdown", text))
+        if (
+            not isinstance(text, str)
+            or not isinstance(source_markdown, str)
+            or len(text) > MAX_CANVAS_TEXT_LENGTH
+            or len(source_markdown) > MAX_CANVAS_TEXT_LENGTH
+        ):
+            raise ValueError(f"canvas.objects[{index}] has invalid text.")
+        color = item.get("color", "#183153")
+        if not isinstance(color, str) or not COLOR_RE.fullmatch(color):
+            raise ValueError(f"canvas.objects[{index}] has an invalid color.")
+        clean: dict[str, Any] = {
+            "id": object_id,
+            "type": "text",
+            "text": text,
+            "source_markdown": source_markdown,
+            "x": _canvas_number(item.get("x"), f"canvas.objects[{index}].x"),
+            "y": _canvas_number(item.get("y"), f"canvas.objects[{index}].y"),
+            "width": _canvas_number(
+                item.get("width"), f"canvas.objects[{index}].width", minimum=4
+            ),
+            "height": _canvas_number(
+                item.get("height"), f"canvas.objects[{index}].height", minimum=4
+            ),
+            "font_size": _canvas_number(
+                item.get("font_size", item.get("fontSize", 32)),
+                f"canvas.objects[{index}].font_size",
+                minimum=6,
+                maximum=500,
+            ),
+            "color": color.lower(),
+            "translation": {"x": 0.0, "y": 0.0},
+            "role": "ai_practice_problem",
+            "origin": "ai_practice",
+        }
+        wrap_width = item.get("wrap_width", item.get("wrapWidth"))
+        if wrap_width is not None:
+            clean["wrap_width"] = _canvas_number(
+                wrap_width, f"canvas.objects[{index}].wrap_width", minimum=4
+            )
+        for snake, camel in (
+            ("practice_problem_id", "practiceProblemId"),
+            ("source_study_interaction_id", "sourceStudyInteractionId"),
+        ):
+            identifier = item.get(snake, item.get(camel))
+            if identifier is not None:
+                if not isinstance(identifier, str) or not OBJECT_ID_RE.fullmatch(identifier):
+                    raise ValueError(
+                        f"canvas.objects[{index}].{snake} has an invalid id."
+                    )
+                clean[snake] = identifier
+        for snake, camel in (
+            ("generated_at", "generatedAt"),
+            ("created_at", "createdAt"),
+        ):
+            timestamp = item.get(snake, item.get(camel))
+            if timestamp is not None and timestamp != "":
+                clean[snake] = _canvas_number(
+                    timestamp,
+                    f"canvas.objects[{index}].{snake}",
+                    minimum=0,
+                    maximum=10_000_000_000,
+                )
+        seen_ids.add(object_id)
+        clean_objects.append(clean)
+
+    updated_at = value.get("updated_at", value.get("updatedAt"))
+    clean_updated_at = None
+    if updated_at is not None:
+        clean_updated_at = _canvas_number(
+            updated_at,
+            "canvas.updated_at",
+            minimum=0,
+            maximum=10_000_000_000,
+        )
+    return {
+        "schema_version": 1,
+        "revision": revision,
+        "updated_at": clean_updated_at,
+        "viewport": clean_viewport,
+        "source_boards": validate_source_boards(value.get("source_boards", [])),
+        "objects": clean_objects,
+    }
+
+
+def reconcile_folder_canvas(
+    value: Any,
+    board_order: list[str],
+    board_metadata: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    """Reconcile placements to lecture membership without touching board scenes."""
+    original = value
+    clean = validate_folder_canvas(value)
+    existing = {
+        item["board_id"]: item
+        for item in clean["source_boards"]
+    }
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+    for board_id in board_order:
+        if (
+            isinstance(board_id, str)
+            and len(board_id) == BOARD_ID_LEN
+            and board_id not in seen
+            and isinstance(board_metadata.get(board_id), dict)
+        ):
+            seen.add(board_id)
+            ordered_ids.append(board_id)
+
+    placements: list[dict[str, Any]] = []
+    for index, board_id in enumerate(ordered_ids, start=1):
+        metadata = board_metadata[board_id]
+        width, height = board_dimensions(metadata)
+        previous = existing.get(board_id)
+        if previous:
+            placement = dict(previous)
+            placement["board_order"] = index
+            placement["width"] = width
+            placement["height"] = height
+            placement["label"] = str(
+                previous.get("label") or f"Whiteboard {index}"
+            )[:80]
+        else:
+            x, y = place_source_board(placements, width=width, height=height)
+            placement = {
+                "board_id": board_id,
+                "board_order": index,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "label": f"Whiteboard {index}",
+            }
+        placements.append(placement)
+
+    if not clean["source_boards"] and placements:
+        first = placements[0]
+        clean["viewport"] = {
+            "x": first["x"],
+            "y": first["y"],
+            "width": first["width"],
+            "height": first["height"],
+        }
+    clean["source_boards"] = placements
+    return clean, clean != original
 
 
 def default_source_board(board_id: str, metadata: dict[str, Any]) -> dict[str, Any]:

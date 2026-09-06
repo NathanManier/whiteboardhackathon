@@ -97,7 +97,16 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertEqual(data["workspace_board_id"], host_id)
         self.assertEqual(data["active_board_id"], host_id)
         self.assertEqual(len(data["lecture_boards"]), 3)
-        self.assertEqual(data["source_boards"][0]["board_id"], host_id)
+        self.assertEqual(
+            [item["board_id"] for item in data["source_boards"]],
+            [host_id, second_id, third_id],
+        )
+        self.assertGreater(data["source_boards"][1]["x"], 800)
+        self.assertGreater(
+            data["source_boards"][2]["x"],
+            data["source_boards"][1]["x"] + 700,
+        )
+        self.assertEqual(data["canvas"]["source_boards"], data["source_boards"])
         html = self.client.get(f"/board/{second_id}")
         self.assertEqual(html.status_code, 200)
         self.assertNotIn("Location", html.headers)
@@ -106,12 +115,123 @@ class LectureWorkspaceTests(unittest.TestCase):
         ).get_json()
         self.assertEqual(second["active_board_id"], second_id)
         self.assertEqual(second["workspace_board_id"], second_id)
-        self.assertEqual(second["source_boards"][0]["board_id"], second_id)
+        self.assertEqual(
+            [item["board_id"] for item in second["source_boards"]],
+            [host_id, second_id, third_id],
+        )
         third = self.client.get(
             f"/board/{third_id}", headers={"Accept": "application/json"}
         ).get_json()
         self.assertEqual(third["active_board_id"], third_id)
-        self.assertEqual(third["source_boards"][0]["board_id"], third_id)
+        self.assertEqual(
+            [item["board_id"] for item in third["source_boards"]],
+            [host_id, second_id, third_id],
+        )
+
+    def test_folder_canvas_round_trips_and_reconciles_members(self):
+        folder = self.client.post(
+            "/api/folders", json={"name": "Shared Canvas"}
+        ).get_json()["folder"]
+        folder_id = folder["id"]
+        first_id = "1" * 32
+        second_id = "2" * 32
+        third_id = "3" * 32
+        self._ready_board(first_id, "Whiteboard 1", folder_id, 800, 600)
+        self._ready_board(second_id, "Whiteboard 2", folder_id, 700, 500)
+        library = board_app.read_library()
+        library["boards"][first_id] = {
+            "name": "Whiteboard 1", "folder_id": folder_id,
+            "created_at": 1, "updated_at": 1,
+        }
+        library["boards"][second_id] = {
+            "name": "Whiteboard 2", "folder_id": folder_id,
+            "created_at": 2, "updated_at": 2,
+        }
+        board_app.sync_folder_board_order(library, folder_id)
+        board_app.write_library(library)
+
+        initial = self.client.get(f"/api/folders/{folder_id}/canvas").get_json()["canvas"]
+        self.assertEqual(
+            [item["board_id"] for item in initial["source_boards"]],
+            [first_id, second_id],
+        )
+        self.assertGreater(initial["source_boards"][1]["x"], 800)
+        initial["viewport"] = {"x": 120, "y": -45, "width": 1440, "height": 900}
+        initial["source_boards"][0]["x"] = -300
+        initial["source_boards"][1]["x"] = 900
+        initial["objects"] = [{
+            "id": "practice-card-1",
+            "type": "text",
+            "text": "Rendered fallback",
+            "source_markdown": r"## Practice\nSolve $x^2=4$.",
+            "x": 1800,
+            "y": 120,
+            "width": 640,
+            "height": 360,
+            "font_size": 34,
+            "color": "#183153",
+            "role": "ai_practice_problem",
+            "practice_problem_id": "problem-1",
+            "source_study_interaction_id": "interaction-1",
+        }]
+        saved_response = self.client.put(
+            f"/api/folders/{folder_id}/canvas",
+            json={"canvas": initial},
+        )
+        self.assertEqual(saved_response.status_code, 200, saved_response.get_data(as_text=True))
+        saved = saved_response.get_json()["canvas"]
+        self.assertEqual(saved["revision"], initial["revision"] + 1)
+        self.assertEqual(saved["viewport"]["x"], 120)
+        self.assertNotIn("board_id", saved["objects"][0])
+        self.assertEqual(
+            saved["objects"][0]["source_markdown"],
+            r"## Practice\nSolve $x^2=4$.",
+        )
+        self.assertEqual(saved["objects"][0]["practice_problem_id"], "problem-1")
+        self.assertEqual(
+            saved["objects"][0]["source_study_interaction_id"],
+            "interaction-1",
+        )
+
+        conflict = self.client.put(
+            f"/api/folders/{folder_id}/canvas",
+            json={"canvas": initial},
+        )
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.get_json()["canvas"]["revision"], saved["revision"])
+
+        reloaded = self.client.get(f"/api/folders/{folder_id}/canvas").get_json()["canvas"]
+        self.assertEqual(reloaded, saved)
+        persisted = board_app.read_library()
+        persisted_folder = board_app.folder_by_id(persisted, folder_id)
+        self.assertEqual(persisted_folder["canvas"], saved)
+
+        self._ready_board(third_id, "Whiteboard 3", folder_id, 640, 480)
+        persisted["boards"][third_id] = {
+            "name": "Whiteboard 3", "folder_id": folder_id,
+            "created_at": 3, "updated_at": 3,
+        }
+        board_app.sync_folder_board_order(persisted, folder_id)
+        board_app.write_library(persisted)
+        expanded = self.client.get(f"/api/folders/{folder_id}/canvas").get_json()["canvas"]
+        placements = expanded["source_boards"]
+        self.assertEqual(
+            [item["board_id"] for item in placements],
+            [first_id, second_id, third_id],
+        )
+        self.assertEqual(placements[0]["x"], -300)
+        self.assertEqual(placements[1]["x"], 900)
+        self.assertGreater(placements[2]["x"], placements[1]["x"] + placements[1]["width"])
+
+        deleted = self.client.delete(f"/api/boards/{second_id}")
+        self.assertEqual(deleted.status_code, 200)
+        reduced = self.client.get(f"/api/folders/{folder_id}/canvas").get_json()["canvas"]
+        self.assertEqual(
+            [item["board_id"] for item in reduced["source_boards"]],
+            [first_id, third_id],
+        )
+        self.assertEqual(reduced["source_boards"][0]["x"], -300)
+        self.assertEqual(reduced["source_boards"][1]["x"], placements[2]["x"])
 
     def test_legacy_merged_host_is_migrated_without_touching_member_scene(self):
         folder = self.client.post("/api/folders", json={"name": "Isolated Lecture"}).get_json()["folder"]

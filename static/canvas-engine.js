@@ -505,6 +505,78 @@
     };
   }
 
+  function practiceCardMetrics(board = {}) {
+    const boardWidth = Math.max(1, finiteNumber(board.width, 1200));
+    const boardHeight = Math.max(1, finiteNumber(board.height, 800));
+    const width = Math.min(700, Math.max(500, boardWidth * 0.42));
+    const height = Math.min(450, Math.max(300, boardHeight * 0.36));
+    return {
+      width,
+      height,
+      fontSize: Math.min(34, Math.max(26, width / 21)),
+      gap: Math.min(250, Math.max(100, width * 0.2)),
+      sourceGap: Math.min(250, Math.max(100, Math.min(boardWidth, boardHeight) * 0.14))
+    };
+  }
+
+  function placePracticeCards({
+    count = 2,
+    anchor,
+    board,
+    card,
+    obstacles = []
+  } = {}) {
+    const amount = Math.max(1, Math.min(2, Math.floor(finiteNumber(count, 2))));
+    const metrics = { ...practiceCardMetrics(board), ...(card || {}) };
+    const source = anchor || board || { x: 0, y: 0, width: 1, height: 1 };
+    const boardBox = board && board.width > 0 && board.height > 0 ? board : null;
+    const gap = Math.max(1, finiteNumber(metrics.gap, 120));
+    const sourceGap = Math.max(1, finiteNumber(metrics.sourceGap, gap));
+    const pairWidth = metrics.width * amount + gap * (amount - 1);
+    const pairHeight = metrics.height * amount + gap * (amount - 1);
+    const baseX = finiteNumber(source.x) + finiteNumber(source.width) / 2 - pairWidth / 2;
+    const belowY = (boardBox
+      ? Math.max(finiteNumber(source.y) + finiteNumber(source.height), boardBox.y + boardBox.height)
+      : finiteNumber(source.y) + finiteNumber(source.height)) + sourceGap;
+    const rightX = (boardBox
+      ? Math.max(finiteNumber(source.x) + finiteNumber(source.width), boardBox.x + boardBox.width)
+      : finiteNumber(source.x) + finiteNumber(source.width)) + sourceGap;
+    const candidates = [
+      { x: baseX, y: belowY, vertical: false },
+      { x: rightX, y: finiteNumber(source.y), vertical: true },
+      {
+        x: boardBox ? boardBox.x : finiteNumber(source.x),
+        y: belowY,
+        vertical: true
+      },
+      {
+        x: rightX,
+        y: finiteNumber(source.y) + finiteNumber(source.height) / 2 - pairHeight / 2,
+        vertical: true
+      }
+    ];
+    const occupied = obstacles.filter(item => item && item.width > 0 && item.height > 0);
+    const boxesFor = candidate => Array.from({ length: amount }, (_, index) => ({
+      x: candidate.x + (candidate.vertical ? 0 : index * (metrics.width + gap)),
+      y: candidate.y + (candidate.vertical ? index * (metrics.height + gap) : 0),
+      width: metrics.width,
+      height: metrics.height
+    }));
+    for (const candidate of candidates) {
+      const boxes = boxesFor(candidate);
+      if (!boxes.some(box => occupied.some(obstacle => intersects(box, obstacle)))) return boxes;
+    }
+    const fallback = candidates[0];
+    let boxes = boxesFor(fallback);
+    let guard = 0;
+    while (boxes.some(box => occupied.some(obstacle => intersects(box, obstacle))) && guard < 40) {
+      fallback.y += metrics.height + gap;
+      boxes = boxesFor(fallback);
+      guard += 1;
+    }
+    return boxes;
+  }
+
   function finiteNumber(value, fallback = 0) {
     const next = Number(value);
     return Number.isFinite(next) ? next : fallback;
@@ -806,6 +878,8 @@
     SpatialHash,
     intersects,
     expand,
+    practiceCardMetrics,
+    placePracticeCards,
     cameraCss,
     cameraZoom,
     cameraAsPanZoom,

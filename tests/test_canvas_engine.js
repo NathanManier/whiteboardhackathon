@@ -63,4 +63,20 @@ assert(broken.width > 0 && broken.height > 0, "sanitized zoom is positive");
 const level = engine.chooseLevel({ zoom: 0.2, screenSize: 8, commandCount: 12 });
 assert(level === engine.LEVEL.FULL, "small symbols stay full fidelity");
 
+const practiceMetrics = engine.practiceCardMetrics({ width: 1600, height: 900 });
+assert(practiceMetrics.width >= 500 && practiceMetrics.width <= 700, "practice width is substantial");
+assert(practiceMetrics.height >= 300 && practiceMetrics.height <= 450, "practice height is substantial");
+const sourceBoard = { x: 0, y: 0, width: 1600, height: 900 };
+const practice = engine.placePracticeCards({
+  count: 2,
+  anchor: { x: 280, y: 220, width: 320, height: 180 },
+  board: sourceBoard,
+  card: practiceMetrics,
+  obstacles: [sourceBoard]
+});
+assert(practice.length === 2, "two practice cards are placed");
+assert(!engine.intersects(practice[0], practice[1]), "practice cards do not overlap");
+assert(!engine.intersects(practice[0], sourceBoard), "practice card avoids source board");
+assert(practice[1].x - (practice[0].x + practice[0].width) >= 100, "practice cards have deliberate spacing");
+
 console.log("canvas-engine tests passed");

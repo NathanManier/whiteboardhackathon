@@ -223,11 +223,22 @@ class BoardWorkflowTests(unittest.TestCase):
             )
         self.assertEqual(finished.status_code, 200, finished.get_data(as_text=True))
         payload = finished.get_json()
-        self.assertEqual(payload["workspace_id"], new_id)
-        self.assertEqual(payload["url"], f"/board/{new_id}")
+        self.assertEqual(payload["workspace_id"], host_id)
+        self.assertEqual(payload["url"], f"/board/{host_id}?focus={new_id}")
         refreshed = self.client.get("/api/library").get_json()
         refreshed_folder = next(item for item in refreshed["folders"] if item["id"] == folder["id"])
         self.assertEqual(refreshed_folder["board_order"], [host_id, new_id])
+        canvas = self.client.get(
+            f"/api/folders/{folder['id']}/canvas"
+        ).get_json()["canvas"]
+        self.assertEqual(
+            [item["board_id"] for item in canvas["source_boards"]],
+            [host_id, new_id],
+        )
+        self.assertGreater(
+            canvas["source_boards"][1]["x"],
+            canvas["source_boards"][0]["x"] + canvas["source_boards"][0]["width"],
+        )
         host_editor = self.client.get(f"/api/boards/{host_id}/editor").get_json()["editor"]
         self.assertEqual(
             [item["board_id"] for item in host_editor["source_boards"]],
@@ -258,15 +269,37 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertIn('id="import-image"', template)
         self.assertNotIn("?_method=PUT", source)
 
-    def test_board_frontend_switches_routes_and_mounts_only_the_active_scene(self):
+    def test_board_frontend_composes_scenes_and_focuses_without_navigation(self):
         source = (Path(__file__).parents[1] / "static" / "board.js").read_text(encoding="utf-8")
-        self.assertIn("const boards = [activeSceneBoard()];", source)
-        self.assertIn("location.assign(`/board/${encodeURIComponent(board.boardId)}`)", source)
+        self.assertIn("Promise.all(state.sourceBoards.map(async board =>", source)
+        self.assertIn("state.boardScenes = new Map();", source)
+        self.assertIn('class: "user-board-scene"', source)
+        self.assertIn("worldBoundsFor(object", source)
+        self.assertIn("state.camera = cameraForBoard(board);", source)
         self.assertIn("await flushEditorSave()", source)
-        self.assertIn("cancelTransientInteraction(\"board-switch\")", source)
+        self.assertIn('cancelTransientInteraction("board-focus")', source)
         self.assertIn("state.selected.clear()", source)
-        self.assertIn("board_id: boardId", source)
-        self.assertNotIn("for (const board of lectureBoardsFromData())", source)
+        self.assertIn("board_id: ownerBoardId", source)
+        self.assertIn("boardPayload(ownerBoardId", source)
+        self.assertIn("object.boardId === ownerBoardId", source)
+        self.assertNotIn(
+            "location.assign(`/board/${encodeURIComponent(board.boardId)}`)",
+            source,
+        )
+
+    def test_frontend_uses_large_lecture_practice_cards_and_semantic_confidence(self):
+        root = Path(__file__).parents[1]
+        source = (root / "static" / "board.js").read_text(encoding="utf-8")
+        engine = (root / "static" / "canvas-engine.js").read_text(encoding="utf-8")
+        template = (root / "templates" / "board.html").read_text(encoding="utf-8")
+        self.assertIn("Engine.placePracticeCards", source)
+        self.assertIn('scope: state.lecture.isLecture ? "lecture" : "board"', source)
+        self.assertIn('class: "practice-card-surface"', source)
+        self.assertIn("width = Math.min(700, Math.max(500", engine)
+        self.assertIn("height = Math.min(450, Math.max(300", engine)
+        self.assertIn('id="study-confidence"', template)
+        self.assertIn("setStudyHeading(interaction.title", source)
+        self.assertIn("interaction.confidence", source)
 
     def test_board_management_route_methods_match_frontend_contract(self):
         tracked = {
@@ -277,6 +310,7 @@ class BoardWorkflowTests(unittest.TestCase):
             "/api/boards/<board_id>",
             "/api/folders",
             "/api/folders/<folder_id>",
+            "/api/folders/<folder_id>/canvas",
         }
         methods = {path: set() for path in tracked}
         for rule in board_app.app.url_map.iter_rules():
@@ -289,6 +323,9 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertTrue({"PATCH", "DELETE"}.issubset(methods["/api/boards/<board_id>"]))
         self.assertIn("POST", methods["/api/folders"])
         self.assertTrue({"PATCH", "DELETE"}.issubset(methods["/api/folders/<folder_id>"]))
+        self.assertTrue(
+            {"GET", "PUT"}.issubset(methods["/api/folders/<folder_id>/canvas"])
+        )
 
 
 if __name__ == "__main__":

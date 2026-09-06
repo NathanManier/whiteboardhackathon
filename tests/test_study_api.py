@@ -290,6 +290,119 @@ class StudyApiTests(unittest.TestCase):
         )
         self.assertNotIn("Solution", stripped_transport_solution["problem"])
 
+    def test_explain_parser_accepts_structured_and_degraded_model_outputs(self):
+        from study.ai import StudyAIError, _parse_model_json
+
+        chemistry = r"Use **water** as $H_2O$ or $\ce{H2O}$."
+        cases = [
+            (
+                "json object",
+                {"title": "Water", "confidence": "HIGH", "answer": chemistry},
+                "Water",
+                "high",
+                chemistry,
+            ),
+            (
+                "fenced json",
+                "```json\n"
+                + json.dumps({
+                    "title": "Gradient",
+                    "confidence": "low",
+                    "answer": r"Use $\nabla f \neq 0$.",
+                })
+                + "\n```",
+                "Gradient",
+                "low",
+                r"Use $\nabla f \neq 0$.",
+            ),
+            (
+                "json encoded string",
+                json.dumps(json.dumps({
+                    "title": "Energy",
+                    "confidence": "moderate",
+                    "answer": r"Keep $E=\frac{1}{2}mv^2$.",
+                })),
+                "Energy",
+                "medium",
+                r"Keep $E=\frac{1}{2}mv^2$.",
+            ),
+            (
+                "malformed wrapper",
+                '{"response": {"title": "Acids", "confidence": "92%", '
+                r'"answer": "Use **ions** and $\ce{H2O}$. A "quoted" term."'
+                '\n}, "debug": "discard this"',
+                "Acids",
+                "high",
+                r'Use **ions** and $\ce{H2O}$. A "quoted" term.',
+            ),
+            (
+                "label prefixed",
+                "Title: Vector direction\nConfidence: uncertain\nAnswer: "
+                r"The arrow is **opposite** to $\vec{v}$.",
+                "Vector direction",
+                "low",
+                r"The arrow is **opposite** to $\vec{v}$.",
+            ),
+            (
+                "echoed metadata",
+                {
+                    "title": "Ignored wrapper",
+                    "confidence": "low",
+                    "answer": (
+                        "Title: Stoichiometry\nConfidence: certain\nAnswer:\n"
+                        r"Balance $2H_2 + O_2 \rightarrow 2H_2O$."
+                    ),
+                },
+                "Stoichiometry",
+                "high",
+                r"Balance $2H_2 + O_2 \rightarrow 2H_2O$.",
+            ),
+            (
+                "normal prose",
+                "This is ordinary **Markdown** with $SO_4^{2-}$.",
+                "Explanation",
+                "medium",
+                "This is ordinary **Markdown** with $SO_4^{2-}$.",
+            ),
+            (
+                "prose with trailing model metadata",
+                (
+                    "The visible reaction is balanced."
+                    '\n\n{"model": "gemini", "confidence": "high", "debug": {"tokens": 42}}'
+                ),
+                "Explanation",
+                "medium",
+                "The visible reaction is balanced.",
+            ),
+        ]
+        for name, raw, title, confidence, answer in cases:
+            with self.subTest(name=name):
+                parsed = _parse_model_json(raw)
+                self.assertEqual(parsed["title"], title)
+                self.assertEqual(parsed["confidence"], confidence)
+                self.assertEqual(parsed["answer"], answer)
+                self.assertNotIn('"debug"', parsed["answer"])
+                self.assertNotIn('"confidence"', parsed["answer"])
+
+        action = _parse_model_json({
+            "title": "Check my work",
+            "answer": "The setup is correct.",
+            "confidence": 0.2,
+            "verdict": "correct",
+            "sourceBoardOrder": 2,
+        })
+        self.assertEqual(action["confidence"], "low")
+        self.assertEqual(action["verdict"], "correct")
+        self.assertEqual(action["sourceBoardOrder"], 2)
+
+        for unsafe in (
+            '{"title": "Only metadata", "confidence": "high"}',
+            'debug: {"model": "gemini", "tokens": 42}',
+            "```json\n{\"model\": \"gemini\", \"debug\": true}\n```",
+        ):
+            with self.subTest(unsafe=unsafe), self.assertRaises(StudyAIError):
+                _parse_model_json(unsafe)
+
     def test_parse_study_guide_uses_content_not_raw_json(self):
         from study.ai import parse_study_guide
 
@@ -726,6 +839,50 @@ class StudyApiTests(unittest.TestCase):
         self.assertNotIn("image_url", serialized)
         self.assertNotIn("chat/completions", captured["url"])
         self.assertNotIn("gpt-4o", serialized)
+
+    def test_explain_and_non_practice_followups_use_response_schema(self):
+        from study.ai import (
+            EXPLAIN_RESPONSE_SCHEMA,
+            explain_selection,
+            follow_up_question,
+        )
+
+        response = {
+            "title": "Concept",
+            "answer": "A concise explanation.",
+            "confidence": "medium",
+        }
+        with patch("study.ai.call_study_model", return_value=response) as model:
+            explain_selection(
+                question="Explain this.",
+                board_title="Chemistry",
+                folder_name="Lecture 1",
+                object_meta=[],
+                images={"selected": "data:image/png;base64,aaa"},
+            )
+        self.assertIs(
+            model.call_args.kwargs["response_schema"],
+            EXPLAIN_RESPONSE_SCHEMA,
+        )
+        self.assertEqual(
+            EXPLAIN_RESPONSE_SCHEMA["properties"]["confidence"]["enum"],
+            ["high", "medium", "low"],
+        )
+        self.assertIn("verdict", EXPLAIN_RESPONSE_SCHEMA["properties"])
+        self.assertIn("sourceBoardOrder", EXPLAIN_RESPONSE_SCHEMA["properties"])
+
+        with patch("study.ai.call_study_model", return_value=response) as model:
+            follow_up_question(
+                question="Why?",
+                prior_answer="The original explanation.",
+                history=[],
+                images={"selected": "data:image/png;base64,aaa"},
+                action="go_deeper",
+            )
+        self.assertIs(
+            model.call_args.kwargs["response_schema"],
+            EXPLAIN_RESPONSE_SCHEMA,
+        )
 
     def test_practice_model_uses_one_compact_structured_minimal_thinking_request(self):
         from study.ai import follow_up_question

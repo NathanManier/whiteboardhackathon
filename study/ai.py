@@ -168,6 +168,42 @@ PRACTICE_PROBLEMS_SCHEMA = {
     "required": ["problems"],
 }
 
+EXPLAIN_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "A short, semantic title for the selected concept.",
+        },
+        "answer": {
+            "type": "string",
+            "description": "The student-facing Markdown explanation.",
+        },
+        "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "Confidence grounded in the visible lecture evidence.",
+        },
+        "verdict": {
+            "type": "string",
+            "enum": [
+                "correct",
+                "mostly_correct",
+                "partially_correct",
+                "incorrect",
+                "insufficient_evidence",
+            ],
+            "description": "Optional result for check-my-work actions.",
+        },
+        "sourceBoardOrder": {
+            "anyOf": [{"type": "integer"}, {"type": "null"}],
+            "description": "Optional one-based source whiteboard order for where-from actions.",
+        },
+    },
+    "required": ["title", "answer", "confidence"],
+}
+
 ACTION_INSTRUCTIONS = {
     "go_deeper": (
         "Go deeper on this concept. Build on the previous explanation. "
@@ -851,16 +887,291 @@ def parse_study_guide(raw: str) -> dict[str, Any]:
     }
 
 
-def _parse_model_json(raw: str) -> dict[str, str]:
-    value = _load_json_object(raw)
-    answer = unescape_study_newlines(str(value.get("answer") or raw or "").strip())
-    title = str(value.get("title") or "Explanation").strip()[:120]
-    confidence = str(value.get("confidence") or "medium").strip().lower()
-    if confidence not in {"high", "medium", "low"}:
-        confidence = "medium"
-    if not answer:
+_RESPONSE_WRAPPER_FIELDS = ("response", "result", "output", "data", "content", "message")
+_RESPONSE_FIELD_NAMES = {
+    "title",
+    "answer",
+    "confidence",
+    "verdict",
+    "sourceboardorder",
+}
+_JSON_FENCE_RE = re.compile(
+    r"^\s*```(?:json|javascript)?\s*(.*?)\s*```\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_LABELED_FIELD_RE = re.compile(
+    r"(?im)^[ \t]*(?:[-*][ \t]+)?(title|confidence|answer)[ \t]*:[ \t]*(.*)$"
+)
+
+
+def _strip_json_fence(text: str) -> str:
+    match = _JSON_FENCE_RE.match(str(text or ""))
+    return match.group(1).strip() if match else str(text or "").strip()
+
+
+def _decode_json_response(raw: Any) -> Any:
+    value: Any = raw
+    for _ in range(4):
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", "replace")
+        if not isinstance(value, str):
+            return value
+        text = _strip_json_fence(value)
+        if not text:
+            return ""
+        try:
+            decoded = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            decoder = json.JSONDecoder()
+            decoded = None
+            for match in re.finditer(r"\{", text):
+                try:
+                    candidate, _ = decoder.raw_decode(text[match.start() :])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict):
+                    keys = {str(key).lower() for key in candidate}
+                    if "answer" in keys or keys & set(_RESPONSE_WRAPPER_FIELDS):
+                        decoded = candidate
+                        break
+            return decoded if decoded is not None else text
+        if decoded == value:
+            return decoded
+        value = decoded
+    return value
+
+
+def _response_mapping(value: Any) -> dict[str, Any]:
+    decoded = _decode_json_response(value)
+    if not isinstance(decoded, dict):
+        return {}
+    lowered = {str(key).lower() for key in decoded}
+    if lowered & _RESPONSE_FIELD_NAMES:
+        return decoded
+    for field in _RESPONSE_WRAPPER_FIELDS:
+        if field not in decoded:
+            continue
+        nested = _response_mapping(decoded[field])
+        if nested:
+            return nested
+    return decoded
+
+
+def _extract_loose_json_field(raw: str, field: str) -> str:
+    text = str(raw or "")
+    marker = re.search(rf'(?i)(?:"{re.escape(field)}"|{re.escape(field)})\s*:', text)
+    if not marker:
+        return ""
+    cursor = marker.end()
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if cursor >= len(text):
+        return ""
+    if text[cursor] not in {'"', "'"}:
+        line = text[cursor:].splitlines()[0]
+        return line.rstrip(",} \t").strip()
+    quote = text[cursor]
+    cursor += 1
+    chunks: list[str] = []
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "\\" and cursor + 1 < len(text):
+            nxt = text[cursor + 1]
+            chunks.append(
+                {"n": "\n", "t": "\t", "r": "\n", '"': '"', "'": "'", "\\": "\\"}.get(
+                    nxt, "\\" + nxt
+                )
+            )
+            cursor += 2
+            continue
+        if char == quote:
+            remainder = text[cursor + 1 :]
+            if re.match(
+                r'\s*(?:,\s*(?:"?[A-Za-z_][A-Za-z0-9_]*"?\s*:)|[}\]])',
+                remainder,
+            ) or not remainder.strip():
+                return "".join(chunks)
+        chunks.append(char)
+        cursor += 1
+    return "".join(chunks).rstrip("} \t\r\n")
+
+
+def _parse_labeled_response(text: str) -> dict[str, str]:
+    matches = list(_LABELED_FIELD_RE.finditer(str(text or "")))
+    if not matches or str(text or "")[: matches[0].start()].strip():
+        return {}
+    answer_match = next(
+        (match for match in matches if match.group(1).lower() == "answer"),
+        None,
+    )
+    if not answer_match:
+        return {}
+    result: dict[str, str] = {}
+    for match in matches:
+        name = match.group(1).lower()
+        if name in {"title", "confidence"} and match.start() < answer_match.start():
+            result[name] = match.group(2).strip()
+    answer_start = answer_match.start(2)
+    answer_end = len(text)
+    for match in matches:
+        if match.start() <= answer_match.start():
+            continue
+        if match.group(1).lower() in {"title", "confidence"}:
+            answer_end = match.start()
+            break
+    result["answer"] = text[answer_start:answer_end].strip()
+    return result
+
+
+def _normalise_confidence(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        score = float(value)
+        if score > 1:
+            score /= 100
+        return "high" if score >= 0.75 else "medium" if score >= 0.4 else "low"
+    text = str(value or "").strip().lower()
+    numeric = re.fullmatch(r"(?:confidence\s*[:=]\s*)?(\d+(?:\.\d+)?)\s*%?", text)
+    if numeric:
+        score = float(numeric.group(1))
+        if "%" in text or score > 1:
+            score /= 100
+        return "high" if score >= 0.75 else "medium" if score >= 0.4 else "low"
+    if re.search(r"\b(?:very\s+high|high|certain|strong)\b", text):
+        return "high"
+    if re.search(r"\b(?:low|uncertain|weak)\b", text):
+        return "low"
+    return "medium"
+
+
+def _looks_like_response_metadata(text: str) -> bool:
+    stripped = str(text or "").lstrip()
+    if stripped.startswith(("{", "[")) or _JSON_FENCE_RE.match(stripped):
+        return True
+    return bool(
+        re.match(
+            r'(?i)^\s*(?:"?(?:title|answer|confidence|verdict|sourceBoardOrder|'
+            r'model|debug|metadata)"?)\s*:',
+            stripped,
+        )
+    )
+
+
+def _remove_trailing_model_metadata(text: str) -> str:
+    value = str(text or "").strip()
+    metadata_block = re.search(
+        r"(?is)\n{1,2}(?:```json\s*)?(\{.*\})(?:\s*```)?\s*$",
+        value,
+    )
+    if metadata_block:
+        try:
+            trailing = json.loads(metadata_block.group(1))
+        except json.JSONDecodeError:
+            trailing = None
+        if isinstance(trailing, dict):
+            keys = {str(key).lower() for key in trailing}
+            if keys & {
+                "title",
+                "confidence",
+                "model",
+                "model_name",
+                "debug",
+                "metadata",
+                "usage",
+                "finishreason",
+            }:
+                value = value[: metadata_block.start()].rstrip()
+    lines = value.splitlines()
+    while lines and re.match(
+        r"(?i)^\s*(?:"
+        r"(?:model|model_name|modelName)\s*:\s*(?:gemini|gpt|claude|models/)"
+        r"|(?:debug|metadata|usage|token_count|finish_reason)\s*:"
+        r")",
+        lines[-1],
+    ):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _answer_from_value(value: Any) -> tuple[str, dict[str, Any]]:
+    mapping = _response_mapping(value)
+    if mapping:
+        answer_value = mapping.get("answer")
+        if answer_value is None:
+            for field in _RESPONSE_WRAPPER_FIELDS:
+                if field in mapping:
+                    answer_value = mapping[field]
+                    break
+        if answer_value is not None:
+            nested = _response_mapping(answer_value)
+            if nested and nested is not mapping:
+                nested_answer, nested_meta = _answer_from_value(nested)
+                if nested_answer:
+                    return nested_answer, {**mapping, **nested_meta}
+            if isinstance(answer_value, str):
+                labeled = _parse_labeled_response(answer_value)
+                if labeled.get("answer"):
+                    return labeled["answer"], {**mapping, **labeled}
+                decoded_answer = _decode_json_response(answer_value)
+                if isinstance(decoded_answer, str):
+                    return decoded_answer.strip(), mapping
+                nested_answer, nested_meta = _answer_from_value(decoded_answer)
+                if nested_answer:
+                    return nested_answer, {**mapping, **nested_meta}
+        return "", mapping
+    decoded = _decode_json_response(value)
+    if isinstance(decoded, str):
+        labeled = _parse_labeled_response(decoded)
+        if labeled.get("answer"):
+            return labeled["answer"], labeled
+        loose = {
+            field: _extract_loose_json_field(decoded, field)
+            for field in ("title", "confidence", "answer")
+        }
+        if loose["answer"]:
+            nested_answer, nested_meta = _answer_from_value(loose["answer"])
+            if nested_answer and nested_answer != loose["answer"]:
+                return nested_answer, {**loose, **nested_meta}
+            return loose["answer"], loose
+        if not _looks_like_response_metadata(decoded):
+            return decoded.strip(), {}
+    return "", {}
+
+
+def _parse_model_json(raw: Any) -> dict[str, Any]:
+    answer, metadata = _answer_from_value(raw)
+    answer = _remove_trailing_model_metadata(unescape_study_newlines(answer))
+    if _looks_like_response_metadata(answer):
+        nested_answer, nested_metadata = _answer_from_value(answer)
+        if nested_answer and nested_answer != answer:
+            answer = unescape_study_newlines(nested_answer).strip()
+            metadata = {**metadata, **nested_metadata}
+    if not answer or _looks_like_response_metadata(answer):
         raise StudyAIError("The study assistant returned an empty explanation.")
-    return {"title": title or "Explanation", "answer": answer, "confidence": confidence}
+    title = str(metadata.get("title") or "Explanation").strip()[:120]
+    result: dict[str, Any] = {
+        "title": title or "Explanation",
+        "answer": answer,
+        "confidence": _normalise_confidence(metadata.get("confidence")),
+    }
+    verdict = str(metadata.get("verdict") or "").strip().lower()
+    if verdict in {
+        "correct",
+        "mostly_correct",
+        "partially_correct",
+        "incorrect",
+        "insufficient_evidence",
+    }:
+        result["verdict"] = verdict
+    source_order = metadata.get("sourceBoardOrder")
+    if source_order is None:
+        source_order = metadata.get("source_board_order")
+    if isinstance(source_order, int) and not isinstance(source_order, bool):
+        result["sourceBoardOrder"] = source_order
+    elif source_order is None and (
+        "sourceBoardOrder" in metadata or "source_board_order" in metadata
+    ):
+        result["sourceBoardOrder"] = None
+    return result
 
 
 PREAMBLE_RE = re.compile(
@@ -1129,6 +1440,7 @@ def explain_selection(**kwargs: Any) -> dict[str, str]:
         user_text=build_explain_prompt(**kwargs),
         images=images,
         max_tokens=1_600 if action in {"check_my_work", "explain_across_boards", "where_from"} else 1_200,
+        response_schema=EXPLAIN_RESPONSE_SCHEMA,
     )
 
 
@@ -1315,13 +1627,13 @@ def follow_up_question(
         lines.append(instruction or question)
         if question and question != instruction:
             lines.append(f"Additional student note: {question}")
-    parser = parse_practice_problems if kind == "practice_problems" else _parse_model_json
     return call_study_model(
         system=ACTION_SYSTEMS.get(kind, FOLLOW_UP_SYSTEM),
         user_text="\n".join(lines),
         images=images,
         history=history,
-        parser=parser,
-        max_tokens=1_000 if kind == "practice_problems" else 1_600,
-        temperature=0.35 if kind == "practice_problems" else 0.2,
+        parser=_parse_model_json,
+        max_tokens=1_600,
+        temperature=0.2,
+        response_schema=EXPLAIN_RESPONSE_SCHEMA,
     )
