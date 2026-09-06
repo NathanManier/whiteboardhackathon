@@ -21,6 +21,11 @@
       </button>
       <span class="save-status" id="save-status" role="status" aria-live="polite">Ready</span>
     </div>
+    <nav class="lecture-board-nav" id="lecture-board-nav" aria-label="Whiteboards in this lecture" hidden>
+      <button class="icon-button" id="previous-board" type="button" aria-label="Previous whiteboard">‹</button>
+      <span id="board-position">Whiteboard 1 of 1</span>
+      <button class="icon-button" id="next-board" type="button" aria-label="Next whiteboard">›</button>
+    </nav>
     <div class="header-actions">
       <button class="icon-button chrome-essential" id="pencil-palette-button" type="button" title="Pencil tools" aria-label="Pencil tools" aria-expanded="false" aria-controls="pencil-palette">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4.2 20 4.2-1.1 10.2-10.2a2.15 2.15 0 0 0-3-3L5.4 15.9 4.2 20Z"/><path d="m13.2 7.2 3.6 3.6"/></svg>
@@ -28,7 +33,7 @@
       <button class="icon-button chrome-essential" id="focus-mode-button" type="button" title="Focus Mode" aria-label="Focus Mode" aria-pressed="false">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9V5h4"/><path d="M15 5h4v4"/><path d="M19 15v4h-4"/><path d="M9 19H5v-4"/></svg>
       </button>
-      <button class="button button-ghost button-small lecture-action header-extended" id="import-whiteboard" type="button">+ Import Whiteboard</button>
+      <button class="button button-ghost button-small lecture-action header-extended" id="import-whiteboard" type="button">+ Add Board</button>
       <button class="button button-ghost button-small lecture-action header-extended" id="study-guide-button" type="button">Generate Study Guide</button>
       <button class="button button-ghost button-small lecture-action chrome-essential" id="study-notes-button" type="button">Study notes</button>
       <a class="button button-ghost button-small header-extended" href="/">Lectures</a>
@@ -37,7 +42,7 @@
       <div class="chrome-menu">
         <button class="icon-button" id="chrome-menu-button" type="button" title="More" aria-label="More" aria-haspopup="true" aria-expanded="false" aria-controls="chrome-menu">⋯</button>
         <div class="chrome-menu-panel" id="chrome-menu" hidden>
-          <button type="button" id="menu-import">Import whiteboard</button>
+          <button type="button" id="menu-import">Add board</button>
           <button type="button" id="menu-study-guide">Study guide</button>
           <button type="button" id="menu-export">Export SVG</button>
           <button type="button" id="menu-gestures">Gestures</button>
@@ -165,7 +170,7 @@
           <button class="icon-button" id="toolbar-study-notes" type="button" title="Study Notes" aria-label="Study Notes">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.8h12A1.2 1.2 0 0 1 19.2 6v14.2L12 16.4l-7.2 3.8V6A1.2 1.2 0 0 1 6 4.8Z"/></svg>
           </button>
-          <button class="icon-button" id="toolbar-new-board" type="button" title="New Board" aria-label="New Board">
+          <button class="icon-button" id="toolbar-new-board" type="button" title="Add Board" aria-label="Add Board">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
           </button>
           <button class="icon-button" id="gestures-help-button" type="button" title="Gestures" aria-label="Gestures help" aria-expanded="false" aria-controls="gestures-help">?</button>
@@ -273,12 +278,30 @@
     <div class="study-note-list" id="study-note-list"></div>
   </aside>
 
-  <form id="import-form" class="visually-hidden" method="post" enctype="multipart/form-data" action="/upload">
+  <form id="import-form" class="visually-hidden" method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
     <input type="hidden" name="folder_id" id="import-folder-id" value="">
     <input type="hidden" name="workspace_board_id" id="import-workspace-id" value="">
     <input id="import-image" name="image" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp">
     <input id="import-camera" type="file" accept="image/*" capture="environment">
   </form>
+  <dialog class="add-board-dialog" id="add-board-dialog" aria-labelledby="add-board-title">
+    <form class="dialog-form" method="dialog">
+      <header class="dialog-head">
+        <div>
+          <p class="tool-label">Lecture whiteboards</p>
+          <h2 id="add-board-title">Add Whiteboard</h2>
+        </div>
+        <button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button>
+      </header>
+      <p>Choose how to add the next board. Your current canvas will be saved first.</p>
+      <div class="add-board-actions">
+        <button class="button button-primary" id="take-board-photo" type="button">📷 Take Photo</button>
+        <button class="button button-secondary" id="import-board-photo" type="button">🖼 Import Photo</button>
+      </div>
+      <p class="inline-error" id="add-board-error" role="alert" hidden></p>
+      <button class="text-action" value="cancel" type="submit">Cancel</button>
+    </form>
+  </dialog>
   <aside id="pencil-palette" class="pencil-palette" aria-hidden="true"></aside>
   <button type="button" id="pencil-tool-chip" class="pencil-tool-chip" hidden>Tools</button>
   <div id="pencil-hover-cursor" class="pencil-hover-cursor" hidden></div>

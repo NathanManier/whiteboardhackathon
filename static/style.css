@@ -572,6 +572,17 @@ button:focus-visible, a:focus-visible, input:focus-visible {
 }
 .board-title { display: flex; margin: 0 auto; align-items: center; gap: 8px; font-size: 12px; font-weight: 650; }
 .board-title .tool-label { margin: 0; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.lecture-board-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.lecture-board-nav .icon-button { width: 30px; height: 30px; }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
 .save-status {
   margin-left: 5px;
@@ -838,6 +849,7 @@ kbd { display: inline-block; min-width: 18px; margin-right: 2px; padding: 2px 4p
 .workspace-page .button-ghost {
   color: #f4f7fb;
 }
+.workspace-page .lecture-board-nav { color: #c5cedb; }
 .workspace-page .button-ghost { border-color: #364156; }
 .workspace-page .save-status { color: #9ba8ba; border-color: #364156; }
 .editor-workspace.editor-v2 {
@@ -1239,6 +1251,9 @@ dialog::backdrop { background: rgba(10, 19, 31, .54); }
 .dialog-form { display: grid; gap: 18px; padding: 25px; }
 .dialog-form h2 { margin: 0; font-size: 23px; }
 .dialog-form p { margin: -10px 0 0; color: var(--muted); font-size: 13px; }
+.add-board-actions { display: grid; gap: 10px; }
+.add-board-actions .button { min-height: 48px; justify-content: flex-start; }
+.add-board-dialog .inline-error { margin: 0; color: var(--danger); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .field { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 600; }
 .field input, .field select, .dialog-form input {

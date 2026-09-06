@@ -128,7 +128,9 @@
       studyGuide: null,
       stale: false
     },
-    pendingImportedId: ""
+    pendingImportedId: "",
+    activeLectureBoardId: boardId,
+    importingBoard: false
   };
 
   /* Authoritative high-frequency Pencil buffer. Never wait on React/save/render. */
@@ -473,6 +475,14 @@
   function initCorners() {
     $("#corner-workspace").hidden = false;
     $("#editor-workspace").hidden = true;
+    applyLectureData(state.data);
+    const title = state.lecture.folderName || state.data.title || state.data.name || "Whiteboard";
+    $("#board-name").textContent = title;
+    document.title = `Place corners · ${title}`;
+    ["#import-whiteboard", "#toolbar-new-board", "#menu-import"].forEach(selector => {
+      const control = $(selector);
+      if (control) control.disabled = true;
+    });
     const image = $("#corner-image");
     const source = findAsset("original") || asUrl(state.data.image_url || state.data.image);
     if (!source) {
@@ -558,29 +568,30 @@
     button.disabled = true;
     button.textContent = "Correcting…";
     errorBox.hidden = true;
-    let lastError;
-    for (const url of [`${boardRoute}/corners`, boardRoute]) {
-      try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify(payload)
-        });
-        if (!response.ok) {
-          lastError = new Error(`Server returned ${response.status}`);
-          if ([404, 405].includes(response.status)) continue;
-          throw lastError;
-        }
-        const result = await response.json().catch(() => ({}));
-        if (result.redirect || result.url) location.assign(result.redirect || result.url);
-        else location.reload();
-        return;
-      } catch (error) { lastError = error; }
+    try {
+      const response = await fetch(`${boardRoute}/corners`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const messages = {
+          404: "This board no longer exists. Return to Lectures and add it again.",
+          413: "This image is too large.",
+          500: "Whiteboard processing failed. Your original photo is still saved."
+        };
+        throw new Error(result.error || messages[response.status] || "Could not save those corners.");
+      }
+      if (result.redirect || result.url) location.assign(result.redirect || result.url);
+      else location.reload();
+      return;
+    } catch (error) {
+      errorBox.textContent = error.message || "Could not save corners. Please try again.";
+      errorBox.hidden = false;
     }
     button.disabled = false;
     button.textContent = "Correct board";
-    errorBox.textContent = `Could not save corners. ${lastError?.message || "Please try again."}`;
-    errorBox.hidden = false;
   }
 
   function pathFromPoints(points) {
@@ -1268,12 +1279,12 @@
         keepalive: true
       }).catch(() => {
         if (navigator.sendBeacon) {
-          navigator.sendBeacon(`${editorApi}?_method=PUT`, new Blob([body], { type: "application/json" }));
+          navigator.sendBeacon(editorApi, new Blob([body], { type: "application/json" }));
         }
       });
     } catch (_) {
       if (navigator.sendBeacon) {
-        navigator.sendBeacon(`${editorApi}?_method=PUT`, new Blob([body], { type: "application/json" }));
+        navigator.sendBeacon(editorApi, new Blob([body], { type: "application/json" }));
       }
     }
   }
@@ -5811,6 +5822,7 @@
     const board = lectureBoardsFromData().find(item => item.boardId === boardIdToView)
       || state.sourceBoards.find(item => item.boardId === boardIdToView);
     if (!board) return;
+    state.activeLectureBoardId = board.boardId;
     const rect = sceneRect();
     const aspect = sceneAspect(rect);
     const pad = Math.max(board.width, board.height) * 0.08;
@@ -5827,10 +5839,42 @@
       height
     };
     applyCamera();
+    syncLectureNavigation();
+  }
+
+  function syncLectureNavigation() {
+    const nav = $("#lecture-board-nav");
+    if (!nav) return;
+    const boards = lectureBoardsFromData()
+      .filter(board => board?.boardId)
+      .sort((left, right) => left.boardOrder - right.boardOrder);
+    nav.hidden = !state.lecture.isLecture || !boards.length;
+    if (nav.hidden) return;
+    let index = boards.findIndex(board => board.boardId === state.activeLectureBoardId);
+    if (index < 0) index = 0;
+    state.activeLectureBoardId = boards[index].boardId;
+    const label = boards[index].label || `Whiteboard ${index + 1}`;
+    $("#board-position").textContent = `${label} · ${index + 1} of ${boards.length}`;
+    $("#previous-board").disabled = index === 0;
+    $("#next-board").disabled = index === boards.length - 1;
   }
 
   async function startImportWhiteboard() {
+    if (state.importingBoard) return;
+    const boardStatus = String(state.data?.status || state.data?.pipeline?.status || "");
+    if (boardStatus && boardStatus !== "ready") {
+      toast("Finish processing this board before adding another one.", true);
+      return;
+    }
+    const dialog = $("#add-board-dialog");
+    const errorBox = $("#add-board-error");
+    if (errorBox) errorBox.hidden = true;
     try {
+      await flushEditorSave();
+      if (state.dirty) {
+        toast("Save the current canvas before adding another board.", true);
+        return;
+      }
       if (!state.lecture.folderId) {
         const created = await requestJSON(`/api/boards/${encodeURIComponent(boardId)}/lecture/ensure-folder`, {
           method: "POST",
@@ -5857,26 +5901,81 @@
     const workspaceField = $("#import-workspace-id");
     if (folderField) folderField.value = state.lecture.folderId || "";
     if (workspaceField) workspaceField.value = state.lecture.workspaceId || boardId;
-    const camera = $("#import-camera");
-    const picker = $("#import-image");
-    if (window.matchMedia?.("(pointer: coarse)").matches && camera) camera.click();
-    else picker?.click();
+    syncLectureNavigation();
+    dialog?.showModal();
   }
 
   function bindImport() {
     const form = $("#import-form");
     const picker = $("#import-image");
     const camera = $("#import-camera");
-    const submitFile = input => {
+    const dialog = $("#add-board-dialog");
+    const errorBox = $("#add-board-error");
+    const chooseFile = input => {
+      if (state.importingBoard) return;
+      input?.click();
+    };
+    const submitFile = async input => {
       if (!input?.files?.[0]) return;
       picker.name = input === picker ? "image" : "";
       if (camera) camera.name = input === camera ? "image" : "";
-      toast("Processing whiteboard…");
-      form?.submit();
+      state.importingBoard = true;
+      dialog?.close();
+      toast("Analyzing whiteboard…");
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 180000);
+      try {
+        const response = await fetch(form?.action || "/upload", {
+          method: "POST",
+          headers: { Accept: "application/json" },
+          body: new FormData(form),
+          signal: controller.signal
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const messages = {
+            400: "That photo could not be read. Choose another image.",
+            404: "This lecture no longer exists. Return to Lectures and reopen it.",
+            413: "That photo is too large. Choose a smaller image.",
+            415: "Choose a JPG, PNG, or WebP photo.",
+            500: "Whiteboard processing failed. Please try again."
+          };
+          throw new Error(result.error || messages[response.status] || "Could not add this board.");
+        }
+        if (!result.url) throw new Error("The new board was saved, but could not be opened.");
+        location.assign(result.url);
+      } catch (error) {
+        const message = error?.name === "AbortError"
+          ? "Processing took too long. Return to Lectures to check whether the board was saved."
+          : (error.message || "Could not add this board.");
+        if (errorBox) {
+          errorBox.textContent = message;
+          errorBox.hidden = false;
+        }
+        toast(message, true);
+        dialog?.showModal();
+      } finally {
+        window.clearTimeout(timeout);
+        state.importingBoard = false;
+        input.value = "";
+      }
     };
     picker?.addEventListener("change", () => submitFile(picker));
     camera?.addEventListener("change", () => submitFile(camera));
     $("#import-whiteboard")?.addEventListener("click", startImportWhiteboard);
+    $("#import-board-photo")?.addEventListener("click", () => chooseFile(picker));
+    $("#take-board-photo")?.addEventListener("click", () => chooseFile(camera));
+    $("#previous-board")?.addEventListener("click", () => {
+      const boards = lectureBoardsFromData().sort((left, right) => left.boardOrder - right.boardOrder);
+      const index = boards.findIndex(board => board.boardId === state.activeLectureBoardId);
+      if (index > 0) viewBoard(boards[index - 1].boardId);
+    });
+    $("#next-board")?.addEventListener("click", () => {
+      const boards = lectureBoardsFromData().sort((left, right) => left.boardOrder - right.boardOrder);
+      const index = boards.findIndex(board => board.boardId === state.activeLectureBoardId);
+      if (index >= 0 && index < boards.length - 1) viewBoard(boards[index + 1].boardId);
+    });
+    syncLectureNavigation();
   }
 
   function bindStudy() {
@@ -6503,8 +6602,10 @@
     const imported = new URLSearchParams(location.search).get("imported");
     if (imported) {
       state.pendingImportedId = imported;
+      state.activeLectureBoardId = imported;
+      viewBoard(imported);
       const chip = $("#view-new-board");
-      if (chip) chip.hidden = false;
+      if (chip) chip.hidden = true;
     }
     if (new URLSearchParams(location.search).get("studyGuide") === "1" && studyGuideContent()) {
       openStudyGuideSheet();

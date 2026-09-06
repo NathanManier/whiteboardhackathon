@@ -159,7 +159,17 @@
 
   function visibleBoards() {
     if (state.folderId) {
-      return state.boards.filter(board => itemFolderId(board) === state.folderId);
+      const folder = state.folders.find(item => item.id === state.folderId);
+      const order = folder?.board_order || folder?.boardOrder || [];
+      const positions = new Map(order.map((boardId, index) => [boardId, index]));
+      return state.boards
+        .filter(board => itemFolderId(board) === state.folderId)
+        .sort((left, right) => {
+          const leftIndex = positions.has(left.id) ? positions.get(left.id) : Number.MAX_SAFE_INTEGER;
+          const rightIndex = positions.has(right.id) ? positions.get(right.id) : Number.MAX_SAFE_INTEGER;
+          return leftIndex - rightIndex ||
+            Number(left.created_at || 0) - Number(right.created_at || 0);
+        });
     }
     return [...state.boards].sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0));
   }

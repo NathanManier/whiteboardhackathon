@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import io
 import importlib
 import inspect
@@ -11,10 +12,12 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +36,11 @@ from flask import (
 )
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production and supported dev platforms are Unix.
+    fcntl = None
 
 from lecture import (
     attach_source_board,
@@ -98,6 +106,8 @@ app.config.update(
 )
 BOARDS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+_BOARD_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_BOARD_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 def load_dotenv() -> None:
@@ -123,13 +133,57 @@ def load_dotenv() -> None:
 load_dotenv()
 
 
-def require_board_id(board_id: str) -> Path:
+def board_directory(board_id: str, *, create: bool = False) -> Path:
     if not BOARD_ID_RE.fullmatch(board_id):
+        LOGGER.info("BOARD NOT FOUND invalid_id=true")
         abort(404)
+    BOARDS_DIR.mkdir(parents=True, exist_ok=True)
     board_dir = BOARDS_DIR / board_id
-    if not board_dir.is_dir():
+    if create:
+        existed = board_dir.exists()
+        board_dir.mkdir(mode=0o700, exist_ok=True)
+        if not existed:
+            LOGGER.info("BOARD DIR CREATE board=%s", board_id)
+        LOGGER.info("BOARD DIR READY board=%s", board_id)
+    if board_dir.is_symlink() or not board_dir.is_dir():
+        LOGGER.warning("BOARD DIR MISSING board=%s", board_id)
         abort(404)
     return board_dir
+
+
+def require_board_id(board_id: str) -> Path:
+    return board_directory(board_id)
+
+
+@contextmanager
+def board_operation_lock(board_id: str):
+    if not BOARD_ID_RE.fullmatch(board_id):
+        LOGGER.info("BOARD NOT FOUND invalid_id=true")
+        abort(404)
+    key = str((BOARDS_DIR / board_id).resolve(strict=False))
+    with _BOARD_THREAD_LOCKS_GUARD:
+        thread_lock = _BOARD_THREAD_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        lock_dir = BOARDS_DIR / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"{board_id}.lock"
+        with lock_path.open("a+b") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def locked_board_operation(handler):
+    @wraps(handler)
+    def wrapped(board_id: str, *args, **kwargs):
+        with board_operation_lock(board_id):
+            return handler(board_id, *args, **kwargs)
+
+    return wrapped
 
 
 def metadata_path(board_dir: Path) -> Path:
@@ -146,7 +200,9 @@ def read_metadata(board_dir: Path) -> dict[str, Any]:
     return value
 
 
-def atomic_json(path: Path, value: Any) -> None:
+def atomic_json(path: Path, value: Any, *, create_parent: bool = False) -> None:
+    if create_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
     try:
         temporary.write_text(
@@ -157,7 +213,9 @@ def atomic_json(path: Path, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def atomic_bytes(path: Path, value: bytes) -> None:
+def atomic_bytes(path: Path, value: bytes, *, create_parent: bool = False) -> None:
+    if create_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
     try:
         temporary.write_bytes(value)
@@ -175,8 +233,19 @@ def atomic_image(path: Path, image: np.ndarray) -> None:
 
 
 def update_metadata(board_dir: Path, metadata: dict[str, Any]) -> None:
+    expected_parent = BOARDS_DIR.resolve(strict=False)
+    if (
+        board_dir.parent.resolve(strict=False) != expected_parent
+        or not BOARD_ID_RE.fullmatch(board_dir.name)
+    ):
+        raise ValueError("Invalid board metadata path.")
+    if board_dir.is_symlink() or not board_dir.is_dir():
+        LOGGER.warning("BOARD DIR MISSING board=%s", board_dir.name)
+        abort(404)
+    LOGGER.info("BOARD METADATA WRITE START board=%s", board_dir.name)
     metadata["updated_at"] = time.time()
     atomic_json(metadata_path(board_dir), metadata)
+    LOGGER.info("BOARD METADATA WRITE COMPLETE board=%s", board_dir.name)
 
 
 def default_board_title(folder_name: str | None = None) -> str:
@@ -277,7 +346,7 @@ def read_library() -> dict[str, Any]:
 
 
 def write_library(value: dict[str, Any]) -> None:
-    atomic_json(library_path(), value)
+    atomic_json(library_path(), value, create_parent=True)
 
 
 def folder_ids(library: dict[str, Any]) -> set[str]:
@@ -1310,8 +1379,19 @@ def validate_corners(value: Any, image: np.ndarray) -> np.ndarray:
         or np.any(points[:, 1] >= height)
     ):
         raise ValueError("Corner points must lie inside the original image.")
+    minimum_separation = max(2.0, min(width, height) * 0.005)
+    for first in range(4):
+        for second in range(first + 1, 4):
+            if float(np.linalg.norm(points[first] - points[second])) < minimum_separation:
+                raise ValueError("Each corner must be a distinct point.")
     ordered = order_corners(points)
-    if cv2.contourArea(ordered.astype(np.float32)) < width * height * 0.01:
+    contour = ordered.astype(np.float32)
+    if not cv2.isContourConvex(contour):
+        raise ValueError("The selected corners must form a valid quadrilateral.")
+    edges = np.roll(ordered, -1, axis=0) - ordered
+    if np.any(np.linalg.norm(edges, axis=1) < minimum_separation):
+        raise ValueError("The selected board edges are too short.")
+    if cv2.contourArea(contour) < width * height * 0.01:
         raise ValueError("The selected board area is too small.")
     return ordered
 
@@ -1322,8 +1402,9 @@ def load_original(board_dir: Path, metadata: dict[str, Any]) -> np.ndarray:
         abort(500, description="Original asset metadata is invalid.")
     try:
         return decode_image((board_dir / filename).read_bytes())
-    except (OSError, ValueError) as exc:
-        abort(500, description=f"Original image is unavailable: {exc}")
+    except (OSError, ValueError):
+        LOGGER.exception("BOARD ORIGINAL LOAD FAILED board=%s", board_dir.name)
+        abort(500, description="The original board image is unavailable.")
 
 
 def asset_paths(metadata: dict[str, Any]) -> set[str]:
@@ -1682,6 +1763,7 @@ def ensure_lecture_workspace(
     return host_id, editor
 
 
+@locked_board_operation
 def attach_imported_board(workspace_id: str, new_board_id: str) -> str:
     if workspace_id == new_board_id:
         return workspace_id
@@ -2028,15 +2110,66 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
 
 
 @app.errorhandler(RequestEntityTooLarge)
-def too_large(_: RequestEntityTooLarge) -> tuple[str, int]:
+def too_large(_: RequestEntityTooLarge) -> tuple[str, int] | tuple[Response, int]:
     limit_mb = app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
+    message = f"That photo is too large. Choose an image under {limit_mb:.0f} MB."
+    if request.accept_mimetypes["application/json"] > request.accept_mimetypes["text/html"]:
+        return jsonify(error=message), 413
     return (
         render_template(
             "index.html",
-            upload_error=f"That photo is too large. Choose an image under {limit_mb:.0f} MB.",
+            upload_error=message,
         ),
         413,
     )
+
+
+def upload_failure(message: str, status: int) -> tuple[str, int] | tuple[Response, int]:
+    log = LOGGER.error if status >= 500 else LOGGER.info
+    log("BOARD IMPORT FAILED status=%d", status)
+    if request.accept_mimetypes["application/json"] > request.accept_mimetypes["text/html"]:
+        return jsonify(error=message), status
+    return render_template("index.html", upload_error=message), status
+
+
+def board_destination(board_id: str, metadata: dict[str, Any]) -> tuple[str, str]:
+    workspace_id = metadata.get("workspace_board_id")
+    redirect_id = board_id
+    imported_id = None
+    if (
+        isinstance(workspace_id, str)
+        and BOARD_ID_RE.fullmatch(workspace_id)
+        and workspace_id != board_id
+    ):
+        try:
+            attach_imported_board(workspace_id, board_id)
+            redirect_id = workspace_id
+            imported_id = board_id
+        except Exception:
+            LOGGER.exception("LECTURE ATTACH FAILED workspace=%s board=%s", workspace_id, board_id)
+    return redirect_id, workspace_redirect_url(redirect_id, imported_id)
+
+
+def upload_success(
+    board_id: str,
+    metadata: dict[str, Any],
+    *,
+    status: str,
+) -> Response:
+    redirect_id, next_url = board_destination(board_id, metadata) if status == "ready" else (
+        board_id,
+        url_for("board", board_id=board_id),
+    )
+    if request.accept_mimetypes["application/json"] > request.accept_mimetypes["text/html"]:
+        response = jsonify(
+            id=board_id,
+            status=status,
+            url=next_url,
+            workspace_id=redirect_id,
+        )
+        response.status_code = 201
+        return response
+    return redirect(next_url)
 
 
 @app.get("/")
@@ -2044,6 +2177,7 @@ def index() -> str:
     return render_template("index.html")
 
 
+@app.post("/upload/")
 @app.post("/upload")
 def upload() -> Response | tuple[str, int]:
     upload_started = time.perf_counter()
@@ -2054,17 +2188,19 @@ def upload() -> Response | tuple[str, int]:
     )
     uploaded = request.files.get("image")
     if uploaded is None or not uploaded.filename:
-        return render_template("index.html", upload_error="Choose a whiteboard photo to continue."), 400
+        return upload_failure("Choose a whiteboard photo to continue.", 400)
     extension = Path(uploaded.filename).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
-        return render_template(
-            "index.html", upload_error="We couldn't use that file. Choose a JPG, PNG, or WEBP image."
-        ), 415
+        return upload_failure(
+            "We couldn't use that file. Choose a JPG, PNG, or WEBP image.",
+            415,
+        )
     content_type = (uploaded.mimetype or "").lower()
     if content_type not in ALLOWED_MIME_TYPES:
-        return render_template(
-            "index.html", upload_error="We couldn't read that image type. Choose a JPG, PNG, or WEBP photo."
-        ), 415
+        return upload_failure(
+            "We couldn't read that image type. Choose a JPG, PNG, or WEBP photo.",
+            415,
+        )
     data = uploaded.read(app.config["MAX_CONTENT_LENGTH"] + 1)
     LOGGER.info(
         "UPLOAD COMPLETE filename=%s bytes=%d elapsed=%.3fs",
@@ -2090,10 +2226,10 @@ def upload() -> Response | tuple[str, int]:
             time.perf_counter() - load_started,
         )
     except ValueError as exc:
-        return render_template(
-            "index.html",
-            upload_error=f"We couldn't process that image. {exc} Try another photo.",
-        ), 400
+        return upload_failure(
+            f"We couldn't process that image. {exc} Try another photo.",
+            400,
+        )
 
     library = read_library()
     requested_folder = request.form.get("folder_id", "").strip() or None
@@ -2101,19 +2237,19 @@ def upload() -> Response | tuple[str, int]:
     if workspace_board_id and not BOARD_ID_RE.fullmatch(workspace_board_id):
         workspace_board_id = None
     if requested_folder is not None and requested_folder not in folder_ids(library):
-        return render_template(
-            "index.html",
-            upload_error="The selected folder does not exist.",
-        ), 400
+        return upload_failure("The selected lecture no longer exists.", 404)
     if workspace_board_id:
         workspace_entry = library["boards"].get(workspace_board_id)
         if not isinstance(workspace_entry, dict):
-            return render_template(
-                "index.html",
-                upload_error="The lecture workspace could not be found.",
-            ), 400
+            return upload_failure("The lecture workspace could not be found.", 404)
+        workspace_folder = workspace_entry.get("folder_id")
+        if workspace_folder not in folder_ids(library):
+            return upload_failure("The lecture workspace no longer belongs to a lecture.", 404)
+        if requested_folder and workspace_folder != requested_folder:
+            return upload_failure("The lecture workspace does not match the selected lecture.", 400)
         if not requested_folder:
-            requested_folder = workspace_entry.get("folder_id")
+            requested_folder = workspace_folder
+        board_directory(workspace_board_id)
     requested_name = (request.form.get("name") or "").strip()
     try:
         if requested_name and not looks_like_source_filename(requested_name):
@@ -2132,13 +2268,14 @@ def upload() -> Response | tuple[str, int]:
                 requested_folder,
             )
     except ValueError as exc:
-        return render_template("index.html", upload_error=str(exc)), 400
+        return upload_failure(str(exc), 400)
 
     board_id = secrets.token_hex(16)
-    board_dir = BOARDS_DIR / board_id
-    board_dir.mkdir(mode=0o700)
+    LOGGER.info("BOARD CREATE START board=%s lecture=%s", board_id, requested_folder or "none")
+    board_dir = board_directory(board_id, create=True)
     original_name = f"original{extension}"
     atomic_bytes(board_dir / original_name, data)
+    LOGGER.info("BOARD IMAGE SAVED board=%s bytes=%d", board_id, len(data))
     metadata: dict[str, Any] = {
         "schema_version": 1,
         "id": board_id,
@@ -2187,7 +2324,16 @@ def upload() -> Response | tuple[str, int]:
         image.shape[1],
         image.shape[0],
     )
-    corners, confidence = detect_corners(image)
+    try:
+        corners, confidence = detect_corners(image)
+    except Exception:
+        LOGGER.exception("BOARD CREATE FAILED board=%s stage=detection", board_id)
+        metadata.setdefault("pipeline", {})["status"] = "failed"
+        update_metadata(board_dir, metadata)
+        return upload_failure(
+            "We couldn't analyze that whiteboard photo. Try another image.",
+            500,
+        )
     set_stage(metadata, "detection", started)
     LOGGER.info(
         "BOARD DETECTION COMPLETE confidence=%.4f elapsed=%.3fs",
@@ -2222,17 +2368,39 @@ def upload() -> Response | tuple[str, int]:
             for point in corners
         ]
     metadata["pipeline"]["status"] = "needs_corners"
-    # A usable master exists even before the user supplies corners.
+    if corners is not None and confidence >= DETECTION_CONFIDENCE_THRESHOLD:
+        LOGGER.info("BOARD PROCESSING RESUME board=%s manual=false", board_id)
+        try:
+            run_downstream(board_dir, metadata, image, corners)
+        except Exception:
+            LOGGER.exception("BOARD CREATE FAILED board=%s stage=processing", board_id)
+            metadata.setdefault("pipeline", {})["status"] = "failed"
+            update_metadata(board_dir, metadata)
+            return upload_failure(
+                "We couldn't finish processing that whiteboard. Your original photo is still saved.",
+                500,
+            )
+        LOGGER.info(
+            "BOARD CREATE COMPLETE board=%s lecture=%s state=ready elapsed=%.3fs",
+            board_id,
+            requested_folder or "none",
+            time.perf_counter() - upload_started,
+        )
+        return upload_success(board_id, metadata, status="ready")
+
+    # A usable preview exists while the user supplies manual corners.
     atomic_image(board_dir / "master.png", image)
     metadata["assets"]["master"] = "master.png"
     metadata["dimensions"] = {"width": int(width), "height": int(height)}
     update_metadata(board_dir, metadata)
+    LOGGER.info("BOARD NEEDS_CORNERS board=%s", board_id)
     LOGGER.info(
-        "TOTAL COMPLETE board=%s state=needs_corners elapsed=%.3fs",
+        "BOARD CREATE COMPLETE board=%s lecture=%s state=needs_corners elapsed=%.3fs",
         board_id,
+        requested_folder or "none",
         time.perf_counter() - upload_started,
     )
-    return redirect(url_for("board", board_id=board_id))
+    return upload_success(board_id, metadata, status="needs_corners")
 
 
 @app.get("/board/<board_id>")
@@ -2257,8 +2425,10 @@ def board(board_id: str) -> str | Response:
 
 
 @app.post("/board/<board_id>/corners")
+@locked_board_operation
 def set_corners(board_id: str) -> Response | tuple[str, int]:
     request_started = time.perf_counter()
+    LOGGER.info("BOARD CORNERS RECEIVED board=%s", board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     image = load_original(board_dir, metadata)
@@ -2267,6 +2437,7 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
     try:
         corners = validate_corners(raw_corners, image)
     except (ValueError, TypeError) as exc:
+        LOGGER.info("BOARD CORNERS FAILED board=%s status=400 reason=invalid", board_id)
         if request.is_json:
             return jsonify(error=str(exc)), 400
         return str(exc), 400
@@ -2291,11 +2462,12 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
             pass
     metadata.setdefault("pipeline", {})["status"] = "processing"
     update_metadata(board_dir, metadata)
-    LOGGER.info("MANUAL CORNERS ACCEPTED board=%s", board_id)
+    LOGGER.info("BOARD CORNERS SAVED board=%s", board_id)
+    LOGGER.info("BOARD PROCESSING RESUME board=%s manual=true", board_id)
     try:
         run_downstream(board_dir, metadata, image, corners)
     except Exception:
-        LOGGER.exception("WHITEBOARD PROCESSING FAILED board=%s", board_id)
+        LOGGER.exception("BOARD CORNERS FAILED board=%s stage=processing", board_id)
         metadata.setdefault("pipeline", {})["status"] = "failed"
         update_metadata(board_dir, metadata)
         if request.is_json:
@@ -2306,23 +2478,15 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
         board_id,
         time.perf_counter() - request_started,
     )
-    workspace_id = metadata.get("workspace_board_id")
-    redirect_id = board_id
-    imported_id = None
-    if isinstance(workspace_id, str) and BOARD_ID_RE.fullmatch(workspace_id) and workspace_id != board_id:
-        try:
-            attach_imported_board(workspace_id, board_id)
-            redirect_id = workspace_id
-            imported_id = board_id
-        except Exception:
-            LOGGER.exception("LECTURE ATTACH FAILED workspace=%s board=%s", workspace_id, board_id)
-    next_url = workspace_redirect_url(redirect_id, imported_id)
+    LOGGER.info("BOARD READY board=%s manual=true", board_id)
+    redirect_id, next_url = board_destination(board_id, metadata)
     if request.is_json:
         return jsonify(id=board_id, status="ready", url=next_url, workspace_id=redirect_id)
     return redirect(next_url)
 
 
 @app.post("/board/<board_id>/save")
+@locked_board_operation
 def save_board(board_id: str) -> Response | tuple[Response, int]:
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
@@ -2347,6 +2511,7 @@ def save_board(board_id: str) -> Response | tuple[Response, int]:
 
 
 @app.route("/api/boards/<board_id>/editor", methods=["GET", "PUT", "POST"])
+@locked_board_operation
 def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
@@ -2550,9 +2715,10 @@ def delete_folder(folder_id: str) -> Response | tuple[Response, int]:
     if recursive:
         for board_id in board_ids:
             if BOARD_ID_RE.fullmatch(board_id):
-                board_dir = BOARDS_DIR / board_id
-                if board_dir.is_dir():
-                    shutil.rmtree(board_dir)
+                with board_operation_lock(board_id):
+                    board_dir = BOARDS_DIR / board_id
+                    if board_dir.is_dir() and not board_dir.is_symlink():
+                        shutil.rmtree(board_dir)
             library["boards"].pop(board_id, None)
     library["folders"] = [
         folder
@@ -2651,6 +2817,7 @@ def generate_study_guide_route(folder_id: str) -> Response | tuple[Response, int
 
 
 @app.post("/api/boards/<board_id>/lecture/ensure-folder")
+@locked_board_operation
 def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int]:
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
@@ -2705,6 +2872,7 @@ def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int
 
 
 @app.patch("/api/boards/<board_id>")
+@locked_board_operation
 def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
     board_dir = require_board_id(board_id)
     payload = request.get_json(silent=True)
@@ -2720,6 +2888,7 @@ def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
             "folder_id": metadata.get("folder_id"),
             "created_at": metadata.get("created_at"),
         }
+    previous_folder_id = entry.get("folder_id")
     try:
         if "name" in payload:
             entry["name"] = validate_display_name(payload["name"], "Board name")
@@ -2735,6 +2904,17 @@ def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
         return jsonify(error=str(exc)), 400
     entry["updated_at"] = time.time()
     library["boards"][board_id] = entry
+    affected_folders = {
+        folder_id
+        for folder_id in (previous_folder_id, entry.get("folder_id"))
+        if isinstance(folder_id, str) and folder_id in folder_ids(library)
+    }
+    for folder_id in affected_folders:
+        folder = folder_by_id(library, folder_id)
+        sync_folder_board_order(library, folder_id)
+        mark_study_guide_stale(folder)
+        if folder:
+            folder["lecture_context"] = None
     write_library(library)
     metadata = read_metadata(board_dir)
     metadata["name"] = entry["name"]
@@ -2744,11 +2924,20 @@ def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
 
 
 @app.delete("/api/boards/<board_id>")
+@locked_board_operation
 def delete_board(board_id: str) -> Response:
     board_dir = require_board_id(board_id)
     library = read_library()
+    entry = library["boards"].get(board_id)
+    folder_id = entry.get("folder_id") if isinstance(entry, dict) else None
     shutil.rmtree(board_dir)
     library["boards"].pop(board_id, None)
+    if isinstance(folder_id, str) and folder_id in folder_ids(library):
+        folder = folder_by_id(library, folder_id)
+        sync_folder_board_order(library, folder_id)
+        mark_study_guide_stale(folder)
+        if folder:
+            folder["lecture_context"] = None
     write_library(library)
     return jsonify(status="deleted", id=board_id)
 
