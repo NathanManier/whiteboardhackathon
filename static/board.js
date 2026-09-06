@@ -21,7 +21,11 @@
   const MAX_ZOOM = globalThis.BoardEngine?.MAX_ZOOM || 64;
   const PINCH_ZOOM_SLOP = 16;
   const DISPLAY_CELL = 240;
-  const TOOLS = new Set(["select", "pen", "highlighter", "object-eraser", "pixel-eraser"]);
+  const Pencil = globalThis.PencilTools || null;
+  const TOOLS = new Set([
+    "select", "lasso", "pen", "marker", "pencil", "highlighter",
+    "object-eraser", "pixel-eraser"
+  ]);
 
   const assetAliases = {
     original: ["original", "original_url", "input", "source"],
@@ -51,12 +55,18 @@
     importedTransforms: {},
     selected: new Set(),
     tool: "pen",
+    toolConfig: Pencil ? Pencil.createToolState() : null,
+    toolbarVisible: true,
+    autoHideToolbar: false,
+    paletteMode: "closed",
+    lastPenScreen: null,
+    pencilCapabilities: Pencil ? Pencil.detectPencilCapabilities() : null,
     penSize: 4,
-    penColor: "#183153",
+    penColor: "#111827",
     highlighterSize: 18,
-    highlighterColor: "#facc15",
+    highlighterColor: "#eab308",
     eraserSize: 16,
-    color: "#183153",
+    color: "#111827",
     size: 4,
     history: [],
     future: [],
@@ -123,6 +133,8 @@
 
   /* Authoritative high-frequency Pencil buffer. Never wait on React/save/render. */
   let activeInk = null;
+  let studyGuideBusy = false;
+  let studyGuideProgressTimer = 0;
 
   const DEBUG_EDITOR = (() => {
     try {
@@ -403,6 +415,7 @@
     }
     const guideButton = $("#study-guide-button");
     if (guideButton) guideButton.hidden = !state.lecture.folderId;
+    syncStudyGuideButton();
   }
 
   function normalizeGroup(group) {
@@ -1100,8 +1113,14 @@
   }
 
   function updateHistoryButtons() {
-    $("#undo-button").disabled = !state.history.length;
-    $("#redo-button").disabled = !state.future.length;
+    const undoable = Boolean(state.history.length);
+    const redoable = Boolean(state.future.length);
+    $$("[data-history='undo']").forEach(button => { button.disabled = !undoable; });
+    $$("[data-history='redo']").forEach(button => { button.disabled = !redoable; });
+    const undoButton = $("#undo-button");
+    const redoButton = $("#redo-button");
+    if (undoButton) undoButton.disabled = !undoable;
+    if (redoButton) redoButton.disabled = !redoable;
   }
 
   function inkIsActive() {
@@ -1204,7 +1223,8 @@
       return;
     }
     state.saving = true;
-    $("#save-button").disabled = true;
+    if ($("#save-button")) $("#save-button").disabled = true;
+    if ($("#header-save-button")) $("#header-save-button").disabled = true;
     setSaveStatus("Saving…");
     try {
       const result = await requestJSON(editorApi, {
@@ -1228,7 +1248,8 @@
       }
     } finally {
       state.saving = false;
-      $("#save-button").disabled = false;
+      if ($("#save-button")) $("#save-button").disabled = false;
+      if ($("#header-save-button")) $("#header-save-button").disabled = false;
       if (state.saveAgain) {
         state.saveAgain = false;
         saveEditor(false);
@@ -2095,11 +2116,13 @@
       "data-object-id": object.id,
       transform: objectTransformValue(object.tx, object.ty, object.sx, object.sy)
     });
+    const ink = object.ink || (object.type === "highlighter" ? "highlighter" : "pen");
     const path = svgEl("path", {
       d: strokePath(object), fill: "none", stroke: object.color,
       "stroke-width": object.width, "stroke-opacity": object.opacity,
       "stroke-linecap": "round", "stroke-linejoin": "round",
-      "pointer-events": "stroke"
+      "pointer-events": "stroke",
+      "data-ink": ink
     });
     if (object.erasures?.length) {
       const maskId = `mask-${object.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
@@ -2277,6 +2300,7 @@
         persistent.setAttribute("stroke", interaction.kind === "pixel" ? "#dd3f32" : interaction.color);
         persistent.setAttribute("stroke-opacity", String(interaction.kind === "pixel" ? .55 : interaction.opacity));
         persistent.setAttribute("stroke-width", String(interaction.width));
+        persistent.setAttribute("data-ink", interaction.ink || interaction.tool || "pen");
         persistent.setAttribute("visibility", "visible");
         interaction.liveNode = persistent;
         state.liveNode = persistent;
@@ -2293,7 +2317,8 @@
       "stroke-width": interaction.width,
       "stroke-linecap": "round",
       "stroke-linejoin": "round",
-      "pointer-events": "none"
+      "pointer-events": "none",
+      "data-ink": interaction.ink || interaction.tool || "pen"
     });
     $("#interaction-layer")?.append(live);
     interaction.liveNode = live;
@@ -2356,6 +2381,17 @@
     });
     interaction.rawCount = interaction.points.length;
     appendLivePoints(interaction, added);
+    if (interaction.kind === "draw" && interaction.liveNode && added.length) {
+      const latest = interaction.points.at(-1);
+      const liveWidth = Pencil
+        ? Pencil.effectiveStrokeWidth(
+          interaction.baseWidth || interaction.width,
+          latest?.p,
+          interaction.pressureSensitivity || 0
+        )
+        : interaction.width;
+      interaction.liveNode.setAttribute("stroke-width", String(liveWidth));
+    }
     return added;
   }
 
@@ -2537,14 +2573,58 @@
     return [...state.pointers.entries()].filter(([, pointer]) => pointer.type === "touch");
   }
 
+  function canonicalTool(tool = state.tool) {
+    return Pencil ? Pencil.canonicalizeTool(tool) : (tool === "lasso" ? "select" : tool);
+  }
+
+  function isInkTool(tool = state.tool) {
+    return Pencil ? Pencil.isInkTool(tool) : (tool === "pen" || tool === "highlighter");
+  }
+
+  function currentToolRecord(tool = state.tool) {
+    const id = canonicalTool(tool);
+    return state.toolConfig?.byTool?.[id] || null;
+  }
+
   function currentToolWidth() {
-    if (state.tool === "highlighter") return Math.max(8, state.highlighterSize);
-    if (state.tool === "pixel-eraser") return Math.max(8, state.eraserSize);
+    const tool = canonicalTool();
+    const record = currentToolRecord(tool);
+    if (record && Number.isFinite(Number(record.width))) {
+      if (tool === "highlighter" || tool === "pixel-eraser") return Math.max(8, Number(record.width));
+      return Number(record.width);
+    }
+    if (tool === "highlighter") return Math.max(8, state.highlighterSize);
+    if (tool === "pixel-eraser") return Math.max(8, state.eraserSize);
     return state.penSize;
   }
 
   function currentToolColor() {
-    return state.tool === "highlighter" ? state.highlighterColor : state.penColor;
+    const record = currentToolRecord();
+    if (record?.color) return record.color;
+    return canonicalTool() === "highlighter" ? state.highlighterColor : state.penColor;
+  }
+
+  function currentToolOpacity() {
+    const record = currentToolRecord();
+    if (record && Number.isFinite(Number(record.opacity))) return Number(record.opacity);
+    return canonicalTool() === "highlighter" ? .28 : 1;
+  }
+
+  function currentPressureSensitivity() {
+    const record = currentToolRecord();
+    if (record && Number.isFinite(Number(record.pressureSensitivity))) {
+      return Number(record.pressureSensitivity);
+    }
+    return Pencil ? Pencil.toolPreset(state.tool).pressureSensitivity : 0;
+  }
+
+  function persistPencilPrefs() {
+    if (!Pencil || !state.toolConfig) return;
+    state.toolConfig.tool = canonicalTool();
+    state.toolConfig.toolbarVisible = state.toolbarVisible;
+    state.toolConfig.autoHideToolbar = state.autoHideToolbar;
+    clearTimeout(persistPencilPrefs.timer);
+    persistPencilPrefs.timer = setTimeout(() => Pencil.savePrefs(state.toolConfig), 160);
   }
 
   function selectedTextObjects() {
@@ -2572,18 +2652,18 @@
     const textInput = $("#text-size");
     const texts = selectedTextObjects();
     const editingText = state.tool === "select" && texts.length > 0;
-    const usesSize = !editingText &&
-      (state.tool === "pen" || state.tool === "highlighter" || state.tool === "pixel-eraser");
-    const usesColor = state.tool === "pen" || state.tool === "highlighter" || state.tool === "select";
+    const tool = canonicalTool();
+    const usesSize = !editingText && (Pencil ? Pencil.toolUsesWidth(tool) : (
+      tool === "pen" || tool === "highlighter" || tool === "pixel-eraser"
+    ));
+    const usesColor = !editingText && (Pencil ? Pencil.toolUsesColor(tool) : (
+      tool === "pen" || tool === "highlighter" || tool === "select"
+    ));
     if (sizeControl) sizeControl.hidden = !usesSize;
     if (textControl) textControl.hidden = !editingText;
     if (colorTools) colorTools.hidden = !usesColor;
     if (editingText && textInput) textInput.value = String(Math.round(texts[0].fontSize || 24));
-    if (sizeInput) {
-      if (state.tool === "highlighter") sizeInput.value = String(state.highlighterSize);
-      else if (state.tool === "pixel-eraser") sizeInput.value = String(state.eraserSize);
-      else sizeInput.value = String(state.penSize);
-    }
+    if (sizeInput) sizeInput.value = String(currentToolWidth());
     state.size = currentToolWidth();
     state.color = currentToolColor();
     const color = state.color;
@@ -2594,6 +2674,7 @@
     });
     const custom = $("#custom-color");
     if (custom) custom.value = color;
+    syncPencilPalette();
   }
 
   function captureDrawingPointer(event) {
@@ -2636,7 +2717,10 @@
     if (interaction && (interaction.kind === "move" || interaction.kind === "resize") && interaction.before) {
       restore(interaction.before);
     }
-    if (interaction?.kind === "draw") activeInk = null;
+    if (interaction?.kind === "draw") {
+      activeInk = null;
+      setPaletteDrawingLock(false);
+    }
     state.interaction = null;
     state.pointers.clear();
     state.activePointerIds.clear();
@@ -2651,9 +2735,10 @@
   }
 
   function setTool(tool) {
-    if (!TOOLS.has(tool)) return;
+    const next = canonicalTool(tool);
+    if (!TOOLS.has(next) && next !== "select") return;
     const previous = state.tool;
-    if (previous !== tool) state.lastTool = previous;
+    if (previous !== next) state.lastTool = previous;
     if (state.interaction) {
       const kind = state.interaction.kind;
       if (kind === "draw" || kind === "pixel" || kind === "lasso" || kind === "object-erase") {
@@ -2663,15 +2748,82 @@
         renderScene();
       }
     }
-    state.tool = tool;
-    $("#world-scene").dataset.tool = tool;
-    $$(".tool-button").forEach(button => {
-      const active = button.dataset.tool === tool;
+    state.tool = next;
+    if (state.toolConfig) state.toolConfig.tool = next;
+    const scene = $("#world-scene");
+    if (scene) scene.dataset.tool = next;
+    $$(".tool-button, .palette-tool").forEach(button => {
+      const active = canonicalTool(button.dataset.tool) === next;
       button.classList.toggle("is-active", active);
       button.setAttribute("aria-pressed", String(active));
     });
+    syncToolMirrors();
     syncToolControls();
-    if (previous !== tool) editorLog("TOOL CHANGE", { from: previous, to: tool });
+    persistPencilPrefs();
+    if (previous !== next) editorLog("TOOL CHANGE", { from: previous, to: next });
+  }
+
+  function syncToolMirrors() {
+    const tool = canonicalTool();
+    const record = currentToolRecord(tool);
+    if (!record) return;
+    if (tool === "highlighter") {
+      state.highlighterColor = record.color;
+      state.highlighterSize = record.width;
+    } else if (tool === "pixel-eraser" || tool === "object-eraser") {
+      state.eraserSize = record.width;
+    } else if (isInkTool(tool)) {
+      state.penColor = record.color;
+      state.penSize = record.width;
+    }
+    state.color = currentToolColor();
+    state.size = currentToolWidth();
+  }
+
+  function setInkColor(color, { applySelection = false } = {}) {
+    if (typeof color !== "string" || !/^#[0-9A-Fa-f]{6}$/.test(color)) return;
+    const next = color.toLowerCase();
+    const tool = canonicalTool();
+    const record = currentToolRecord(tool);
+    if (record && (Pencil ? Pencil.toolUsesColor(tool) : true)) record.color = next;
+    if (tool === "highlighter") state.highlighterColor = next;
+    else if (isInkTool(tool)) state.penColor = next;
+    else if (tool === "select") {
+      const pen = currentToolRecord("pen");
+      if (pen) pen.color = next;
+      state.penColor = next;
+    }
+    state.color = next;
+    persistPencilPrefs();
+    syncToolControls();
+    if (applySelection) applyColorToSelection(next);
+  }
+
+  function setInkWidth(width) {
+    const value = Number(width);
+    if (!Number.isFinite(value)) return;
+    const tool = canonicalTool();
+    const next = clamp(value, 0.8, 48);
+    const record = currentToolRecord(tool);
+    if (record && (Pencil ? Pencil.toolUsesWidth(tool) : true)) record.width = next;
+    if (tool === "highlighter") state.highlighterSize = next;
+    else if (tool === "pixel-eraser" || tool === "object-eraser") state.eraserSize = next;
+    else state.penSize = next;
+    state.size = next;
+    persistPencilPrefs();
+    syncToolControls();
+  }
+
+  function setInkOpacity(opacity) {
+    const value = Number(opacity);
+    if (!Number.isFinite(value)) return;
+    const tool = canonicalTool();
+    const record = currentToolRecord(tool);
+    if (record && (Pencil ? Pencil.toolUsesOpacity(tool) : isInkTool(tool))) {
+      record.opacity = clamp(value, 0.08, 1);
+    }
+    persistPencilPrefs();
+    syncPencilPalette();
   }
 
   function applyColorToSelection(color) {
@@ -2686,6 +2838,250 @@
     });
     commitLogicalAction(before);
     renderScene();
+  }
+
+  function paletteHost() {
+    return $("#pencil-palette");
+  }
+
+  function toolChipHost() {
+    return $("#pencil-tool-chip");
+  }
+
+  function hoverCursorHost() {
+    return $("#pencil-hover-cursor");
+  }
+
+  function studyUiOpen() {
+    return Boolean(
+      ($("#study-sheet") && !$("#study-sheet").hidden) ||
+      ($("#study-drawer") && !$("#study-drawer").hidden)
+    );
+  }
+
+  function avoidRectsForPalette() {
+    const boxes = [];
+    [".workspace-header", "#study-sheet", "#study-drawer", "#selection-actions"].forEach(selector => {
+      const node = $(selector);
+      if (!node || node.hidden) return;
+      const rect = node.getBoundingClientRect();
+      if (rect.width && rect.height) {
+        boxes.push({ x: rect.left, y: rect.top, width: rect.width, height: rect.height });
+      }
+    });
+    return boxes;
+  }
+
+  function lastPaletteAnchor() {
+    return state.lastPenScreen ||
+      state.pencilAdapter?.getHoverPose?.() ||
+      state.pencilAdapter?.getLastPenPosition?.() ||
+      null;
+  }
+
+  function defaultPaletteAnchor() {
+    const chip = toolChipHost();
+    if (chip && !chip.hidden) {
+      const rect = chip.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top };
+    }
+    const view = Pencil?.currentViewport?.() || {
+      width: window.innerWidth, height: window.innerHeight, left: 0, top: 0, safe: {}
+    };
+    return {
+      x: view.left + view.width * 0.5,
+      y: view.top + view.height * 0.72
+    };
+  }
+
+  function paletteViewport() {
+    const view = Pencil?.currentViewport?.() || {
+      width: window.innerWidth, height: window.innerHeight, left: 0, top: 0, safe: {}
+    };
+    const header = $(".workspace-header");
+    const headerBottom = header ? header.getBoundingClientRect().bottom : 0;
+    return {
+      ...view,
+      safe: {
+        ...(view.safe || {}),
+        top: Math.max(view.safe?.top || 0, Math.max(0, headerBottom - (view.top || 0)))
+      }
+    };
+  }
+
+  function positionPencilPalette(anchor) {
+    const host = paletteHost();
+    if (!host || !Pencil || !host.classList.contains("is-open")) return;
+    const size = {
+      width: host.offsetWidth || 292,
+      height: host.offsetHeight || 320
+    };
+    const placed = Pencil.placePalette(
+      anchor || lastPaletteAnchor() || defaultPaletteAnchor(),
+      size,
+      paletteViewport(),
+      avoidRectsForPalette()
+    );
+    host.style.left = `${Math.round(placed.x)}px`;
+    host.style.top = `${Math.round(placed.y)}px`;
+  }
+
+  function syncPencilPalette() {
+    if (!Pencil) return;
+    const host = paletteHost();
+    const chip = toolChipHost();
+    const snapshot = {
+      tool: canonicalTool(),
+      config: currentToolRecord() || Pencil.toolPreset(state.tool),
+      mode: state.paletteMode,
+      canUndo: Boolean(state.history.length),
+      canRedo: Boolean(state.future.length)
+    };
+    Pencil.syncPalette(host, snapshot);
+    Pencil.syncToolChip(chip, snapshot);
+    if (state.paletteMode !== "closed") positionPencilPalette();
+  }
+
+  function setPaletteDrawingLock(active) {
+    document.body.classList.toggle("is-inking", Boolean(active));
+    paletteHost()?.classList.toggle("is-drawing", Boolean(active));
+  }
+
+  function closePencilPalette() {
+    const host = paletteHost();
+    if (!host) {
+      state.paletteMode = "closed";
+      return;
+    }
+    host.classList.remove("is-open");
+    host.setAttribute("aria-hidden", "true");
+    host.inert = true;
+    state.paletteMode = "closed";
+    const toggle = $("#pencil-palette-button");
+    if (toggle) {
+      toggle.classList.remove("is-open");
+      toggle.setAttribute("aria-expanded", "false");
+    }
+    const chip = toolChipHost();
+    if (chip) chip.hidden = false;
+  }
+
+  function openPencilPalette(position) {
+    const host = paletteHost();
+    if (!host || !Pencil) return;
+    const anchor = position || lastPaletteAnchor() || defaultPaletteAnchor();
+    if (anchor) state.lastPenScreen = { x: anchor.x, y: anchor.y };
+    host.inert = false;
+    host.setAttribute("aria-hidden", "false");
+    host.classList.add("is-open");
+    state.paletteMode = "temporary";
+    const toggle = $("#pencil-palette-button");
+    if (toggle) {
+      toggle.classList.add("is-open");
+      toggle.setAttribute("aria-expanded", "true");
+    }
+    const chip = toolChipHost();
+    if (chip) chip.hidden = true;
+    syncPencilPalette();
+    positionPencilPalette(anchor);
+    requestAnimationFrame(() => positionPencilPalette(anchor));
+  }
+
+  function togglePencilPalette(position) {
+    if (state.paletteMode === "closed") openPencilPalette(position);
+    else closePencilPalette();
+  }
+
+  function setToolbarVisible(visible, { persist = true } = {}) {
+    const next = Boolean(visible);
+    const camera = {
+      x: state.camera.x, y: state.camera.y,
+      width: state.camera.width, height: state.camera.height
+    };
+    const tool = state.tool;
+    state.toolbarVisible = next;
+    document.body.classList.toggle("is-focus-mode", !next);
+    const button = $("#focus-mode-button");
+    if (button) {
+      button.setAttribute("aria-pressed", String(!next));
+      button.title = next ? "Focus Mode" : "Show editing toolbar";
+      button.setAttribute("aria-label", next ? "Focus Mode" : "Show editing toolbar");
+    }
+    if (persist) persistPencilPrefs();
+    requestAnimationFrame(() => {
+      state.camera.x = camera.x;
+      state.camera.y = camera.y;
+      state.camera.width = camera.width;
+      state.tool = tool;
+      syncCameraAspect();
+    });
+  }
+
+  function applyPencilChrome() {
+    setToolbarVisible(state.toolbarVisible, { persist: false });
+    const auto = $("#auto-hide-toolbar");
+    if (auto) auto.checked = Boolean(state.autoHideToolbar);
+    const chip = toolChipHost();
+    if (chip) chip.hidden = state.paletteMode !== "closed";
+  }
+
+  function noteToolbarIdle() {
+    clearTimeout(noteToolbarIdle.timer);
+    if (!state.autoHideToolbar || !state.toolbarVisible) return;
+    noteToolbarIdle.timer = setTimeout(() => {
+      if (!state.autoHideToolbar || inkIsActive()) return;
+      setToolbarVisible(false);
+    }, 8000);
+  }
+
+  function hidePencilUiForStudy() {
+    if (state.paletteMode !== "closed") closePencilPalette();
+    const chip = toolChipHost();
+    if (chip) chip.hidden = true;
+  }
+
+  function restorePencilUiAfterStudy() {
+    const chip = toolChipHost();
+    if (chip) chip.hidden = state.paletteMode !== "closed";
+    syncPencilPalette();
+  }
+
+  function hideHoverCursor() {
+    const cursor = hoverCursorHost();
+    if (cursor) cursor.hidden = true;
+  }
+
+  function updateHoverCursor(event) {
+    const cursor = hoverCursorHost();
+    if (!cursor || !event || event.pointerType !== "pen" || event.buttons !== 0 || inkIsActive()) {
+      hideHoverCursor();
+      return;
+    }
+    const rect = sceneRect();
+    const zoom = rect.width && state.camera.width ? rect.width / state.camera.width : 1;
+    const size = Math.max(6, currentToolWidth() * zoom);
+    cursor.hidden = false;
+    cursor.style.width = `${size}px`;
+    cursor.style.height = `${size}px`;
+    cursor.style.left = `${event.clientX}px`;
+    cursor.style.top = `${event.clientY}px`;
+    cursor.style.borderColor = currentToolColor();
+  }
+
+  function notePenPose(event) {
+    if (!event || event.pointerType !== "pen") return;
+    state.lastPenScreen = { x: event.clientX, y: event.clientY };
+    state.pencilAdapter?.notePenPose?.(event);
+    if (event.buttons === 0) updateHoverCursor(event);
+    else hideHoverCursor();
+  }
+
+  function eventFromEditorChrome(event) {
+    const node = event.target;
+    if (!node || typeof node.closest !== "function") return false;
+    return Boolean(node.closest(
+      "#study-sheet, #study-drawer, #pencil-palette, #pencil-tool-chip, #chrome-menu, #gestures-help"
+    ));
   }
 
   function logCamera(phase, extra = {}) {
@@ -2924,9 +3320,7 @@
   }
 
   function eventFromStudyUi(event) {
-    const node = event.target;
-    if (!node || typeof node.closest !== "function") return false;
-    return Boolean(node.closest("#study-sheet, #study-drawer"));
+    return eventFromEditorChrome(event);
   }
 
   function blurStudyUi() {
@@ -3108,12 +3502,21 @@
     }
     const previousObjects = state.objects;
     const rawPath = interaction.liveD || livePathFromPoints(interaction.points);
+    const avgPressure = Pencil ? Pencil.averagePressure(interaction.points) : null;
+    const committedWidth = Pencil
+      ? Pencil.effectiveStrokeWidth(
+        interaction.baseWidth || interaction.width,
+        avgPressure,
+        interaction.pressureSensitivity || 0
+      )
+      : interaction.width;
     const object = {
       id: uid("stroke"), type: interaction.objectType,
       points: interaction.points,
       d: rawPath,
-      color: interaction.color, width: interaction.width,
+      color: interaction.color, width: committedWidth,
       opacity: interaction.opacity, tx: 0, ty: 0, sx: 1, sy: 1, erasures: [],
+      ink: interaction.ink || interaction.tool || "pen",
       origin: "student",
       folderId: state.lecture.folderId || "",
       createdAt: Date.now() / 1000
@@ -3226,6 +3629,7 @@
     }
     rememberPointer(event);
     beginFingerTap(event);
+    notePenPose(event);
     state.penHud.downs += 1;
     if (event.pointerType !== "touch") {
       try { $("#world-scene")?.focus({ preventScroll: true }); } catch (_) {}
@@ -3261,12 +3665,12 @@
       width: state.camera.width, height: state.camera.height
     };
     const point = screenToCanvas(event.clientX, event.clientY, liveCamera, liveRect);
-    const tool = state.tool;
-    if ((tool === "pen" || tool === "highlighter") && maybePencilDoubleTap(event)) {
+    const tool = canonicalTool();
+    if (isInkTool(tool) && maybePencilDoubleTap(event)) {
       releaseCapturedPointer(event.pointerId);
       return;
     }
-    if (tool === "pen" || tool === "highlighter") {
+    if (isInkTool(tool)) {
       const handle = hitResizeHandle(event);
       const union = selectedUnionBounds();
       if (handle && union && state.selected.size) {
@@ -3326,10 +3730,13 @@
         rawCount: 1,
         renderedCount: 0,
         usedRaw: false,
-        objectType: tool === "highlighter" ? "highlighter" : "stroke",
+        objectType: Pencil ? Pencil.toolObjectType(tool) : (tool === "highlighter" ? "highlighter" : "stroke"),
+        ink: Pencil ? Pencil.toolPreset(tool).ink : tool,
         color: currentToolColor(),
         width: currentToolWidth(),
-        opacity: tool === "highlighter" ? .28 : 1,
+        baseWidth: currentToolWidth(),
+        opacity: currentToolOpacity(),
+        pressureSensitivity: currentPressureSensitivity(),
         sceneRect: liveRect,
         drawCamera: liveCamera,
         liveD: "",
@@ -3337,6 +3744,8 @@
       };
       activeInk = interaction;
       state.interaction = interaction;
+      setPaletteDrawingLock(true);
+      if (state.paletteMode === "temporary") closePencilPalette();
       appendLivePoints(interaction, [point]);
       flushLiveStroke(interaction);
       editorLog("STROKE BEGIN", {
@@ -3511,6 +3920,7 @@
         state.interaction?.pointerId !== event.pointerId) {
       return;
     }
+    notePenPose(event);
     if (state.interaction || state.pointers.has(event.pointerId)) {
       event.preventDefault();
     }
@@ -3787,7 +4197,7 @@
 
   function eraseAlongSegment(from, to) {
     const erasedIds = state.interaction?.erasedIds;
-    const radius = Math.max(4, (state.eraserSize || 16) / 2);
+    const radius = Math.max(4, ((currentToolRecord("object-eraser")?.width || state.eraserSize || 16)) / 2);
     const minX = Math.min(from.x, to.x) - radius;
     const minY = Math.min(from.y, to.y) - radius;
     const segmentBox = {
@@ -3970,7 +4380,13 @@
       interaction.lastPoint = last;
       interaction.current = last;
     }
-    if (interaction.kind === "draw") activeInk = null;
+    if (interaction.kind === "draw") {
+      activeInk = null;
+      setPaletteDrawingLock(false);
+    }
+    if (interaction.kind === "draw" || interaction.kind === "pan" || interaction.kind === "pinch") {
+      noteToolbarIdle();
+    }
     state.interaction = null;
     forgetPointer(interaction.pointerId);
     releaseCapturedPointer(interaction.pointerId);
@@ -4122,6 +4538,7 @@
   }
 
   function pointerLeave(event) {
+    if (event.pointerType === "pen" && !inkIsActive()) hideHoverCursor();
     if (state.interaction?.pointerId !== event.pointerId) return;
     editorLog("POINTER LEAVE", {
       pointerId: event.pointerId,
@@ -4282,7 +4699,15 @@
         event.preventDefault();
         editTextObject(object.id);
       }
+    } else if ((key === "t" || code === "KeyT") && !meta) {
+      event.preventDefault();
+      togglePencilPalette(lastPaletteAnchor());
     } else if (event.key === "Escape") {
+      if (state.paletteMode !== "closed") {
+        event.preventDefault();
+        closePencilPalette();
+        return;
+      }
       if (state.interaction) cancelTransientInteraction("escape");
       state.selected.clear();
       invalidateSelectionUnion();
@@ -4317,14 +4742,38 @@
   }
 
   function renderMarkdownInto(target, source) {
-    const renderer = globalThis.renderStudyMarkdown;
-    if (typeof renderer === "function") {
-      target.append(renderer(source));
-      return;
+    if (!target) return;
+    const paint = () => {
+      target.replaceChildren();
+      const renderer = globalThis.renderStudyMarkdown;
+      if (typeof renderer === "function") {
+        target.append(renderer(source));
+        return;
+      }
+      const p = document.createElement("p");
+      p.textContent = source || "";
+      target.append(p);
+    };
+    paint();
+    if (!globalThis.katex?.renderToString && globalThis.hasMathMarkup?.(source)) {
+      const started = Date.now();
+      const timer = window.setInterval(() => {
+        if (globalThis.katex?.renderToString || Date.now() - started > 4000) {
+          window.clearInterval(timer);
+          if (globalThis.katex?.renderToString) paint();
+        }
+      }, 80);
     }
-    const p = document.createElement("p");
-    p.textContent = source || "";
-    target.append(p);
+  }
+
+  function setStudyHeading(source) {
+    const title = $("#study-title");
+    if (!title) return;
+    const text = source || "Explanation";
+    title.setAttribute("aria-label", String(text).replace(/\$\$?|\\[()[\]]/g, "").replace(/\s+/g, " ").trim() || text);
+    const fill = globalThis.fillStudyRichText;
+    if (typeof fill === "function") fill(title, text);
+    else title.textContent = text;
   }
 
   function actionLabel(kind) {
@@ -4407,7 +4856,9 @@
       button.dataset.studyId = item.id;
       if (item.id === state.activeStudyId) button.classList.add("is-active");
       const title = document.createElement("strong");
-      title.textContent = item.title || "Explanation";
+      const fill = globalThis.fillStudyRichText;
+      if (typeof fill === "function") fill(title, item.title || "Explanation");
+      else title.textContent = item.title || "Explanation";
       const preview = document.createElement("span");
       preview.textContent = String(item.answer || "").replace(/\s+/g, " ").slice(0, 110);
       button.append(title, preview);
@@ -4467,6 +4918,7 @@
 
   function openStudySheet() {
     resetGestureState("study-open");
+    hidePencilUiForStudy();
     $("#study-sheet").hidden = false;
     $("#study-drawer").hidden = true;
     studyLog("PANEL", { action: "open", ...cameraPanZoom(), gesture: state.cameraGesture });
@@ -4478,6 +4930,8 @@
     $("#study-sheet").hidden = true;
     $("#study-sheet")?.classList.remove("is-fresh");
     setStudyStatus("");
+    setStudyProgress(false);
+    restorePencilUiAfterStudy();
     studyLog("PANEL", { action: "close", ...cameraPanZoom(), gesture: state.cameraGesture });
   }
 
@@ -4493,11 +4947,13 @@
     if (!interaction) return;
     state.activeStudyId = id;
     $("#study-kicker").textContent = fresh ? "New explanation" : "Saved explanation";
-    $("#study-title").textContent = interaction.title || "Explanation";
+    setStudyHeading(interaction.title || "Explanation");
     $("#study-sheet")?.classList.toggle("is-fresh", Boolean(fresh));
     renderStudyConversation(interaction, { scrollToLatest: scrollToLatest || fresh });
     showStudyActions(true);
     setStudyStatus("");
+    setStudyGuideMode(false);
+    setStudyProgress(false);
     openStudySheet();
     renderStudyList();
   }
@@ -4787,15 +5243,17 @@
     state.pendingStudyAction = action;
     setStudyBusy(true);
     $("#study-kicker").textContent = action === "check_my_work" ? "Checking work" : "Explaining selection";
-    $("#study-title").textContent = {
+    setStudyHeading({
       explain: "Explain",
       explain_across_boards: "Across boards",
       where_from: "Where this came from",
       check_my_work: "Check my work"
-    }[action] || "Explain";
+    }[action] || "Explain");
     showStudyActions(false);
+    setStudyGuideMode(false);
     $("#study-sheet")?.classList.add("is-fresh");
     setStudyStatus("");
+    setStudyProgress(false);
     openStudySheet();
     const body = $("#study-body");
     if (body) {
@@ -4836,7 +5294,7 @@
       renderStudyMarkers();
     } catch (error) {
       if (token !== state.studyRequestToken) return;
-      $("#study-title").textContent = "Couldn't explain this";
+      setStudyHeading("Couldn't explain this");
       setStudyStatus(error.message || "Couldn't explain this right now. Your board is still saved.", true);
       showStudyActions(false);
     } finally {
@@ -5053,6 +5511,124 @@
     }
   }
 
+  function studyGuideContent(guide = state.lecture.studyGuide) {
+    return String(guide?.content || guide?.answer || "").trim();
+  }
+
+  function syncStudyGuideButton() {
+    const button = $("#study-guide-button");
+    if (!button) return;
+    if (studyGuideBusy) {
+      button.textContent = "Generating…";
+      button.disabled = true;
+      return;
+    }
+    button.disabled = false;
+    button.textContent = studyGuideContent() ? "Study Guide" : "Generate Study Guide";
+  }
+
+  function setStudyGuideMode(active) {
+    const regen = $("#regenerate-study-guide-sheet");
+    if (regen) regen.hidden = !active;
+  }
+
+  function setStudyProgress(visible, label = "", percent = null) {
+    const progress = $("#study-progress");
+    const bar = $("#study-progress-bar");
+    const caption = $("#study-progress-label");
+    if (progress) progress.hidden = !visible;
+    if (caption) caption.textContent = label || "Generating study guide…";
+    if (progress) progress.classList.toggle("is-determinate", percent != null);
+    if (bar && percent != null) {
+      const value = Math.max(4, Math.min(100, Number(percent) || 0));
+      progress?.style.setProperty("--study-progress", `${value}%`);
+      bar.setAttribute("aria-valuenow", String(Math.round(value)));
+    } else {
+      bar?.removeAttribute("aria-valuenow");
+    }
+    if (!visible && studyGuideProgressTimer) {
+      window.clearInterval(studyGuideProgressTimer);
+      studyGuideProgressTimer = 0;
+    }
+  }
+
+  function startStudyGuideProgress() {
+    const steps = [
+      "Reading lecture notes…",
+      "Organizing concepts…",
+      "Writing the study guide…",
+      "Formatting math…"
+    ];
+    let step = 0;
+    setStudyProgress(true, steps[0], 12);
+    if (studyGuideProgressTimer) window.clearInterval(studyGuideProgressTimer);
+    studyGuideProgressTimer = window.setInterval(() => {
+      step = Math.min(steps.length - 1, step + 1);
+      setStudyProgress(true, steps[step], 18 + step * 22);
+    }, 4500);
+  }
+
+  function applyStudySheetSize(width, height) {
+    const sheet = $("#study-sheet");
+    if (!sheet) return;
+    const maxWidth = Math.max(280, window.innerWidth - 24);
+    const maxHeight = Math.max(220, window.innerHeight - 72);
+    const nextWidth = Math.max(280, Math.min(maxWidth, width));
+    const nextHeight = Math.max(240, Math.min(maxHeight, height));
+    sheet.classList.add("is-resized");
+    sheet.style.width = `${Math.round(nextWidth)}px`;
+    sheet.style.height = `${Math.round(nextHeight)}px`;
+    sheet.style.maxHeight = "calc(100vh - 72px)";
+  }
+
+  function persistStudySheetSize() {
+    const sheet = $("#study-sheet");
+    if (!sheet) return;
+    try {
+      localStorage.setItem("boardlift-study-sheet-size", JSON.stringify({
+        width: Math.round(sheet.getBoundingClientRect().width),
+        height: Math.round(sheet.getBoundingClientRect().height)
+      }));
+    } catch (_) { /* ignore quota / private mode */ }
+  }
+
+  function restoreStudySheetSize() {
+    try {
+      const stored = JSON.parse(localStorage.getItem("boardlift-study-sheet-size") || "null");
+      if (stored?.width && stored?.height) applyStudySheetSize(stored.width, stored.height);
+    } catch (_) { /* keep default size */ }
+  }
+
+  function bindStudySheetResize() {
+    const handle = $("#study-sheet-resize");
+    const sheet = $("#study-sheet");
+    if (!handle || !sheet) return;
+    let drag = null;
+    handle.addEventListener("pointerdown", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = sheet.getBoundingClientRect();
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, width: rect.width, height: rect.height };
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener("pointermove", event => {
+      if (!drag || drag.id !== event.pointerId) return;
+      event.preventDefault();
+      applyStudySheetSize(
+        drag.width + (drag.x - event.clientX),
+        drag.height + (drag.y - event.clientY)
+      );
+    });
+    const endDrag = event => {
+      if (!drag || drag.id !== event.pointerId) return;
+      persistStudySheetSize();
+      drag = null;
+    };
+    handle.addEventListener("pointerup", endDrag);
+    handle.addEventListener("pointercancel", endDrag);
+    restoreStudySheetSize();
+  }
+
   function renderStudyGuidePanel() {
     const panel = $("#study-guide-panel");
     const body = $("#study-guide-body");
@@ -5066,14 +5642,41 @@
     panel.hidden = false;
     if (stale) stale.hidden = !state.lecture.stale;
     body.replaceChildren();
-    if (!guide?.content) {
+    const content = studyGuideContent(guide);
+    if (!content) {
       const empty = document.createElement("p");
       empty.className = "library-message";
       empty.textContent = "Generate a study guide for this lecture.";
       body.append(empty);
       return;
     }
-    renderMarkdownInto(body, guide.content);
+    renderMarkdownInto(body, content);
+  }
+
+  function openStudyGuideSheet() {
+    const guide = state.lecture.studyGuide;
+    const content = studyGuideContent(guide);
+    $("#study-kicker").textContent = "Lecture study guide";
+    setStudyHeading(guide?.title || "Study guide");
+    showStudyActions(false);
+    setStudyGuideMode(Boolean(content));
+    const body = $("#study-body");
+    if (body) {
+      if (content) renderMarkdownInto(body, content);
+      else body.replaceChildren();
+    }
+    setStudyStatus(state.lecture.stale ? "Study guide may be outdated" : "");
+    setStudyProgress(false);
+    openStudySheet();
+  }
+
+  function onStudyGuideButton() {
+    if (studyGuideBusy) return;
+    if (studyGuideContent()) {
+      openStudyGuideSheet();
+      return;
+    }
+    generateStudyGuide();
   }
 
   async function generateStudyGuide() {
@@ -5081,7 +5684,18 @@
       toast("Open or create a lecture folder first.", true);
       return;
     }
-    setStudyStatus("Generating study guide…");
+    if (studyGuideBusy) return;
+    studyGuideBusy = true;
+    syncStudyGuideButton();
+    $("#study-kicker").textContent = "Lecture study guide";
+    setStudyHeading(state.lecture.studyGuide?.title || "Study guide");
+    showStudyActions(false);
+    setStudyGuideMode(false);
+    const body = $("#study-body");
+    if (body) body.replaceChildren();
+    setStudyStatus("");
+    startStudyGuideProgress();
+    openStudySheet();
     try {
       const payload = await requestStudy(
         `/api/folders/${encodeURIComponent(state.lecture.folderId)}/study-guide`,
@@ -5090,19 +5704,15 @@
       state.lecture.studyGuide = payload.study_guide || payload.studyGuide;
       state.lecture.stale = Boolean(payload.study_guide_stale);
       renderStudyGuidePanel();
-      $("#study-kicker").textContent = "Lecture study guide";
-      $("#study-title").textContent = "Study guide";
-      const body = $("#study-body");
-      if (body && state.lecture.studyGuide?.content) {
-        body.replaceChildren();
-        renderMarkdownInto(body, state.lecture.studyGuide.content);
-      }
-      showStudyActions(false);
-      openStudySheet();
-      setStudyStatus(state.lecture.stale ? "Study guide may be outdated" : "");
+      setStudyProgress(true, "Finishing…", 96);
+      openStudyGuideSheet();
     } catch (error) {
+      setStudyProgress(false);
       setStudyStatus(error.message || "Couldn't generate a study guide right now.", true);
       openStudySheet();
+    } finally {
+      studyGuideBusy = false;
+      syncStudyGuideButton();
     }
   }
 
@@ -5183,8 +5793,10 @@
     $("#explain-across-button")?.addEventListener("click", () => explainSelection("explain_across_boards"));
     $("#where-from-button")?.addEventListener("click", () => explainSelection("where_from"));
     $("#check-work-button")?.addEventListener("click", () => explainSelection("check_my_work"));
-    $("#study-guide-button")?.addEventListener("click", generateStudyGuide);
+    $("#study-guide-button")?.addEventListener("click", onStudyGuideButton);
     $("#regenerate-study-guide")?.addEventListener("click", generateStudyGuide);
+    $("#regenerate-study-guide-sheet")?.addEventListener("click", generateStudyGuide);
+    bindStudySheetResize();
     $("#view-new-board")?.addEventListener("click", () => {
       if (state.pendingImportedId) viewBoard(state.pendingImportedId);
       const chip = $("#view-new-board");
@@ -5203,8 +5815,11 @@
       drawer.hidden = !drawer.hidden;
       if (!drawer.hidden) {
         closeStudySheet();
+        hidePencilUiForStudy();
         renderStudyGuidePanel();
         renderStudyList();
+      } else {
+        restorePencilUiAfterStudy();
       }
       resetGestureState(opening ? "study-drawer-open" : "study-drawer-close");
       if (!opening) blurStudyUi();
@@ -5212,47 +5827,164 @@
     $("#close-study-drawer")?.addEventListener("click", () => {
       $("#study-drawer").hidden = true;
       blurStudyUi();
+      restorePencilUiAfterStudy();
       resetGestureState("study-drawer-close");
     });
     $("#rename-board")?.addEventListener("click", renameCurrentBoard);
+  }
+
+  function bindPencilPalette() {
+    if (!Pencil) return;
+    const host = paletteHost();
+    const chip = toolChipHost();
+    Pencil.buildPalette(host);
+    Pencil.buildToolChip(chip);
+    state.pencilAdapter = new Pencil.PencilInteractionAdapter();
+    state.pencilCapabilities = state.pencilAdapter.capabilities;
+    state.pencilAdapter.bindHost({
+      openPalette: position => openPencilPalette(position),
+      closePalette: () => closePencilPalette()
+    });
+    state.pencilAdapter.onSqueeze(detail => {
+      const position = detail?.position || lastPaletteAnchor();
+      const action = state.pencilAdapter.getPreferredAction();
+      if (action === "switchPreviousTool") {
+        setTool(state.lastTool || "select");
+        return;
+      }
+      openPencilPalette(position);
+    });
+    state.pencilAdapter.onDoubleTap(() => {
+      setTool(state.lastTool || "select");
+    });
+    window.addEventListener("message", event => {
+      const data = event.data;
+      if (!data || data.channel !== "pencil-native-bridge") return;
+      state.pencilAdapter.ingestNativeEvent(data.kind, data.detail || {});
+    });
+    globalThis.PencilNative = {
+      capabilities: () => state.pencilCapabilities,
+      ingest: (kind, detail) => state.pencilAdapter?.ingestNativeEvent(kind, detail)
+    };
+    const stopPaletteLeak = event => {
+      event.stopPropagation();
+    };
+    host?.addEventListener("pointerdown", stopPaletteLeak);
+    host?.addEventListener("pointermove", stopPaletteLeak);
+    host?.addEventListener("pointerup", stopPaletteLeak);
+    host?.addEventListener("touchstart", stopPaletteLeak);
+    chip?.addEventListener("pointerdown", stopPaletteLeak);
+    if (host) host.inert = true;
+    host?.addEventListener("click", event => {
+      const toolButton = event.target.closest?.("[data-tool]");
+      if (toolButton) {
+        setTool(toolButton.dataset.tool);
+        return;
+      }
+      const colorButton = event.target.closest?.("[data-color]");
+      if (colorButton) {
+        setInkColor(colorButton.dataset.color, { applySelection: true });
+        return;
+      }
+      const widthButton = event.target.closest?.("[data-width-preset]");
+      if (widthButton) {
+        const presets = Pencil.WIDTH_PRESETS[canonicalTool()];
+        const width = presets?.[widthButton.dataset.widthPreset];
+        if (width) setInkWidth(width);
+        return;
+      }
+      const history = event.target.closest?.("[data-history]");
+      if (history?.dataset.history === "undo") undo();
+      if (history?.dataset.history === "redo") redo();
+    });
+    host?.querySelector("#palette-custom-color")?.addEventListener("input", event => {
+      setInkColor(event.target.value);
+    });
+    host?.querySelector("#palette-custom-color")?.addEventListener("change", event => {
+      setInkColor(event.target.value, { applySelection: true });
+    });
+    host?.querySelector("#palette-width-slider")?.addEventListener("input", event => {
+      setInkWidth(event.target.value);
+    });
+    host?.querySelector("#palette-opacity-slider")?.addEventListener("input", event => {
+      setInkOpacity(event.target.value);
+    });
+    chip?.addEventListener("click", () => openPencilPalette(lastPaletteAnchor()));
+    $("#pencil-palette-button")?.addEventListener("click", () => {
+      togglePencilPalette(lastPaletteAnchor());
+    });
+    $("#focus-mode-button")?.addEventListener("click", () => {
+      setToolbarVisible(!state.toolbarVisible);
+    });
+    document.addEventListener("pointerdown", event => {
+      if (state.paletteMode !== "temporary") return;
+      if (event.target?.closest?.("#pencil-palette, #pencil-palette-button, #pencil-tool-chip")) return;
+      closePencilPalette();
+    }, true);
+    window.addEventListener("resize", () => {
+      if (state.paletteMode !== "closed") positionPencilPalette();
+    });
+    window.visualViewport?.addEventListener("resize", () => {
+      if (state.paletteMode !== "closed") positionPencilPalette();
+    });
+    syncPencilPalette();
+  }
+
+  function bindChromeMenu() {
+    const button = $("#chrome-menu-button");
+    const menu = $("#chrome-menu");
+    if (!button || !menu) return;
+    const close = () => {
+      menu.hidden = true;
+      button.setAttribute("aria-expanded", "false");
+    };
+    button.addEventListener("click", () => {
+      const opening = menu.hidden;
+      menu.hidden = !opening;
+      button.setAttribute("aria-expanded", String(opening));
+    });
+    document.addEventListener("pointerdown", event => {
+      if (menu.hidden) return;
+      if (event.target?.closest?.("#chrome-menu, #chrome-menu-button")) return;
+      close();
+    });
+    $("#menu-import")?.addEventListener("click", () => {
+      close();
+      $("#import-whiteboard")?.click();
+    });
+    $("#menu-study-guide")?.addEventListener("click", () => {
+      close();
+      $("#study-guide-button")?.click();
+    });
+    $("#menu-export")?.addEventListener("click", () => {
+      close();
+      $("#export-button")?.click();
+    });
+    $("#menu-gestures")?.addEventListener("click", () => {
+      close();
+      $("#gestures-help-button")?.click();
+    });
+    $("#auto-hide-toolbar")?.addEventListener("change", event => {
+      state.autoHideToolbar = Boolean(event.target.checked);
+      persistPencilPrefs();
+      if (state.autoHideToolbar) noteToolbarIdle();
+    });
   }
 
   function bindEditor() {
     $$(".tool-button").forEach(button =>
       button.addEventListener("click", () => setTool(button.dataset.tool)));
     $$(".color-chip").forEach(button => button.addEventListener("click", () => {
-      const color = button.dataset.color;
-      if (state.tool === "highlighter") state.highlighterColor = color;
-      else state.penColor = color;
-      state.color = color;
-      applyColorToSelection(color);
-      $$(".color-chip").forEach(item => {
-        const active = item === button;
-        item.classList.toggle("is-active", active);
-        item.setAttribute("aria-pressed", String(active));
-      });
-      $("#custom-color").value = color;
+      setInkColor(button.dataset.color, { applySelection: true });
     }));
-    $("#custom-color").addEventListener("input", event => {
-      const color = event.target.value;
-      if (state.tool === "highlighter") state.highlighterColor = color;
-      else state.penColor = color;
-      state.color = color;
-      $$(".color-chip").forEach(item => item.classList.remove("is-active"));
+    $("#custom-color")?.addEventListener("input", event => {
+      setInkColor(event.target.value);
     });
-    $("#custom-color").addEventListener("change", event => {
-      const color = event.target.value;
-      if (state.tool === "highlighter") state.highlighterColor = color;
-      else state.penColor = color;
-      state.color = color;
-      applyColorToSelection(color);
+    $("#custom-color")?.addEventListener("change", event => {
+      setInkColor(event.target.value, { applySelection: true });
     });
-    $("#stroke-size").addEventListener("input", event => {
-      const value = Number(event.target.value);
-      if (state.tool === "highlighter") state.highlighterSize = value;
-      else if (state.tool === "pixel-eraser") state.eraserSize = value;
-      else state.penSize = value;
-      state.size = value;
+    $("#stroke-size")?.addEventListener("input", event => {
+      setInkWidth(event.target.value);
     });
     $("#text-size")?.addEventListener("pointerdown", () => {
       $("#text-size").dataset.history = "1";
@@ -5285,11 +6017,12 @@
       const overlay = $("#canvas-html-overlay");
       if (overlay) overlay.style.display = event.target.checked ? "" : "none";
     });
-    $("#undo-button").addEventListener("click", undo);
-    $("#redo-button").addEventListener("click", redo);
+    $("#undo-button")?.addEventListener("click", undo);
+    $("#redo-button")?.addEventListener("click", redo);
     $("#group-button")?.addEventListener("click", groupSelection);
     $("#ungroup-button")?.addEventListener("click", ungroupSelection);
-    $("#save-button").addEventListener("click", () => saveEditor(true));
+    $("#save-button")?.addEventListener("click", () => saveEditor(true));
+    $("#header-save-button")?.addEventListener("click", () => saveEditor(true));
     $("#clear-button")?.addEventListener("click", () => {
       if (!state.objects.length || !confirm("Clear all editable user objects?")) return;
       const before = snapshot();
@@ -5311,7 +6044,12 @@
     $("#home-button")?.addEventListener("click", resetView);
     $("#toolbar-study-notes")?.addEventListener("click", () => $("#study-notes-button")?.click());
     $("#toolbar-new-board")?.addEventListener("click", () => $("#import-whiteboard")?.click());
+    bindPencilPalette();
+    bindChromeMenu();
     bindGesturesHelp();
+    $(".drawing-toolbar")?.addEventListener("pointerdown", () => {
+      clearTimeout(noteToolbarIdle.timer);
+    });
     if (typeof ResizeObserver === "function") {
       const observer = new ResizeObserver(() => syncCameraAspect());
       observer.observe($("#world-scene"));
@@ -5582,7 +6320,17 @@
     }
   }
 
+  function applyLoadedPencilPrefs() {
+    if (!Pencil) return;
+    const prefs = Pencil.loadPrefs();
+    state.toolConfig = prefs;
+    state.toolbarVisible = prefs.toolbarVisible;
+    state.autoHideToolbar = prefs.autoHideToolbar;
+    syncToolMirrors();
+  }
+
   async function initEditor() {
+    applyLoadedPencilPrefs();
     $("#corner-workspace").hidden = true;
     $("#editor-workspace").hidden = false;
     applyLectureData(state.data);
@@ -5667,8 +6415,15 @@
       const chip = $("#view-new-board");
       if (chip) chip.hidden = false;
     }
-    setTool("pen");
+    if (new URLSearchParams(location.search).get("studyGuide") === "1" && studyGuideContent()) {
+      openStudyGuideSheet();
+    }
+    applyPencilChrome();
+    setTool(state.toolConfig?.tool || "pen");
     updatePenHud();
+    if (state.pencilCapabilities) {
+      editorLog("PENCIL CAPABILITIES", state.pencilCapabilities);
+    }
     setSaveStatus(state.dirty ? "Unsaved changes" : "Saved");
     editorLog("EDITOR READY", {
       imported: state.importedObjects.length,

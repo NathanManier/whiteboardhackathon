@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -104,17 +106,68 @@ def stored_lecture_context(value: Any) -> dict[str, Any] | None:
     }
 
 
+def unescape_study_newlines(text: str) -> str:
+    value = str(text or "")
+    value = re.sub(r"\$(?:\\n)+\$", "\n\n", value)
+    value = re.sub(r"\$(?:\n)+\$", "\n\n", value)
+    value = re.sub(r"\$\\n([A-Z][^$\n]{0,80})\$", r"\n\1", value)
+    value = re.sub(r"\$\\n(?![A-Za-z])", "\n", value)
+    value = re.sub(r"\$\\n(?=[A-Z])", "\n", value)
+    value = re.sub(r"\$\n([A-Z][^$\n]{0,80})\$", r"\n\1", value)
+    value = re.sub(r"(?<!\$)\$(?:\n+)(?!\$)", "\n", value)
+    value = re.sub(r"(?<!\\)\\n(?![A-Za-z])", "\n", value)
+    value = re.sub(r"(?<!\\)\\t(?![A-Za-z])", "\t", value)
+    value = re.sub(r"(?<!\\)\\r(?![A-Za-z])", "\n", value)
+    value = re.sub(r"\$(\s*#{1,4}\s)", r"\1", value)
+    return value
+
+
+def recover_study_guide_markdown(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    value: dict[str, Any] = {}
+    if text.lstrip().startswith("{") and '"content"' in text:
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                value = loaded
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    loaded = json.loads(text[start : end + 1])
+                    if isinstance(loaded, dict):
+                        value = loaded
+                except json.JSONDecodeError:
+                    value = {}
+    inner = value.get("content")
+    if isinstance(inner, str) and inner.strip() and inner.strip() != text:
+        return unescape_study_newlines(inner.strip())
+    return unescape_study_newlines(text)
+
+
 def public_study_guide(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    content = str(value.get("content") or "").strip()
+    content = recover_study_guide_markdown(str(value.get("content") or ""))
     if not content:
         return None
     board_ids = value.get("source_board_ids") or value.get("sourceBoardIds") or []
     if not isinstance(board_ids, list):
         board_ids = []
+    title = str(value.get("title") or "").strip()[:120]
+    if not title and isinstance(value.get("content"), str) and value["content"].lstrip().startswith("{"):
+        try:
+            loaded = json.loads(value["content"])
+            if isinstance(loaded, dict):
+                title = str(loaded.get("title") or "").strip()[:120]
+        except json.JSONDecodeError:
+            title = ""
     return {
         "id": str(value.get("id") or "")[:32],
+        "title": title or "Lecture Study Guide",
         "generatedAt": value.get("generated_at") or value.get("generatedAt"),
         "sourceBoardIds": [str(item) for item in board_ids[:MAX_SOURCE_BOARDS] if item],
         "content": content[:80_000],
@@ -130,6 +183,7 @@ def stored_study_guide(value: Any) -> dict[str, Any] | None:
         return None
     return {
         "id": public["id"],
+        "title": public.get("title") or "Lecture Study Guide",
         "generated_at": public["generatedAt"],
         "source_board_ids": public["sourceBoardIds"],
         "content": public["content"],

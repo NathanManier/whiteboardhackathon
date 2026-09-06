@@ -269,6 +269,24 @@ class LectureWorkspaceTests(unittest.TestCase):
         lecture = next(item for item in listing["folders"] if item["id"] == folder["id"])
         self.assertTrue(lecture["study_guide_stale"])
 
+    def test_public_study_guide_unwraps_raw_json_content(self):
+        from lecture import public_study_guide
+
+        guide = public_study_guide({
+            "id": "guideoneguideone",
+            "title": "Lecture Study Guide",
+            "content": '{"title": "Lecture Study Guide", "content": "# Lecture Study Guide\\n\\nHello $\\\\times$ y."}',
+            "version": 1,
+            "stale": False,
+            "sources": [],
+        })
+        self.assertIsNotNone(guide)
+        self.assertEqual(guide["title"], "Lecture Study Guide")
+        self.assertIn("# Lecture Study Guide", guide["content"])
+        self.assertIn("Hello", guide["content"])
+        self.assertTrue(any(line.startswith("# Lecture Study Guide") for line in guide["content"].splitlines()))
+        self.assertNotIn('"title"', guide["content"])
+
     def test_library_lists_lecture_folders_without_crashing(self):
         folder = self.client.post("/api/folders", json={"name": "Physics — Cross Products"}).get_json()["folder"]
         listing = self.client.get("/api/library").get_json()

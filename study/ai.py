@@ -86,7 +86,7 @@ Write mathematics in LaTeX: inline as $...$ or \\(...\\), display as $$...$$. Us
 
 Return JSON only with this shape:
 {
-  "title": "short title for the selection",
+  "title": "short title for the selection; put any math in $...$",
   "confidence": "high" | "medium" | "low",
   "answer": "markdown explanation with these sections:\\n\\n## What this shows\\n...\\n\\n## Why it matters\\n...\\n\\n## In simple terms\\n..."
 }
@@ -104,7 +104,7 @@ Write mathematics in LaTeX and prose in Markdown.
 """ + LATEX_NOTATION_RULES + """
 Return JSON only:
 {
-  "title": "short title",
+  "title": "short title; put any math in $...$",
   "confidence": "high" | "medium" | "low",
   "answer": "markdown explanation, compact and teaching-oriented"
 }
@@ -120,7 +120,7 @@ Give several short worked examples closely related to the selected concept. Show
 
 Return JSON only:
 {
-  "title": "short title",
+  "title": "short title; put any math in $...$",
   "confidence": "high" | "medium" | "low",
   "answer": "markdown with worked examples"
 }
@@ -200,7 +200,7 @@ Write mathematics in LaTeX and prose in Markdown.
 """ + LATEX_NOTATION_RULES + """
 Return JSON only:
 {
-  "title": "short title",
+  "title": "short title; put any math in $...$",
   "confidence": "high" | "medium" | "low",
   "answer": "markdown explanation that mentions whiteboard order when evidence exists"
 }
@@ -715,6 +715,92 @@ def _load_json_object(raw: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def unescape_study_newlines(text: str) -> str:
+    """Turn leftover JSON-style \\n into real line breaks without touching \\neq."""
+    value = str(text or "")
+    value = re.sub(r"\$(?:\\n)+\$", "\n\n", value)
+    value = re.sub(r"\$(?:\n)+\$", "\n\n", value)
+    value = re.sub(r"\$\\n([A-Z][^$\n]{0,80})\$", r"\n\1", value)
+    value = re.sub(r"\$\\n(?![A-Za-z])", "\n", value)
+    value = re.sub(r"\$\\n(?=[A-Z])", "\n", value)
+    value = re.sub(r"\$\n([A-Z][^$\n]{0,80})\$", r"\n\1", value)
+    value = re.sub(r"(?<!\$)\$(?:\n+)(?!\$)", "\n", value)
+    value = re.sub(r"(?<!\\)\\n(?![A-Za-z])", "\n", value)
+    value = re.sub(r"(?<!\\)\\t(?![A-Za-z])", "\t", value)
+    value = re.sub(r"(?<!\\)\\r(?![A-Za-z])", "\n", value)
+    value = re.sub(r"\$(\s*#{1,4}\s)", r"\1", value)
+    return value
+
+
+def _extract_json_string_field(raw: str, field: str) -> str:
+    text = raw or ""
+    marker = f'"{field}"'
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    cursor = text.find(":", start + len(marker))
+    if cursor < 0:
+        return ""
+    cursor += 1
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if cursor >= len(text) or text[cursor] != '"':
+        return ""
+    cursor += 1
+    chunks: list[str] = []
+    while cursor < len(text):
+        char = text[cursor]
+        if text.startswith("$\\n$", cursor):
+            chunks.append("\n")
+            cursor += 4
+            continue
+        if char == "\\" and cursor + 1 < len(text):
+            nxt = text[cursor + 1]
+            chunks.append({"n": "\n", "t": "\t", "r": "\n", '"': '"', "\\": "\\"}.get(nxt, nxt))
+            cursor += 2
+            continue
+        if char == '"':
+            return "".join(chunks)
+        chunks.append(char)
+        cursor += 1
+    return "".join(chunks)
+
+
+def recover_study_guide_markdown(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    value = _load_json_object(text)
+    inner = value.get("content") if isinstance(value, dict) else None
+    if isinstance(inner, str) and inner.strip() and inner.strip() != text:
+        return unescape_study_newlines(inner.strip())
+    extracted = _extract_json_string_field(text, "content")
+    if extracted.strip() and extracted.strip() != text:
+        return unescape_study_newlines(extracted.strip())
+    return unescape_study_newlines(text)
+
+
+def parse_study_guide(raw: str) -> dict[str, Any]:
+    value = _load_json_object(raw)
+    content = str(value.get("content") or value.get("answer") or "").strip()
+    if not content:
+        content = recover_study_guide_markdown(raw)
+    else:
+        content = unescape_study_newlines(content)
+    content = normalize_study_math(content.strip())
+    title = str(value.get("title") or "Lecture Study Guide").strip()[:120]
+    sources = value.get("sources") if isinstance(value.get("sources"), list) else []
+    if not content:
+        raise StudyAIError("The study assistant returned an empty study guide.")
+    return {
+        "title": title or "Lecture Study Guide",
+        "answer": content,
+        "content": content,
+        "confidence": "medium",
+        "sources": [item for item in sources[:40] if isinstance(item, dict)],
+    }
+
+
 def _parse_model_json(raw: str) -> dict[str, str]:
     value = _load_json_object(raw)
     answer = normalize_study_math(str(value.get("answer") or raw or "").strip())
@@ -738,7 +824,7 @@ SOLUTION_SPLIT_RE = re.compile(
 _TEX_ONE_ARG = {
     "sqrt", "vec", "hat", "bar", "dot", "ddot", "tilde", "overline", "underline",
     "mathbf", "mathrm", "mathbb", "mathcal", "mathit", "mathsf", "mathtt",
-    "text", "textrm", "textbf", "textit", "operatorname", "boxed",
+    "text", "textrm", "textbf", "textit", "texttt", "operatorname", "boxed",
 }
 _TEX_TWO_ARG = {
     "frac", "dfrac", "tfrac", "binom", "dbinom", "tbinom", "overset", "underset",
@@ -778,15 +864,23 @@ def _tex_command_end(text: str, start: int) -> int:
         index += 1
     name = text[start + 1 : index]
     index = _skip_optional(text, index)
+    while index < len(text) and text[index] == " ":
+        index += 1
     if name in _TEX_ONE_ARG:
         index = _skip_optional(text, index)
+        while index < len(text) and text[index] == " ":
+            index += 1
         if index < len(text) and text[index] == "{":
             index = _skip_braced(text, index)
         elif index < len(text) and not text[index].isspace() and text[index] not in "$\\":
             index += 1
     elif name in _TEX_TWO_ARG:
+        while index < len(text) and text[index] == " ":
+            index += 1
         if index < len(text) and text[index] == "{":
             index = _skip_braced(text, index)
+        while index < len(text) and text[index] == " ":
+            index += 1
         if index < len(text) and text[index] == "{":
             index = _skip_braced(text, index)
     elif name == "left":
@@ -809,7 +903,7 @@ def _tex_command_end(text: str, start: int) -> int:
 def _unescape_tex_backslashes(text: str) -> str:
     previous = None
     current = text
-    pattern = re.compile(r"\\{2,}([A-Za-z]+|[()\[\]])")
+    pattern = re.compile(r"\\{2,}([A-Za-z]+|[()\[\],;:! ])")
     while current != previous:
         previous = current
         current = pattern.sub(r"\\\1", current)
@@ -871,6 +965,14 @@ def _wrap_bare_tex(text: str) -> str:
                 index += 1
                 continue
             if text[index] == "\\" and index + 1 < length and text[index + 1].isalpha():
+                name_end = index + 1
+                while name_end < length and text[name_end].isalpha():
+                    name_end += 1
+                name = text[index + 1 : name_end]
+                if name in {"n", "t", "r"} and (name_end >= length or not text[name_end].isalpha()):
+                    out.append("\n" if name == "n" or name == "r" else "\t")
+                    index = name_end
+                    continue
                 end = _tex_command_end(text, index)
                 cursor = end
                 while True:
@@ -1174,13 +1276,13 @@ def generate_study_guide(
         system=STUDY_GUIDE_SYSTEM,
         user_text="\n".join(lines),
         images=images or {},
-        max_tokens=2_400,
+        parser=parse_study_guide,
+        max_tokens=4_000,
     )
-    value = _load_json_object(result.get("answer") or "")
-    content = normalize_study_math(str(value.get("content") or result.get("answer") or "").strip())
-    sources = value.get("sources") if isinstance(value.get("sources"), list) else []
+    content = str(result.get("content") or result.get("answer") or "").strip()
+    sources = result.get("sources") if isinstance(result.get("sources"), list) else []
     return {
-        "title": str(value.get("title") or "Lecture Study Guide")[:120],
+        "title": str(result.get("title") or "Lecture Study Guide")[:120],
         "content": content,
         "sources": [item for item in sources[:40] if isinstance(item, dict)],
     }

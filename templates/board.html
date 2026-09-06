@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0b1018">
   <title>Study canvas · Digital Whiteboard</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
@@ -22,11 +22,31 @@
       <span class="save-status" id="save-status" role="status" aria-live="polite">Ready</span>
     </div>
     <div class="header-actions">
-      <button class="button button-ghost button-small lecture-action" id="import-whiteboard" type="button">+ Import Whiteboard</button>
-      <button class="button button-ghost button-small lecture-action" id="study-guide-button" type="button">Generate Study Guide</button>
-      <button class="button button-ghost button-small lecture-action" id="study-notes-button" type="button">Study notes</button>
-      <a class="button button-ghost button-small" href="/">Lectures</a>
-      <button class="button button-dark button-small" id="export-button" type="button">Export SVG</button>
+      <button class="icon-button chrome-essential" id="pencil-palette-button" type="button" title="Pencil tools" aria-label="Pencil tools" aria-expanded="false" aria-controls="pencil-palette">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4.2 20 4.2-1.1 10.2-10.2a2.15 2.15 0 0 0-3-3L5.4 15.9 4.2 20Z"/><path d="m13.2 7.2 3.6 3.6"/></svg>
+      </button>
+      <button class="icon-button chrome-essential" id="focus-mode-button" type="button" title="Focus Mode" aria-label="Focus Mode" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9V5h4"/><path d="M15 5h4v4"/><path d="M19 15v4h-4"/><path d="M9 19H5v-4"/></svg>
+      </button>
+      <button class="button button-ghost button-small lecture-action header-extended" id="import-whiteboard" type="button">+ Import Whiteboard</button>
+      <button class="button button-ghost button-small lecture-action header-extended" id="study-guide-button" type="button">Generate Study Guide</button>
+      <button class="button button-ghost button-small lecture-action chrome-essential" id="study-notes-button" type="button">Study notes</button>
+      <a class="button button-ghost button-small header-extended" href="/">Lectures</a>
+      <button class="button button-ghost button-small header-extended" id="export-button" type="button">Export SVG</button>
+      <button class="button button-dark button-small chrome-essential" id="header-save-button" type="button">Save</button>
+      <div class="chrome-menu">
+        <button class="icon-button" id="chrome-menu-button" type="button" title="More" aria-label="More" aria-haspopup="true" aria-expanded="false" aria-controls="chrome-menu">⋯</button>
+        <div class="chrome-menu-panel" id="chrome-menu" hidden>
+          <button type="button" id="menu-import">Import whiteboard</button>
+          <button type="button" id="menu-study-guide">Study guide</button>
+          <button type="button" id="menu-export">Export SVG</button>
+          <button type="button" id="menu-gestures">Gestures</button>
+          <label class="chrome-menu-item">
+            <input id="auto-hide-toolbar" type="checkbox">
+            Auto-hide toolbar when idle
+          </label>
+        </div>
+      </div>
     </div>
   </header>
 
@@ -68,11 +88,23 @@
 
     <section id="editor-workspace" class="editor-workspace editor-v2 study-canvas" hidden aria-label="Study canvas">
       <section class="canvas-column">
-        <div class="drawing-toolbar" aria-label="Drawing tools">
+        <div class="drawing-toolbar" id="drawing-toolbar" aria-label="Drawing tools">
           <div class="tool-group">
             <button class="tool-button is-active" data-tool="pen" type="button" aria-pressed="true" title="Pen">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Zm10-12 3 3"/></svg>
               <span>Pen</span>
+            </button>
+            <button class="tool-button" data-tool="marker" type="button" aria-pressed="false" title="Marker">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 20h8"/><path d="m8.4 20 2-9.2h3.2l2 9.2"/><path d="M9.6 6.4c0-2 4.8-2 4.8 0v4.2H9.6Z"/></svg>
+              <span>Marker</span>
+            </button>
+            <button class="tool-button" data-tool="highlighter" type="button" aria-pressed="false" title="Highlighter">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.2 16.2 3.6-8.6h4.4l3.6 8.6"/><path d="M7.6 12.4h8.8"/><path d="M6 19.2h12"/></svg>
+              <span>Highlighter</span>
+            </button>
+            <button class="tool-button" data-tool="pencil" type="button" aria-pressed="false" title="Pencil">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.4 4.6 5 5L8.2 20.8H3.2v-5L14.4 4.6Z"/><path d="m12.2 6.8 5 5"/></svg>
+              <span>Pencil</span>
             </button>
             <button class="tool-button" data-tool="select" type="button" aria-pressed="false" title="Lasso">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5c3 2 7 2 10 0M6 10c4 2 8 2 12 0M7 15c3 2 7 2 10 0"/></svg>
@@ -89,17 +121,17 @@
           </div>
           <div class="tool-divider"></div>
           <div class="color-tools" aria-label="Ink color">
-            <button class="color-chip is-active" data-color="#183153" style="--chip:#183153" type="button" aria-label="Navy" aria-pressed="true"></button>
-            <button class="color-chip" data-color="#111827" style="--chip:#111827" type="button" aria-label="Black" aria-pressed="false"></button>
+            <button class="color-chip is-active" data-color="#111827" style="--chip:#111827" type="button" aria-label="Black" aria-pressed="true"></button>
+            <button class="color-chip" data-color="#4b5563" style="--chip:#4b5563" type="button" aria-label="Dark gray" aria-pressed="false"></button>
+            <button class="color-chip" data-color="#dc2626" style="--chip:#dc2626" type="button" aria-label="Red" aria-pressed="false"></button>
             <button class="color-chip" data-color="#2563eb" style="--chip:#2563eb" type="button" aria-label="Blue" aria-pressed="false"></button>
-            <button class="color-chip" data-color="#e45c3a" style="--chip:#e45c3a" type="button" aria-label="Coral" aria-pressed="false"></button>
-            <button class="color-chip" data-color="#18816b" style="--chip:#18816b" type="button" aria-label="Green" aria-pressed="false"></button>
-            <button class="color-chip" data-color="#8657b5" style="--chip:#8657b5" type="button" aria-label="Purple" aria-pressed="false"></button>
-            <button class="color-chip" data-color="#ec4899" style="--chip:#ec4899" type="button" aria-label="Pink" aria-pressed="false"></button>
-            <button class="color-chip" data-color="#facc15" style="--chip:#facc15" type="button" aria-label="Yellow" aria-pressed="false"></button>
+            <button class="color-chip" data-color="#16a34a" style="--chip:#16a34a" type="button" aria-label="Green" aria-pressed="false"></button>
+            <button class="color-chip" data-color="#eab308" style="--chip:#eab308" type="button" aria-label="Yellow" aria-pressed="false"></button>
+            <button class="color-chip" data-color="#ea580c" style="--chip:#ea580c" type="button" aria-label="Orange" aria-pressed="false"></button>
+            <button class="color-chip" data-color="#7c3aed" style="--chip:#7c3aed" type="button" aria-label="Purple" aria-pressed="false"></button>
             <label class="color-pick" title="Choose a custom ink color">
               <span>Color</span>
-              <input id="custom-color" type="color" value="#183153" aria-label="Custom ink color">
+              <input id="custom-color" type="color" value="#111827" aria-label="Custom ink color">
             </label>
           </div>
           <label class="size-control">Size
@@ -118,13 +150,13 @@
               <path d="M4.5 11.2 12 4.8l7.5 6.4V20a.8.8 0 0 1-.8.8h-5.2v-5.5H10.5V20.8H5.3A.8.8 0 0 1 4.5 20Z"/>
             </svg>
           </button>
-          <button class="icon-button" id="undo-button" type="button" title="Undo" aria-label="Undo" disabled>
+          <button class="icon-button" id="undo-button" data-history="undo" type="button" title="Undo" aria-label="Undo" disabled>
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M7.2 8.2 3.8 11.6 7.2 15"/>
               <path d="M4.2 11.6H14a5 5 0 1 1 0 10"/>
             </svg>
           </button>
-          <button class="icon-button" id="redo-button" type="button" title="Redo" aria-label="Redo" disabled>
+          <button class="icon-button" id="redo-button" data-history="redo" type="button" title="Redo" aria-label="Redo" disabled>
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M16.8 8.2 20.2 11.6 16.8 15"/>
               <path d="M19.8 11.6H10a5 5 0 1 0 0 10"/>
@@ -192,14 +224,24 @@
   </main>
 
   <aside class="study-sheet" id="study-sheet" hidden>
+    <button class="study-sheet-resize" id="study-sheet-resize" type="button" aria-label="Resize study panel"></button>
     <header class="study-sheet-head">
       <div>
         <p class="tool-label" id="study-kicker">Explaining selection</p>
         <h2 id="study-title">Explain</h2>
       </div>
-      <button class="icon-button" id="close-study" type="button" aria-label="Close explanation">×</button>
+      <div class="study-sheet-head-actions">
+        <button class="text-action" id="regenerate-study-guide-sheet" type="button" hidden>Regenerate</button>
+        <button class="icon-button" id="close-study" type="button" aria-label="Close explanation">×</button>
+      </div>
     </header>
     <p class="study-status" id="study-status" hidden></p>
+    <div class="study-progress" id="study-progress" hidden>
+      <div class="study-progress-track">
+        <span class="study-progress-bar" id="study-progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Generating study guide"></span>
+      </div>
+      <p class="study-progress-label" id="study-progress-label">Generating study guide…</p>
+    </div>
     <div class="study-body" id="study-body"></div>
     <div class="study-actions" id="study-actions" hidden>
       <button class="study-action" data-study-action="go_deeper" type="button">Go Deeper</button>
@@ -237,6 +279,9 @@
     <input id="import-image" name="image" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp">
     <input id="import-camera" type="file" accept="image/*" capture="environment">
   </form>
+  <aside id="pencil-palette" class="pencil-palette" aria-hidden="true"></aside>
+  <button type="button" id="pencil-tool-chip" class="pencil-tool-chip" hidden>Tools</button>
+  <div id="pencil-hover-cursor" class="pencil-hover-cursor" hidden></div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <dialog class="gestures-help" id="gestures-help">
     <form method="dialog">
@@ -249,6 +294,8 @@
           <h3>Apple Pencil</h3>
           <ul>
             <li>Draw</li>
+            <li>Open the contextual tool palette from Tools, the floating chip, or T</li>
+            <li>Safari does not receive native Pencil Pro squeeze or hardware double-tap</li>
             <li>Lasso with the Lasso tool</li>
             <li>Tap to select</li>
             <li>Drag a selection to move</li>
@@ -275,7 +322,8 @@
             <li>⌘D = Duplicate</li>
             <li>Delete = Delete</li>
             <li>⌘A = Select All</li>
-            <li>Escape = Deselect</li>
+            <li>T = Pencil tools</li>
+            <li>Escape = Close palette / Deselect</li>
           </ul>
         </section>
       </div>
@@ -284,8 +332,10 @@
 
   <script id="board-data" type="application/json">{{ board_data|default(board|default(data|default({}, true), true), true)|tojson }}</script>
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/mhchem.min.js" crossorigin="anonymous"></script>
   <script src="{{ url_for('static', filename='study-render.js') }}" defer></script>
   <script src="{{ url_for('static', filename='canvas-engine.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='pencil-tools.js') }}" defer></script>
   <script src="{{ url_for('static', filename='board.js') }}" defer></script>
 </body>
 </html>

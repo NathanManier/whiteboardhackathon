@@ -262,6 +262,54 @@ class StudyApiTests(unittest.TestCase):
         self.assertIn("$\\mathbb{C}$", normalize_study_math(r"z belongs to \mathbb{C}"))
         nth = normalize_study_math(r"Find \sqrt[3]{8}")
         self.assertIn("$\\sqrt[3]{8}$", nth)
+        thin = normalize_study_math(r"Keep $\int u \\, dv$")
+        self.assertIn("\\,", thin)
+        self.assertNotIn("\\\\,", thin)
+
+    def test_parse_study_guide_uses_content_not_raw_json(self):
+        from study.ai import parse_study_guide
+
+        raw = (
+            '{"title": "Vectors", "content": "# Lecture Study Guide\\n\\n'
+            'Use $\\\\times$ and $\\\\neq 0$.\\n\\n## Core Concepts\\nDots.", '
+            '"sources": [{"concept": "cross product", "boardOrder": 1}]}'
+        )
+        result = parse_study_guide(raw)
+        self.assertEqual(result["title"], "Vectors")
+        self.assertIn("# Lecture Study Guide", result["content"])
+        self.assertTrue(any(line.startswith("## Core Concepts") for line in result["content"].splitlines()))
+        self.assertNotIn('"title"', result["content"])
+        self.assertIn("\\times", result["content"])
+        self.assertIn("\\neq", result["content"])
+        self.assertEqual(result["sources"][0]["concept"], "cross product")
+
+    def test_parse_study_guide_recovers_literal_newlines_and_wrapper(self):
+        from study.ai import parse_study_guide, recover_study_guide_markdown
+
+        mangled = (
+            r'{"title": "Lecture Study Guide", "content": '
+            r'"# Lecture Study Guide$\\n$The formula is $\\frac{1}{2}$."}'
+        )
+        recovered = recover_study_guide_markdown(mangled)
+        self.assertIn("# Lecture Study Guide", recovered)
+        self.assertIn("The formula is", recovered)
+        self.assertTrue("\n" in recovered or recovered.startswith("# Lecture Study Guide"))
+        parsed = parse_study_guide(mangled)
+        self.assertTrue(parsed["content"].startswith("# Lecture Study Guide"))
+        self.assertIn("frac", parsed["content"])
+
+        wrapped = (
+            '{\n  "title": "Lecture Study Guide: Calculus",\n  "content": '
+            '"# Lecture Study Guide$\\n\\n$## 1. What This Lecture Covered$\\nThis$ lecture '
+            'covers $\\\\sqrt{a^2 - x^2}$."\n}'
+        )
+        unwrapped = parse_study_guide(wrapped)
+        self.assertEqual(unwrapped["title"], "Lecture Study Guide: Calculus")
+        lines = unwrapped["content"].splitlines()
+        self.assertTrue(any(line.startswith("# Lecture Study Guide") for line in lines))
+        self.assertTrue(any(line.startswith("## 1. What This Lecture Covered") for line in lines))
+        self.assertTrue(any("This" in line and "lecture" in line.lower() for line in lines))
+        self.assertNotIn('"title"', unwrapped["content"])
 
     def test_explain_includes_known_text_object_content(self):
         board_app.atomic_json(

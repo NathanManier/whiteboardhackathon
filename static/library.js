@@ -218,6 +218,11 @@
     if (actions) {
       actions.hidden = !activeFolder;
       if (stale) stale.hidden = !(activeFolder?.study_guide_stale || activeFolder?.studyGuideStale);
+      const guideButton = $("#generate-folder-guide");
+      if (guideButton) {
+        const hasGuide = Boolean(activeFolder?.study_guide || activeFolder?.studyGuide);
+        guideButton.textContent = hasGuide ? "Study Guide" : "Generate Study Guide";
+      }
       if (openLecture) {
         const workspace = activeFolder?.workspace_board_id || activeFolder?.url;
         openLecture.hidden = !boards.length;
@@ -463,6 +468,13 @@
     });
     $("#generate-folder-guide")?.addEventListener("click", async () => {
       if (!state.folderId) return;
+      const active = state.folders.find(item => item.id === state.folderId);
+      const existing = active?.study_guide || active?.studyGuide;
+      if (existing?.content && active?.url) {
+        const sep = active.url.includes("?") ? "&" : "?";
+        location.assign(`${active.url}${sep}studyGuide=1`);
+        return;
+      }
       try {
         toast("Generating study guide…");
         const payload = await request(`/api/folders/${encodeURIComponent(state.folderId)}/study-guide`, {

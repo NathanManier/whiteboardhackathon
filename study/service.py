@@ -1121,6 +1121,7 @@ def generate_lecture_study_guide(
     )
     stored = stored_study_guide({
         "id": secrets.token_hex(8),
+        "title": result.get("title") or "Lecture Study Guide",
         "generated_at": time.time(),
         "source_board_ids": member_ids,
         "content": result.get("content"),
