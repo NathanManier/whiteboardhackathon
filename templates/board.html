@@ -4,22 +4,28 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b1018">
-  <title>Board workspace · Boardlift</title>
+  <title>Study canvas · Digital Whiteboard</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" crossorigin="anonymous">
 </head>
 <body class="workspace-page">
   <header class="workspace-header">
-    <a class="brand" href="/" aria-label="Boardlift home">
+    <a class="brand" href="/" aria-label="My Boards">
       <span class="brand-mark" aria-hidden="true">B</span>
-      <span>Boardlift</span>
+      <span>Boards</span>
     </a>
     <div class="board-title">
-      <span class="status-dot" aria-hidden="true"></span>
-      <span id="board-name">Board workspace</span>
+      <p class="tool-label" id="lecture-kicker">Lecture workspace</p>
+      <button class="board-title-button" id="rename-board" type="button" title="Rename lecture">
+        <span id="board-name">Study canvas</span>
+      </button>
       <span class="save-status" id="save-status" role="status" aria-live="polite">Ready</span>
     </div>
     <div class="header-actions">
-      <a class="button button-ghost button-small" href="/">New board</a>
+      <button class="button button-ghost button-small lecture-action" id="import-whiteboard" type="button">+ Import Whiteboard</button>
+      <button class="button button-ghost button-small lecture-action" id="study-guide-button" type="button">Generate Study Guide</button>
+      <button class="button button-ghost button-small lecture-action" id="study-notes-button" type="button">Study notes</button>
+      <a class="button button-ghost button-small" href="/">Lectures</a>
       <button class="button button-dark button-small" id="export-button" type="button">Export SVG</button>
     </div>
   </header>
@@ -29,7 +35,7 @@
       <div class="instruction-panel">
         <p class="step-label">Manual correction</p>
         <h1 id="corner-title">Mark the four board corners</h1>
-        <p>Drag each numbered handle onto the matching corner. Order matters: start at the top left and move clockwise.</p>
+        <p>Suggested corners are only a starting point. Drag each numbered handle onto the real board corner before processing. You have the final say on all four corners.</p>
         <ol class="corner-order">
           <li><span>1</span>Top left</li>
           <li><span>2</span>Top right</li>
@@ -60,57 +66,19 @@
       </div>
     </section>
 
-    <section id="editor-workspace" class="editor-workspace editor-v2" hidden aria-label="Digital board editor">
-      <aside class="editor-sidebar">
-        <div>
-          <p class="step-label">Workspace</p>
-          <h1>Board editor</h1>
-        </div>
-
-        <div class="layers-panel">
-          <div class="section-label"><span>Layers</span><small id="object-count">0 objects</small></div>
-          <label class="layer-row">
-            <input id="master-layer-toggle" type="checkbox" checked>
-            <span class="layer-swatch"></span>
-            <span><strong>Enhanced master</strong><small>Immutable image</small></span>
-          </label>
-          <label class="layer-row">
-            <input id="professor-layer-toggle" type="checkbox" checked>
-            <span class="layer-swatch professor"></span>
-            <span><strong>Imported vectors</strong><small>Locked layer</small></span>
-          </label>
-          <label class="layer-row">
-            <input id="user-layer-toggle" type="checkbox" checked>
-            <span class="layer-swatch user"></span>
-            <span><strong>Your objects</strong><small>Editable layer</small></span>
-          </label>
-        </div>
-
-        <div class="keyboard-help">
-          <span><kbd>Space</kbd> + drag to pan</span>
-          <span><kbd>Ctrl</kbd><kbd>Z</kbd> Undo</span>
-          <span><kbd>Del</kbd> Delete selection</span>
-          <span>Double-click text to edit</span>
-        </div>
-      </aside>
-
+    <section id="editor-workspace" class="editor-workspace editor-v2 study-canvas" hidden aria-label="Study canvas">
       <section class="canvas-column">
         <div class="drawing-toolbar" aria-label="Drawing tools">
           <div class="tool-group">
-            <button class="tool-button is-active" data-tool="select" type="button" aria-pressed="true" title="Select or lasso">
-              <span>Lasso</span>
-            </button>
-            <button class="tool-button" data-tool="pen" type="button" aria-pressed="false" title="Pen">
+            <button class="tool-button is-active" data-tool="pen" type="button" aria-pressed="true" title="Pen">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Zm10-12 3 3"/></svg>
               <span>Pen</span>
             </button>
-            <button class="tool-button" data-tool="highlighter" type="button" aria-pressed="false" title="Highlighter"><span>Highlight</span></button>
-            <button class="tool-button" data-tool="text" type="button" aria-pressed="false" title="Text box"><span>Text</span></button>
+            <button class="tool-button" data-tool="select" type="button" aria-pressed="false" title="Select or lasso">
+              <span>Lasso</span>
+            </button>
             <button class="tool-button" data-tool="object-eraser" type="button" aria-pressed="false" title="Delete whole objects"><span>Object erase</span></button>
-            <button class="tool-button" data-tool="pixel-eraser" type="button" aria-pressed="false" title="Erase parts of user strokes"><span>Pixel erase</span></button>
-            <button class="text-button selection-action" id="group-button" type="button" disabled>Group</button>
-            <button class="text-button selection-action" id="ungroup-button" type="button" disabled>Ungroup</button>
-            <button class="tool-button" data-tool="make-space" type="button" aria-pressed="false" title="Spread nearby content"><span>Make space</span></button>
+            <button class="tool-button" data-tool="pixel-eraser" type="button" aria-pressed="false" title="Erase parts of strokes"><span>Pixel erase</span></button>
           </div>
           <div class="tool-divider"></div>
           <div class="color-tools" aria-label="Ink color">
@@ -122,57 +90,142 @@
             <button class="color-chip" data-color="#8657b5" style="--chip:#8657b5" type="button" aria-label="Purple" aria-pressed="false"></button>
             <button class="color-chip" data-color="#ec4899" style="--chip:#ec4899" type="button" aria-label="Pink" aria-pressed="false"></button>
             <button class="color-chip" data-color="#facc15" style="--chip:#facc15" type="button" aria-label="Yellow" aria-pressed="false"></button>
-            <input id="custom-color" type="color" value="#183153" aria-label="Custom ink color">
+            <label class="color-pick" title="Choose a custom ink color">
+              <span>Color</span>
+              <input id="custom-color" type="color" value="#183153" aria-label="Custom ink color">
+            </label>
           </div>
           <label class="size-control">Size
             <input id="stroke-size" type="range" min="1" max="48" value="4">
+          </label>
+          <label class="size-control" id="text-size-control" hidden>
+            Text
+            <input id="text-size" type="range" min="10" max="96" value="24" aria-label="Text size">
           </label>
           <div class="toolbar-spacer"></div>
           <button class="icon-button" id="zoom-out" type="button" title="Zoom out" aria-label="Zoom out">−</button>
           <span class="zoom-label" id="zoom-label">100%</span>
           <button class="icon-button" id="zoom-in" type="button" title="Zoom in" aria-label="Zoom in">+</button>
-          <button class="text-button" id="fit-button" type="button">Fit</button>
-          <button class="icon-button" id="undo-button" type="button" title="Undo" aria-label="Undo" disabled>↶</button>
-          <button class="icon-button" id="redo-button" type="button" title="Redo" aria-label="Redo" disabled>↷</button>
-          <button class="text-button danger" id="clear-button" type="button">Clear objects</button>
-          <select id="export-scope" class="compact-select" aria-label="Export bounds">
+          <button class="icon-button" id="home-button" type="button" title="Home" aria-label="Home">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4.5 11.2 12 4.8l7.5 6.4V20a.8.8 0 0 1-.8.8h-5.2v-5.5H10.5V20.8H5.3A.8.8 0 0 1 4.5 20Z"/>
+            </svg>
+          </button>
+          <button class="icon-button" id="undo-button" type="button" title="Undo" aria-label="Undo" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M7.2 8.2 3.8 11.6 7.2 15"/>
+              <path d="M4.2 11.6H14a5 5 0 1 1 0 10"/>
+            </svg>
+          </button>
+          <button class="icon-button" id="redo-button" type="button" title="Redo" aria-label="Redo" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M16.8 8.2 20.2 11.6 16.8 15"/>
+              <path d="M19.8 11.6H10a5 5 0 1 0 0 10"/>
+            </svg>
+          </button>
+          <select id="export-scope" class="compact-select" hidden aria-hidden="true">
+            <option value="content" selected>Fit content</option>
             <option value="full">Full board</option>
-            <option value="content">Fit content</option>
           </select>
-          <button class="text-button" id="export-png" type="button">PNG</button>
           <button class="button button-primary button-small" id="save-button" type="button">Save</button>
         </div>
 
         <div class="board-viewport" id="board-viewport">
           <div class="board-frame primary-frame" id="primary-frame">
             <svg id="world-scene" xmlns="http://www.w3.org/2000/svg" role="application"
-                 aria-label="Editable whiteboard canvas" data-tool="select">
+                 aria-label="Editable study canvas" data-tool="pen"
+                 preserveAspectRatio="none">
               <defs id="scene-defs"></defs>
-              <g id="master-layer"><image id="master-image" x="0" y="0" preserveAspectRatio="none"></image></g>
-              <g id="imported-layer" aria-label="Locked imported SVG"></g>
-              <g id="user-layer" aria-label="Editable user objects"></g>
+              <rect id="canvas-hitfill" x="-100000" y="-100000" width="200000" height="200000"
+                    fill="transparent" pointer-events="all"></rect>
+              <g id="master-layer" hidden>
+                <rect id="board-bounds" x="0" y="0" fill="none" stroke="#eceae4" pointer-events="none"></rect>
+                <image id="master-image" x="0" y="0" preserveAspectRatio="none" pointer-events="none"></image>
+              </g>
+              <g id="board-papers" aria-hidden="true"></g>
+              <rect id="board-paper" x="0" y="0" fill="#f7f6f2" pointer-events="none"></rect>
+              <rect id="board-paper-edge" x="0" y="0" fill="none" stroke="#e4e1d8" pointer-events="none"></rect>
+              <g id="imported-layer" aria-label="Professor notes"></g>
+              <g id="user-layer" aria-label="Your notes"></g>
+              <g id="study-layer" aria-label="Study notes"></g>
+              <g id="live-ink-layer" pointer-events="none">
+                <path id="live-ink" fill="none" stroke-linecap="round" stroke-linejoin="round"
+                      pointer-events="none" visibility="hidden"></path>
+              </g>
               <g id="interaction-layer" aria-hidden="true"></g>
             </svg>
-            <textarea id="text-editor" hidden aria-label="Edit text object"></textarea>
-            <div class="empty-state" id="canvas-empty" hidden>
-              <strong>Enhanced master unavailable</strong>
-              <span>User objects can still be edited and exported.</span>
+            <div id="canvas-html-overlay" class="canvas-html-overlay" aria-hidden="true">
+              <div id="canvas-html-world" class="canvas-html-world"></div>
             </div>
+            <div id="pen-debug" hidden aria-hidden="true">Pencil strokes: 0</div>
+            <div class="empty-state" id="canvas-empty" hidden>
+              <strong>Notes unavailable</strong>
+              <span>You can still write on this canvas.</span>
+            </div>
+            <div class="selection-actions" id="selection-actions" hidden>
+              <button class="explain-chip" id="explain-button" type="button">Explain</button>
+              <button class="explain-chip explain-chip-secondary" id="explain-across-button" type="button" hidden>Explain Across Boards</button>
+              <button class="explain-chip explain-chip-secondary" id="where-from-button" type="button" hidden>Where did this come from?</button>
+              <button class="explain-chip" id="check-work-button" type="button" hidden>Check My Work</button>
+            </div>
+            <button class="view-board-chip" id="view-new-board" type="button" hidden>View new board</button>
           </div>
         </div>
-
-        <p class="canvas-caption">
-          <span id="canvas-dimensions">Master canvas</span>
-          <span>Drawings stay aligned at every screen size</span>
-        </p>
       </section>
-
     </section>
   </main>
 
+  <aside class="study-sheet" id="study-sheet" hidden>
+    <header class="study-sheet-head">
+      <div>
+        <p class="tool-label" id="study-kicker">Explaining selection</p>
+        <h2 id="study-title">Explain</h2>
+      </div>
+      <button class="icon-button" id="close-study" type="button" aria-label="Close explanation">×</button>
+    </header>
+    <p class="study-status" id="study-status" hidden></p>
+    <div class="study-body" id="study-body"></div>
+    <div class="study-actions" id="study-actions" hidden>
+      <button class="study-action" data-study-action="go_deeper" type="button">Go Deeper</button>
+      <button class="study-action" data-study-action="practice_examples" type="button">Practice Examples</button>
+      <button class="study-action" data-study-action="practice_problems" type="button">Practice Problems</button>
+    </div>
+    <form class="study-followup" id="study-followup" hidden>
+      <label class="field">
+        <span class="visually-hidden">Ask a follow-up</span>
+        <input id="followup-input" name="question" maxlength="2000" placeholder="Ask a follow-up…" autocomplete="off">
+      </label>
+      <button class="button button-primary" type="submit">Ask</button>
+    </form>
+  </aside>
+
+  <aside class="study-drawer" id="study-drawer" hidden>
+    <header class="study-sheet-head">
+      <h2>Study notes</h2>
+      <button class="icon-button" id="close-study-drawer" type="button" aria-label="Close study notes">×</button>
+    </header>
+    <section class="study-guide-panel" id="study-guide-panel" hidden>
+      <div class="study-guide-head">
+        <strong>Study guide</strong>
+        <button class="text-action" id="regenerate-study-guide" type="button">Regenerate</button>
+      </div>
+      <p class="study-guide-stale" id="study-guide-stale" hidden>Study guide may be outdated</p>
+      <div class="study-guide-body" id="study-guide-body"></div>
+    </section>
+    <div class="study-note-list" id="study-note-list"></div>
+  </aside>
+
+  <form id="import-form" class="visually-hidden" method="post" enctype="multipart/form-data" action="/upload">
+    <input type="hidden" name="folder_id" id="import-folder-id" value="">
+    <input type="hidden" name="workspace_board_id" id="import-workspace-id" value="">
+    <input id="import-image" name="image" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp">
+    <input id="import-camera" type="file" accept="image/*" capture="environment">
+  </form>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
   <script id="board-data" type="application/json">{{ board_data|default(board|default(data|default({}, true), true), true)|tojson }}</script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js" crossorigin="anonymous"></script>
+  <script src="{{ url_for('static', filename='study-render.js') }}" defer></script>
   <script src="{{ url_for('static', filename='board.js') }}" defer></script>
 </body>
 </html>

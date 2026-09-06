@@ -54,6 +54,8 @@ class EditorApiTests(unittest.TestCase):
                     "width": 6,
                     "opacity": 1,
                     "translation": {"x": 10, "y": -5},
+                    "scaleX": 1.5,
+                    "scaleY": 0.75,
                     "points": [{"x": -20, "y": 15}, {"x": 1250, "y": 900}],
                     "erasures": [
                         {
@@ -73,6 +75,9 @@ class EditorApiTests(unittest.TestCase):
                     "font_size": 32,
                     "color": "#334455",
                     "translation": {"x": 0, "y": 0},
+                    "role": "ai_practice_problem",
+                    "practice_problem_id": "prob-one",
+                    "source_study_interaction_id": "aaaaaaaaaaaaaaaa",
                 },
             ],
         }
@@ -92,6 +97,10 @@ class EditorApiTests(unittest.TestCase):
         saved = response.get_json()["editor"]
         self.assertEqual(saved["revision"], 1)
         self.assertEqual(saved["objects"][1]["text"], "Editable text")
+        self.assertEqual(saved["objects"][1]["role"], "ai_practice_problem")
+        self.assertEqual(saved["objects"][1]["practice_problem_id"], "prob-one")
+        self.assertEqual(saved["objects"][0]["scaleX"], 1.5)
+        self.assertEqual(saved["objects"][0]["scaleY"], 0.75)
         stale = self.client.put(
             f"/api/boards/{self.board_id}/editor", json=self.editor_state()
         )
@@ -149,6 +158,59 @@ class EditorApiTests(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(data["user_strokes"][0]["id"], "old-ink")
         self.assertEqual(data["name"], "Legacy lecture")
+
+    def test_imported_transforms_persist_and_export(self):
+        (self.board_dir / "board.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" '
+            'viewBox="0 0 1200 800">'
+            '<path id="black-abc123def456" d="M 10 10 L 40 10" fill="#111111"/>'
+            "</svg>",
+            encoding="utf-8",
+        )
+        metadata = json.loads((self.board_dir / "board.json").read_text(encoding="utf-8"))
+        metadata["assets"]["svg"] = "board.svg"
+        (self.board_dir / "board.json").write_text(json.dumps(metadata), encoding="utf-8")
+        state = self.editor_state()
+        state["imported_transforms"] = {
+            "black-abc123def456": {"x": 340, "y": -80, "scaleX": 1.25, "scaleY": 0.8}
+        }
+        saved = self.client.put(f"/api/boards/{self.board_id}/editor", json=state)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        loaded = self.client.get(f"/api/boards/{self.board_id}/editor").get_json()["editor"]
+        self.assertEqual(loaded["imported_transforms"]["black-abc123def456"]["x"], 340)
+        self.assertEqual(loaded["imported_transforms"]["black-abc123def456"]["y"], -80)
+        self.assertEqual(loaded["imported_transforms"]["black-abc123def456"]["scaleX"], 1.25)
+        self.assertEqual(loaded["imported_transforms"]["black-abc123def456"]["scaleY"], 0.8)
+        markup = self.client.get(f"/board/{self.board_id}/svg").get_data(as_text=True)
+        self.assertIn('id="black-abc123def456"', markup)
+        self.assertIn("translate(340.0000 -80.0000)", markup)
+        self.assertIn("scale(1.2500 0.8000)", markup)
+        self.assertIn('d="M 10 10 L 40 10"', markup)
+        self.assertIn("scale(1.5000 0.7500)", markup)
+
+    def test_deleted_imported_object_is_omitted_from_export(self):
+        (self.board_dir / "board.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" '
+            'viewBox="0 0 1200 800">'
+            '<path id="black-abc123def456" d="M 10 10 L 40 10" fill="#111111"/>'
+            "</svg>",
+            encoding="utf-8",
+        )
+        metadata = json.loads((self.board_dir / "board.json").read_text(encoding="utf-8"))
+        metadata["assets"]["svg"] = "board.svg"
+        (self.board_dir / "board.json").write_text(json.dumps(metadata), encoding="utf-8")
+        state = self.editor_state()
+        state["imported_transforms"] = {
+            "black-abc123def456": {
+                "x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "deleted": True
+            }
+        }
+        saved = self.client.put(f"/api/boards/{self.board_id}/editor", json=state)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        loaded = self.client.get(f"/api/boards/{self.board_id}/editor").get_json()["editor"]
+        self.assertTrue(loaded["imported_transforms"]["black-abc123def456"]["deleted"])
+        markup = self.client.get(f"/board/{self.board_id}/svg").get_data(as_text=True)
+        self.assertNotIn('id="black-abc123def456"', markup)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-# Boardlift
+# Digital Whiteboard
 
-Boardlift turns a photo of a physical whiteboard into a perspective-corrected digital board. It keeps the enhanced full-color image as the visual source of truth, preserves detected board ink as contour-based SVG geometry, and stores later edits separately.
+Turn a photograph of a physical professor whiteboard into an editable infinite study canvas. The professor’s ink stays vector geometry. Students can write on top, lasso a confusing region, and ask for a visual explanation.
 
 ## Install and run
 
@@ -8,6 +8,7 @@ Requirements:
 
 - Python 3.10 or newer
 - A browser with modern SVG and Pointer Events support
+- Optional: `GEMINI_API_KEY` for the study assistant (Gemini 3.6 Flash)
 
 From the project directory:
 
@@ -18,23 +19,42 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python app.py
+```
+
 Open `http://127.0.0.1:5000`. Set `FLASK_DEBUG=1` before starting for Flask debug mode. Uploads default to a 16 MB limit; set `MAX_UPLOAD_BYTES` to change it.
 
-## Features
+### Study assistant
 
-- Multipart upload for PNG, JPEG, and WebP board photos, including drag/drop preview
-- Automatic perspective detection with a manual corner-selection fallback
-- Enhanced immutable master raster and conservative imported contour SVG
-- Infinite SVG workspace with pan, cursor-centered zoom, and fit-to-board
-- Pen, translucent highlighter, editable text, selection/lasso, object eraser, and non-destructive pixel eraser
-- Bounded undo/redo and debounced autosave
-- Flat folders with board create, open, rename, move, and confirmed deletion
-- Full-board SVG and PNG export
-- Filesystem-backed local storage with no database or account required
+Explanations call Gemini 3.6 Flash from the **server only**. Never put the key in frontend JavaScript.
+
+Create a local `.env` file (already gitignored):
+
+```
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-3.6-flash
+```
+
+`GOOGLE_API_KEY` is also accepted if `GEMINI_API_KEY` is unset. If the key is missing, the canvas still works. Explain shows a recoverable error and does not change the board.
+
+## Using the app
+
+1. Open **My Boards**.
+2. Tap **New Board**, choose or take a photo, then **Process board**.
+3. The infinite canvas shows the vectorized professor notes, not the raw photo.
+4. Write with Apple Pencil. Fingers pan and pinch.
+5. Lasso a confusing diagram or equation and tap **Explain selection**.
+6. Ask follow-up questions. The explanation stays with the saved board.
+
+Organize boards into one-level folders. Rename boards from the library or by tapping the title on the canvas.
 
 ## Storage
 
-All persisted board data lives under `boards/`. Display names are metadata only: board directories use validated stable IDs, so renaming or moving a board does not change its URL or filesystem path.
+All persisted board data lives under `boards/`. Display names are metadata only: board directories use validated stable IDs.
 
 ```text
 boards/
@@ -42,122 +62,43 @@ boards/
   <32-character-board-id>/
     board.json
     editor.json
+    study.json
     original.<ext>
-    master.png
+    master.png          # processing artifact, not an editor layer
     board.svg
-    ...pipeline artifacts
+    thumbnail.png
 ```
 
-Writes to catalog and editor JSON files are atomic. Do not edit a file while the app is writing it.
+Writes to catalog, editor, and study JSON files are atomic.
 
-### `boards/library.json`
+## API
 
-The library is a lightweight catalog. Folders are flat rather than nested.
+- `GET /api/library` — folders and boards (metadata + thumbnail URLs)
+- `POST /api/folders` — create a folder
+- `PATCH /api/folders/<id>` — rename a folder
+- `DELETE /api/folders/<id>` — delete an empty folder; `?recursive=1` deletes contained boards after UI confirmation
+- `PATCH /api/boards/<id>` — rename or move a board
+- `DELETE /api/boards/<id>` — delete a board
+- `GET/PUT /api/boards/<id>/editor` — canvas objects, camera, imported transforms
+- `GET /api/boards/<id>/study` — saved explanations
+- `POST /api/boards/<id>/study/explain` — visual explain for a lasso selection
+- `POST /api/boards/<id>/study/<id>/followup` — follow-up on the same selection
 
-```json
-{
-  "schema_version": 1,
-  "folders": [
-    {
-      "id": "stable-folder-id",
-      "name": "Calculus",
-      "created_at": 1788642000.0,
-      "updated_at": 1788642000.0
-    }
-  ],
-  "boards": {
-    "0123456789abcdef0123456789abcdef": {
-      "name": "Limits review",
-      "folder_id": "stable-folder-id"
-    }
-  }
-}
-```
+`POST /upload` remains a browser multipart request. Optional `name` and `folder_id` fields place the board. If `name` is omitted or looks like a camera filename, the server names the board `New Whiteboard — Sep 5` or `Physics — Sep 5` when created inside a folder.
 
-The `GET /api/library` representation may return boards as an array for convenient rendering. Each board includes at least `id`, `name`, nullable `folder_id`, and timestamps/status when available.
-
-### `boards/<id>/board.json`
-
-`board.json` remains the processing manifest. It records the stable board ID, source image metadata, dimensions, pipeline status/timings, asset filenames, corner detection data, and legacy `user_strokes` where present. Processing assets are referenced by safe filenames and remain independent from library display names.
-
-### `boards/<id>/editor.json`
-
-Editor state uses master-image pixels as world coordinates:
-
-```json
-{
-  "schema_version": 2,
-  "revision": 7,
-  "updated_at": 1788642000.0,
-  "viewport": {
-    "x": -120,
-    "y": -80,
-    "width": 2400,
-    "height": 1350
-  },
-  "objects": [
-    {
-      "id": "obj_1",
-      "type": "stroke",
-      "points": [[120, 140], [126, 146]],
-      "color": "#183153",
-      "width": 4,
-      "opacity": 1,
-      "translation": {"x": 0, "y": 0},
-      "erasures": []
-    },
-    {
-      "id": "obj_2",
-      "type": "text",
-      "x": 240,
-      "y": 180,
-      "width": 320,
-      "height": 100,
-      "text": "Review this step",
-      "font_size": 28,
-      "color": "#e45c3a",
-      "translation": {"x": 0, "y": 0}
-    }
-  ]
-}
-```
-
-Highlighters use the same point model with `type: "highlighter"`, a wider stroke, and reduced opacity. Pixel erasures are paths attached to individual drawn objects; this prevents an old erasure from affecting a newly drawn stroke. The server validates object IDs, types, colors, finite coordinates, dimensions, text length, and collection/point limits.
-
-## Library API
-
-- `GET /api/library` — list folders and boards
-- `POST /api/folders` with `{"name": "..."}` — create a folder
-- `PATCH /api/folders/<id>` with `{"name": "..."}` — rename a folder
-- `DELETE /api/folders/<id>` — delete an empty folder; returns `409` when nonempty
-- `DELETE /api/folders/<id>?recursive=1` — delete a nonempty folder and its boards after the UI's second confirmation
-- `PATCH /api/boards/<id>` with `name` and/or nullable `folder_id` — rename or move a board
-- `DELETE /api/boards/<id>` — permanently delete a board
-- `GET/PUT /api/boards/<id>/editor` — load or save versioned editor state
-
-`POST /upload` remains a browser multipart request. The required field is `image`; optional `name` and `folder_id` fields place the resulting board in the library.
-
-API errors are JSON with an `error` or `message` string. Invalid IDs and unknown records return an appropriate 4xx response. Display names are never used as paths.
+The explain endpoint receives object IDs and a selection bounding box. The server renders a selected-region image, a local context crop, and a whole-board overview, then calls the AI service. SVG path strings are not the primary AI input.
 
 ## Backwards compatibility
 
-Existing 32-character board directories are discovered even when they are absent from `library.json`. Their original `board.json` and processing artifacts remain valid. If no `editor.json` exists, legacy `board.json.user_strokes` are adapted into editor objects at load time. Existing `/board/<id>`, asset, legacy save, and combined SVG routes remain compatibility paths.
-
-The image-processing pipeline is unchanged: the enhanced master stays immutable, and imported contour SVG is a locked layer separate from user content.
+Existing 32-character board directories are discovered even when they are absent from `library.json`. If no `editor.json` exists, legacy `board.json.user_strokes` are adapted into editor objects. The Enhanced Master remains a processing artifact and is not shown as an editing layer.
 
 ## Export
 
-SVG export composes the full board in layer order: embedded enhanced master, imported contour geometry, then user vectors, text, and per-stroke eraser masks. PNG export rasterizes the same full-board composition at a useful bounded resolution; it is not a screenshot of only the current viewport.
-
-Exports are generated in the browser. A browser may block composition if an asset is served from another origin or cannot be decoded; running through the Flask server on one origin avoids that limitation.
+SVG export composes imported professor vectors and student strokes with their transforms. It does not embed the Enhanced Master raster or study notes.
 
 ## MVP limitations
 
-- Folders are one level deep; there are no nested folders.
-- Pixel erasing applies only to user-created pen/highlighter strokes, never the master image or imported ink.
-- Imported ink is preserved as a locked layer rather than individually semantic shapes.
-- Text boxes resize and move but objects do not rotate.
-- Selection uses practical bounds/intersection tests rather than full computational geometry.
-- There is no authentication, cloud sync, real-time collaboration, or conflict merging.
-- Autosave is local-server persistence; abrupt browser/process termination can still lose the most recent debounce window.
-- Very large images, object counts, and exports are bounded for browser and server reliability.
+- Folders are one level deep.
+- Study explanations do not rewrite board geometry.
+- There is no authentication, cloud sync, or collaboration.
+- Autosave is local-server persistence after completed interactions, not every Pencil point.

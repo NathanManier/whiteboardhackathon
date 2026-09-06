@@ -19,11 +19,8 @@
   const HISTORY_LIMIT = 80;
   const MIN_ZOOM = 0.08;
   const MAX_ZOOM = 24;
-  const SPREAD_RADIUS = 400;
-  const BUBBLE_GAP = 100;
-  const TARGET_GAP = 150;
-  const MAX_SPREAD_ITERATIONS = 20;
-  const MAX_SINGLE_SPREAD_DISPLACEMENT = 500;
+  const PINCH_ZOOM_SLOP = 12;
+  const TOOLS = new Set(["select", "pen", "highlighter", "object-eraser", "pixel-eraser"]);
 
   const assetAliases = {
     original: ["original", "original_url", "input", "source"],
@@ -52,21 +49,85 @@
     importedObjects: [],
     importedTransforms: {},
     selected: new Set(),
-    tool: "select",
+    tool: "pen",
+    penSize: 4,
+    penColor: "#183153",
+    highlighterSize: 18,
+    highlighterColor: "#facc15",
+    eraserSize: 16,
     color: "#183153",
     size: 4,
     history: [],
     future: [],
     interaction: null,
     pointers: new Map(),
+    activePointerIds: new Set(),
     spaceDown: false,
     dirty: false,
     saveTimer: 0,
     saving: false,
     saveAgain: false,
     importedMarkup: "",
-    masterUrl: ""
+    masterUrl: "",
+    capturedPointer: null,
+    captureSerial: 0,
+    releasingCapture: false,
+    importedMap: { x: 0, y: 0, scaleX: 1, scaleY: 1 },
+    historyTimer: 0,
+    pendingHistory: [],
+    cachedSceneRect: null,
+    liveNode: null,
+    liveInkRaf: 0,
+    penHud: { strokes: 0, downs: 0, moves: 0, ups: 0, lastRaw: 0, lastRendered: 0, lastFinal: 0 },
+    studyInteractions: [],
+    activeStudyId: null,
+    pendingStudyId: null,
+    studyRequestToken: 0,
+    explaining: false,
+    pendingStudyQuestion: "",
+    pendingStudyAction: "",
+    cameraGesture: "idle",
+    sourceBoards: [],
+    lecture: {
+      folderId: "",
+      folderName: "",
+      workspaceId: "",
+      isLecture: false,
+      boards: [],
+      studyGuide: null,
+      stale: false
+    },
+    pendingImportedId: ""
   };
+
+  /* Authoritative high-frequency Pencil buffer. Never wait on React/save/render. */
+  let activeInk = null;
+
+  const DEBUG_EDITOR = (() => {
+    try {
+      return /(?:\?|&|#)editorDebug=1\b/.test(`${location.search}${location.hash}`) ||
+        localStorage.getItem("boardlift-editor-debug") === "1";
+    } catch (_) { return false; }
+  })();
+  const DEBUG_STUDY = (() => {
+    try {
+      return DEBUG_EDITOR ||
+        /(?:\?|&|#)studyDebug=1\b/.test(`${location.search}${location.hash}`) ||
+        localStorage.getItem("boardlift-study-debug") === "1";
+    } catch (_) { return false; }
+  })();
+
+  function editorLog(event, detail) {
+    if (!DEBUG_EDITOR) return;
+    if (detail !== undefined) console.info(`[editor] ${event}`, detail);
+    else console.info(`[editor] ${event}`);
+  }
+
+  function studyLog(event, detail) {
+    if (!DEBUG_STUDY) return;
+    if (detail !== undefined) console.info(`[study] ${event}`, detail);
+    else console.info(`[study] ${event}`);
+  }
 
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
   const clone = value => JSON.parse(JSON.stringify(value));
@@ -121,12 +182,13 @@
       ...options,
       headers: { Accept: "application/json", ...(options.headers || {}) }
     });
+    const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const error = new Error(`Server returned ${response.status}`);
+      const error = new Error(payload.error || payload.message || `Server returned ${response.status}`);
       error.status = response.status;
       throw error;
     }
-    return response.json();
+    return payload;
   }
 
   function normalizeBoard(raw) {
@@ -154,29 +216,46 @@
       opacity: Number.isFinite(Number(stroke.opacity)) ? Number(stroke.opacity) : 1,
       tx: Number(stroke.tx ?? stroke.translation?.x) || 0,
       ty: Number(stroke.ty ?? stroke.translation?.y) || 0,
+      sx: Number(stroke.sx ?? stroke.scaleX ?? stroke.scale?.x) || 1,
+      sy: Number(stroke.sy ?? stroke.scaleY ?? stroke.scale?.y) || 1,
       erasures: (Array.isArray(stroke.erasures) ? stroke.erasures :
         (Array.isArray(stroke.erase_paths) ? stroke.erase_paths : [])).map(erasure => ({
           ...erasure,
           points: Array.isArray(erasure.points) ? erasure.points.map(point => ({
             x: Number(point.x ?? point[0]), y: Number(point.y ?? point[1])
           })).filter(point => Number.isFinite(point.x) && Number.isFinite(point.y)) : undefined
-        }))
+        })),
+      boardId: stroke.boardId || stroke.board_id || "",
+      origin: stroke.origin || "student",
+      folderId: stroke.folderId || stroke.folder_id || "",
+      createdAt: Number(stroke.createdAt || stroke.created_at) || 0
     };
   }
 
   function normalizeObject(object) {
     if (!object || typeof object !== "object") return null;
     if (object.type === "text") {
+      const role = object.role === "ai_practice_problem" || object.role === "practice_problem"
+        ? "ai_practice_problem" : "";
       return {
         id: object.id || uid("text"),
         type: "text",
         x: Number(object.x) || 0,
         y: Number(object.y) || 0,
-        width: Math.max(40, Number(object.width) || 240),
-        height: Math.max(30, Number(object.height) || 90),
+        width: Math.max(4, Number(object.width) || 40),
+        height: Math.max(4, Number(object.height) || 20),
         text: String(object.text || ""),
         color: object.color || "#183153",
-        fontSize: clamp(Number(object.fontSize || object.font_size || 28), 8, 240)
+        fontSize: clamp(Number(object.fontSize || object.font_size || 28), 8, 240),
+        wrapWidth: Number(object.wrapWidth || object.wrap_width) || 0,
+        role,
+        practiceProblemId: object.practiceProblemId || object.practice_problem_id || "",
+        sourceStudyInteractionId: object.sourceStudyInteractionId || object.source_study_interaction_id || "",
+        generatedAt: Number(object.generatedAt || object.generated_at) || 0,
+        boardId: object.boardId || object.board_id || "",
+        origin: object.origin || (role === "ai_practice_problem" ? "ai_practice" : ""),
+        folderId: object.folderId || object.folder_id || "",
+        createdAt: Number(object.createdAt || object.created_at) || 0
       };
     }
     if (object.type === "stroke" || object.type === "highlighter" || object.points || object.d) {
@@ -189,19 +268,78 @@
     const source = raw?.editor && typeof raw.editor === "object" ? raw.editor : (raw || {});
     const legacy = state.data.user_strokes || state.data.strokes || state.data.annotations || [];
     const objects = Array.isArray(source.objects) ? source.objects : legacy;
-    const needsMigration = objects.some(object => !object?.id) ||
-      Number(source.schema_version || 0) !== 2;
+    const schema = Number(source.schema_version || 0);
+    const needsMigration = objects.some(object => !object?.id) || (schema > 0 && schema < 2);
     const camera = source.viewport || source.camera;
     state.revision = Math.max(0, Number(source.revision) || 0);
     state.objects = objects.map(normalizeObject).filter(Boolean);
     state.groups = Array.isArray(source.groups) ? source.groups.map(normalizeGroup).filter(Boolean) : [];
     state.importedTransforms = source.imported_transforms && typeof source.imported_transforms === "object"
       ? source.imported_transforms : {};
+    state.sourceBoards = normalizeSourceBoards(source.source_boards || source.sourceBoards || state.data.source_boards);
     state.camera = validCamera(camera) ? {
       x: Number(camera.x), y: Number(camera.y),
       width: Number(camera.width), height: Number(camera.height)
-    } : { x: 0, y: 0, width: state.width, height: state.height };
+    } : paddedBoardCamera();
     if (needsMigration && state.objects.length) markChanged();
+  }
+
+  function normalizeSourceBoards(value) {
+    if (!Array.isArray(value)) return [];
+    return value.filter(item => item && (item.board_id || item.boardId)).map((item, index) => ({
+      boardId: item.boardId || item.board_id,
+      boardOrder: Number(item.boardOrder || item.board_order || index + 1) || index + 1,
+      x: Number(item.x) || 0,
+      y: Number(item.y) || 0,
+      width: Math.max(1, Number(item.width) || state.width),
+      height: Math.max(1, Number(item.height) || state.height),
+      label: item.label || `Whiteboard ${index + 1}`
+    }));
+  }
+
+  function lectureBoardsFromData(data = state.data) {
+    const members = Array.isArray(data.lecture_boards || data.lectureBoards)
+      ? (data.lecture_boards || data.lectureBoards) : [];
+    if (members.length) {
+      return members.map((item, index) => ({
+        boardId: item.boardId || item.id,
+        boardOrder: Number(item.boardOrder || item.board_order || index + 1) || index + 1,
+        x: Number(item.x) || 0,
+        y: Number(item.y) || 0,
+        width: Math.max(1, Number(item.width) || state.width),
+        height: Math.max(1, Number(item.height) || state.height),
+        label: item.label || `Whiteboard ${index + 1}`,
+        svgUrl: item.svgUrl || item.svg_url || professorSvgUrl(item.boardId || item.id),
+        name: item.name || item.label || `Whiteboard ${index + 1}`,
+        status: item.status || "ready"
+      })).filter(item => item.status === "ready" || item.boardId === boardId);
+    }
+    return state.sourceBoards.length ? state.sourceBoards.map(item => ({
+      ...item,
+      svgUrl: professorSvgUrl(item.boardId),
+      name: item.label
+    })) : [{
+      boardId, boardOrder: 1, x: 0, y: 0, width: state.width, height: state.height,
+      label: "Whiteboard 1", svgUrl: professorSvgUrl(boardId), name: "Whiteboard 1"
+    }];
+  }
+
+  function applyLectureData(data = state.data) {
+    state.lecture.folderId = data.folder_id || data.folderId || "";
+    state.lecture.folderName = data.folder_name || data.folderName || "";
+    state.lecture.workspaceId = data.workspace_board_id || data.workspaceBoardId || boardId;
+    state.lecture.isLecture = Boolean(data.is_lecture || data.isLecture || state.lecture.folderId);
+    state.lecture.studyGuide = data.study_guide || data.studyGuide || null;
+    state.lecture.stale = Boolean(data.study_guide_stale || data.studyGuideStale || state.lecture.studyGuide?.stale);
+    if (!state.sourceBoards.length) {
+      state.sourceBoards = normalizeSourceBoards(data.source_boards || lectureBoardsFromData(data));
+    }
+    const kicker = $("#lecture-kicker");
+    if (kicker) {
+      kicker.textContent = state.lecture.isLecture ? "Lecture workspace" : "Study canvas";
+    }
+    const guideButton = $("#study-guide-button");
+    if (guideButton) guideButton.hidden = !state.lecture.folderId;
   }
 
   function normalizeGroup(group) {
@@ -229,7 +367,8 @@
 
   function isManualMode(data) {
     const status = String(data.status || data.mode || "").toLowerCase();
-    return Boolean(data.needs_corners || data.requires_corners || data.manual_corners ||
+    if (["ready", "complete", "processing"].includes(status)) return false;
+    return Boolean(data.needs_corners || data.requires_corners ||
       ["manual", "corners", "needs_corners", "corner_selection"].includes(status));
   }
 
@@ -384,6 +523,12 @@
 
   const strokePath = object => object.d || pathFromPoints(object.points);
 
+  function objectTransformValue(tx = 0, ty = 0, sx = 1, sy = 1) {
+    const translate = `translate(${Number(tx) || 0} ${Number(ty) || 0})`;
+    if ((Number(sx) || 1) === 1 && (Number(sy) || 1) === 1) return translate;
+    return `${translate} scale(${Number(sx) || 1} ${Number(sy) || 1})`;
+  }
+
   function sanitizeSVG(markup) {
     if (!markup) return null;
     const parsed = new DOMParser().parseFromString(markup, "image/svg+xml");
@@ -397,97 +542,291 @@
         const value = attribute.value.trim().toLowerCase();
         if (name.startsWith("on") || value.startsWith("javascript:")) node.removeAttribute(attribute.name);
       });
-      node.style.pointerEvents = "none";
     });
-    return document.importNode(svg, true);
+    return svg;
   }
 
-  async function loadImportedSVG() {
-    const inline = state.data.svg_markup ||
-      (typeof state.data.svg === "string" && state.data.svg.trim().startsWith("<") ? state.data.svg : "");
-    let markup = inline || "";
-    if (!markup) {
-      const url = findAsset("professor_svg") || asUrl(state.data.svg_url) ||
-        (boardId ? `${boardRoute}/svg` : "");
-      if (url) {
-        try {
-          const response = await fetch(url);
-          if (response.ok) markup = await response.text();
-        } catch (error) { console.warn("Imported SVG unavailable", error); }
-      }
+  function parseViewBox(svg) {
+    const parts = String(svg.getAttribute("viewBox") || "").trim().split(/[\s,]+/).map(Number);
+    if (parts.length === 4 && parts.every(Number.isFinite) && parts[2] > 0 && parts[3] > 0) {
+      return { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
     }
+    const width = Number(svg.getAttribute("width")) || state.width;
+    const height = Number(svg.getAttribute("height")) || state.height;
+    return { x: 0, y: 0, width, height };
+  }
+
+  function importedPrefix(sourceBoardId) {
+    return !sourceBoardId || sourceBoardId === boardId ? "" : `${sourceBoardId.slice(0, 8)}_`;
+  }
+
+  function professorSvgUrl(sourceBoardId) {
+    if (sourceBoardId === boardId) {
+      return findAsset("professor_svg") || `/boards/${encodeURIComponent(sourceBoardId)}/board.svg`;
+    }
+    return sourceBoardId ? `/boards/${encodeURIComponent(sourceBoardId)}/board.svg` : "";
+  }
+
+  async function fetchBoardSvg(board) {
+    const url = board.svgUrl || professorSvgUrl(board.boardId);
+    if (!url) return "";
+    try {
+      const response = await fetch(url);
+      if (response.ok) return await response.text();
+    } catch (error) {
+      console.warn("Imported SVG unavailable", error);
+    }
+    return "";
+  }
+
+  function mountImportedBoard(board, markup, layer) {
     const safe = sanitizeSVG(markup);
-    if (!safe) return;
-    safe.setAttribute("x", "0");
-    safe.setAttribute("y", "0");
-    safe.setAttribute("width", state.width);
-    safe.setAttribute("height", state.height);
-    safe.setAttribute("preserveAspectRatio", "none");
-    safe.setAttribute("aria-hidden", "true");
-    state.importedMarkup = safe.outerHTML;
-    $("#imported-layer").replaceChildren(safe);
-    state.importedObjects = [...safe.querySelectorAll("path")].map((path, index) => {
-      const id = /^[A-Za-z0-9_.-]{1,64}$/.test(path.id || "")
-        ? path.id : `ink-region-${String(index).padStart(5, "0")}`;
-      path.id = id;
-      path.dataset.objectId = id;
-      path.style.pointerEvents = "all";
-      let box = { x: 0, y: 0, width: 0, height: 0 };
-      try { box = path.getBBox(); } catch (_) {}
-      const saved = state.importedTransforms?.[id] || {};
-      return { id, type: "imported", bbox: box, tx: Number(saved.x) || 0, ty: Number(saved.y) || 0,
-        sx: Number(saved.scaleX) || 1, sy: Number(saved.scaleY) || 1,
-        node: path, locked: false };
+    if (!safe) return [];
+    const viewBox = parseViewBox(safe);
+    const scaleX = board.width / viewBox.width;
+    const scaleY = board.height / viewBox.height;
+    const map = { x: viewBox.x, y: viewBox.y, scaleX, scaleY };
+    const wrap = svgEl("g", {
+      class: "source-board-ink",
+      "data-source-board": board.boardId,
+      transform: `translate(${board.x} ${board.y})`
     });
+    const needsMap = Math.abs(scaleX - 1) > 1e-6 || Math.abs(scaleY - 1) > 1e-6 ||
+      viewBox.x !== 0 || viewBox.y !== 0;
+    let host = wrap;
+    if (needsMap) {
+      host = svgEl("g", {
+        transform: `scale(${scaleX} ${scaleY}) translate(${-viewBox.x} ${-viewBox.y})`
+      });
+      wrap.append(host);
+    }
+    layer.append(wrap);
+    const prefix = importedPrefix(board.boardId);
+    return [...safe.querySelectorAll("path")].map((path, index) => {
+      const original = /^[A-Za-z0-9_.-]{1,64}$/.test(path.id || "")
+        ? path.id : `ink-region-${String(index).padStart(5, "0")}`;
+      const id = `${prefix}${original}`.slice(0, 64);
+      const saved = state.importedTransforms?.[id] || state.importedTransforms?.[original] || {};
+      const tx = Number(saved.x) || 0;
+      const ty = Number(saved.y) || 0;
+      const sx = Number(saved.scaleX) || 1;
+      const sy = Number(saved.scaleY) || 1;
+      const deleted = Boolean(saved.deleted);
+      const wrapper = svgEl("g", {
+        id: `${id}-wrap`,
+        class: "imported-object",
+        "data-object-id": id,
+        "data-board-id": board.boardId,
+        transform: objectTransformValue(tx, ty, sx, sy)
+      });
+      if (deleted) wrapper.setAttribute("display", "none");
+      const node = document.importNode(path, true);
+      node.id = id;
+      node.dataset.objectId = id;
+      node.dataset.boardId = board.boardId;
+      node.style.pointerEvents = "visiblePainted";
+      wrapper.append(node);
+      host.append(wrapper);
+      let box = { x: 0, y: 0, width: 0, height: 0 };
+      try { box = node.getBBox(); } catch (_) {}
+      return {
+        id, type: "imported", bbox: box,
+        color: node.getAttribute("fill") || node.getAttribute("stroke") || "",
+        color_class: node.getAttribute("data-ink") || "",
+        tx, ty, sx, sy, deleted,
+        node: wrapper, path: node, locked: false,
+        boardId: board.boardId,
+        boardOrder: board.boardOrder,
+        originX: board.x,
+        originY: board.y,
+        map
+      };
+    });
+  }
+
+  /* Paths leave the source SVG so they are not clipped to the photographed board. */
+  async function loadImportedSVG() {
+    const layer = $("#imported-layer");
+    layer.replaceChildren();
+    const boards = lectureBoardsFromData();
+    if (!state.sourceBoards.length) {
+      state.sourceBoards = boards.map(item => ({
+        boardId: item.boardId, boardOrder: item.boardOrder, x: item.x, y: item.y,
+        width: item.width, height: item.height, label: item.label
+      }));
+    }
+    state.importedMap = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+    const objects = [];
+    for (const board of boards) {
+      const markup = await fetchBoardSvg(board);
+      if (!markup) continue;
+      objects.push(...mountImportedBoard(board, markup, layer));
+    }
+    state.importedObjects = objects;
+    state.importedMarkup = layer.innerHTML;
+    renderBoardPapers(boards);
+  }
+
+  function renderBoardPapers(boards = lectureBoardsFromData()) {
+    const papers = $("#board-papers");
+    const single = $("#board-paper");
+    const edge = $("#board-paper-edge");
+    if (single) single.setAttribute("hidden", "");
+    if (edge) edge.setAttribute("hidden", "");
+    if (!papers) return;
+    papers.replaceChildren();
+    boards.forEach(board => {
+      papers.append(svgEl("rect", {
+        class: "source-board-paper",
+        x: board.x, y: board.y, width: board.width, height: board.height,
+        fill: "#f7f6f2", stroke: "#e4e1d8",
+        "stroke-width": Math.max(1, board.width / 900),
+        "pointer-events": "none"
+      }));
+      const label = svgEl("text", {
+        class: "source-board-label",
+        x: board.x + 12,
+        y: board.y - 10,
+        fill: "#8a93a3",
+        "font-size": Math.max(12, Math.min(18, board.width / 90)),
+        "font-family": "system-ui, sans-serif",
+        "pointer-events": "none"
+      });
+      label.textContent = board.label || `Whiteboard ${board.boardOrder}`;
+      papers.append(label);
+    });
+  }
+
+  function refreshSceneRect() {
+    const svg = $("#world-scene");
+    state.cachedSceneRect = svg
+      ? svg.getBoundingClientRect()
+      : { left: 0, top: 0, width: 0, height: 0 };
+    return state.cachedSceneRect;
+  }
+
+  function sceneRect() {
+    const cached = state.cachedSceneRect;
+    if (cached && cached.width > 0 && cached.height > 0) return cached;
+    return refreshSceneRect();
+  }
+
+  function sceneAspect(rect = sceneRect()) {
+    return rect.width > 0 && rect.height > 0 ? rect.width / rect.height : state.width / state.height;
+  }
+
+  function cameraZoom(camera = state.camera, rect = sceneRect()) {
+    return rect.width > 0 ? rect.width / camera.width : state.width / camera.width;
+  }
+
+  function clampCameraSize(width) {
+    const bounds = lectureContentBounds();
+    const basis = Math.max(state.width, bounds.width);
+    return clamp(width, basis / MAX_ZOOM, basis / MIN_ZOOM);
+  }
+
+  function cameraWithAspect(camera, aspect = sceneAspect()) {
+    const width = clampCameraSize(camera.width);
+    const height = width / (aspect || 1);
+    return { x: camera.x, y: camera.y, width, height };
+  }
+
+  function cameraPanZoom(camera = state.camera) {
+    return { panX: camera.x, panY: camera.y, zoom: cameraZoom(camera) };
   }
 
   function applyCamera() {
-    const camera = state.camera;
+    const camera = state.camera = cameraWithAspect(state.camera);
     $("#world-scene").setAttribute("viewBox", `${camera.x} ${camera.y} ${camera.width} ${camera.height}`);
-    const zoom = state.width / camera.width;
-    $("#zoom-label").textContent = `${Math.round(zoom * 100)}%`;
-    if (!$("#text-editor").hidden) positionTextEditor();
+    $("#zoom-label").textContent = `${Math.round(cameraZoom(camera) * 100)}%`;
+    syncHtmlOverlayCamera();
+    syncStudyMarkerAnchors();
+    syncStudyMarkerScale();
+    positionExplainButton();
   }
 
-  function fitCamera() {
-    state.camera = { x: 0, y: 0, width: state.width, height: state.height };
+  function defaultCamera() {
+    const bounds = lectureContentBounds();
+    const padX = bounds.width * .08;
+    const padY = bounds.height * .08;
+    const contentW = bounds.width + padX * 2;
+    const contentH = bounds.height + padY * 2;
+    const aspect = sceneAspect();
+    let width;
+    let height;
+    if (contentW / contentH > aspect) {
+      width = contentW;
+      height = width / aspect;
+    } else {
+      height = contentH;
+      width = height * aspect;
+    }
+    return {
+      x: bounds.x + (bounds.width - width) / 2,
+      y: bounds.y + (bounds.height - height) / 2,
+      width,
+      height
+    };
+  }
+
+  const paddedBoardCamera = defaultCamera;
+
+  function resetView() {
+    const before = clone(state.camera);
+    state.camera = defaultCamera();
     applyCamera();
+    editorLog("CAMERA RESET", {
+      before, after: clone(state.camera), zoom: cameraZoom()
+    });
     markChanged();
   }
 
-  /* Convert pointer pixels through SVG CTM so every tool works in world coordinates. */
-  function clientToWorld(clientX, clientY) {
-    const svg = $("#world-scene");
-    const point = svg.createSVGPoint();
-    point.x = clientX;
-    point.y = clientY;
-    const matrix = svg.getScreenCTM();
-    return matrix ? point.matrixTransform(matrix.inverse()) : { x: 0, y: 0 };
+  function syncCameraAspect() {
+    refreshSceneRect();
+    const cam = state.camera;
+    const aspect = sceneAspect();
+    if (!aspect || !cam.width) return;
+    if (Math.abs(cam.width / cam.height - aspect) < 1e-4) return;
+    const cy = cam.y + cam.height / 2;
+    state.camera = { x: cam.x, y: cy - (cam.width / aspect) / 2, width: cam.width, height: cam.width / aspect };
+    applyCamera();
   }
 
-  function worldToClient(x, y) {
-    const svg = $("#world-scene");
-    const point = svg.createSVGPoint();
-    point.x = x;
-    point.y = y;
-    const matrix = svg.getScreenCTM();
-    return matrix ? point.matrixTransform(matrix) : { x: 0, y: 0 };
+  /* Screen ↔ canvas uses the authoritative camera, never ad-hoc CTM math. */
+  function screenToCanvas(clientX, clientY, camera = state.camera, rect = sceneRect()) {
+    if (!rect.width || !rect.height) return { x: camera.x, y: camera.y };
+    return {
+      x: camera.x + (clientX - rect.left) * camera.width / rect.width,
+      y: camera.y + (clientY - rect.top) * camera.height / rect.height
+    };
   }
+
+  function canvasToScreen(x, y, camera = state.camera, rect = sceneRect()) {
+    if (!rect.width || !rect.height) return { x: rect.left, y: rect.top };
+    return {
+      x: rect.left + (x - camera.x) * rect.width / camera.width,
+      y: rect.top + (y - camera.y) * rect.height / camera.height
+    };
+  }
+
+  const screenToCanvasPoint = screenToCanvas;
+  const canvasToScreenPoint = canvasToScreen;
+  const clientToWorld = screenToCanvas;
+  const worldToClient = canvasToScreen;
 
   function zoomAt(factor, clientX, clientY) {
+    const rect = sceneRect();
     const old = state.camera;
-    const anchor = clientToWorld(clientX, clientY);
-    const newWidth = clamp(old.width / factor, state.width / MAX_ZOOM, state.width / MIN_ZOOM);
-    const actual = old.width / newWidth;
-    const newHeight = old.height / actual;
+    const focus = screenToCanvas(clientX, clientY, old, rect);
+    const newWidth = clampCameraSize(old.width / factor);
+    const newHeight = newWidth / sceneAspect(rect);
     state.camera = {
-      x: anchor.x - (anchor.x - old.x) / actual,
-      y: anchor.y - (anchor.y - old.y) / actual,
+      x: focus.x - (clientX - rect.left) * newWidth / rect.width,
+      y: focus.y - (clientY - rect.top) * newHeight / rect.height,
       width: newWidth,
       height: newHeight
     };
     applyCamera();
-    markChanged();
   }
 
   function snapshot() {
@@ -495,7 +834,9 @@
       objects: clone(state.objects),
       groups: clone(state.groups),
       importedTransforms: Object.fromEntries(state.importedObjects.map(object => [object.id, {
-        x: object.tx || 0, y: object.ty || 0, scaleX: object.sx || 1, scaleY: object.sy || 1
+        x: object.tx || 0, y: object.ty || 0,
+        scaleX: object.sx || 1, scaleY: object.sy || 1,
+        deleted: Boolean(object.deleted)
       }]))
     };
   }
@@ -510,12 +851,17 @@
       object.ty = Number(transform.y) || 0;
       object.sx = Number(transform.scaleX) || 1;
       object.sy = Number(transform.scaleY) || 1;
+      object.deleted = Boolean(transform.deleted);
+      if (object.node) {
+        if (object.deleted) object.node.setAttribute("display", "none");
+        else object.node.removeAttribute("display");
+      }
     });
   }
 
   /* History stores bounded before-action snapshots, not individual pointer samples. */
-  function commitLogicalAction(before) {
-    if (JSON.stringify(before) === JSON.stringify(snapshot())) return false;
+  function commitLogicalAction(before, { force = false } = {}) {
+    if (!force && JSON.stringify(before) === JSON.stringify(snapshot())) return false;
     state.history.push(before);
     if (state.history.length > HISTORY_LIMIT) state.history.shift();
     state.future = [];
@@ -526,27 +872,31 @@
 
   function undo() {
     if (!state.history.length) return;
-    closeTextEditor(true);
     state.future.push(snapshot());
     restore(state.history.pop());
     state.selected.clear();
     markChanged();
     renderScene();
+    editorLog("UNDO", { remaining: state.history.length });
   }
 
   function redo() {
     if (!state.future.length) return;
-    closeTextEditor(true);
     state.history.push(snapshot());
     restore(state.future.pop());
     state.selected.clear();
     markChanged();
     renderScene();
+    editorLog("REDO", { remaining: state.future.length });
   }
 
   function updateHistoryButtons() {
     $("#undo-button").disabled = !state.history.length;
     $("#redo-button").disabled = !state.future.length;
+  }
+
+  function inkIsActive() {
+    return Boolean(activeInk || state.interaction?.kind === "draw");
   }
 
   function markChanged() {
@@ -564,6 +914,15 @@
           id: object.id, type: "text", text: object.text,
           x: object.x, y: object.y, width: object.width, height: object.height,
           font_size: object.fontSize, color: object.color,
+          wrap_width: object.wrapWidth || undefined,
+          role: object.role || undefined,
+          practice_problem_id: object.practiceProblemId || undefined,
+          source_study_interaction_id: object.sourceStudyInteractionId || undefined,
+          generated_at: object.generatedAt || undefined,
+          board_id: object.boardId || undefined,
+          origin: object.origin || undefined,
+          folder_id: object.folderId || state.lecture.folderId || undefined,
+          created_at: object.createdAt || undefined,
           translation: { x: 0, y: 0 }
         };
       }
@@ -571,26 +930,52 @@
         id: object.id, type: object.type, points: object.points,
         color: object.color, width: object.width, opacity: object.opacity,
         translation: { x: object.tx || 0, y: object.ty || 0 },
+        scaleX: object.sx || 1, scaleY: object.sy || 1,
         erasures: (object.erasures || []).map(erasure => ({
           points: erasure.points, width: erasure.width
-        }))
+        })),
+        board_id: object.boardId || undefined,
+        origin: object.origin || "student",
+        folder_id: object.folderId || state.lecture.folderId || undefined,
+        created_at: object.createdAt || undefined
       };
     });
     return {
-      schema_version: 3,
+      schema_version: 4,
       revision: state.revision,
       viewport: clone(state.camera),
       objects,
       groups: clone(state.groups),
       imported_transforms: Object.fromEntries(state.importedObjects.map(object =>
         [object.id, { x: object.tx || 0, y: object.ty || 0,
-          scaleX: object.sx || 1, scaleY: object.sy || 1 }]))
+          scaleX: object.sx || 1, scaleY: object.sy || 1,
+          deleted: Boolean(object.deleted) }])),
+      source_boards: (state.sourceBoards.length ? state.sourceBoards : lectureBoardsFromData()).map(item => ({
+        board_id: item.boardId,
+        board_order: item.boardOrder,
+        x: item.x, y: item.y, width: item.width, height: item.height,
+        label: item.label
+      }))
     };
   }
 
   /* Editor persistence uses one versioned document; revision is server-controlled. */
+  async function flushEditorSave() {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = 0;
+    let guard = 0;
+    while ((inkIsActive() || state.saving) && guard++ < 80) {
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    if (state.dirty && boardId) await saveEditor(false);
+  }
+
   async function saveEditor(showToast = false) {
     clearTimeout(state.saveTimer);
+    if (inkIsActive()) {
+      state.saveTimer = setTimeout(() => saveEditor(showToast), 400);
+      return;
+    }
     if (!state.dirty || !boardId) return;
     if (state.saving) {
       state.saveAgain = true;
@@ -650,24 +1035,66 @@
     }
   }
 
+  function importedWorldBounds(object) {
+    const map = object.map || state.importedMap || { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+    const sx = object.sx || 1;
+    const sy = object.sy || 1;
+    const tx = object.tx || 0;
+    const ty = object.ty || 0;
+    const originX = Number(object.originX) || 0;
+    const originY = Number(object.originY) || 0;
+    return {
+      x: originX + ((object.bbox.x * sx) + tx - map.x) * map.scaleX,
+      y: originY + ((object.bbox.y * sy) + ty - map.y) * map.scaleY,
+      width: (object.bbox.width || 0) * sx * map.scaleX,
+      height: (object.bbox.height || 0) * sy * map.scaleY
+    };
+  }
+
+  function sourceBoardFor(object) {
+    const id = object?.boardId;
+    return (state.sourceBoards || []).find(item => item.boardId === id) || null;
+  }
+
+  function lectureContentBounds() {
+    const boards = state.sourceBoards.length ? state.sourceBoards : lectureBoardsFromData();
+    if (!boards.length) {
+      return { x: 0, y: 0, width: state.width, height: state.height };
+    }
+    const left = Math.min(...boards.map(item => item.x));
+    const top = Math.min(...boards.map(item => item.y));
+    const right = Math.max(...boards.map(item => item.x + item.width));
+    const bottom = Math.max(...boards.map(item => item.y + item.height));
+    return { x: left, y: top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
+  }
+
+  function isBoardFillingObject(object) {
+    if (object?.type !== "imported") return false;
+    const board = sourceBoardFor(object);
+    const width = board?.width || state.width;
+    const height = board?.height || state.height;
+    const box = importedWorldBounds(object);
+    return box.width >= width * .85 && box.height >= height * .85;
+  }
+
   function objectBounds(object) {
     if (object?.type === "group") return groupBounds(object);
-    if (object?.type === "imported") {
-      return transformedBounds({
-        x: object.bbox.x + (object.tx || 0), y: object.bbox.y + (object.ty || 0),
-        width: object.bbox.width * (object.sx || 1), height: object.bbox.height * (object.sy || 1)
-      }, object.id);
-    }
+    if (object?.type === "imported") return transformedBounds(importedWorldBounds(object), object.id);
     if (object.type === "text") {
       return transformedBounds({ x: object.x, y: object.y, width: object.width, height: object.height }, object.id);
     }
     const points = object.points || [];
     if (points.length) {
-      const xs = points.map(point => point.x);
-      const ys = points.map(point => point.y);
-      const pad = object.width / 2;
+      const sx = object.sx || 1;
+      const sy = object.sy || 1;
+      const tx = object.tx || 0;
+      const ty = object.ty || 0;
+      const xs = points.map(point => point.x * sx + tx);
+      const ys = points.map(point => point.y * sy + ty);
+      const pad = (object.width / 2) * Math.max(Math.abs(sx), Math.abs(sy));
       return transformedBounds({
-        x: Math.min(...xs) - pad, y: Math.min(...ys) - pad,
+        x: Math.min(...xs) - pad,
+        y: Math.min(...ys) - pad,
         width: Math.max(...xs) - Math.min(...xs) + pad * 2,
         height: Math.max(...ys) - Math.min(...ys) + pad * 2
       }, object.id);
@@ -686,7 +1113,7 @@
   }
 
   function allObjects() {
-    return [...state.objects, ...state.importedObjects];
+    return [...state.objects, ...state.importedObjects.filter(object => !object.deleted)];
   }
 
   function findObject(id) {
@@ -756,7 +1183,7 @@
   }
 
   function lassoSelectsObject(object, polygon) {
-    if (polygon.length < 3) return false;
+    if (polygon.length < 3 || isBoardFillingObject(object)) return false;
     const bounds = objectBounds(object);
     const lassoBounds = unionBounds([{ type: "stroke", points: polygon, width: 0 }]);
     if (!intersects(bounds, lassoBounds)) return false;
@@ -769,7 +1196,8 @@
           { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 }
         ]
       : (object.points || []).map(point => ({
-          x: point.x + (object.tx || 0), y: point.y + (object.ty || 0)
+          x: point.x * (object.sx || 1) + (object.tx || 0),
+          y: point.y * (object.sy || 1) + (object.ty || 0)
         }));
     const contained = samples.filter(point => pointInPolygon(point, polygon)).length;
     return contained >= Math.max(1, Math.ceil(samples.length * .65));
@@ -790,47 +1218,259 @@
     };
   }
 
-  function renderText(object) {
-    const group = svgEl("g", { "data-object-id": object.id, tabindex: "0" });
-    const hit = svgEl("rect", {
-      x: object.x, y: object.y, width: object.width, height: object.height,
-      fill: "transparent", stroke: "none", "pointer-events": "all"
-    });
-    const text = svgEl("text", {
-      x: object.x + 5, y: object.y + object.fontSize,
-      fill: object.color, "font-size": object.fontSize,
-      "font-family": "system-ui, sans-serif", "pointer-events": "none"
-    });
-    const maxChars = Math.max(1, Math.floor((object.width - 10) / (object.fontSize * .58)));
+  function textUsesRichRender(object) {
+    const text = String(object?.text || "");
+    if (object?.role === "ai_practice_problem") return true;
+    return typeof globalThis.hasRichMarkup === "function"
+      ? globalThis.hasRichMarkup(text)
+      : /\$\$|\\\(|\\\[|(^|[^\\])\$/.test(text);
+  }
+
+  function textMeasureHost() {
+    let host = $("#canvas-text-measure");
+    if (host) return host;
+    host = document.createElement("div");
+    host.id = "canvas-text-measure";
+    host.className = "canvas-text-measure canvas-rich-text";
+    host.setAttribute("aria-hidden", "true");
+    document.body.append(host);
+    return host;
+  }
+
+  function wrapPlainLines(text, fontSize, maxWidth) {
+    const canvas = wrapPlainLines.canvas || (wrapPlainLines.canvas = document.createElement("canvas"));
+    const ctx = canvas.getContext("2d");
+    ctx.font = `${fontSize}px system-ui, -apple-system, sans-serif`;
     const lines = [];
-    String(object.text).split("\n").forEach(paragraph => {
+    String(text || "").split("\n").forEach(paragraph => {
+      if (!paragraph) {
+        lines.push("");
+        return;
+      }
       const words = paragraph.split(/\s+/);
       let line = "";
       words.forEach(word => {
         const candidate = line ? `${line} ${word}` : word;
-        if (candidate.length > maxChars && line) {
+        if (maxWidth && ctx.measureText(candidate).width > maxWidth && line) {
           lines.push(line);
           line = word;
         } else line = candidate;
       });
       lines.push(line);
     });
-    lines.slice(0, Math.max(1, Math.floor(object.height / (object.fontSize * 1.2)))).forEach((line, index) => {
+    const width = Math.max(1, ...lines.map(line => ctx.measureText(line).width));
+    const height = Math.max(fontSize, lines.length * fontSize * 1.2);
+    return { lines, width, height };
+  }
+
+  function canvasRichMarkdown(text) {
+    const renderer = globalThis.renderStudyMarkdown;
+    if (typeof renderer === "function") return renderer(text, { mathOutput: "mathml" });
+    const node = document.createElement("span");
+    node.textContent = text || "";
+    return node;
+  }
+
+  function richTextContentOffset(object) {
+    const fontSize = Math.max(8, Number(object.fontSize) || 24);
+    const pad = Math.max(2, fontSize * 0.08);
+    const signifier = object.role === "ai_practice_problem" ? Math.max(10, fontSize * 0.7) : 0;
+    return {
+      x: pad + signifier,
+      y: pad,
+      width: Math.max(4, (Number(object.width) || 4) - pad * 2 - signifier),
+      height: Math.max(4, (Number(object.height) || 4) - pad * 2),
+      fontSize,
+      color: object.color || "#183153"
+    };
+  }
+
+  function syncHtmlOverlayCamera() {
+    const world = $("#canvas-html-world");
+    if (!world) return;
+    const camera = state.camera;
+    const rect = sceneRect();
+    const scaleX = camera.width ? rect.width / camera.width : 1;
+    const scaleY = camera.height ? rect.height / camera.height : 1;
+    world.style.transform = `scale(${scaleX}, ${scaleY}) translate(${-camera.x}px, ${-camera.y}px)`;
+  }
+
+  function applyHtmlOverlayBox(el, object) {
+    const local = richTextContentOffset(object);
+    const world = transformedBounds({
+      x: object.x + local.x,
+      y: object.y + local.y,
+      width: local.width,
+      height: local.height
+    }, object.id);
+    const scale = local.width ? world.width / local.width : 1;
+    el.style.left = `${world.x}px`;
+    el.style.top = `${world.y}px`;
+    el.style.width = `${local.width}px`;
+    el.style.fontSize = `${local.fontSize}px`;
+    el.style.color = local.color;
+    el.style.lineHeight = "1.28";
+    el.style.transform = scale === 1 ? "none" : `scale(${scale})`;
+  }
+
+  function upsertHtmlOverlayItem(object) {
+    const world = $("#canvas-html-world");
+    if (!world || !object || object.deleted || object.type !== "text" || !textUsesRichRender(object)) {
+      removeHtmlOverlayItem(object?.id);
+      return;
+    }
+    let el = world.querySelector(`[data-object-id="${CSS.escape(object.id)}"]`);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "canvas-html-text canvas-rich-text";
+      el.dataset.objectId = object.id;
+      world.append(el);
+    }
+    el.replaceChildren(canvasRichMarkdown(object.text));
+    applyHtmlOverlayBox(el, object);
+    const editing = $("#text-editor-overlay")?.dataset.objectId;
+    el.hidden = editing === object.id;
+  }
+
+  function removeHtmlOverlayItem(id) {
+    if (!id) return;
+    $("#canvas-html-world")?.querySelector(`[data-object-id="${CSS.escape(id)}"]`)?.remove();
+  }
+
+  function applyHtmlOverlayVisual(object) {
+    if (!object || object.type !== "text" || !textUsesRichRender(object)) return;
+    const el = $("#canvas-html-world")?.querySelector(`[data-object-id="${CSS.escape(object.id)}"]`);
+    if (!el) return;
+    applyHtmlOverlayBox(el, object);
+  }
+
+  function renderHtmlOverlay() {
+    const world = $("#canvas-html-world");
+    if (!world) return;
+    world.replaceChildren();
+    state.objects.forEach(object => {
+      if (object.deleted || object.type !== "text" || !textUsesRichRender(object)) return;
+      upsertHtmlOverlayItem(object);
+    });
+    syncHtmlOverlayCamera();
+  }
+
+  function measureRichText(text, fontSize, wrapWidth, color) {
+    const host = textMeasureHost();
+    const maxWidth = Math.max(40, wrapWidth || fontSize * 28);
+    host.style.cssText = [
+      "position:absolute", "left:-12000px", "top:0", "visibility:hidden",
+      "pointer-events:none", "width:max-content", `max-width:${maxWidth}px`,
+      `font-size:${fontSize}px`, "line-height:1.28",
+      `color:${color || "#183153"}`, "font-family:system-ui,-apple-system,sans-serif"
+    ].join(";");
+    host.replaceChildren();
+    host.append(canvasRichMarkdown(text));
+    const width = Math.max(4, host.scrollWidth || host.offsetWidth || 4);
+    const height = Math.max(4, host.scrollHeight || host.offsetHeight || 4);
+    return { width, height };
+  }
+
+  function intendedWrapWidth(object) {
+    if (Number(object.wrapWidth) > 0) return object.wrapWidth;
+    const existing = Number(object.width);
+    if (existing > object.fontSize * 4) return existing;
+    return object.fontSize * 28;
+  }
+
+  function measureRenderedText(object) {
+    const fontSize = Math.max(8, Number(object.fontSize) || 24);
+    const pad = Math.max(2, fontSize * 0.08);
+    const signifier = object.role === "ai_practice_problem" ? Math.max(10, fontSize * 0.7) : 0;
+    let width;
+    let height;
+    if (textUsesRichRender(object)) {
+      const measured = measureRichText(
+        object.text, fontSize, intendedWrapWidth(object), object.color
+      );
+      width = measured.width;
+      height = measured.height;
+    } else {
+      const measured = wrapPlainLines(object.text, fontSize, intendedWrapWidth(object));
+      width = measured.width;
+      height = measured.height;
+    }
+    return {
+      width: Math.max(4, width + pad * 2 + signifier),
+      height: Math.max(4, height + pad * 2),
+      pad,
+      signifier
+    };
+  }
+
+  function fitTextObject(object) {
+    if (!object || object.type !== "text") return object;
+    const size = measureRenderedText(object);
+    object.width = size.width;
+    object.height = size.height;
+    return object;
+  }
+
+  function renderText(object) {
+    const size = measureRenderedText(object);
+    object.width = size.width;
+    object.height = size.height;
+    const group = svgEl("g", {
+      "data-object-id": object.id,
+      tabindex: "0",
+      transform: `translate(${object.x} ${object.y})`
+    });
+    const hit = svgEl("rect", {
+      class: "text-hit",
+      x: 0, y: 0, width: object.width, height: object.height,
+      fill: "transparent", stroke: "none", "pointer-events": "all"
+    });
+    group.append(hit);
+    if (object.role === "ai_practice_problem") {
+      const mark = svgEl("text", {
+        class: "practice-signifier",
+        x: size.pad + size.signifier * 0.35,
+        y: size.pad + object.fontSize * 0.72,
+        "font-size": Math.max(9, object.fontSize * 0.42),
+        "text-anchor": "middle",
+        fill: "#6aa8e6",
+        "font-family": "Times New Roman, serif",
+        "font-weight": "700",
+        "pointer-events": "none",
+        "aria-hidden": "true"
+      });
+      mark.textContent = "?";
+      group.append(mark);
+    }
+    const contentX = size.pad + size.signifier;
+    const contentY = size.pad;
+    if (textUsesRichRender(object)) {
+      /* HTML overlay renders KaTeX; SVG foreignObject leaks positioned math to the page. */
+      return group;
+    }
+    const wrapped = wrapPlainLines(object.text, object.fontSize, intendedWrapWidth(object));
+    const text = svgEl("text", {
+      x: contentX,
+      y: contentY + object.fontSize,
+      fill: object.color, "font-size": object.fontSize,
+      "font-family": "system-ui, sans-serif", "pointer-events": "none"
+    });
+    wrapped.lines.forEach((line, index) => {
       const tspan = svgEl("tspan", {
-        x: object.x + 5,
+        x: contentX,
         dy: index ? object.fontSize * 1.2 : 0
       });
       tspan.textContent = line;
       text.append(tspan);
     });
-    group.append(hit, text);
+    group.append(text);
     return group;
   }
 
   function renderStroke(object) {
     const group = svgEl("g", {
       "data-object-id": object.id,
-      transform: `translate(${object.tx || 0} ${object.ty || 0})`
+      transform: objectTransformValue(object.tx, object.ty, object.sx, object.sy)
     });
     const path = svgEl("path", {
       d: strokePath(object), fill: "none", stroke: object.color,
@@ -840,6 +1480,7 @@
     });
     if (object.erasures?.length) {
       const maskId = `mask-${object.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+      $("#scene-defs")?.querySelector(`#${CSS.escape(maskId)}`)?.remove();
       const mask = svgEl("mask", {
         id: maskId, maskUnits: "userSpaceOnUse",
         x: -state.width, y: -state.height, width: state.width * 3, height: state.height * 3
@@ -859,33 +1500,68 @@
     return group;
   }
 
+  function selectedItems() {
+    return [...state.selected].map(findObject).filter(Boolean);
+  }
+
+  function selectedUnionBounds() {
+    const items = selectedItems();
+    if (!items.length) return null;
+    const bounds = items.map(objectBounds);
+    const left = Math.min(...bounds.map(box => box.x));
+    const top = Math.min(...bounds.map(box => box.y));
+    const right = Math.max(...bounds.map(box => box.x + box.width));
+    const bottom = Math.max(...bounds.map(box => box.y + box.height));
+    const pad = Math.max(4, state.camera.width / 400);
+    return {
+      x: left - pad, y: top - pad,
+      width: Math.max(1, right - left + pad * 2),
+      height: Math.max(1, bottom - top + pad * 2)
+    };
+  }
+
+  function pointInRect(point, box) {
+    return box && point.x >= box.x && point.x <= box.x + box.width &&
+      point.y >= box.y && point.y <= box.y + box.height;
+  }
+
   function renderSelection() {
     const layer = $("#interaction-layer");
-    const selectedObjects = [...state.groups, ...allObjects()]
-      .filter(object => state.selected.has(object.id));
-    selectedObjects.forEach(object => {
-      const box = objectBounds(object);
+    const union = selectedUnionBounds();
+    if (!union) return;
+    const stroke = Math.max(1, state.camera.width / 900);
+    const handle = Math.max(stroke * 8, state.camera.width / 70);
+    layer.append(svgEl("rect", {
+      x: union.x, y: union.y, width: union.width, height: union.height,
+      fill: "#3977d5", "fill-opacity": .04, stroke: "#3977d5",
+      "stroke-width": stroke,
+      "stroke-dasharray": `${state.camera.width / 300} ${state.camera.width / 450}`,
+      "data-selection-box": "1",
+      "pointer-events": "all"
+    }));
+    const handles = [
+      ["nw", union.x, union.y],
+      ["n", union.x + union.width / 2, union.y],
+      ["ne", union.x + union.width, union.y],
+      ["e", union.x + union.width, union.y + union.height / 2],
+      ["se", union.x + union.width, union.y + union.height],
+      ["s", union.x + union.width / 2, union.y + union.height],
+      ["sw", union.x, union.y + union.height],
+      ["w", union.x, union.y + union.height / 2]
+    ];
+    handles.forEach(([name, x, y]) => {
       layer.append(svgEl("rect", {
-        x: box.x, y: box.y, width: box.width, height: box.height,
-        fill: "none", stroke: "#3977d5",
-        "stroke-width": Math.max(1, state.camera.width / 900),
-        "stroke-dasharray": `${state.camera.width / 300} ${state.camera.width / 450}`,
-        "pointer-events": "none"
+        x: x - handle / 2, y: y - handle / 2, width: handle, height: handle,
+        fill: "#ffffff", stroke: "#3977d5", "stroke-width": stroke,
+        rx: handle / 6, ry: handle / 6,
+        "data-resize": name,
+        "pointer-events": "all"
       }));
-      if (selectedObjects.length === 1) {
-        const box = objectBounds(object);
-        layer.append(svgEl("circle", {
-          cx: box.x + box.width, cy: box.y + box.height,
-          r: Math.max(6, state.camera.width / 150),
-          fill: "#fff", stroke: "#3977d5",
-          "stroke-width": Math.max(1, state.camera.width / 900),
-          "data-resize-id": object.id, "pointer-events": "all"
-        }));
-      }
     });
   }
 
   function renderScene() {
+    if (inkIsActive()) return;
     const defs = $("#scene-defs");
     const user = $("#user-layer");
     const interaction = $("#interaction-layer");
@@ -896,34 +1572,171 @@
     state.objects.filter(object => !childIds.has(object.id)).forEach(object => user.append(renderNode(object.id)));
     state.groups.filter(group => !childIds.has(group.id)).forEach(group => user.append(renderNode(group.id)));
     renderImportedTransforms();
-    if (state.interaction?.kind === "draw" || state.interaction?.kind === "pixel") {
-      const active = state.interaction;
-      interaction.append(svgEl("path", {
-        d: pathFromPoints(active.points), fill: "none",
-        stroke: active.kind === "pixel" ? "#dd3f32" : active.color,
-        "stroke-opacity": active.kind === "pixel" ? .55 : active.opacity,
-        "stroke-width": active.width, "stroke-linecap": "round",
-        "stroke-linejoin": "round", "pointer-events": "none"
-      }));
-    } else if (state.interaction?.kind === "lasso") {
-      interaction.append(svgEl("path", {
-        d: `${pathFromPoints(state.interaction.points)} Z`,
-        fill: "#3977d5", "fill-opacity": .08, stroke: "#3977d5",
+    syncLiveOverlay();
+    renderSelection();
+    renderStudyMarkers();
+    renderHtmlOverlay();
+    const count = $("#object-count");
+    if (count) count.textContent = `${state.objects.length} object${state.objects.length === 1 ? "" : "s"}`;
+    updateHistoryButtons();
+    updateSelectionActions();
+    positionExplainButton();
+  }
+
+  function liveOverlayAttributes(interaction) {
+    if (interaction.kind === "lasso") {
+      return {
+        d: `${pathFromPoints(interaction.points)} Z`,
+        fill: "#3977d5",
+        "fill-opacity": .08,
+        stroke: "#3977d5",
         "stroke-width": Math.max(1, state.camera.width / 900),
         "stroke-dasharray": `${state.camera.width / 300} ${state.camera.width / 450}`,
         "stroke-linejoin": "round"
-      }));
+      };
     }
-    renderSelection();
-    $("#object-count").textContent = `${state.objects.length} object${state.objects.length === 1 ? "" : "s"}`;
-    updateHistoryButtons();
-    updateSelectionActions();
+    return null;
+  }
+
+  function livePathFromPoints(points) {
+    if (!points?.length) return "";
+    let path = `M ${points[0].x} ${points[0].y}`;
+    if (points.length === 1) return `${path} L ${points[0].x + .01} ${points[0].y + .01}`;
+    for (let index = 1; index < points.length; index++) {
+      path += ` L ${points[index].x} ${points[index].y}`;
+    }
+    return path;
+  }
+
+  function ensureLiveStroke(interaction) {
+    const persistent = $("#live-ink");
+    if (persistent) {
+      if (interaction.liveNode !== persistent) {
+        persistent.setAttribute("stroke", interaction.kind === "pixel" ? "#dd3f32" : interaction.color);
+        persistent.setAttribute("stroke-opacity", String(interaction.kind === "pixel" ? .55 : interaction.opacity));
+        persistent.setAttribute("stroke-width", String(interaction.width));
+        persistent.setAttribute("visibility", "visible");
+        interaction.liveNode = persistent;
+        state.liveNode = persistent;
+      }
+      return persistent;
+    }
+    let live = interaction.liveNode;
+    if (live?.isConnected) return live;
+    live = svgEl("path", {
+      "data-live": "1",
+      fill: "none",
+      stroke: interaction.kind === "pixel" ? "#dd3f32" : interaction.color,
+      "stroke-opacity": interaction.kind === "pixel" ? .55 : interaction.opacity,
+      "stroke-width": interaction.width,
+      "stroke-linecap": "round",
+      "stroke-linejoin": "round",
+      "pointer-events": "none"
+    });
+    $("#interaction-layer")?.append(live);
+    interaction.liveNode = live;
+    state.liveNode = live;
+    return live;
+  }
+
+  function flushLiveStroke(interaction) {
+    if (!interaction) return;
+    const path = interaction.liveD || livePathFromPoints(interaction.points);
+    if (!path) return;
+    ensureLiveStroke(interaction).setAttribute("d", path);
+    interaction.renderedCount = interaction.points.length;
+  }
+
+  function scheduleLiveStroke(interaction) {
+    if (state.liveInkRaf) return;
+    state.liveInkRaf = requestAnimationFrame(() => {
+      state.liveInkRaf = 0;
+      if (state.interaction === interaction || activeInk === interaction) {
+        flushLiveStroke(interaction);
+      }
+    });
+  }
+
+  function appendLivePoints(interaction, points) {
+    if (!points?.length) return;
+    if (!interaction.liveD) interaction.liveD = livePathFromPoints(points);
+    else {
+      for (const point of points) interaction.liveD += ` L ${point.x} ${point.y}`;
+    }
+    scheduleLiveStroke(interaction);
+  }
+
+  function pointerSamples(event) {
+    const coalesced = event.getCoalescedEvents?.();
+    return coalesced?.length ? coalesced : [event];
+  }
+
+  function ingestDrawSamples(interaction, event) {
+    const camera = interaction.drawCamera || state.camera;
+    const rect = interaction.sceneRect || sceneRect();
+    const added = [];
+    pointerSamples(event).forEach(sample => {
+      const stamp = sample.timeStamp;
+      if (Number.isFinite(stamp) && stamp < (interaction.lastSampleAt ?? -1)) return;
+      const next = screenToCanvas(sample.clientX, sample.clientY, camera, rect);
+      if (Number.isFinite(stamp) && stamp === interaction.lastSampleAt) {
+        const prev = interaction.points.at(-1);
+        if (prev && prev.x === next.x && prev.y === next.y) return;
+      }
+      if (Number.isFinite(stamp)) interaction.lastSampleAt = stamp;
+      interaction.points.push(next);
+      interaction.current = next;
+      added.push(next);
+    });
+    interaction.rawCount = interaction.points.length;
+    appendLivePoints(interaction, added);
+    return added;
+  }
+
+  function isStalePointerEvent(event, interaction) {
+    return Boolean(event && interaction &&
+      Number.isFinite(interaction.startedAt) &&
+      event.timeStamp < interaction.startedAt);
+  }
+
+  function updatePenHud() {
+    const el = $("#pen-debug");
+    if (!el) return;
+    const hud = state.penHud;
+    el.textContent = `Pencil strokes: ${hud.strokes}  last raw/render/final: ${hud.lastRaw}/${hud.lastRendered}/${hud.lastFinal}`;
+  }
+
+  function syncLiveOverlay() {
+    const interaction = state.interaction;
+    if (interaction && (interaction.kind === "draw" || interaction.kind === "pixel")) {
+      appendLivePoints(interaction, interaction.liveD ? [] : interaction.points);
+      if (interaction.liveNode && interaction.liveD) {
+        interaction.liveNode.setAttribute("d", interaction.liveD);
+      }
+      return;
+    }
+    const layer = $("#interaction-layer");
+    const attributes = interaction ? liveOverlayAttributes(interaction) : null;
+    let live = layer.querySelector("[data-live='1']");
+    if (!attributes) {
+      live?.remove();
+      return;
+    }
+    if (!live) {
+      live = svgEl("path", { "data-live": "1", "pointer-events": "none" });
+      layer.append(live);
+    }
+    Object.entries(attributes).forEach(([key, value]) => live.setAttribute(key, String(value)));
   }
 
   function updateSelectionActions() {
     const selected = [...state.selected].map(findObject).filter(Boolean);
-    $("#group-button").disabled = selected.length < 2;
-    $("#ungroup-button").disabled = !selected.some(item => item.type === "group");
+    const groupButton = $("#group-button");
+    const ungroupButton = $("#ungroup-button");
+    if (groupButton) groupButton.disabled = selected.length < 2;
+    if (ungroupButton) ungroupButton.disabled = !selected.some(item => item.type === "group");
+    syncToolControls();
+    positionExplainButton();
   }
 
   function groupSelection() {
@@ -957,8 +1770,8 @@
       } else if (object.type === "text") {
         object.x = object.x * transform.scaleX + transform.x;
         object.y = object.y * transform.scaleY + transform.y;
-        object.width *= transform.scaleX;
-        object.height *= transform.scaleY;
+        object.fontSize = Math.max(8, object.fontSize * Math.min(Math.abs(transform.scaleX), Math.abs(transform.scaleY)));
+        fitTextObject(object);
       } else if (object.type === "stroke" || object.type === "highlighter") {
         object.points.forEach(point => {
           point.x = point.x * transform.scaleX + transform.x;
@@ -986,52 +1799,6 @@
     renderScene();
   }
 
-  function bboxGap(a, b) {
-    const dx = Math.max(0, Math.max(a.x - (b.x + b.width), b.x - (a.x + a.width)));
-    const dy = Math.max(0, Math.max(a.y - (b.y + b.height), b.y - (a.y + a.height)));
-    return Math.hypot(dx, dy);
-  }
-
-  function spreadAt(point) {
-    const candidates = topLevelItems().filter(item => {
-      const box = objectBounds(item);
-      const dx = Math.max(0, Math.max(box.x - point.x, point.x - (box.x + box.width)));
-      const dy = Math.max(0, Math.max(box.y - point.y, point.y - (box.y + box.height)));
-      return Math.hypot(dx, dy) <= SPREAD_RADIUS;
-    });
-    if (candidates.length < 2) return;
-    const before = snapshot();
-    const selected = candidates.filter(item => bboxGap(objectBounds(item), objectBounds({
-      type: "text", x: point.x, y: point.y, width: 0, height: 0
-    })) <= SPREAD_RADIUS);
-    if (selected.length < 2) return;
-    for (let iteration = 0; iteration < MAX_SPREAD_ITERATIONS; iteration++) {
-      let changed = false;
-      for (let i = 0; i < selected.length; i++) for (let j = i + 1; j < selected.length; j++) {
-        const a = selected[i], b = selected[j];
-        const ab = objectBounds(a), bb = objectBounds(b);
-        const overlapX = Math.min(ab.x + ab.width, bb.x + bb.width) - Math.max(ab.x, bb.x);
-        const overlapY = Math.min(ab.y + ab.height, bb.y + bb.height) - Math.max(ab.y, bb.y);
-        const gap = bboxGap(ab, bb);
-        if (overlapX <= 0 && overlapY <= 0 && gap >= TARGET_GAP) continue;
-        const horizontal = Math.abs((ab.x + ab.width / 2) - (bb.x + bb.width / 2)) >=
-          Math.abs((ab.y + ab.height / 2) - (bb.y + bb.height / 2));
-        const amount = Math.min(MAX_SINGLE_SPREAD_DISPLACEMENT, TARGET_GAP - gap + Math.max(0, Math.min(overlapX, overlapY)));
-        const direction = horizontal
-          ? ((ab.x + ab.width / 2) <= (bb.x + bb.width / 2) ? -1 : 1)
-          : ((ab.y + ab.height / 2) <= (bb.y + bb.height / 2) ? -1 : 1);
-        moveObject(a, horizontal ? direction * amount / 2 : 0, horizontal ? 0 : direction * amount / 2);
-        moveObject(b, horizontal ? -direction * amount / 2 : 0, horizontal ? 0 : -direction * amount / 2);
-        changed = true;
-      }
-      if (!changed) break;
-    }
-    if (commitLogicalAction(before)) {
-      state.selected = new Set(selected.map(item => item.id));
-      renderScene();
-    }
-  }
-
   function renderNode(id) {
     const group = state.groups.find(item => item.id === id);
     if (group) {
@@ -1051,25 +1818,171 @@
     return object.type === "text" ? renderText(object) : renderStroke(object);
   }
 
+  function importedTransformValue(object) {
+    const parts = [];
+    let parent = parentGroup(object.id);
+    while (parent) {
+      const transform = parent.transform || {};
+      parts.unshift(`translate(${transform.x || 0} ${transform.y || 0}) scale(${transform.scaleX || 1} ${transform.scaleY || 1}) rotate(${transform.rotation || 0})`);
+      parent = parentGroup(parent.id);
+    }
+    parts.push(objectTransformValue(object.tx, object.ty, object.sx, object.sy));
+    return parts.join(" ");
+  }
+
+  function applyImportedTransform(object) {
+    if (!object?.node) return;
+    object.node.setAttribute("transform", importedTransformValue(object));
+  }
+
   function renderImportedTransforms() {
-    state.importedObjects.forEach(object => {
-      const path = object.node;
-      if (!path) return;
-      const transforms = [];
-      if (object.tx || object.ty) transforms.push(`translate(${object.tx || 0} ${object.ty || 0})`);
-      if (object.sx !== 1 || object.sy !== 1) transforms.push(`scale(${object.sx || 1} ${object.sy || 1})`);
-      let parent = parentGroup(object.id);
-      while (parent) {
-        const transform = parent.transform || {};
-        transforms.unshift(`translate(${transform.x || 0} ${transform.y || 0}) scale(${transform.scaleX || 1} ${transform.scaleY || 1}) rotate(${transform.rotation || 0})`);
-        parent = parentGroup(parent.id);
-      }
-      path.setAttribute("transform", transforms.join(" ") || "");
+    state.importedObjects.forEach(applyImportedTransform);
+  }
+
+  function isDrawPointer(event) {
+    return event.pointerType === "pen" || event.pointerType === "mouse";
+  }
+
+  function isTouchPointer(event) {
+    return event.pointerType === "touch";
+  }
+
+  function rememberPointer(event) {
+    state.pointers.set(event.pointerId, {
+      x: event.clientX, y: event.clientY, type: event.pointerType
     });
+    state.activePointerIds.add(event.pointerId);
+  }
+
+  function forgetPointer(pointerId) {
+    state.pointers.delete(pointerId);
+    state.activePointerIds.delete(pointerId);
+  }
+
+  function touchPointers() {
+    return [...state.pointers.entries()].filter(([, pointer]) => pointer.type === "touch");
+  }
+
+  function currentToolWidth() {
+    if (state.tool === "highlighter") return Math.max(8, state.highlighterSize);
+    if (state.tool === "pixel-eraser") return Math.max(8, state.eraserSize);
+    return state.penSize;
+  }
+
+  function currentToolColor() {
+    return state.tool === "highlighter" ? state.highlighterColor : state.penColor;
+  }
+
+  function selectedTextObjects() {
+    return selectedItems().filter(item => item.type === "text");
+  }
+
+  function applyTextSizeToSelection(fontSize) {
+    const targets = selectedTextObjects();
+    if (!targets.length) return;
+    const next = clamp(Number(fontSize), 8, 240);
+    const before = snapshot();
+    targets.forEach(object => {
+      object.fontSize = next;
+      fitTextObject(object);
+    });
+    commitLogicalAction(before);
+    renderScene();
+  }
+
+  function syncToolControls() {
+    const sizeControl = $("#stroke-size")?.closest(".size-control");
+    const textControl = $("#text-size-control");
+    const colorTools = $(".color-tools");
+    const sizeInput = $("#stroke-size");
+    const textInput = $("#text-size");
+    const texts = selectedTextObjects();
+    const editingText = state.tool === "select" && texts.length > 0;
+    const usesSize = !editingText &&
+      (state.tool === "pen" || state.tool === "highlighter" || state.tool === "pixel-eraser");
+    const usesColor = state.tool === "pen" || state.tool === "highlighter" || state.tool === "select";
+    if (sizeControl) sizeControl.hidden = !usesSize;
+    if (textControl) textControl.hidden = !editingText;
+    if (colorTools) colorTools.hidden = !usesColor;
+    if (editingText && textInput) textInput.value = String(Math.round(texts[0].fontSize || 24));
+    if (sizeInput) {
+      if (state.tool === "highlighter") sizeInput.value = String(state.highlighterSize);
+      else if (state.tool === "pixel-eraser") sizeInput.value = String(state.eraserSize);
+      else sizeInput.value = String(state.penSize);
+    }
+    state.size = currentToolWidth();
+    state.color = currentToolColor();
+    const color = state.color;
+    $$(".color-chip").forEach(item => {
+      const active = item.dataset.color === color;
+      item.classList.toggle("is-active", active);
+      item.setAttribute("aria-pressed", String(active));
+    });
+    const custom = $("#custom-color");
+    if (custom) custom.value = color;
+  }
+
+  function captureDrawingPointer(event) {
+    const token = ++state.captureSerial;
+    /* Touch stays uncaptured so a second finger can pinch. Pen/mouse capture
+       plus window-level listeners keep rapid Pencil strokes from going missing. */
+    if (event.pointerType === "touch") return token;
+    const svg = $("#world-scene");
+    try {
+      svg.setPointerCapture(event.pointerId);
+      state.capturedPointer = event.pointerId;
+    } catch (_) { /* Window listeners still finish the gesture. */ }
+    return token;
+  }
+
+  function releaseCapturedPointer(pointerId) {
+    const svg = $("#world-scene");
+    const id = pointerId ?? state.capturedPointer;
+    if (id == null || !svg) return;
+    state.releasingCapture = true;
+    try {
+      if (svg.hasPointerCapture?.(id)) svg.releasePointerCapture(id);
+    } catch (_) { /* Capture may already be gone. */ }
+    state.releasingCapture = false;
+    if (state.capturedPointer === id) state.capturedPointer = null;
+  }
+
+  function recaptureIfNeeded(event) {
+    const svg = $("#world-scene");
+    if (!svg || state.interaction?.pointerId !== event.pointerId) return;
+    if (svg.hasPointerCapture?.(event.pointerId)) return;
+    if (["pan", "pinch"].includes(state.interaction.kind)) return;
+    try { svg.setPointerCapture(event.pointerId); } catch (_) {}
+    editorLog("POINTER CAPTURE", { action: "recapture", pointerId: event.pointerId });
+  }
+
+  function cancelTransientInteraction(reason = "cancel") {
+    const interaction = state.interaction;
+    if (interaction?.pointerId != null) releaseCapturedPointer(interaction.pointerId);
+    if (interaction && (interaction.kind === "move" || interaction.kind === "resize") && interaction.before) {
+      restore(interaction.before);
+    }
+    if (interaction?.kind === "draw") activeInk = null;
+    state.interaction = null;
+    state.pointers.clear();
+    state.activePointerIds.clear();
+    state.cameraGesture = "idle";
+    $("#world-scene")?.classList.remove("is-panning");
+    editorLog("POINTER CANCEL", { reason, kind: interaction?.kind || null });
   }
 
   function setTool(tool) {
-    closeTextEditor(true);
+    if (!TOOLS.has(tool)) return;
+    const previous = state.tool;
+    if (state.interaction) {
+      const kind = state.interaction.kind;
+      if (kind === "draw" || kind === "pixel" || kind === "lasso" || kind === "object-erase") {
+        finishPointerInteraction(null, { reason: "tool-change", pointerId: state.interaction.pointerId });
+      } else {
+        cancelTransientInteraction("tool-change");
+        renderScene();
+      }
+    }
     state.tool = tool;
     $("#world-scene").dataset.tool = tool;
     $$(".tool-button").forEach(button => {
@@ -1077,37 +1990,233 @@
       button.classList.toggle("is-active", active);
       button.setAttribute("aria-pressed", String(active));
     });
+    syncToolControls();
+    if (previous !== tool) editorLog("TOOL CHANGE", { from: previous, to: tool });
   }
 
-  function updateSelectedTextStyle(property, value) {
-    const selectedText = state.objects.filter(
-      object => object.type === "text" && state.selected.has(object.id)
+  function applyColorToSelection(color) {
+    const targets = state.objects.filter(object =>
+      state.selected.has(object.id) && ["stroke", "highlighter", "text"].includes(object.type)
     );
-    if (!selectedText.length) return;
+    if (!targets.length) return;
     const before = snapshot();
-    selectedText.forEach(object => { object[property] = value; });
+    targets.forEach(object => { object.color = color; });
     commitLogicalAction(before);
     renderScene();
   }
 
+  function logCamera(phase, extra = {}) {
+    const interaction = state.interaction;
+    editorLog(`CAMERA ${phase}`, {
+      pointerType: extra.pointerType || interaction?.pointerType || null,
+      pointerId: extra.pointerId ?? interaction?.pointerId ?? null,
+      activeTouchIds: touchPointers().map(([id]) => id),
+      gesture: interaction?.kind || "idle",
+      ...cameraPanZoom(),
+      ...extra
+    });
+  }
+
+  function endCameraGesture(reason = "idle") {
+    const wasCamera = state.interaction && ["pan", "pinch"].includes(state.interaction.kind);
+    if (wasCamera) {
+      logCamera("END", { reason, ...cameraPanZoom() });
+      markChanged();
+    }
+    if (wasCamera) state.interaction = null;
+    state.cameraGesture = "idle";
+    $("#world-scene")?.classList.remove("is-panning");
+  }
+
   function beginPan(event) {
+    refreshSceneRect();
+    state.cameraGesture = "pan";
     state.interaction = {
-      kind: "pan", pointerId: event.pointerId,
+      kind: "pan",
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      startedAt: event.timeStamp,
+      tool: state.tool,
       client: { x: event.clientX, y: event.clientY },
-      camera: clone(state.camera)
+      camera: clone(state.camera),
+      sceneRect: sceneRect()
     };
     $("#world-scene").classList.add("is-panning");
+    logCamera("START", {
+      kind: "pan", pointerId: event.pointerId, pointerType: event.pointerType
+    });
+  }
+
+  function beginPanFromPointer(pointerId, pointer) {
+    refreshSceneRect();
+    state.cameraGesture = "pan";
+    state.interaction = {
+      kind: "pan",
+      pointerId,
+      pointerType: "touch",
+      startedAt: performance.now(),
+      tool: state.tool,
+      client: { x: pointer.x, y: pointer.y },
+      camera: clone(state.camera),
+      sceneRect: sceneRect()
+    };
+    $("#world-scene").classList.add("is-panning");
+    logCamera("START", { kind: "pan", pointerId, pointerType: "touch", reason: "pinch-to-pan" });
   }
 
   function beginPinch() {
-    const points = [...state.pointers.values()];
+    const points = touchPointers().map(([, pointer]) => pointer);
     if (points.length < 2) return;
+    refreshSceneRect();
+    const distance = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
+    const midpoint = { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2 };
+    state.cameraGesture = "pinch";
     state.interaction = {
       kind: "pinch",
-      distance: Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y),
-      midpoint: { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2 },
-      camera: clone(state.camera)
+      pointerType: "touch",
+      startedAt: performance.now(),
+      tool: state.tool,
+      distance: Math.max(1, distance),
+      midpoint,
+      camera: clone(state.camera),
+      sceneRect: sceneRect(),
+      zoomLatched: false
     };
+    $("#world-scene").classList.add("is-panning");
+    logCamera("START", { kind: "pinch", initialDistance: distance });
+  }
+
+  function syncCameraFromTouches() {
+    const touches = touchPointers();
+    if (touches.length === 0) {
+      endCameraGesture("no-touches");
+      return;
+    }
+    if (touches.length === 1) {
+      const [id, pointer] = touches[0];
+      if (state.interaction?.kind !== "pan" || state.interaction.pointerId !== id) {
+        beginPanFromPointer(id, pointer);
+      }
+      return;
+    }
+    if (state.interaction?.kind !== "pinch") beginPinch();
+  }
+
+  function applyPanCamera(clientX, clientY) {
+    const interaction = state.interaction;
+    if (!interaction || interaction.kind !== "pan") return;
+    const rect = interaction.sceneRect || sceneRect();
+    const start = interaction.camera;
+    if (!rect.width || !rect.height) return;
+    state.camera = {
+      x: start.x - (clientX - interaction.client.x) * start.width / rect.width,
+      y: start.y - (clientY - interaction.client.y) * start.height / rect.height,
+      width: start.width,
+      height: start.height
+    };
+    applyCamera();
+  }
+
+  function applyPinchCamera() {
+    const interaction = state.interaction;
+    if (!interaction || interaction.kind !== "pinch") return;
+    const points = touchPointers().map(([, pointer]) => pointer);
+    if (points.length < 2) return;
+    const rect = interaction.sceneRect || sceneRect();
+    if (!rect.width || !rect.height) return;
+    const start = interaction.camera;
+    const currentDistance = Math.max(1, Math.hypot(
+      points[0].x - points[1].x, points[0].y - points[1].y
+    ));
+    const midpoint = {
+      x: (points[0].x + points[1].x) / 2,
+      y: (points[0].y + points[1].y) / 2
+    };
+    if (!interaction.zoomLatched &&
+      Math.abs(currentDistance - interaction.distance) >= PINCH_ZOOM_SLOP) {
+      interaction.zoomLatched = true;
+    }
+    const factor = interaction.zoomLatched
+      ? currentDistance / interaction.distance
+      : 1;
+    const width = clampCameraSize(start.width / factor);
+    const height = width / sceneAspect(rect);
+    const origin = interaction.midpoint;
+    const focus = screenToCanvas(origin.x, origin.y, start, rect);
+    state.camera = {
+      x: focus.x - (midpoint.x - rect.left) * width / rect.width,
+      y: focus.y - (midpoint.y - rect.top) * height / rect.height,
+      width,
+      height
+    };
+    applyCamera();
+  }
+
+  function forgetTouchPointers() {
+    [...state.pointers.entries()].forEach(([id, pointer]) => {
+      if (pointer.type === "touch") forgetPointer(id);
+    });
+  }
+
+  function eventFromStudyUi(event) {
+    const node = event.target;
+    if (!node || typeof node.closest !== "function") return false;
+    return Boolean(node.closest("#study-sheet, #study-drawer"));
+  }
+
+  function blurStudyUi() {
+    const active = document.activeElement;
+    if (active && typeof active.closest === "function" &&
+        active.closest("#study-sheet, #study-drawer")) {
+      active.blur();
+    }
+  }
+
+  function resetGestureState(reason = "study-ui") {
+    if (state.interaction?.kind === "draw" || inkIsActive()) return;
+    const preserved = { panX: state.camera.x, panY: state.camera.y, zoom: cameraZoom() };
+    const previous = {
+      gesture: state.interaction?.kind || state.cameraGesture || "idle",
+      pointerIds: [...state.activePointerIds],
+      interactionPointer: state.interaction?.pointerId ?? null
+    };
+    if (state.interaction && ["pan", "pinch"].includes(state.interaction.kind)) {
+      endCameraGesture(reason);
+    } else if (state.interaction) {
+      cancelTransientInteraction(reason);
+    }
+    state.pointers.clear();
+    state.activePointerIds.clear();
+    state.cameraGesture = "idle";
+    state.interaction = null;
+    releaseCapturedPointer();
+    $("#world-scene")?.classList.remove("is-panning");
+    refreshSceneRect();
+    studyLog("GESTURE RESET", {
+      reason,
+      previousGesture: previous.gesture,
+      previousPointerIds: previous.pointerIds,
+      previousPointer: previous.interactionPointer,
+      preservedPanX: preserved.panX,
+      preservedPanY: preserved.panY,
+      preservedZoom: preserved.zoom,
+      ...cameraPanZoom()
+    });
+    logCamera("GESTURE RESET", {
+      reason,
+      preservedPanX: preserved.panX,
+      preservedPanY: preserved.panY,
+      preservedZoom: preserved.zoom,
+      ...cameraPanZoom()
+    });
+  }
+
+  function recoverCameraIfStuck() {
+    const interaction = state.interaction;
+    if (!interaction || !["pan", "pinch"].includes(interaction.kind)) return;
+    if (interaction.pointerType === "touch" && touchPointers().length === 0) {
+      endCameraGesture("orphaned");
+    }
   }
 
   function hitObject(event) {
@@ -1115,76 +2224,397 @@
     return target?.dataset.groupId || target?.dataset.objectId || "";
   }
 
+  function hitResizeHandle(event) {
+    return event.target?.dataset?.resize || event.target?.closest?.("[data-resize]")?.dataset?.resize || "";
+  }
+
+  function captureItemTransforms(items) {
+    return items.map(object => ({
+      id: object.id,
+      type: object.type,
+      tx: object.tx || 0,
+      ty: object.ty || 0,
+      sx: object.sx || 1,
+      sy: object.sy || 1,
+      x: object.x,
+      y: object.y,
+      width: object.width,
+      height: object.height,
+      fontSize: object.fontSize,
+      wrapWidth: object.wrapWidth,
+      transform: object.transform ? { ...object.transform } : null
+    }));
+  }
+
+  function scaleObjectFromStart(start, origin, scaleX, scaleY) {
+    const object = findObject(start.id);
+    if (!object) return;
+    invalidateEraseBounds(object);
+    if (object.type === "group" && start.transform) {
+      object.transform.scaleX = start.transform.scaleX * scaleX;
+      object.transform.scaleY = start.transform.scaleY * scaleY;
+      object.transform.x = start.transform.x * scaleX + origin.x * (1 - scaleX);
+      object.transform.y = start.transform.y * scaleY + origin.y * (1 - scaleY);
+      return;
+    }
+    if (object.type === "imported") {
+      const map = state.importedMap || { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+      object.sx = start.sx * scaleX;
+      object.sy = start.sy * scaleY;
+      object.tx = start.tx * scaleX + map.x * (1 - scaleX) + origin.x * (1 - scaleX) / (map.scaleX || 1);
+      object.ty = start.ty * scaleY + map.y * (1 - scaleY) + origin.y * (1 - scaleY) / (map.scaleY || 1);
+      return;
+    }
+    if (object.type === "text") {
+      const handle = state.interaction?.handle || "";
+      object.x = start.x * scaleX + origin.x * (1 - scaleX);
+      object.y = start.y * scaleY + origin.y * (1 - scaleY);
+      if (["e", "w"].includes(handle)) {
+        object.fontSize = start.fontSize;
+        object.wrapWidth = Math.max((start.fontSize || 24) * 4, (start.wrapWidth || start.width) * scaleX);
+        object.width = Math.max(4, start.width * scaleX);
+        object.height = start.height;
+      } else {
+        const uniform = ["n", "s"].includes(handle) ? scaleY : Math.min(scaleX, scaleY);
+        object.fontSize = Math.max(8, start.fontSize * uniform);
+        object.width = Math.max(4, start.width * uniform);
+        object.height = Math.max(4, start.height * uniform);
+      }
+      return;
+    }
+    object.sx = start.sx * scaleX;
+    object.sy = start.sy * scaleY;
+    object.tx = start.tx * scaleX + origin.x * (1 - scaleX);
+    object.ty = start.ty * scaleY + origin.y * (1 - scaleY);
+  }
+
+  function resizeOrigin(handle, bounds) {
+    const origins = {
+      nw: { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
+      n: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height },
+      ne: { x: bounds.x, y: bounds.y + bounds.height },
+      e: { x: bounds.x, y: bounds.y + bounds.height / 2 },
+      se: { x: bounds.x, y: bounds.y },
+      s: { x: bounds.x + bounds.width / 2, y: bounds.y },
+      sw: { x: bounds.x + bounds.width, y: bounds.y },
+      w: { x: bounds.x + bounds.width, y: bounds.y + bounds.height / 2 }
+    };
+    return origins[handle] || { x: bounds.x, y: bounds.y };
+  }
+
+  function objectsAtPoint(point, radius = 0) {
+    return allObjects().filter(object => {
+      if (object.deleted || isBoardFillingObject(object)) return false;
+      const bounds = objectBounds(object);
+      return point.x >= bounds.x - radius && point.x <= bounds.x + bounds.width + radius &&
+        point.y >= bounds.y - radius && point.y <= bounds.y + bounds.height + radius;
+    });
+  }
+
+  function appendUserObject(object) {
+    const childIds = new Set(state.groups.flatMap(group => group.children));
+    if (childIds.has(object.id)) return;
+    $("#user-layer")?.append(renderNode(object.id));
+    upsertHtmlOverlayItem(object);
+    const count = $("#object-count");
+    if (count) count.textContent = `${state.objects.length} object${state.objects.length === 1 ? "" : "s"}`;
+  }
+
+  function commitLiveStroke(interaction, reason) {
+    if (!interaction.points?.length) {
+      removeLiveOverlay();
+      editorLog("STROKE FINALIZE", {
+        pointerId: interaction.pointerId, points: 0, reason, empty: true
+      });
+      return;
+    }
+    const previousObjects = state.objects;
+    const rawPath = interaction.liveD || livePathFromPoints(interaction.points);
+    const object = {
+      id: uid("stroke"), type: interaction.objectType,
+      points: interaction.points,
+      d: rawPath,
+      color: interaction.color, width: interaction.width,
+      opacity: interaction.opacity, tx: 0, ty: 0, sx: 1, sy: 1, erasures: [],
+      origin: "student",
+      folderId: state.lecture.folderId || "",
+      createdAt: Date.now() / 1000
+    };
+    state.objects = previousObjects.concat(object);
+    const live = $("#live-ink");
+    if (live?.getAttribute("d")) {
+      const group = svgEl("g", { "data-object-id": object.id });
+      const path = live.cloneNode();
+      path.removeAttribute("id");
+      path.removeAttribute("visibility");
+      path.setAttribute("pointer-events", "stroke");
+      group.append(path);
+      $("#user-layer")?.append(group);
+    } else {
+      appendUserObject(object);
+    }
+    removeLiveOverlay();
+    const hud = state.penHud;
+    hud.strokes += 1;
+    hud.lastRaw = interaction.rawCount || interaction.points.length;
+    hud.lastRendered = interaction.renderedCount || interaction.points.length;
+    hud.lastFinal = interaction.points.length;
+    updatePenHud();
+    const count = $("#object-count");
+    if (count) count.textContent = `${state.objects.length} object${state.objects.length === 1 ? "" : "s"}`;
+    editorLog("STROKE FINALIZE", {
+      id: object.id,
+      pointerId: interaction.pointerId,
+      points: object.points.length,
+      raw: hud.lastRaw,
+      rendered: hud.lastRendered,
+      final: hud.lastFinal,
+      reason,
+      tool: interaction.tool
+    });
+    const groupsAtCommit = state.groups;
+    const importedAtCommit = state.importedObjects;
+    queueHistoryCommit(() => ({
+      objects: typeof structuredClone === "function"
+        ? structuredClone(previousObjects)
+        : clone(previousObjects),
+      groups: clone(groupsAtCommit),
+      importedTransforms: Object.fromEntries(importedAtCommit.map(item => [item.id, {
+        x: item.tx || 0, y: item.ty || 0,
+        scaleX: item.sx || 1, scaleY: item.sy || 1,
+        deleted: Boolean(item.deleted)
+      }]))
+    }));
+  }
+
+  function queueHistoryCommit(entry) {
+    state.pendingHistory.push(entry);
+    if (state.historyTimer) return;
+    const flushHistory = () => {
+      state.historyTimer = 0;
+      if (inkIsActive()) {
+        state.historyTimer = setTimeout(flushHistory, 32);
+        return;
+      }
+      const entries = state.pendingHistory.splice(0).map(item => (
+        typeof item === "function" ? item() : item
+      ));
+      entries.forEach(snapshotEntry => {
+        state.history.push(snapshotEntry);
+        if (state.history.length > HISTORY_LIMIT) state.history.shift();
+      });
+      if (entries.length) {
+        state.future = [];
+        markChanged();
+        updateHistoryButtons();
+      }
+    };
+    state.historyTimer = setTimeout(flushHistory, 0);
+  }
+
+  function removeLiveOverlay() {
+    if (state.liveInkRaf) {
+      cancelAnimationFrame(state.liveInkRaf);
+      state.liveInkRaf = 0;
+    }
+    const persistent = $("#live-ink");
+    if (persistent) {
+      persistent.setAttribute("d", "");
+      persistent.setAttribute("visibility", "hidden");
+    }
+    if (state.liveNode && state.liveNode !== persistent) state.liveNode.remove();
+    $("#interaction-layer")?.querySelector("[data-live='1']")?.remove();
+    state.liveNode = null;
+  }
+
   function pointerDown(event) {
     if (event.pointerType === "mouse" && event.button !== 0 && event.button !== 1) return;
     event.preventDefault();
-    const svg = $("#world-scene");
-    svg.setPointerCapture(event.pointerId);
-    state.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (state.pointers.size === 2 && event.pointerType !== "mouse") {
-      state.interaction = null;
-      beginPinch();
-      renderScene();
+    const drawing = isDrawPointer(event);
+    const sameStuckPointer = state.interaction &&
+      state.interaction.pointerId === event.pointerId &&
+      drawing;
+    if (sameStuckPointer) {
+      finishPointerInteraction(event, { reason: "reentry" });
+    } else if (drawing && state.interaction &&
+      (state.interaction.kind === "pan" || state.interaction.kind === "pinch")) {
+      endCameraGesture("pencil-preempt");
+    } else if (drawing && state.interaction &&
+      state.interaction.pointerId !== event.pointerId) {
+      finishPointerInteraction(null, {
+        reason: "superseded", pointerId: state.interaction.pointerId
+      });
+    }
+    rememberPointer(event);
+    state.penHud.downs += 1;
+    editorLog("PEN DOWN", {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      tool: state.tool,
+      buttons: event.buttons,
+      pressure: event.pressure,
+      timestamp: event.timeStamp
+    });
+    if (isTouchPointer(event)) {
+      if (state.interaction && !["pan", "pinch"].includes(state.interaction.kind)) {
+        forgetPointer(event.pointerId);
+        return;
+      }
+      recoverCameraIfStuck();
+      logCamera("DOWN", {
+        pointerId: event.pointerId, pointerType: event.pointerType
+      });
+      syncCameraFromTouches();
       return;
     }
     if (event.button === 1 || state.spaceDown) {
       beginPan(event);
       return;
     }
-    const point = clientToWorld(event.clientX, event.clientY);
-    const hit = hitObject(event);
-    const resizeId = event.target.dataset?.resizeId;
-    if (resizeId) {
-      const object = findObject(resizeId);
-      if (!object) return;
-      state.interaction = { kind: "resize", pointerId: event.pointerId, object, start: point, before: snapshot(),
-        original: { bounds: objectBounds(object), transform: clone(object.transform || {}) } };
+    const captureToken = captureDrawingPointer(event);
+    const liveRect = sceneRect();
+    const liveCamera = {
+      x: state.camera.x, y: state.camera.y,
+      width: state.camera.width, height: state.camera.height
+    };
+    const point = screenToCanvas(event.clientX, event.clientY, liveCamera, liveRect);
+    const tool = state.tool;
+    if (tool === "pen" || tool === "highlighter") {
+      const interaction = {
+        kind: "draw",
+        pointerId: event.pointerId,
+        pointerType: event.pointerType,
+        captureToken,
+        startedAt: event.timeStamp,
+        lastSampleAt: event.timeStamp,
+        tool,
+        start: point,
+        current: point,
+        points: [point],
+        rawCount: 1,
+        renderedCount: 0,
+        usedRaw: false,
+        objectType: tool === "highlighter" ? "highlighter" : "stroke",
+        color: currentToolColor(),
+        width: currentToolWidth(),
+        opacity: tool === "highlighter" ? .28 : 1,
+        sceneRect: liveRect,
+        drawCamera: liveCamera,
+        liveD: "",
+        liveNode: null
+      };
+      activeInk = interaction;
+      state.interaction = interaction;
+      appendLivePoints(interaction, [point]);
+      flushLiveStroke(interaction);
+      editorLog("STROKE BEGIN", {
+        pointerId: event.pointerId,
+        pointerType: event.pointerType,
+        tool,
+        width: interaction.width,
+        timestamp: event.timeStamp
+      });
       return;
     }
-    if (state.tool === "pen" || state.tool === "highlighter") {
+    if (tool === "object-eraser") {
       state.interaction = {
-        kind: "draw", pointerId: event.pointerId, before: snapshot(), points: [point],
-        objectType: state.tool === "highlighter" ? "highlighter" : "stroke",
-        color: state.color,
-        width: state.tool === "highlighter" ? Math.max(18, state.size * 3) : state.size,
-        opacity: state.tool === "highlighter" ? .28 : 1
+        kind: "object-erase",
+        pointerId: event.pointerId,
+        pointerType: event.pointerType,
+        captureToken,
+        startedAt: event.timeStamp,
+        tool,
+        start: point,
+        current: point,
+        lastPoint: point,
+        before: null,
+        erased: false,
+        erasedIds: new Set(),
+        sceneRect: liveRect,
+        startCamera: liveCamera
       };
-      renderScene();
+      eraseAlongSegment(point, point);
       return;
     }
-    if (state.tool === "text") {
-      const before = snapshot();
-      const object = {
-        id: uid("text"), type: "text", x: point.x, y: point.y,
-        width: Math.min(260, state.width / 3), height: 90,
-        text: "", color: state.color, fontSize: Math.max(18, state.size * 4)
-      };
-      state.objects.push(object);
-      state.selected = new Set([object.id]);
-      commitLogicalAction(before);
-      renderScene();
-      openTextEditor(object);
-      return;
-    }
-    if (state.tool === "object-eraser") {
-      state.interaction = { kind: "object-erase", pointerId: event.pointerId, before: snapshot() };
-      eraseWholeObject(hit);
-      return;
-    }
-    if (state.tool === "pixel-eraser") {
+    if (tool === "pixel-eraser") {
       state.interaction = {
-        kind: "pixel", pointerId: event.pointerId, before: snapshot(), points: [point],
-        width: Math.max(12, state.size * 3)
+        kind: "pixel",
+        pointerId: event.pointerId,
+        pointerType: event.pointerType,
+        captureToken,
+        startedAt: event.timeStamp,
+        tool,
+        start: point,
+        current: point,
+        points: [point],
+        width: currentToolWidth(),
+        sceneRect: liveRect,
+        drawCamera: liveCamera,
+        liveD: "",
+        liveNode: null
       };
-      renderScene();
+      appendLivePoints(state.interaction, [point]);
       return;
     }
-    if (state.tool === "make-space") {
-      state.interaction = { kind: "make-space", pointerId: event.pointerId, point };
-      return;
-    }
-    if (state.tool === "select") {
-      if (hit) {
+    if (tool === "select") {
+      const handle = hitResizeHandle(event);
+      const union = selectedUnionBounds();
+      if (handle && union && state.selected.size) {
+        state.interaction = {
+          kind: "resize",
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          captureToken,
+          startedAt: event.timeStamp,
+          tool,
+          handle,
+          origin: resizeOrigin(handle, union),
+          startBounds: union,
+          start: point,
+          current: point,
+          before: snapshot(),
+          startTransforms: captureItemTransforms(selectedItems()),
+          sceneRect: liveRect,
+          startCamera: liveCamera,
+          moved: false
+        };
+        editorLog("OBJECT TRANSFORM", { action: "resize-start", handle, ids: [...state.selected] });
+        return;
+      }
+      const onSelection = event.target?.dataset?.selectionBox === "1" || pointInRect(point, union);
+      if (onSelection && !event.shiftKey && state.selected.size) {
+        state.interaction = {
+          kind: "move",
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          captureToken,
+          startedAt: event.timeStamp,
+          tool,
+          start: point,
+          current: point,
+          startScreen: { x: event.clientX, y: event.clientY },
+          startCanvas: point,
+          startCamera: clone(state.camera),
+          sceneRect: liveRect,
+          startTransforms: captureItemTransforms(selectedItems()),
+          before: snapshot(),
+          moved: false
+        };
+        editorLog("DRAG START", {
+          ids: [...state.selected],
+          startScreen: { x: event.clientX, y: event.clientY },
+          objectStart: selectedItems().map(item => ({
+            id: item.id,
+            x: item.tx ?? item.transform?.x ?? item.x,
+            y: item.ty ?? item.transform?.y ?? item.y
+          })),
+          zoom: cameraZoom()
+        });
+        return;
+      }
+      const hit = hitObject(event);
+      const hitObjectRef = hit ? findObject(hit) : null;
+      if (hit && hitObjectRef && !hitObjectRef.deleted && !isBoardFillingObject(hitObjectRef)) {
         const hitGroup = state.groups.find(group => group.id === hit);
         const selectableId = hitGroup ? hitGroup.id : (parentGroup(hit)?.id || hit);
         if (event.shiftKey) {
@@ -1192,80 +2622,142 @@
           else state.selected.add(selectableId);
         } else if (!state.selected.has(selectableId)) state.selected = new Set([selectableId]);
         state.interaction = {
-          kind: "move", pointerId: event.pointerId, start: point,
-          before: snapshot(), moved: false
+          kind: "move",
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          captureToken,
+          startedAt: event.timeStamp,
+          tool,
+          start: point,
+          current: point,
+          startScreen: { x: event.clientX, y: event.clientY },
+          startCanvas: point,
+          startCamera: clone(state.camera),
+          sceneRect: liveRect,
+          startTransforms: captureItemTransforms(selectedItems()),
+          before: snapshot(),
+          moved: false
         };
-      } else {
-        if (!event.shiftKey) state.selected.clear();
-        state.interaction = { kind: "lasso", pointerId: event.pointerId, points: [point] };
+        editorLog("DRAG START", {
+          ids: [...state.selected],
+          startScreen: { x: event.clientX, y: event.clientY },
+          objectStart: selectedItems().map(item => ({
+            id: item.id,
+            x: item.tx ?? item.transform?.x ?? item.x,
+            y: item.ty ?? item.transform?.y ?? item.y
+          })),
+          zoom: cameraZoom()
+        });
+        const layer = $("#interaction-layer");
+        layer.replaceChildren();
+        renderSelection();
+        return;
       }
-      renderScene();
+      if (!event.shiftKey) state.selected.clear();
+      state.interaction = {
+        kind: "lasso",
+        pointerId: event.pointerId,
+        pointerType: event.pointerType,
+        captureToken,
+        startedAt: event.timeStamp,
+        tool,
+        start: point,
+        current: point,
+        points: [point],
+        sceneRect: liveRect,
+        startCamera: liveCamera
+      };
+      const layer = $("#interaction-layer");
+      layer.replaceChildren();
+      syncLiveOverlay();
+      editorLog("SELECTION START", { pointerId: event.pointerId });
     }
   }
 
   function pointerMove(event) {
+    if (eventFromStudyUi(event) && !state.pointers.has(event.pointerId) &&
+        state.interaction?.pointerId !== event.pointerId) {
+      return;
+    }
+    if (state.interaction || state.pointers.has(event.pointerId)) {
+      event.preventDefault();
+    }
     if (state.pointers.has(event.pointerId)) {
-      state.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      state.pointers.set(event.pointerId, {
+        x: event.clientX, y: event.clientY, type: event.pointerType
+      });
     }
     const interaction = state.interaction;
     if (!interaction) return;
+    if (isStalePointerEvent(event, interaction)) return;
     if (interaction.kind === "pinch") {
-      const points = [...state.pointers.values()];
-      if (points.length < 2) return;
-      const distance = Math.max(1, Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y));
-      const midpoint = { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2 };
-      state.camera = clone(interaction.camera);
-      zoomAt(distance / interaction.distance, interaction.midpoint.x, interaction.midpoint.y);
-      const before = clientToWorld(interaction.midpoint.x, interaction.midpoint.y);
-      const after = clientToWorld(midpoint.x, midpoint.y);
-      state.camera.x += before.x - after.x;
-      state.camera.y += before.y - after.y;
-      applyCamera();
+      applyPinchCamera();
       return;
     }
     if (interaction.pointerId !== event.pointerId) return;
     if (interaction.kind === "pan") {
-      const svg = $("#world-scene");
-      const rect = svg.getBoundingClientRect();
-      state.camera.x = interaction.camera.x -
-        (event.clientX - interaction.client.x) * interaction.camera.width / rect.width;
-      state.camera.y = interaction.camera.y -
-        (event.clientY - interaction.client.y) * interaction.camera.height / rect.height;
-      applyCamera();
+      applyPanCamera(event.clientX, event.clientY);
       return;
     }
-    const samples = event.getCoalescedEvents ? event.getCoalescedEvents() : [event];
-    if (interaction.kind === "draw" || interaction.kind === "pixel") {
-      samples.forEach(sample => interaction.points.push(clientToWorld(sample.clientX, sample.clientY)));
-      renderScene();
+    const samples = pointerSamples(event);
+    if (interaction.kind === "draw") {
+      state.penHud.moves += 1;
+      ingestDrawSamples(interaction, event);
+      if (DEBUG_EDITOR && interaction.points.length % 24 === 0) {
+        editorLog("PEN MOVE", { points: interaction.points.length, timestamp: event.timeStamp });
+      }
       return;
     }
-    const point = clientToWorld(event.clientX, event.clientY);
+    if (interaction.kind === "pixel") {
+      ingestDrawSamples(interaction, event);
+      return;
+    }
+    if (interaction.kind === "object-erase") {
+      const camera = interaction.startCamera || state.camera;
+      const rect = interaction.sceneRect || sceneRect();
+      let previous = interaction.lastPoint || interaction.current;
+      samples.forEach(sample => {
+        const next = screenToCanvas(sample.clientX, sample.clientY, camera, rect);
+        eraseAlongSegment(previous, next);
+        previous = next;
+      });
+      interaction.lastPoint = previous;
+      interaction.current = previous;
+      return;
+    }
+    const camera = interaction.startCamera || interaction.drawCamera || state.camera;
+    const rect = interaction.sceneRect || sceneRect();
+    const point = screenToCanvas(event.clientX, event.clientY, camera, rect);
+    interaction.current = point;
     if (interaction.kind === "lasso") {
       interaction.points.push(point);
-      renderScene();
+      syncLiveOverlay();
     } else if (interaction.kind === "move") {
-      const dx = point.x - interaction.start.x;
-      const dy = point.y - interaction.start.y;
-      restore(interaction.before);
-      [...state.selected].map(findObject).filter(Boolean).forEach(object => moveObject(object, dx, dy));
+      const dx = point.x - interaction.startCanvas.x;
+      const dy = point.y - interaction.startCanvas.y;
+      (interaction.startTransforms || []).forEach(start => applyMoveFromStart(start, dx, dy));
+      applySelectionVisuals();
       interaction.moved = Math.hypot(dx, dy) > state.camera.width / 1000;
-      renderScene();
+      const layer = $("#interaction-layer");
+      layer.replaceChildren();
+      renderSelection();
     } else if (interaction.kind === "resize") {
-      const object = interaction.object;
-      if (object.type === "group") {
-        const original = interaction.original.bounds;
-        const factorX = (original.width + point.x - interaction.start.x) / Math.max(1, original.width);
-        const factorY = (original.height + point.y - interaction.start.y) / Math.max(1, original.height);
-        object.transform.scaleX = clamp(interaction.original.transform.scaleX * factorX, .05, 20);
-        object.transform.scaleY = clamp(interaction.original.transform.scaleY * factorY, .05, 20);
-      } else if (object.type === "text") {
-        object.width = Math.max(40, interaction.original.bounds.width + point.x - interaction.start.x);
-        object.height = Math.max(30, interaction.original.bounds.height + point.y - interaction.start.y);
-      }
-      renderScene();
-    } else if (interaction.kind === "object-erase") {
-      eraseWholeObject(hitObject(event));
+      const bounds = interaction.startBounds;
+      const origin = interaction.origin;
+      let scaleX = 1;
+      let scaleY = 1;
+      if (bounds.width) scaleX = (point.x - origin.x) / (interaction.start.x - origin.x || bounds.width);
+      if (bounds.height) scaleY = (point.y - origin.y) / (interaction.start.y - origin.y || bounds.height);
+      if (["n", "s"].includes(interaction.handle)) scaleX = 1;
+      if (["e", "w"].includes(interaction.handle)) scaleY = 1;
+      scaleX = clamp(Math.abs(scaleX) || 1, 0.05, 40);
+      scaleY = clamp(Math.abs(scaleY) || 1, 0.05, 40);
+      interaction.startTransforms.forEach(start => scaleObjectFromStart(start, origin, scaleX, scaleY));
+      applySelectionVisuals();
+      interaction.moved = true;
+      const layer = $("#interaction-layer");
+      layer.replaceChildren();
+      renderSelection();
     }
   }
 
@@ -1276,172 +2768,547 @@
       return;
     }
     if (object.type === "imported") {
-      object.tx = (object.tx || 0) + dx;
-      object.ty = (object.ty || 0) + dy;
+      const map = state.importedMap || { scaleX: 1, scaleY: 1 };
+      object.tx = (object.tx || 0) + dx / (map.scaleX || 1);
+      object.ty = (object.ty || 0) + dy / (map.scaleY || 1);
       return;
     }
     if (object.type === "text") {
       object.x += dx;
       object.y += dy;
-    } else if (object.points?.length) {
-      object.points.forEach(point => { point.x += dx; point.y += dy; });
-    } else if (object.d) {
-      object.tx = (object.tx || 0) + dx;
-      object.ty = (object.ty || 0) + dy;
+      return;
+    }
+    object.tx = (object.tx || 0) + dx;
+    object.ty = (object.ty || 0) + dy;
+  }
+
+  function applyMoveFromStart(start, dx, dy) {
+    const object = findObject(start.id);
+    if (!object) return;
+    invalidateEraseBounds(object);
+    if (object.type === "group" && start.transform) {
+      object.transform.x = start.transform.x + dx;
+      object.transform.y = start.transform.y + dy;
+      return;
+    }
+    if (object.type === "imported") {
+      const map = state.importedMap || { scaleX: 1, scaleY: 1 };
+      object.tx = start.tx + dx / (map.scaleX || 1);
+      object.ty = start.ty + dy / (map.scaleY || 1);
+      return;
+    }
+    if (object.type === "text") {
+      object.x = start.x + dx;
+      object.y = start.y + dy;
+      return;
+    }
+    object.tx = start.tx + dx;
+    object.ty = start.ty + dy;
+  }
+
+  function applySelectionVisuals() {
+    const seen = new Set();
+    const visit = object => {
+      if (!object || seen.has(object.id)) return;
+      seen.add(object.id);
+      applyObjectVisual(object);
+      if (object.type === "group") {
+        object.children.map(findObject).filter(Boolean).forEach(visit);
+      }
+    };
+    selectedItems().forEach(visit);
+    syncStudyMarkerAnchors();
+  }
+
+  function applyObjectVisual(object) {
+    if (object.type === "imported") {
+      applyImportedTransform(object);
+      return;
+    }
+    const node = object.type === "group"
+      ? $(`[data-group-id="${CSS.escape(object.id)}"]`)
+      : $(`[data-object-id="${CSS.escape(object.id)}"]`);
+    if (!node) return;
+    if (object.type === "group") {
+      const transform = object.transform || {};
+      node.setAttribute("transform",
+        `translate(${transform.x || 0} ${transform.y || 0}) scale(${transform.scaleX || 1} ${transform.scaleY || 1}) rotate(${transform.rotation || 0})`);
+      return;
+    }
+    if (object.type === "text") {
+      node.setAttribute("transform", `translate(${object.x} ${object.y})`);
+      const hit = node.querySelector("rect.text-hit, rect");
+      if (hit) {
+        hit.setAttribute("width", String(object.width));
+        hit.setAttribute("height", String(object.height));
+      }
+      const label = node.querySelector("text:not(.practice-signifier)");
+      if (label) label.setAttribute("font-size", String(object.fontSize));
+      applyHtmlOverlayVisual(object);
+      return;
+    }
+    node.setAttribute("transform", objectTransformValue(object.tx, object.ty, object.sx, object.sy));
+  }
+
+  function expandBounds(box, pad) {
+    return {
+      x: box.x - pad,
+      y: box.y - pad,
+      width: box.width + pad * 2,
+      height: box.height + pad * 2
+    };
+  }
+
+  function pointInBounds(point, box) {
+    return point.x >= box.x && point.x <= box.x + box.width &&
+      point.y >= box.y && point.y <= box.y + box.height;
+  }
+
+  function segmentsIntersect(a1, a2, b1, b2) {
+    const dx1 = a2.x - a1.x;
+    const dy1 = a2.y - a1.y;
+    const dx2 = b2.x - b1.x;
+    const dy2 = b2.y - b1.y;
+    const denom = dx1 * dy2 - dy1 * dx2;
+    if (Math.abs(denom) < 1e-12) return false;
+    const cx = b1.x - a1.x;
+    const cy = b1.y - a1.y;
+    const t = (cx * dy2 - cy * dx2) / denom;
+    const u = (cx * dy1 - cy * dx1) / denom;
+    return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+  }
+
+  function distPointToSegment(point, a, b) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    if (len2 <= 1e-12) return Math.hypot(point.x - a.x, point.y - a.y);
+    const t = clamp(((point.x - a.x) * dx + (point.y - a.y) * dy) / len2, 0, 1);
+    return Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
+  }
+
+  function segmentHitsRect(a, b, box) {
+    if (pointInBounds(a, box) || pointInBounds(b, box)) return true;
+    const x1 = box.x;
+    const y1 = box.y;
+    const x2 = box.x + box.width;
+    const y2 = box.y + box.height;
+    return segmentsIntersect(a, b, { x: x1, y: y1 }, { x: x2, y: y1 }) ||
+      segmentsIntersect(a, b, { x: x2, y: y1 }, { x: x2, y: y2 }) ||
+      segmentsIntersect(a, b, { x: x2, y: y2 }, { x: x1, y: y2 }) ||
+      segmentsIntersect(a, b, { x: x1, y: y2 }, { x: x1, y: y1 });
+  }
+
+  function segmentsTooClose(a1, a2, b1, b2, threshold) {
+    if (segmentsIntersect(a1, a2, b1, b2)) return true;
+    return distPointToSegment(a1, b1, b2) <= threshold ||
+      distPointToSegment(a2, b1, b2) <= threshold ||
+      distPointToSegment(b1, a1, a2) <= threshold ||
+      distPointToSegment(b2, a1, a2) <= threshold;
+  }
+
+  function eraserBounds(object) {
+    if (object._eraseBounds) return object._eraseBounds;
+    object._eraseBounds = objectBounds(object);
+    return object._eraseBounds;
+  }
+
+  function invalidateEraseBounds(object) {
+    if (!object) return;
+    object._eraseBounds = null;
+    if (object.type === "group") {
+      object.children.map(findObject).forEach(invalidateEraseBounds);
+    }
+  }
+
+  function transformedStrokePoint(object, point) {
+    return {
+      x: point.x * (object.sx || 1) + (object.tx || 0),
+      y: point.y * (object.sy || 1) + (object.ty || 0)
+    };
+  }
+
+  function strokeHitsEraserSegment(object, from, to, radius) {
+    const points = object.points;
+    if (!points?.length) return true;
+    const width = (object.width || 0) * Math.max(Math.abs(object.sx || 1), Math.abs(object.sy || 1));
+    const threshold = radius + width / 2;
+    let previous = transformedStrokePoint(object, points[0]);
+    if (points.length === 1) return distPointToSegment(previous, from, to) <= threshold;
+    for (let index = 1; index < points.length; index++) {
+      const next = transformedStrokePoint(object, points[index]);
+      if (segmentsTooClose(from, to, previous, next, threshold)) return true;
+      previous = next;
+    }
+    return false;
+  }
+
+  function objectHitsEraserSegment(object, from, to, radius) {
+    if (object.deleted || isBoardFillingObject(object)) return false;
+    if (!segmentHitsRect(from, to, expandBounds(eraserBounds(object), radius))) return false;
+    if (object.type === "stroke" || object.type === "highlighter") {
+      return strokeHitsEraserSegment(object, from, to, radius);
+    }
+    return true;
+  }
+
+  function eraseAlongSegment(from, to) {
+    const erasedIds = state.interaction?.erasedIds;
+    const radius = Math.max(4, (state.eraserSize || 16) / 2);
+    const hits = [];
+    for (const object of allObjects()) {
+      if (erasedIds?.has(object.id)) continue;
+      if (objectHitsEraserSegment(object, from, to, radius)) hits.push(object);
+    }
+    hits.forEach(object => eraseWholeObject(object.id));
+  }
+
+  function markObjectErased(id) {
+    const interaction = state.interaction;
+    if (interaction?.kind !== "object-erase") return;
+    interaction.erasedIds.add(id);
+    interaction.erased = true;
+  }
+
+  function rememberEraseUndo() {
+    const interaction = state.interaction;
+    if (interaction?.kind === "object-erase" && !interaction.before) {
+      interaction.before = snapshot();
     }
   }
 
   function eraseWholeObject(id) {
-    if (!id) return;
+    if (!id) return false;
+    const interaction = state.interaction;
+    if (interaction?.kind === "object-erase" && interaction.erasedIds.has(id)) return false;
+    const imported = state.importedObjects.find(object => object.id === id);
+    if (imported) {
+      if (isBoardFillingObject(imported) || imported.deleted) return false;
+      rememberEraseUndo();
+      imported.deleted = true;
+      imported.node?.setAttribute("display", "none");
+      state.selected.delete(id);
+      markObjectErased(id);
+      editorLog("OBJECT ERASE", { id, type: "imported" });
+      return true;
+    }
     const index = state.objects.findIndex(object => object.id === id);
-    if (index < 0) return;
+    if (index < 0) {
+      const group = state.groups.find(item => item.id === id);
+      if (!group) return false;
+      rememberEraseUndo();
+      group.children.forEach(childId => eraseWholeObject(childId));
+      state.groups = state.groups.filter(item => item.id !== id);
+      state.selected.delete(id);
+      markObjectErased(id);
+      return true;
+    }
+    const object = state.objects[index];
+    rememberEraseUndo();
     state.objects.splice(index, 1);
     state.selected.delete(id);
-    renderScene();
+    $(`[data-object-id="${CSS.escape(id)}"]`)?.remove();
+    removeHtmlOverlayItem(id);
+    markObjectErased(id);
+    editorLog("OBJECT ERASE", { id, type: object.type });
+    return true;
+  }
+
+  function refreshUserObject(object) {
+    const existing = $(`[data-object-id="${CSS.escape(object.id)}"]`);
+    const node = object.type === "text" ? renderText(object) : renderStroke(object);
+    if (existing) existing.replaceWith(node);
+    else $("#user-layer")?.append(node);
+    upsertHtmlOverlayItem(object);
   }
 
   function finishPixelEraser(interaction) {
-    if (interaction.points.length < 2) return;
-    const eraserBounds = unionBounds([{
+    if (!interaction.points.length) return [];
+    const touched = [];
+    const trailBounds = unionBounds([{
       type: "stroke", points: interaction.points, width: interaction.width
     }]);
     state.objects.filter(object =>
-      ["stroke", "highlighter"].includes(object.type) && intersects(objectBounds(object), eraserBounds)
+      ["stroke", "highlighter"].includes(object.type) && intersects(objectBounds(object), trailBounds)
     )
       .forEach(object => {
-        let touched = !object.points?.length;
+        const sx = object.sx || 1;
+        const sy = object.sy || 1;
+        const tx = object.tx || 0;
+        const ty = object.ty || 0;
+        let hit = !object.points?.length;
         if (object.points?.length) {
-          const threshold = (object.width + interaction.width) / 2;
-          touched = object.points.some(strokePoint => interaction.points.some(erasePoint =>
-            Math.hypot(strokePoint.x - erasePoint.x, strokePoint.y - erasePoint.y) <= threshold
+          const threshold = (object.width * Math.max(Math.abs(sx), Math.abs(sy)) + interaction.width) / 2;
+          hit = object.points.some(strokePoint => interaction.points.some(erasePoint =>
+            Math.hypot(strokePoint.x * sx + tx - erasePoint.x, strokePoint.y * sy + ty - erasePoint.y) <= threshold
           ));
         }
-        // Pixel erasure is persisted per user stroke as a black path in that stroke's mask.
-        if (touched) {
+        if (hit) {
           object.erasures ||= [];
           object.erasures.push({
             id: uid("erase"),
             points: interaction.points.map(point => ({
-              x: point.x - (object.tx || 0),
-              y: point.y - (object.ty || 0)
+              x: (point.x - tx) / (sx || 1),
+              y: (point.y - ty) / (sy || 1)
             })),
-            width: interaction.width
+            width: interaction.width / Math.max(Math.abs(sx), Math.abs(sy), 0.01)
           });
+          object._eraseBounds = null;
+          touched.push(object);
         }
       });
+    return touched;
   }
 
-  function pointerUp(event) {
-    state.pointers.delete(event.pointerId);
+  function pointerRawUpdate(event) {
+    const interaction = activeInk || state.interaction;
+    if (!interaction || interaction.kind !== "draw") return;
+    if (interaction.pointerId !== event.pointerId) return;
+    if (isStalePointerEvent(event, interaction)) return;
+    interaction.usedRaw = true;
+    state.penHud.moves += 1;
+    ingestDrawSamples(interaction, event);
+  }
+
+  function finishPointerInteraction(event, { reason = "up", pointerId } = {}) {
+    const endedId = pointerId ?? event?.pointerId;
     const interaction = state.interaction;
-    if (!interaction) return;
-    if (interaction.kind === "pinch") {
-      if (state.pointers.size < 2) {
-        state.interaction = null;
-        markChanged();
+    if (!interaction) {
+      if (endedId != null) {
+        forgetPointer(endedId);
+        releaseCapturedPointer(endedId);
       }
       return;
     }
-    if (interaction.pointerId !== event.pointerId) return;
-    if (interaction.kind === "draw") {
-      state.objects.push({
-        id: uid("stroke"), type: interaction.objectType, points: interaction.points,
-        color: interaction.color, width: interaction.width,
-        opacity: interaction.opacity, erasures: []
-      });
-      commitLogicalAction(interaction.before);
-    } else if (interaction.kind === "pixel") {
-      finishPixelEraser(interaction);
-      commitLogicalAction(interaction.before);
-    } else if (interaction.kind === "object-erase" || interaction.kind === "resize" ||
-      (interaction.kind === "move" && interaction.moved)) {
-      commitLogicalAction(interaction.before);
-    } else if (interaction.kind === "make-space") {
-      spreadAt(interaction.point);
-    } else if (interaction.kind === "lasso") {
-      topLevelItems().filter(object => lassoSelectsObject(object, interaction.points))
-        .forEach(object => state.selected.add(object.id));
+    if (event && reason !== "superseded" && reason !== "tool-change" &&
+      interaction.kind !== "pan" && interaction.kind !== "pinch" &&
+      isStalePointerEvent(event, interaction)) {
+      editorLog("PEN UP ignored", { reason: "stale-timestamp", pointerId: endedId });
+      return;
     }
+    if (interaction.kind === "pinch" || interaction.kind === "pan") {
+      if (endedId != null) forgetPointer(endedId);
+      if (interaction.pointerType === "touch" || interaction.kind === "pinch") {
+        syncCameraFromTouches();
+      } else {
+        endCameraGesture(reason);
+      }
+      return;
+    }
+    if (endedId != null && interaction.pointerId !== endedId &&
+      reason !== "superseded" && reason !== "tool-change") {
+      forgetPointer(endedId);
+      return;
+    }
+    const keepFinal = Boolean(event && interaction.pointerId === event.pointerId &&
+      (reason === "up" || reason === "cancel"));
+    if (keepFinal && interaction.points) {
+      const camera = interaction.drawCamera || interaction.startCamera || state.camera;
+      const rect = interaction.sceneRect || sceneRect();
+      const last = screenToCanvas(event.clientX, event.clientY, camera, rect);
+      const prev = interaction.points.at(-1);
+      if (!prev || prev.x !== last.x || prev.y !== last.y) {
+        interaction.points.push(last);
+        if (interaction.kind === "draw" || interaction.kind === "pixel") {
+          appendLivePoints(interaction, [last]);
+        }
+      }
+      interaction.current = last;
+    }
+    if (keepFinal && interaction.kind === "object-erase") {
+      const camera = interaction.startCamera || state.camera;
+      const rect = interaction.sceneRect || sceneRect();
+      const last = screenToCanvas(event.clientX, event.clientY, camera, rect);
+      eraseAlongSegment(interaction.lastPoint || interaction.current || last, last);
+      interaction.lastPoint = last;
+      interaction.current = last;
+    }
+    if (interaction.kind === "draw") activeInk = null;
     state.interaction = null;
+    forgetPointer(interaction.pointerId);
+    releaseCapturedPointer(interaction.pointerId);
+    let needsScene = false;
+    if (interaction.kind === "draw") {
+      if (state.liveInkRaf) {
+        cancelAnimationFrame(state.liveInkRaf);
+        state.liveInkRaf = 0;
+      }
+      flushLiveStroke(interaction);
+      state.penHud.ups += 1;
+      editorLog("PEN UP", {
+        pointerId: interaction.pointerId,
+        pointerType: interaction.pointerType,
+        points: interaction.points.length,
+        duration: event ? Math.max(0, event.timeStamp - (interaction.startedAt || event.timeStamp)) : 0,
+        finalized: true,
+        reason
+      });
+      commitLiveStroke(interaction, reason);
+    } else if (interaction.kind === "pixel") {
+      const previousObjects = state.objects;
+      const erasureCounts = new Map(previousObjects.map(object =>
+        [object.id, (object.erasures || []).length]));
+      finishPixelEraser(interaction).forEach(refreshUserObject);
+      queueHistoryCommit(() => {
+        const snap = {
+          objects: clone(previousObjects),
+          groups: clone(state.groups),
+          importedTransforms: Object.fromEntries(state.importedObjects.map(item => [item.id, {
+            x: item.tx || 0, y: item.ty || 0,
+            scaleX: item.sx || 1, scaleY: item.sy || 1,
+            deleted: Boolean(item.deleted)
+          }]))
+        };
+        snap.objects.forEach(object => {
+          const count = erasureCounts.get(object.id) ?? 0;
+          if (object.erasures) object.erasures = object.erasures.slice(0, count);
+        });
+        return snap;
+      });
+    } else if (interaction.kind === "object-erase") {
+      if (interaction.erased && interaction.before) queueHistoryCommit(interaction.before);
+    } else if (interaction.kind === "move" || interaction.kind === "resize") {
+      if (interaction.moved) {
+        if (interaction.kind === "resize") {
+          selectedItems().forEach(item => {
+            if (item.type === "text") fitTextObject(item);
+          });
+        }
+        commitLogicalAction(interaction.before);
+        editorLog("OBJECT TRANSFORM", {
+          action: interaction.kind,
+          ids: [...state.selected],
+          startScreen: interaction.startScreen,
+          currentScreen: event ? { x: event.clientX, y: event.clientY } : null,
+          zoom: cameraZoom(),
+          canvasDelta: interaction.startCanvas && interaction.current ? {
+            x: interaction.current.x - interaction.startCanvas.x,
+            y: interaction.current.y - interaction.startCanvas.y
+          } : null,
+          transforms: selectedItems().map(item => ({
+            id: item.id,
+            x: item.tx ?? item.transform?.x ?? item.x,
+            y: item.ty ?? item.transform?.y ?? item.y,
+            scaleX: item.sx ?? item.transform?.scaleX ?? 1,
+            scaleY: item.sy ?? item.transform?.scaleY ?? 1
+          }))
+        });
+      }
+      needsScene = true;
+    } else if (interaction.kind === "lasso") {
+      const ids = topLevelItems()
+        .filter(object => lassoSelectsObject(object, interaction.points))
+        .map(object => object.id);
+      ids.forEach(id => state.selected.add(id));
+      editorLog("SELECTION END", { count: ids.length, ids });
+      needsScene = true;
+    }
     $("#world-scene").classList.remove("is-panning");
-    if (interaction.kind === "pan") markChanged();
-    renderScene();
+    editorLog("POINTER UP", {
+      reason, kind: interaction.kind, pointerId: interaction.pointerId, type: interaction.pointerType,
+      points: interaction.points?.length || 0
+    });
+    if (needsScene) renderScene();
+    else if (interaction.kind !== "draw") {
+      removeLiveOverlay();
+      updateHistoryButtons();
+      updateSelectionActions();
+    }
+  }
+
+  function pointerUp(event) {
+    if (eventFromStudyUi(event) && !state.pointers.has(event.pointerId) &&
+        state.interaction?.pointerId !== event.pointerId) {
+      return;
+    }
+    if (state.interaction || state.pointers.has(event.pointerId)) event.preventDefault();
+    const interaction = state.interaction;
+    if (interaction && ["pan", "pinch"].includes(interaction.kind)) {
+      logCamera("UP", {
+        pointerId: event.pointerId, pointerType: event.pointerType, reason: "up"
+      });
+    }
+    finishPointerInteraction(event, { reason: "up" });
   }
 
   function pointerCancel(event) {
-    state.pointers.delete(event.pointerId);
-    const interaction = state.interaction;
-    if (interaction?.before) restore(interaction.before);
-    state.interaction = null;
-    $("#world-scene").classList.remove("is-panning");
-    renderScene();
-  }
-
-  function openTextEditor(object) {
-    const editor = $("#text-editor");
-    editor.dataset.objectId = object.id;
-    editor.value = object.text;
-    editor.style.color = object.color;
-    editor.style.fontSize = `${Math.max(12, object.fontSize * state.width / state.camera.width)}px`;
-    editor.hidden = false;
-    editor.dataset.before = JSON.stringify(snapshot());
-    positionTextEditor();
-    editor.focus();
-    editor.select();
-  }
-
-  function positionTextEditor() {
-    const editor = $("#text-editor");
-    const object = state.objects.find(item => item.id === editor.dataset.objectId);
-    if (!object) {
-      editor.hidden = true;
+    if (eventFromStudyUi(event) && !state.pointers.has(event.pointerId) &&
+        state.interaction?.pointerId !== event.pointerId) {
       return;
     }
-    const frame = $("#primary-frame").getBoundingClientRect();
-    const topLeft = worldToClient(object.x, object.y);
-    const bottomRight = worldToClient(object.x + object.width, object.y + object.height);
-    editor.style.left = `${topLeft.x - frame.left}px`;
-    editor.style.top = `${topLeft.y - frame.top}px`;
-    editor.style.width = `${Math.max(80, bottomRight.x - topLeft.x)}px`;
-    editor.style.height = `${Math.max(42, bottomRight.y - topLeft.y)}px`;
+    const interaction = state.interaction;
+    editorLog("POINTER CANCEL", {
+      pointerId: event.pointerId,
+      type: event.pointerType,
+      kind: interaction?.kind || null,
+      points: interaction?.points?.length || 0,
+      buttons: event.buttons
+    });
+    if (interaction && ["pan", "pinch"].includes(interaction.kind)) {
+      logCamera("CANCEL", {
+        pointerId: event.pointerId, pointerType: event.pointerType
+      });
+      finishPointerInteraction(event, { reason: "cancel" });
+      return;
+    }
+    if (isStalePointerEvent(event, interaction)) {
+      editorLog("POINTER CANCEL ignored", { reason: "stale-timestamp", pointerId: event.pointerId });
+      return;
+    }
+    /* iPad Safari often fires pointercancel after setPointerCapture while the
+       Pencil is still writing. Ending the stroke here drops the rest of the letter. */
+    if (interaction?.kind === "draw" && interaction.pointerId === event.pointerId) {
+      editorLog("POINTER CANCEL ignored", { reason: "keep-ink-alive", pointerId: event.pointerId });
+      recaptureIfNeeded(event);
+      return;
+    }
+    const ink = interaction &&
+      ["pixel", "object-erase", "lasso"].includes(interaction.kind);
+    if (ink && interaction.pointerId === event.pointerId && event.buttons) {
+      editorLog("POINTER CANCEL ignored", { reason: "pen-still-down", pointerId: event.pointerId });
+      return;
+    }
+    finishPointerInteraction(event, { reason: "cancel" });
   }
 
-  function closeTextEditor(commit) {
-    const editor = $("#text-editor");
-    if (editor.hidden) return;
-    const object = state.objects.find(item => item.id === editor.dataset.objectId);
-    const before = JSON.parse(editor.dataset.before || "[]");
-    if (object) {
-      if (commit) object.text = editor.value;
-      else state.objects = before;
-    }
-    editor.hidden = true;
-    editor.removeAttribute("data-object-id");
-    if (commit) commitLogicalAction(before);
-    renderScene();
+  function pointerLeave(event) {
+    if (state.interaction?.pointerId !== event.pointerId) return;
+    editorLog("POINTER LEAVE", {
+      pointerId: event.pointerId,
+      kind: state.interaction.kind,
+      points: state.interaction.points?.length || 0
+    });
+  }
+
+  function lostPointerCapture(event) {
+    editorLog("POINTER CAPTURE", {
+      action: "lost", pointerId: event.pointerId, releasing: state.releasingCapture,
+      kind: state.interaction?.kind || null, buttons: event.buttons
+    });
+    if (state.releasingCapture) return;
+    if (state.interaction?.pointerId !== event.pointerId) return;
+    if (event.buttons) recaptureIfNeeded(event);
   }
 
   function deleteSelection() {
     if (!state.selected.size) return;
     const before = snapshot();
-    state.objects = state.objects.filter(object => !state.selected.has(object.id));
+    const ids = new Set(state.selected);
+    state.objects = state.objects.filter(object => !ids.has(object.id));
+    state.importedObjects.forEach(object => {
+      if (ids.has(object.id)) {
+        object.deleted = true;
+        object.node?.setAttribute("display", "none");
+      }
+    });
+    state.groups = state.groups.filter(group => !ids.has(group.id));
     state.selected.clear();
     commitLogicalAction(before);
     renderScene();
   }
 
   function handleKeyDown(event) {
-    if (event.target === $("#text-editor")) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeTextEditor(false);
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-        event.preventDefault();
-        closeTextEditor(true);
-      }
-      return;
-    }
+    if (event.target.matches?.("input, textarea, select")) return;
     if (event.code === "Space") {
       state.spaceDown = true;
       event.preventDefault();
@@ -1455,51 +3322,1018 @@
     } else if ((event.key === "Delete" || event.key === "Backspace") && state.tool === "select") {
       event.preventDefault();
       deleteSelection();
+    } else if (event.key === "Enter" && state.tool === "select" && state.selected.size === 1) {
+      const object = findObject([...state.selected][0]);
+      if (object?.type === "text") {
+        event.preventDefault();
+        editTextObject(object.id);
+      }
     } else if (event.key === "Escape") {
       state.selected.clear();
+      closeStudySheet();
       renderScene();
     }
+  }
+
+  function studyApi(path) {
+    return `/api/boards/${encodeURIComponent(boardId)}${path}`;
+  }
+
+  async function requestStudy(url, options = {}) {
+    const response = await fetch(url, {
+      ...options,
+      headers: { Accept: "application/json", ...(options.headers || {}) }
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error || payload.message || "Couldn't explain this right now. Your board is still saved.");
+    }
+    return payload;
+  }
+
+  function newStudyRequestId() {
+    const bytes = new Uint8Array(8);
+    (globalThis.crypto || window.crypto).getRandomValues(bytes);
+    return [...bytes].map(value => value.toString(16).padStart(2, "0")).join("");
+  }
+
+  function followUpsOf(interaction) {
+    return interaction?.followUps || interaction?.follow_ups || [];
+  }
+
+  function renderMarkdownInto(target, source) {
+    const renderer = globalThis.renderStudyMarkdown;
+    if (typeof renderer === "function") {
+      target.append(renderer(source));
+      return;
+    }
+    const p = document.createElement("p");
+    p.textContent = source || "";
+    target.append(p);
+  }
+
+  function actionLabel(kind) {
+    return {
+      go_deeper: "Go Deeper",
+      practice_examples: "Practice examples",
+      practice_problems: "Practice Problems",
+      followup: "Follow-up"
+    }[kind] || "Follow-up";
+  }
+
+  function appendUserTurn(parent, text) {
+    const question = document.createElement("p");
+    question.className = "study-user-q";
+    question.textContent = `You: ${text}`;
+    parent.append(question);
+  }
+
+  function appendAssistantTurn(parent, source) {
+    const wrap = document.createElement("div");
+    wrap.className = "study-ai-turn";
+    renderMarkdownInto(wrap, source || "");
+    parent.append(wrap);
+  }
+
+  function appendGenerating(parent) {
+    const status = document.createElement("p");
+    status.className = "study-generating";
+    status.textContent = "Generating...";
+    parent.append(status);
+  }
+
+  function upsertStudyInteraction(interaction) {
+    if (!interaction?.id) return null;
+    const next = [];
+    let found = false;
+    state.studyInteractions.forEach(item => {
+      if (item.id === interaction.id) {
+        next.push(interaction);
+        found = true;
+      } else next.push(item);
+    });
+    if (!found) next.unshift(interaction);
+    state.studyInteractions = next;
+    return interaction;
+  }
+
+  function setStudyStatus(message, isError = false) {
+    const status = $("#study-status");
+    if (!status) return;
+    status.hidden = !message;
+    status.textContent = message || "";
+    status.classList.toggle("is-error", Boolean(isError));
+  }
+
+  function setStudyBusy(busy) {
+    state.explaining = Boolean(busy);
+    const button = $("#explain-button");
+    if (button) button.disabled = state.explaining;
+    $$("#study-actions .study-action, #selection-actions button").forEach(node => { node.disabled = state.explaining; });
+    const ask = $("#study-followup button");
+    if (ask) ask.disabled = state.explaining;
+  }
+
+  function renderStudyList() {
+    const list = $("#study-note-list");
+    if (!list) return;
+    list.replaceChildren();
+    if (!state.studyInteractions.length) {
+      const empty = document.createElement("p");
+      empty.className = "library-message";
+      empty.textContent = "Lasso something confusing, then tap Explain.";
+      list.append(empty);
+      return;
+    }
+    state.studyInteractions.forEach(item => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "study-note-item";
+      button.dataset.studyId = item.id;
+      if (item.id === state.activeStudyId) button.classList.add("is-active");
+      const title = document.createElement("strong");
+      title.textContent = item.title || "Explanation";
+      const preview = document.createElement("span");
+      preview.textContent = String(item.answer || "").replace(/\s+/g, " ").slice(0, 110);
+      button.append(title, preview);
+      button.addEventListener("click", () => openStudyInteraction(item.id));
+      list.append(button);
+    });
+  }
+
+  function appendPracticeCanvasButton(parent, follow) {
+    const problems = Array.isArray(follow.problems) && follow.problems.length
+      ? follow.problems.map(item => item.problem || item.text || item).filter(Boolean)
+      : [follow.problem || (follow.kind === "practice_problems" ? follow.answer : "")].filter(Boolean);
+    if (!problems.length) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "study-canvas-action";
+    button.textContent = problems.length > 1 ? "Add to Canvas" : "Add to Canvas";
+    button.addEventListener("click", () => addPracticeProblemsToCanvas(problems, follow));
+    parent.append(button);
+  }
+
+  function renderStudyConversation(interaction, { scrollToLatest = false } = {}) {
+    const body = $("#study-body");
+    if (!body || !interaction) return;
+    body.replaceChildren();
+    const originalQuestion = interaction.question || "Explain this";
+    appendUserTurn(body, originalQuestion);
+    if (interaction.answer) appendAssistantTurn(body, interaction.answer);
+    followUpsOf(interaction).forEach(follow => {
+      const block = document.createElement("div");
+      block.className = "study-follow-block";
+      block.dataset.followId = follow.id || "";
+      const asked = follow.kind === "followup"
+        ? follow.question
+        : actionLabel(follow.kind);
+      appendUserTurn(block, asked || actionLabel(follow.kind));
+      if (follow.answer || follow.problem) {
+        appendAssistantTurn(block, follow.answer || follow.problem || "");
+      }
+      appendPracticeCanvasButton(block, follow);
+      body.append(block);
+    });
+    if (state.explaining && state.pendingStudyQuestion) {
+      const pending = document.createElement("div");
+      pending.className = "study-follow-block is-pending";
+      appendUserTurn(pending, state.pendingStudyQuestion);
+      appendGenerating(pending);
+      body.append(pending);
+    } else if (state.explaining && !interaction.answer) {
+      appendGenerating(body);
+    }
+    if (scrollToLatest) {
+      const latest = body.lastElementChild;
+      latest?.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function openStudySheet() {
+    resetGestureState("study-open");
+    $("#study-sheet").hidden = false;
+    $("#study-drawer").hidden = true;
+    studyLog("PANEL", { action: "open", ...cameraPanZoom(), gesture: state.cameraGesture });
+  }
+
+  function closeStudySheet() {
+    blurStudyUi();
+    resetGestureState("study-close");
+    $("#study-sheet").hidden = true;
+    $("#study-sheet")?.classList.remove("is-fresh");
+    setStudyStatus("");
+    studyLog("PANEL", { action: "close", ...cameraPanZoom(), gesture: state.cameraGesture });
+  }
+
+  function showStudyActions(visible) {
+    const actions = $("#study-actions");
+    const form = $("#study-followup");
+    if (actions) actions.hidden = !visible;
+    if (form) form.hidden = !visible;
+  }
+
+  function openStudyInteraction(id, { fresh = false, scrollToLatest = false } = {}) {
+    const interaction = state.studyInteractions.find(item => item.id === id);
+    if (!interaction) return;
+    state.activeStudyId = id;
+    $("#study-kicker").textContent = fresh ? "New explanation" : "Saved explanation";
+    $("#study-title").textContent = interaction.title || "Explanation";
+    $("#study-sheet")?.classList.toggle("is-fresh", Boolean(fresh));
+    renderStudyConversation(interaction, { scrollToLatest: scrollToLatest || fresh });
+    showStudyActions(true);
+    setStudyStatus("");
+    openStudySheet();
+    renderStudyList();
+  }
+
+  function selectionHasPracticeWork() {
+    const items = [...state.selected].map(findObject).filter(object => object && !object.deleted);
+    const hasProblem = items.some(item => item.role === "ai_practice_problem");
+    const hasWork = items.some(item => item.role !== "ai_practice_problem");
+    return hasProblem && hasWork;
+  }
+
+  function lectureHasMultipleBoards() {
+    return lectureBoardsFromData().length > 1;
+  }
+
+  function positionExplainButton() {
+    const cluster = $("#selection-actions");
+    const button = $("#explain-button");
+    if (!cluster || !button) return;
+    const union = selectedUnionBounds();
+    if (!union || !state.selected.size || inkIsActive()) {
+      cluster.hidden = true;
+      return;
+    }
+    const frame = $("#primary-frame");
+    const rect = sceneRect();
+    if (!frame || !rect.width) {
+      cluster.hidden = true;
+      return;
+    }
+    const check = selectionHasPracticeWork();
+    const multi = lectureHasMultipleBoards();
+    $("#explain-across-button").hidden = check || !multi;
+    $("#where-from-button").hidden = check || !multi;
+    $("#check-work-button").hidden = !check;
+    button.hidden = false;
+    const frameBox = frame.getBoundingClientRect();
+    const left = canvasToScreen(union.x, union.y, state.camera, rect);
+    const right = canvasToScreen(union.x + union.width, union.y, state.camera, rect);
+    const x = (left.x + right.x) / 2 - frameBox.left;
+    const y = left.y - frameBox.top - 56;
+    cluster.hidden = false;
+    cluster.style.left = `${Math.max(12, Math.min(frameBox.width - 12, x))}px`;
+    cluster.style.top = `${Math.max(8, y)}px`;
+  }
+
+  function selectionCanvasBox(ids = [...state.selected]) {
+    const items = ids.map(findObject).filter(object => object && !object.deleted);
+    if (!items.length) return null;
+    const bounds = items.map(objectBounds);
+    const left = Math.min(...bounds.map(box => box.x));
+    const top = Math.min(...bounds.map(box => box.y));
+    const right = Math.max(...bounds.map(box => box.x + box.width));
+    const bottom = Math.max(...bounds.map(box => box.y + box.height));
+    return {
+      x: left, y: top,
+      width: Math.max(1, right - left),
+      height: Math.max(1, bottom - top)
+    };
+  }
+
+  function unionCanvasBoxes(boxes) {
+    const items = boxes.filter(box => box && box.width > 0 && box.height > 0);
+    if (!items.length) return null;
+    const left = Math.min(...items.map(box => box.x));
+    const top = Math.min(...items.map(box => box.y));
+    const right = Math.max(...items.map(box => box.x + box.width));
+    const bottom = Math.max(...items.map(box => box.y + box.height));
+    return {
+      x: left, y: top,
+      width: Math.max(1, right - left),
+      height: Math.max(1, bottom - top)
+    };
+  }
+
+  function studyAnchorFor(item) {
+    const ids = item.selectedObjectIds || item.selected_object_ids || [];
+    const live = unionCanvasBoxes(ids.map(id => {
+      const object = findObject(id);
+      return object && !object.deleted ? objectBounds(object) : null;
+    }));
+    const box = live;
+    if (box) {
+      const scale = studyMarkerScale();
+      const pad = 10 * scale;
+      return { x: box.x + box.width + pad, y: box.y };
+    }
+    const anchorX = Number(item.anchorX ?? item.anchor_x);
+    const anchorY = Number(item.anchorY ?? item.anchor_y);
+    if (Number.isFinite(anchorX) && Number.isFinite(anchorY)) {
+      return { x: anchorX, y: anchorY };
+    }
+    const stored = item.selectionBBox || item.selection_bbox;
+    if (stored && Number.isFinite(Number(stored.x)) && Number.isFinite(Number(stored.y))) {
+      return { x: Number(stored.x) + Number(stored.width || 0), y: Number(stored.y) };
+    }
+    return null;
+  }
+
+  function studyMarkerScale() {
+    const rect = sceneRect();
+    return rect.width > 0 ? state.camera.width / rect.width : 1;
+  }
+
+  function setStudyMarkerAnchor(node, x, y) {
+    const scale = studyMarkerScale();
+    node.setAttribute("data-anchor-x", String(x));
+    node.setAttribute("data-anchor-y", String(y));
+    node.setAttribute("transform", `translate(${x} ${y}) scale(${scale})`);
+  }
+
+  function syncStudyMarkerScale() {
+    const layer = $("#study-layer");
+    if (!layer) return;
+    const scale = studyMarkerScale();
+    [...layer.children].forEach(node => {
+      const x = node.getAttribute("data-anchor-x");
+      const y = node.getAttribute("data-anchor-y");
+      if (x == null || y == null) return;
+      node.setAttribute("transform", `translate(${x} ${y}) scale(${scale})`);
+    });
+  }
+
+  function syncStudyMarkerAnchors() {
+    const layer = $("#study-layer");
+    if (!layer) return;
+    state.studyInteractions.forEach(item => {
+      const node = layer.querySelector(`[data-study-marker="${CSS.escape(item.id)}"]`);
+      if (!node) return;
+      const anchor = studyAnchorFor(item);
+      if (!anchor) return;
+      setStudyMarkerAnchor(node, anchor.x, anchor.y);
+    });
+  }
+
+  function renderStudyMarkers() {
+    const layer = $("#study-layer");
+    if (!layer) return;
+    layer.replaceChildren();
+    $("#primary-frame")?.querySelectorAll("[data-study-marker]").forEach(node => {
+      if (node.namespaceURI !== NS) node.remove();
+    });
+    state.studyInteractions.forEach(item => {
+      const anchor = studyAnchorFor(item);
+      if (!anchor) return;
+      const group = svgEl("g", {
+        class: "study-marker",
+        "data-study-marker": item.id,
+        "data-anchor-x": String(anchor.x),
+        "data-anchor-y": String(anchor.y),
+        role: "button",
+        "aria-label": item.title || "Open explanation",
+        transform: `translate(${anchor.x} ${anchor.y}) scale(${studyMarkerScale()})`
+      });
+      const hit = svgEl("circle", {
+        class: "study-marker-hit",
+        cx: 0, cy: 0, r: 14,
+        fill: "transparent", stroke: "none",
+        "pointer-events": "all"
+      });
+      const icon = svgEl("g", {
+        class: "study-marker-icon",
+        "pointer-events": "none"
+      });
+      icon.append(svgEl("circle", {
+        cx: 0, cy: 0, r: 8, fill: "#ffffff", stroke: "#183153", "stroke-width": 1.6
+      }));
+      const label = svgEl("text", {
+        x: 0, y: 3.5, "text-anchor": "middle", "font-size": 10,
+        "font-family": "system-ui, sans-serif", "font-weight": 700,
+        fill: "#183153", "pointer-events": "none"
+      });
+      label.textContent = "i";
+      icon.append(label);
+      group.append(hit, icon);
+      let press = null;
+      group.addEventListener("pointerdown", event => {
+        event.stopPropagation();
+        event.preventDefault();
+        press = { x: event.clientX, y: event.clientY, id: event.pointerId };
+      });
+      group.addEventListener("pointerup", event => {
+        event.stopPropagation();
+        if (!press || press.id !== event.pointerId) return;
+        if (Math.hypot(event.clientX - press.x, event.clientY - press.y) < 14) {
+          openStudyInteraction(item.id);
+        }
+        press = null;
+      });
+      group.addEventListener("pointercancel", () => { press = null; });
+      layer.append(group);
+    });
+  }
+
+  async function loadStudyInteractions() {
+    if (!boardId) return;
+    try {
+      const payload = await requestStudy(studyApi("/study"));
+      state.studyInteractions = Array.isArray(payload.interactions) ? payload.interactions : [];
+      renderStudyList();
+      renderStudyMarkers();
+    } catch (_) {
+      state.studyInteractions = [];
+    }
+  }
+
+  function ensureBoardContext() {
+    if (!boardId) return;
+    requestStudy(studyApi("/study/analyze"), { method: "POST" }).catch(() => {});
+    if (state.lecture.folderId && lectureHasMultipleBoards() && !state.lecture.studyGuide) {
+      fetch(`/api/folders/${encodeURIComponent(state.lecture.folderId)}/analyze`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: "{}"
+      }).catch(() => {});
+    }
+  }
+
+  function selectedTextPayload(ids = [...state.selected]) {
+    return ids.map(findObject).filter(object => object?.type === "text" && !object.deleted).map(object => ({
+      id: object.id,
+      type: "text",
+      role: object.role || "text",
+      text: object.text,
+      fontSize: object.fontSize,
+      x: object.x,
+      y: object.y,
+      width: object.width,
+      height: object.height,
+      practiceProblemId: object.practiceProblemId || undefined,
+      sourceStudyInteractionId: object.sourceStudyInteractionId || undefined
+    }));
+  }
+
+  function boxesOverlap(a, b) {
+    return a.x <= b.x + b.width && a.x + a.width >= b.x &&
+      a.y <= b.y + b.height && a.y + a.height >= b.y;
+  }
+
+  function originalBoardBox() {
+    return { x: 0, y: 0, width: state.width, height: state.height };
+  }
+
+  async function explainSelection(action = "explain") {
+    if (state.explaining || !boardId || !state.selected.size) return;
+    const ids = [...state.selected];
+    const bbox = selectionCanvasBox(ids) || selectedUnionBounds();
+    const board = originalBoardBox();
+    studyLog("AI_SELECTION", {
+      objects: ids.length,
+      ids,
+      bbox: bbox ? [bbox.x, bbox.y, bbox.width, bbox.height] : null,
+      insideOriginalBoard: Boolean(bbox && boxesOverlap(bbox, board)),
+      contentFound: ids.length > 0,
+      objectCoords: ids.map(id => {
+        const object = findObject(id);
+        const box = object ? objectBounds(object) : null;
+        return {
+          id,
+          type: object?.type,
+          box,
+          insideOriginalBoard: Boolean(box && boxesOverlap(box, board))
+        };
+      })
+    });
+    await flushEditorSave();
+    const scale = studyMarkerScale();
+    const pad = bbox ? 10 * scale : 12;
+    const anchor = bbox
+      ? { x: bbox.x + bbox.width + pad, y: bbox.y }
+      : studyAnchorFor({ selectedObjectIds: ids, selectionBBox: bbox });
+    const offsets = bbox && bbox.width && bbox.height && anchor
+      ? { nx: (anchor.x - bbox.x) / bbox.width, ny: (anchor.y - bbox.y) / bbox.height }
+      : { nx: 1, ny: 0 };
+    const requestId = newStudyRequestId();
+    const token = ++state.studyRequestToken;
+    const question = {
+      explain: "Explain this",
+      explain_across_boards: "How does this relate to the previous board?",
+      where_from: "Where did this come from?",
+      check_my_work: "Check my work"
+    }[action] || "Explain this";
+    state.pendingStudyId = requestId;
+    state.pendingStudyQuestion = question;
+    state.pendingStudyAction = action;
+    setStudyBusy(true);
+    $("#study-kicker").textContent = action === "check_my_work" ? "Checking work" : "Explaining selection";
+    $("#study-title").textContent = {
+      explain: "Explain",
+      explain_across_boards: "Across boards",
+      where_from: "Where this came from",
+      check_my_work: "Check my work"
+    }[action] || "Explain";
+    showStudyActions(false);
+    $("#study-sheet")?.classList.add("is-fresh");
+    setStudyStatus("");
+    openStudySheet();
+    const body = $("#study-body");
+    if (body) {
+      body.replaceChildren();
+      appendUserTurn(body, question);
+      appendGenerating(body);
+    }
+    try {
+      const payload = await requestStudy(studyApi("/study/explain"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          selectedObjectIds: ids,
+          selectedTextObjects: selectedTextPayload(ids),
+          selectionBBox: bbox,
+          anchorX: anchor?.x,
+          anchorY: anchor?.y,
+          anchorOffsetNx: offsets.nx,
+          anchorOffsetNy: offsets.ny,
+          studyInteractionId: requestId,
+          requestId,
+          question,
+          action
+        })
+      });
+      const interaction = payload.interaction || payload;
+      if (!interaction?.id) throw new Error("Couldn't explain this right now. Your board is still saved.");
+      interaction.anchorOffsetNx = interaction.anchorOffsetNx ?? offsets.nx;
+      interaction.anchorOffsetNy = interaction.anchorOffsetNy ?? offsets.ny;
+      upsertStudyInteraction(interaction);
+      if (token !== state.studyRequestToken) return;
+      const openId = payload.studyInteractionId || interaction.id;
+      state.pendingStudyId = null;
+      state.pendingStudyQuestion = "";
+      state.pendingStudyAction = "";
+      state.activeStudyId = openId;
+      openStudyInteraction(openId, { fresh: true, scrollToLatest: true });
+      renderStudyMarkers();
+    } catch (error) {
+      if (token !== state.studyRequestToken) return;
+      $("#study-title").textContent = "Couldn't explain this";
+      setStudyStatus(error.message || "Couldn't explain this right now. Your board is still saved.", true);
+      showStudyActions(false);
+    } finally {
+      if (token === state.studyRequestToken) {
+        state.pendingStudyId = null;
+        state.pendingStudyQuestion = "";
+        state.pendingStudyAction = "";
+        setStudyBusy(false);
+      }
+    }
+  }
+
+  async function sendStudyAction({ action = "followup", question = "" } = {}) {
+    const interactionId = state.activeStudyId;
+    if (state.explaining || !interactionId) return;
+    const requestId = newStudyRequestId();
+    const token = ++state.studyRequestToken;
+    const displayQuestion = action === "followup" ? question : actionLabel(action);
+    state.pendingStudyQuestion = displayQuestion;
+    state.pendingStudyAction = action;
+    setStudyBusy(true);
+    setStudyStatus("");
+    const current = state.studyInteractions.find(item => item.id === interactionId);
+    if (current) renderStudyConversation(current, { scrollToLatest: true });
+    try {
+      const payload = await requestStudy(
+        studyApi(`/study/${encodeURIComponent(interactionId)}/followup`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action,
+            question,
+            requestId,
+            studyInteractionId: interactionId
+          })
+        }
+      );
+      const interaction = payload.interaction || payload;
+      if (!interaction?.id) throw new Error("Couldn't explain this right now. Your board is still saved.");
+      upsertStudyInteraction(interaction);
+      if (payload.studyInteractionId && payload.studyInteractionId !== interactionId &&
+          payload.studyInteractionId !== interaction.id) {
+        return;
+      }
+      if (state.activeStudyId !== interactionId) return;
+      state.pendingStudyQuestion = "";
+      openStudyInteraction(interaction.id, { scrollToLatest: true });
+      if (action === "practice_problems" && (payload.problems || payload.problem || interaction.problem)) {
+        setStudyStatus("Practice problems ready. Add them to the canvas if you want to solve them here.");
+      } else {
+        setStudyStatus("");
+      }
+      renderStudyList();
+    } catch (error) {
+      if (token !== state.studyRequestToken && state.activeStudyId !== interactionId) return;
+      setStudyStatus(error.message || "Couldn't explain this right now. Your board is still saved.", true);
+    } finally {
+      state.pendingStudyQuestion = "";
+      state.pendingStudyAction = "";
+      setStudyBusy(false);
+      const latest = state.studyInteractions.find(item => item.id === interactionId);
+      if (latest && state.activeStudyId === interactionId) {
+        renderStudyConversation(latest, { scrollToLatest: true });
+      }
+    }
+  }
+
+  async function sendFollowUp(event) {
+    event.preventDefault();
+    const input = $("#followup-input");
+    const question = input.value.trim();
+    if (!question) return;
+    input.value = "";
+    await sendStudyAction({ action: "followup", question });
+  }
+
+  function addPracticeProblemsToCanvas(problems, follow = {}) {
+    const statements = (Array.isArray(problems) ? problems : [problems])
+      .map(item => {
+        if (item && typeof item === "object") return String(item.problem || item.text || "").trim();
+        return String(item || "").trim();
+      })
+      .filter(Boolean);
+    if (!statements.length) return;
+    const interaction = state.studyInteractions.find(item => item.id === state.activeStudyId);
+    const ids = interaction?.selectedObjectIds || [...state.selected];
+    const live = unionCanvasBoxes(ids.map(id => {
+      const object = findObject(id);
+      return object && !object.deleted ? objectBounds(object) : null;
+    }));
+    const fontSize = 24;
+    let x = live ? live.x : (Number(interaction?.anchorX) || state.camera.x + 40);
+    let y = live ? live.y + live.height + Math.max(28, fontSize) : (Number(interaction?.anchorY) || state.camera.y + 40);
+    const created = [];
+    const metaProblems = Array.isArray(follow.problems) ? follow.problems : [];
+    statements.forEach((text, index) => {
+      const object = {
+        id: uid("text"),
+        type: "text",
+        x,
+        y,
+        width: 40,
+        height: 20,
+        text,
+        color: "#183153",
+        fontSize,
+        wrapWidth: Math.max(live?.width || 0, fontSize * 22),
+        role: "ai_practice_problem",
+        practiceProblemId: metaProblems[index]?.id || uid("prob").slice(0, 20),
+        sourceStudyInteractionId: interaction?.id || "",
+        generatedAt: Date.now() / 1000,
+        origin: "ai_practice",
+        folderId: state.lecture.folderId || "",
+        createdAt: Date.now() / 1000
+      };
+      fitTextObject(object);
+      created.push(object);
+      y += object.height + Math.max(18, fontSize * 0.75);
+    });
+    const before = snapshot();
+    created.forEach(object => state.objects.push(object));
+    state.selected = new Set(created.map(object => object.id));
+    commitLogicalAction(before);
+    renderScene();
+    toast(created.length > 1 ? "Practice problems added to the canvas." : "Practice problem added to the canvas.");
+  }
+
+  function closeTextEditor(save = true) {
+    const editor = $("#text-editor-overlay");
+    if (!editor) return;
+    const object = findObject(editor.dataset.objectId);
+    const nextText = editor.value;
+    editor.remove();
+    if (object) {
+      const overlay = $("#canvas-html-world")?.querySelector(`[data-object-id="${CSS.escape(object.id)}"]`);
+      if (overlay) overlay.hidden = false;
+    }
+    if (!save || !object || object.type !== "text") return;
+    if (object.text === nextText) return;
+    const before = snapshot();
+    object.text = nextText;
+    fitTextObject(object);
+    commitLogicalAction(before);
+    renderScene();
+  }
+
+  function editTextObject(id) {
+    const object = findObject(id);
+    if (!object || object.type !== "text") return;
+    closeTextEditor(true);
+    const frame = $("#primary-frame");
+    const rect = sceneRect();
+    if (!frame || !rect.width) return;
+    const frameBox = frame.getBoundingClientRect();
+    const topLeft = canvasToScreen(object.x, object.y, state.camera, rect);
+    const bottomRight = canvasToScreen(object.x + object.width, object.y + object.height, state.camera, rect);
+    const editor = document.createElement("textarea");
+    editor.id = "text-editor-overlay";
+    editor.className = "text-editor-overlay";
+    editor.dataset.objectId = object.id;
+    editor.value = object.text;
+    editor.style.left = `${Math.max(8, topLeft.x - frameBox.left)}px`;
+    editor.style.top = `${Math.max(8, topLeft.y - frameBox.top)}px`;
+    editor.style.width = `${Math.max(120, bottomRight.x - topLeft.x)}px`;
+    editor.style.height = `${Math.max(48, bottomRight.y - topLeft.y)}px`;
+    editor.addEventListener("pointerdown", event => event.stopPropagation());
+    editor.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeTextEditor(false);
+      } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        closeTextEditor(true);
+      }
+    });
+    editor.addEventListener("blur", () => closeTextEditor(true));
+    frame.append(editor);
+    const overlay = $("#canvas-html-world")?.querySelector(`[data-object-id="${CSS.escape(id)}"]`);
+    if (overlay) overlay.hidden = true;
+    editor.focus();
+    editor.select();
+  }
+
+  async function renameCurrentBoard() {
+    const current = $("#board-name")?.textContent || "";
+    const name = window.prompt(state.lecture.folderId ? "Lecture name" : "Board name", current);
+    if (!name || name.trim() === current) return;
+    try {
+      if (state.lecture.folderId) {
+        const payload = await requestJSON(`/api/folders/${encodeURIComponent(state.lecture.folderId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: name.trim() })
+        });
+        const saved = payload.folder?.name || name.trim();
+        state.lecture.folderName = saved;
+        $("#board-name").textContent = saved;
+        document.title = `${saved} · Digital Whiteboard`;
+        toast("Lecture renamed.");
+        return;
+      }
+      const payload = await requestJSON(`/api/boards/${encodeURIComponent(boardId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.trim() })
+      });
+      const saved = payload.board?.name || name.trim();
+      $("#board-name").textContent = saved;
+      document.title = `${saved} · Digital Whiteboard`;
+      toast("Board renamed.");
+    } catch (error) {
+      toast(error.message || "Could not rename this lecture.", true);
+    }
+  }
+
+  function renderStudyGuidePanel() {
+    const panel = $("#study-guide-panel");
+    const body = $("#study-guide-body");
+    const stale = $("#study-guide-stale");
+    if (!panel || !body) return;
+    const guide = state.lecture.studyGuide;
+    if (!state.lecture.folderId) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    if (stale) stale.hidden = !state.lecture.stale;
+    body.replaceChildren();
+    if (!guide?.content) {
+      const empty = document.createElement("p");
+      empty.className = "library-message";
+      empty.textContent = "Generate a study guide for this lecture.";
+      body.append(empty);
+      return;
+    }
+    renderMarkdownInto(body, guide.content);
+  }
+
+  async function generateStudyGuide() {
+    if (!state.lecture.folderId) {
+      toast("Open or create a lecture folder first.", true);
+      return;
+    }
+    setStudyStatus("Generating study guide…");
+    try {
+      const payload = await requestStudy(
+        `/api/folders/${encodeURIComponent(state.lecture.folderId)}/study-guide`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      );
+      state.lecture.studyGuide = payload.study_guide || payload.studyGuide;
+      state.lecture.stale = Boolean(payload.study_guide_stale);
+      renderStudyGuidePanel();
+      $("#study-kicker").textContent = "Lecture study guide";
+      $("#study-title").textContent = "Study guide";
+      const body = $("#study-body");
+      if (body && state.lecture.studyGuide?.content) {
+        body.replaceChildren();
+        renderMarkdownInto(body, state.lecture.studyGuide.content);
+      }
+      showStudyActions(false);
+      openStudySheet();
+      setStudyStatus(state.lecture.stale ? "Study guide may be outdated" : "");
+    } catch (error) {
+      setStudyStatus(error.message || "Couldn't generate a study guide right now.", true);
+      openStudySheet();
+    }
+  }
+
+  function viewBoard(boardIdToView) {
+    const board = lectureBoardsFromData().find(item => item.boardId === boardIdToView)
+      || state.sourceBoards.find(item => item.boardId === boardIdToView);
+    if (!board) return;
+    const rect = sceneRect();
+    const aspect = sceneAspect(rect);
+    const pad = Math.max(board.width, board.height) * 0.08;
+    let width = board.width + pad * 2;
+    let height = width / aspect;
+    if (height < board.height + pad * 2) {
+      height = board.height + pad * 2;
+      width = height * aspect;
+    }
+    state.camera = {
+      x: board.x + board.width / 2 - width / 2,
+      y: board.y + board.height / 2 - height / 2,
+      width,
+      height
+    };
+    applyCamera();
+  }
+
+  async function startImportWhiteboard() {
+    try {
+      if (!state.lecture.folderId) {
+        const created = await requestJSON(`/api/boards/${encodeURIComponent(boardId)}/lecture/ensure-folder`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        });
+        state.lecture.folderId = created.folder?.id || "";
+        state.lecture.folderName = created.folder?.name || state.lecture.folderName;
+        state.lecture.workspaceId = created.workspace_board_id || boardId;
+        state.lecture.isLecture = true;
+        applyLectureData({
+          ...state.data,
+          folder_id: state.lecture.folderId,
+          folder_name: state.lecture.folderName,
+          workspace_board_id: state.lecture.workspaceId,
+          is_lecture: true
+        });
+      }
+    } catch (error) {
+      toast(error.message || "Could not create a lecture workspace.", true);
+      return;
+    }
+    const folderField = $("#import-folder-id");
+    const workspaceField = $("#import-workspace-id");
+    if (folderField) folderField.value = state.lecture.folderId || "";
+    if (workspaceField) workspaceField.value = state.lecture.workspaceId || boardId;
+    const camera = $("#import-camera");
+    const picker = $("#import-image");
+    if (window.matchMedia?.("(pointer: coarse)").matches && camera) camera.click();
+    else picker?.click();
+  }
+
+  function bindImport() {
+    const form = $("#import-form");
+    const picker = $("#import-image");
+    const camera = $("#import-camera");
+    const submitFile = input => {
+      if (!input?.files?.[0]) return;
+      picker.name = input === picker ? "image" : "";
+      if (camera) camera.name = input === camera ? "image" : "";
+      toast("Processing whiteboard…");
+      form?.submit();
+    };
+    picker?.addEventListener("change", () => submitFile(picker));
+    camera?.addEventListener("change", () => submitFile(camera));
+    $("#import-whiteboard")?.addEventListener("click", startImportWhiteboard);
+  }
+
+  function bindStudy() {
+    $("#explain-button")?.addEventListener("click", () => explainSelection("explain"));
+    $("#explain-across-button")?.addEventListener("click", () => explainSelection("explain_across_boards"));
+    $("#where-from-button")?.addEventListener("click", () => explainSelection("where_from"));
+    $("#check-work-button")?.addEventListener("click", () => explainSelection("check_my_work"));
+    $("#study-guide-button")?.addEventListener("click", generateStudyGuide);
+    $("#regenerate-study-guide")?.addEventListener("click", generateStudyGuide);
+    $("#view-new-board")?.addEventListener("click", () => {
+      if (state.pendingImportedId) viewBoard(state.pendingImportedId);
+      const chip = $("#view-new-board");
+      if (chip) chip.hidden = true;
+    });
+    $("#close-study")?.addEventListener("click", closeStudySheet);
+    $("#study-followup")?.addEventListener("submit", sendFollowUp);
+    $("#study-actions")?.addEventListener("click", event => {
+      const action = event.target?.closest?.("[data-study-action]")?.dataset?.studyAction;
+      if (!action) return;
+      sendStudyAction({ action });
+    });
+    $("#study-notes-button")?.addEventListener("click", () => {
+      const drawer = $("#study-drawer");
+      const opening = drawer.hidden;
+      drawer.hidden = !drawer.hidden;
+      if (!drawer.hidden) {
+        closeStudySheet();
+        renderStudyGuidePanel();
+        renderStudyList();
+      }
+      resetGestureState(opening ? "study-drawer-open" : "study-drawer-close");
+      if (!opening) blurStudyUi();
+    });
+    $("#close-study-drawer")?.addEventListener("click", () => {
+      $("#study-drawer").hidden = true;
+      blurStudyUi();
+      resetGestureState("study-drawer-close");
+    });
+    $("#rename-board")?.addEventListener("click", renameCurrentBoard);
   }
 
   function bindEditor() {
     $$(".tool-button").forEach(button =>
       button.addEventListener("click", () => setTool(button.dataset.tool)));
     $$(".color-chip").forEach(button => button.addEventListener("click", () => {
-      state.color = button.dataset.color;
-      updateSelectedTextStyle("color", state.color);
+      const color = button.dataset.color;
+      if (state.tool === "highlighter") state.highlighterColor = color;
+      else state.penColor = color;
+      state.color = color;
+      applyColorToSelection(color);
       $$(".color-chip").forEach(item => {
         const active = item === button;
         item.classList.toggle("is-active", active);
         item.setAttribute("aria-pressed", String(active));
       });
+      $("#custom-color").value = color;
     }));
     $("#custom-color").addEventListener("input", event => {
-      state.color = event.target.value;
+      const color = event.target.value;
+      if (state.tool === "highlighter") state.highlighterColor = color;
+      else state.penColor = color;
+      state.color = color;
       $$(".color-chip").forEach(item => item.classList.remove("is-active"));
     });
     $("#custom-color").addEventListener("change", event => {
-      updateSelectedTextStyle("color", event.target.value);
+      const color = event.target.value;
+      if (state.tool === "highlighter") state.highlighterColor = color;
+      else state.penColor = color;
+      state.color = color;
+      applyColorToSelection(color);
     });
-    $("#stroke-size").addEventListener("input", event => { state.size = Number(event.target.value); });
-    $("#stroke-size").addEventListener("change", event => {
-      updateSelectedTextStyle("fontSize", Math.max(8, Number(event.target.value) * 4));
+    $("#stroke-size").addEventListener("input", event => {
+      const value = Number(event.target.value);
+      if (state.tool === "highlighter") state.highlighterSize = value;
+      else if (state.tool === "pixel-eraser") state.eraserSize = value;
+      else state.penSize = value;
+      state.size = value;
     });
-    $("#master-layer-toggle").addEventListener("change", event => {
+    $("#text-size")?.addEventListener("pointerdown", () => {
+      $("#text-size").dataset.history = "1";
+      $("#text-size")._before = snapshot();
+    });
+    $("#text-size")?.addEventListener("input", event => {
+      if (inkIsActive()) return;
+      if (!$("#text-size")._before) $("#text-size")._before = snapshot();
+      const next = clamp(Number(event.target.value), 8, 240);
+      selectedTextObjects().forEach(object => {
+        object.fontSize = next;
+        fitTextObject(object);
+      });
+      renderScene();
+    });
+    $("#text-size")?.addEventListener("change", () => {
+      const before = $("#text-size")?._before;
+      if (before) commitLogicalAction(before);
+      if ($("#text-size")) $("#text-size")._before = null;
+    });
+    $("#master-layer-toggle")?.addEventListener("change", event => {
       $("#master-layer").style.display = event.target.checked ? "" : "none";
     });
-    $("#professor-layer-toggle").addEventListener("change", event => {
+    $("#professor-layer-toggle")?.addEventListener("change", event => {
       $("#imported-layer").style.display = event.target.checked ? "" : "none";
     });
-    $("#user-layer-toggle").addEventListener("change", event => {
+    $("#user-layer-toggle")?.addEventListener("change", event => {
       $("#user-layer").style.display = event.target.checked ? "" : "none";
       $("#interaction-layer").style.display = event.target.checked ? "" : "none";
+      const overlay = $("#canvas-html-overlay");
+      if (overlay) overlay.style.display = event.target.checked ? "" : "none";
     });
     $("#undo-button").addEventListener("click", undo);
     $("#redo-button").addEventListener("click", redo);
-    $("#group-button").addEventListener("click", groupSelection);
-    $("#ungroup-button").addEventListener("click", ungroupSelection);
+    $("#group-button")?.addEventListener("click", groupSelection);
+    $("#ungroup-button")?.addEventListener("click", ungroupSelection);
     $("#save-button").addEventListener("click", () => saveEditor(true));
-    $("#clear-button").addEventListener("click", () => {
+    $("#clear-button")?.addEventListener("click", () => {
       if (!state.objects.length || !confirm("Clear all editable user objects?")) return;
       const before = snapshot();
       state.objects = [];
@@ -1510,37 +4344,72 @@
     $("#zoom-in").addEventListener("click", () => {
       const rect = $("#world-scene").getBoundingClientRect();
       zoomAt(1.25, rect.left + rect.width / 2, rect.top + rect.height / 2);
+      markChanged();
     });
     $("#zoom-out").addEventListener("click", () => {
       const rect = $("#world-scene").getBoundingClientRect();
       zoomAt(.8, rect.left + rect.width / 2, rect.top + rect.height / 2);
+      markChanged();
     });
-    $("#fit-button").addEventListener("click", fitCamera);
+    $("#home-button")?.addEventListener("click", resetView);
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(() => syncCameraAspect());
+      observer.observe($("#world-scene"));
+    }
+    window.addEventListener("resize", syncCameraAspect);
     $("#export-button").addEventListener("click", () => exportBoard("svg"));
-    $("#export-png").addEventListener("click", () => exportBoard("png"));
+    $("#export-png")?.addEventListener("click", () => exportBoard("png"));
     const svg = $("#world-scene");
-    svg.addEventListener("pointerdown", pointerDown);
-    svg.addEventListener("pointermove", pointerMove);
-    svg.addEventListener("pointerup", pointerUp);
-    svg.addEventListener("pointercancel", pointerCancel);
+    svg.style.touchAction = "none";
+    svg.addEventListener("pointerdown", pointerDown, { passive: false });
     svg.addEventListener("dblclick", event => {
-      const id = hitObject(event);
-      const object = state.objects.find(item => item.id === id && item.type === "text");
-      if (object) openTextEditor(object);
+      if (state.tool !== "select") return;
+      const hit = hitObject(event);
+      const object = hit ? findObject(hit) : null;
+      if (object?.type === "text") {
+        event.preventDefault();
+        editTextObject(object.id);
+      }
     });
+    window.addEventListener("pointermove", pointerMove, { passive: false, capture: true });
+    window.addEventListener("pointerup", pointerUp, { passive: false, capture: true });
+    window.addEventListener("pointercancel", pointerCancel, { passive: false, capture: true });
+    window.addEventListener("pointerrawupdate", pointerRawUpdate, { passive: true, capture: true });
+    svg.addEventListener("pointerrawupdate", pointerRawUpdate, { passive: true });
+    svg.addEventListener("touchstart", event => {
+      event.preventDefault();
+    }, { passive: false });
+    svg.addEventListener("touchmove", event => {
+      event.preventDefault();
+    }, { passive: false });
+    const clearTouches = event => {
+      if (event.touches && event.touches.length > 0) return;
+      forgetTouchPointers();
+      if (state.interaction && ["pan", "pinch"].includes(state.interaction.kind)) {
+        endCameraGesture("touch-empty");
+      }
+    };
+    window.addEventListener("touchend", clearTouches, { capture: true });
+    window.addEventListener("touchcancel", clearTouches, { capture: true });
+    svg.addEventListener("pointerleave", pointerLeave);
+    svg.addEventListener("lostpointercapture", lostPointerCapture);
+    svg.addEventListener("gotpointercapture", event => {
+      editorLog("POINTER CAPTURE", { action: "got", pointerId: event.pointerId, type: event.pointerType });
+    });
+    svg.addEventListener("gesturestart", event => event.preventDefault());
+    svg.addEventListener("gesturechange", event => event.preventDefault());
     svg.addEventListener("wheel", event => {
       event.preventDefault();
       zoomAt(Math.exp(-event.deltaY * .0015), event.clientX, event.clientY);
+      markChanged();
     }, { passive: false });
-    $("#text-editor").addEventListener("blur", () => closeTextEditor(true));
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", event => {
       if (event.code === "Space") state.spaceDown = false;
     });
     window.addEventListener("pagehide", unloadSave);
-    window.addEventListener("resize", () => {
-      if (!$("#text-editor").hidden) positionTextEditor();
-    });
+    bindStudy();
+    bindImport();
   }
 
   function escapeXML(value) {
@@ -1550,17 +4419,17 @@
 
   function exportObject(object) {
     if (object.type === "text") {
-      const lines = escapeXML(object.text).split("\n");
-      const tspans = lines.map((line, index) =>
-        `<tspan x="${object.x + 5}" dy="${index ? object.fontSize * 1.2 : 0}">${line}</tspan>`
+      const wrapped = wrapPlainLines(object.text, object.fontSize, intendedWrapWidth(object));
+      const tspans = wrapped.lines.map((line, index) =>
+        `<tspan x="${object.x + 5}" dy="${index ? object.fontSize * 1.2 : 0}">${escapeXML(line)}</tspan>`
       ).join("");
-      return `<text x="${object.x + 5}" y="${object.y + object.fontSize}" fill="${escapeXML(object.color)}" font-size="${object.fontSize}" font-family="system-ui, sans-serif">${tspans}</text>`;
+      return `<text id="${escapeXML(object.id)}" x="${object.x + 5}" y="${object.y + object.fontSize}" fill="${escapeXML(object.color)}" font-size="${object.fontSize}" font-family="system-ui, sans-serif">${tspans}</text>`;
     }
     const id = `export-mask-${object.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
     const erasures = object.erasures || [];
     const mask = erasures.length ? `<mask id="${id}" maskUnits="userSpaceOnUse" x="${-state.width}" y="${-state.height}" width="${state.width * 3}" height="${state.height * 3}"><rect x="${-state.width}" y="${-state.height}" width="${state.width * 3}" height="${state.height * 3}" fill="white"/>${erasures.map(erasure => `<path d="${escapeXML(erasure.d || pathFromPoints(erasure.points))}" fill="none" stroke="black" stroke-width="${Number(erasure.width)}" stroke-linecap="round" stroke-linejoin="round"/>`).join("")}</mask>` : "";
-    const transform = object.tx || object.ty
-      ? ` transform="translate(${Number(object.tx) || 0} ${Number(object.ty) || 0})"` : "";
+    const transform = (object.tx || object.ty || (object.sx || 1) !== 1 || (object.sy || 1) !== 1)
+      ? ` transform="${objectTransformValue(object.tx, object.ty, object.sx, object.sy)}"` : "";
     const path = `<path d="${escapeXML(strokePath(object))}" fill="none" stroke="${escapeXML(object.color)}" stroke-width="${Number(object.width)}" stroke-opacity="${Number(object.opacity)}" stroke-linecap="round" stroke-linejoin="round"${transform}${erasures.length ? ` mask="url(#${id})"` : ""}/>`;
     return `${mask}${path}`;
   }
@@ -1589,16 +4458,39 @@
     });
   }
 
+  function exportImported() {
+    return state.importedObjects.map(object => {
+      if (object.deleted) return "";
+      const path = object.path;
+      if (!path) return "";
+      const clone = path.cloneNode(true);
+      clone.removeAttribute("style");
+      clone.removeAttribute("data-object-id");
+      return `<g id="${escapeXML(object.id)}-object" transform="${objectTransformValue(object.tx, object.ty, object.sx, object.sy)}">${clone.outerHTML}</g>`;
+    }).join("");
+  }
+
+  function exportBounds(scope) {
+    const board = { x: 0, y: 0, width: state.width, height: state.height };
+    const items = [...state.objects, ...state.importedObjects.filter(item => !item.deleted && !isBoardFillingObject(item))];
+    if (!items.length) return board;
+    const content = unionBounds(items);
+    if (scope === "content") return content;
+    const left = Math.min(board.x, content.x);
+    const top = Math.min(board.y, content.y);
+    const right = Math.max(board.x + board.width, content.x + content.width);
+    const bottom = Math.max(board.y + board.height, content.y + content.height);
+    return { x: left, y: top, width: right - left, height: bottom - top };
+  }
+
   async function buildExportSVG() {
-    const scope = $("#export-scope").value;
-    const bounds = scope === "content" ? unionBounds(state.objects) :
-      { x: 0, y: 0, width: state.width, height: state.height };
-    const master = await imageDataUrl(state.masterUrl);
-    const imported = $("#imported-layer")?.innerHTML || state.importedMarkup || "";
+    const scope = $("#export-scope")?.value || "content";
+    const bounds = exportBounds(scope);
+    const imported = exportImported();
     const nested = new Set(state.groups.flatMap(group => group.children));
     const objects = state.objects.filter(object => !nested.has(object.id)).map(object => exportNode(object.id)).join("") +
       state.groups.filter(group => !nested.has(group.id)).map(group => exportNode(group.id)).join("");
-    return `<svg xmlns="${NS}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" width="${Math.ceil(bounds.width)}" height="${Math.ceil(bounds.height)}"><rect x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="white"/>${master ? `<image href="${escapeXML(master)}" x="0" y="0" width="${state.width}" height="${state.height}" preserveAspectRatio="none"/>` : ""}<g id="imported-vectors">${imported}</g><g id="user-objects">${objects}</g></svg>`;
+    return `<svg xmlns="${NS}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" width="${Math.ceil(bounds.width)}" height="${Math.ceil(bounds.height)}"><rect x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="#f7f6f2"/><g id="imported-vectors">${imported}</g><g id="user-objects">${objects}</g></svg>`;
   }
 
   function downloadBlob(blob, extension) {
@@ -1652,23 +4544,70 @@
   async function initEditor() {
     $("#corner-workspace").hidden = true;
     $("#editor-workspace").hidden = false;
-    $("#board-name").textContent = state.data.title || state.data.name || `Board ${boardId || ""}`.trim();
+    applyLectureData(state.data);
+    const title = state.lecture.folderName || state.data.title || state.data.name || `Board ${boardId || ""}`.trim();
+    $("#board-name").textContent = title;
+    document.title = `${title} · Digital Whiteboard`;
     state.masterUrl = findAsset("enhanced") || findAsset("corrected");
+    const paper = $("#board-paper");
+    const edge = $("#board-paper-edge");
+    if (paper) {
+      paper.setAttribute("width", state.width);
+      paper.setAttribute("height", state.height);
+    }
+    if (edge) {
+      edge.setAttribute("width", state.width);
+      edge.setAttribute("height", state.height);
+      edge.setAttribute("stroke-width", Math.max(1, state.width / 900));
+    }
+    const bounds = $("#board-bounds");
+    if (bounds) {
+      bounds.setAttribute("width", state.width);
+      bounds.setAttribute("height", state.height);
+      bounds.setAttribute("stroke-width", Math.max(1, state.width / 900));
+    }
     const master = $("#master-image");
-    master.setAttribute("width", state.width);
-    master.setAttribute("height", state.height);
-    if (state.masterUrl) {
-      master.setAttribute("href", state.masterUrl);
-      master.addEventListener("error", () => { $("#canvas-empty").hidden = false; }, { once: true });
-    } else $("#canvas-empty").hidden = false;
+    if (master) {
+      master.removeAttribute("href");
+      master.setAttribute("width", state.width);
+      master.setAttribute("height", state.height);
+    }
+    if ($("#master-layer")) $("#master-layer").setAttribute("hidden", "");
+    if ($("#canvas-empty")) $("#canvas-empty").hidden = true;
+    if ($("#pen-debug")) $("#pen-debug").hidden = !DEBUG_EDITOR;
+    const caption = $("#canvas-dimensions");
+    if (caption) caption.textContent = "Study canvas";
     $("#world-scene").setAttribute("viewBox", `0 0 ${state.width} ${state.height}`);
-    $("#canvas-dimensions").textContent = `${state.width} × ${state.height} master canvas`;
+    $("#world-scene").setAttribute("preserveAspectRatio", "none");
+    refreshSceneRect();
     bindEditor();
-    await Promise.all([loadEditor(), loadImportedSVG()]);
+    await loadEditor();
+    state.objects.forEach(object => {
+      if (object.type === "text") fitTextObject(object);
+    });
+    await loadImportedSVG();
+    await loadStudyInteractions();
+    renderStudyGuidePanel();
+    ensureBoardContext();
+    state.selected.clear();
+    syncCameraAspect();
     applyCamera();
     renderScene();
-    setTool("select");
+    refreshSceneRect();
+    const imported = new URLSearchParams(location.search).get("imported");
+    if (imported) {
+      state.pendingImportedId = imported;
+      const chip = $("#view-new-board");
+      if (chip) chip.hidden = false;
+    }
+    setTool("pen");
+    updatePenHud();
     setSaveStatus(state.dirty ? "Unsaved changes" : "Saved");
+    editorLog("EDITOR READY", {
+      imported: state.importedObjects.length,
+      user: state.objects.length,
+      selected: [...state.selected]
+    });
   }
 
   async function start() {

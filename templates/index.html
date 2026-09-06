@@ -4,233 +4,157 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f4f3ef">
-  <meta name="description" content="Turn a physical whiteboard photo into an editable digital board.">
-  <title>Digital Whiteboard</title>
+  <meta name="description" content="Your digital copies of professor whiteboards.">
+  <title>My Lectures · Digital Whiteboard</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-  <style>
-    .home-main{width:min(1160px,calc(100% - 40px));margin:auto;padding:clamp(38px,6vw,76px) 0 60px}
-    .home-hero{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(330px,.85fr);gap:clamp(32px,6vw,72px);align-items:start}
-    .home-hero h1{margin:0;font-size:clamp(45px,6vw,76px);line-height:1;letter-spacing:-.06em}
-    .home-hero h1 em{color:var(--accent);font-family:"Fraunces",serif;font-weight:600}
-    .hero-copy{margin-bottom:0}.upload-card{padding:clamp(20px,3vw,30px)}
-    .drop-zone{min-height:190px;margin:20px 0 16px;padding:24px}
-    .upload-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
-    .field{display:grid;gap:6px;color:var(--muted);font-size:12px;font-weight:600}
-    .field input,.field select,.dialog-form input{width:100%;min-height:43px;padding:0 12px;border:1px solid var(--line);border-radius:9px;color:var(--ink);background:var(--surface);font:inherit}
-    .library{margin-top:clamp(58px,8vw,90px)}
-    .library-toolbar{display:flex;align-items:end;justify-content:space-between;gap:20px;padding-bottom:18px;border-bottom:1px solid var(--line)}
-    .library-toolbar h2{margin:4px 0 0;font-size:clamp(27px,3vw,38px);letter-spacing:-.04em}
-    .library-actions{display:flex;gap:8px;flex-wrap:wrap}
-    .library-path{display:flex;align-items:center;gap:8px;min-height:44px;margin:18px 0 8px;color:var(--muted);font-size:13px}
-    .path-button{padding:0;border:0;color:var(--ink);background:none;cursor:pointer;font-weight:700}
-    .library-message{padding:36px 20px;border:1px dashed var(--line);border-radius:14px;text-align:center;color:var(--muted)}
-    .library-message[role=alert]{color:#9b321f;background:#fae9e4;border-style:solid}
-    .library-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:14px}
-    .library-card{display:flex;min-height:145px;padding:18px;flex-direction:column;border:1px solid var(--line);border-radius:15px;background:rgba(255,254,250,.9);box-shadow:0 7px 25px rgba(28,39,53,.05)}
-    .library-card.folder-card{min-height:105px;background:#f0ede6}.card-icon{font-size:23px}.library-card h3{margin:12px 0 3px;font-size:16px;overflow-wrap:anywhere}
-    .library-card p{margin:0;color:var(--muted);font-size:12px}.card-spacer{flex:1}
-    .card-actions{display:flex;gap:6px;margin-top:16px;flex-wrap:wrap}
-    .card-actions button,.card-actions a{min-height:32px;padding:0 10px;border:1px solid var(--line);border-radius:7px;color:var(--ink);background:transparent;cursor:pointer;font-size:12px;font-weight:600;text-decoration:none}
-    .card-actions .open-action{color:#fff;border-color:var(--ink);background:var(--ink)}.card-actions .danger-action{color:#a43b26}
-    dialog{width:min(420px,calc(100% - 32px));padding:0;border:0;border-radius:16px;color:var(--ink);background:var(--surface);box-shadow:var(--shadow)}
-    dialog::backdrop{background:rgba(10,19,31,.54)}.dialog-form{display:grid;gap:18px;padding:25px}.dialog-form h2{margin:0;font-size:23px}
-    .dialog-form p{margin:-10px 0 0;color:var(--muted);font-size:13px}.dialog-actions{display:flex;justify-content:flex-end;gap:8px}
-    .toast{position:fixed;z-index:100;right:20px;bottom:20px;max-width:360px;padding:13px 16px;border-radius:10px;color:#fff;background:var(--ink);box-shadow:var(--shadow);font-size:13px}
-    @media(max-width:800px){.home-hero{grid-template-columns:1fr}.library-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:560px){.home-main{width:min(100% - 24px,1160px)}.upload-fields,.library-grid{grid-template-columns:1fr}.library-toolbar{align-items:start;flex-direction:column}.upload-actions{align-items:stretch;flex-direction:column}.privacy-note{margin:0}}
-  </style>
 </head>
-<body class="home-page">
+<body class="home-page library-page">
   <header class="app-header">
     <a class="app-identity" href="/" aria-label="Digital Whiteboard home">
       <span class="board-glyph" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
       <span>Digital Whiteboard</span>
     </a>
-    <details class="app-menu">
-      <summary aria-label="Open application information">
-        <span></span><span></span><span></span>
-      </summary>
-      <nav aria-label="Application information">
-        <a href="#privacy">Image storage</a>
-        <a href="https://github.com/NathanManier/whiteboardhackathon" target="_blank" rel="noreferrer">View source</a>
-      </nav>
-    </details>
+    <button class="button button-primary" id="new-board-button" type="button">New Board</button>
   </header>
 
-  <main class="home-shell">
-    <section class="capture-workspace" aria-labelledby="capture-title">
-      <header class="capture-intro">
-        <p class="tool-label">Physical board → editable SVG</p>
-        <h1 id="capture-title">Turn a whiteboard photo into an editable digital board.</h1>
-        <p>Handwriting, diagrams, arrows, and marker color are preserved as visual geometry—not replaced with typed text.</p>
-      </header>
+  <main class="library-shell">
+    {% if upload_error %}
+    <div class="upload-error" role="alert">
+      <strong>We couldn't open that whiteboard.</strong>
+      <span>{{ upload_error }}</span>
+    </div>
+    {% endif %}
 
-      <form id="upload-form" class="capture-form" method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
-        {% if upload_error %}
-        <div class="upload-error" role="alert">
-          <strong>We couldn't open that whiteboard.</strong>
-          <span>{{ upload_error }}</span>
-        </div>
-        {% endif %}
-        <div id="upload-idle">
-          <label class="capture-target" id="drop-zone" for="board-image">
-            <input id="board-image" name="image" type="file"
-                   accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" required>
-            <span class="capture-icon" aria-hidden="true">
-              <svg viewBox="0 0 32 32">
-                <path d="M5.5 9.5V5.5h4M22.5 5.5h4v4M26.5 22.5v4h-4M9.5 26.5h-4v-4"/>
-                <path d="M9 11.5h14v10H9zM11.5 19l3.2-3 2.4 2 2.2-2 2.2 2.5"/>
-              </svg>
-            </span>
-            <strong>Upload whiteboard</strong>
-            <span>Drop a photo here or choose one below</span>
-          </label>
+    <header class="library-heading">
+      <div>
+        <p class="tool-label">Lecture workspace</p>
+        <h1>My Lectures</h1>
+      </div>
+      <div class="library-heading-actions">
+        <button class="button button-secondary" id="create-folder" type="button">New lecture</button>
+        <button class="button button-ghost button-small" id="refresh-library" type="button">Refresh</button>
+      </div>
+    </header>
 
-          <div class="capture-actions">
-            <label class="button button-primary" for="board-image">Choose photo</label>
-            <label class="button button-secondary" for="camera-image">Take photo</label>
-            <input id="camera-image" type="file" accept="image/*" capture="environment">
-          </div>
-          <p class="format-note">JPG, PNG, or WEBP · 16 MB maximum</p>
-        </div>
+    <nav class="library-path" id="library-path" aria-label="Lecture location"></nav>
+    <div class="lecture-actions" id="lecture-actions" hidden>
+      <button class="button button-primary button-small" id="open-lecture" type="button">Open lecture</button>
+      <button class="button button-secondary button-small" id="import-lecture-board" type="button">+ Import Whiteboard</button>
+      <button class="button button-ghost button-small" id="generate-folder-guide" type="button">Generate Study Guide</button>
+      <p class="study-guide-stale" id="folder-guide-stale" hidden>Study guide may be outdated</p>
+    </div>
 
-        <div class="selection-state" id="upload-selected" hidden>
-          <figure class="selection-preview">
-            <img id="upload-preview" alt="">
-            <figcaption>
-              <strong id="file-title"></strong>
-              <span id="file-detail"></span>
-            </figcaption>
-          </figure>
-          <div class="selection-actions">
-            <button class="text-action" id="cancel-selection" type="button">Cancel</button>
-            <button class="button button-secondary" id="replace-selection" type="button">Replace</button>
-            <button class="button button-primary" id="upload-submit" type="submit">Process board</button>
-          </div>
-        </div>
+    <section class="library-section" id="folders-section" aria-labelledby="folders-title">
+      <h2 id="folders-title">Lectures</h2>
+      <div class="folder-row" id="folder-row"></div>
+    </section>
 
-        <div class="processing-state" id="processing" role="status" aria-live="polite" hidden>
-          <div class="processing-head">
-            <div>
-              <p class="tool-label">Processing on this server</p>
-              <h2>Building your digital board</h2>
-            </div>
-            <time id="processing-time">00:00</time>
-          </div>
-          <div class="activity-track" aria-hidden="true"><span></span></div>
-          <ol class="processing-sequence" aria-label="Processing pipeline order">
-            <li>Prepare image</li>
-            <li>Detect board</li>
-            <li>Correct perspective</li>
-            <li>Enhance board</li>
-            <li>Analyze ink</li>
-            <li>Build vector geometry</li>
-          </ol>
-          <p>The editor opens when processing finishes. If automatic detection is uncertain, you can place the board corners manually.</p>
-        </div>
-      </form>
-
-      <aside class="storage-note" id="privacy">
-        <strong>Image storage</strong>
-        <p>Uploads and generated files are stored on this server until its operator removes them. This prototype has no accounts; anyone with a board link may be able to open it. No external AI API is used.</p>
-      </aside>
+    <section class="library-section" aria-labelledby="boards-title">
+      <h2 id="boards-title">Whiteboards</h2>
+      <p class="library-message" id="library-status" hidden></p>
+      <div class="board-grid" id="library-grid"></div>
     </section>
   </main>
 
-  <footer class="app-footer">
-    <span>Digital Whiteboard · Hackathon prototype</span>
-    <a href="https://github.com/NathanManier/whiteboardhackathon" target="_blank" rel="noreferrer">Source code</a>
-  </footer>
+  <dialog class="capture-dialog" id="capture-dialog" aria-labelledby="capture-title">
+    <form id="upload-form" class="capture-form" method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
+      <input type="hidden" name="folder_id" id="upload-folder-id" value="">
+      <input type="hidden" name="workspace_board_id" id="upload-workspace-id" value="">
+      <header class="dialog-head">
+        <div>
+          <p class="tool-label">Import whiteboard</p>
+          <h2 id="capture-title">Add a photographed whiteboard</h2>
+        </div>
+        <button class="icon-button" id="close-capture" type="button" aria-label="Close">×</button>
+      </header>
 
-  <script>
-    (() => {
-      const form = document.querySelector('#upload-form');
-      const standardInput = document.querySelector('#board-image');
-      const cameraInput = document.querySelector('#camera-image');
-      const idle = document.querySelector('#upload-idle');
-      const selected = document.querySelector('#upload-selected');
-      const processing = document.querySelector('#processing');
-      const preview = document.querySelector('#upload-preview');
-      const fileTitle = document.querySelector('#file-title');
-      const fileDetail = document.querySelector('#file-detail');
-      const dropZone = document.querySelector('#drop-zone');
-      let previewUrl;
+      <div id="upload-idle">
+        <label class="capture-target" id="drop-zone" for="board-image">
+          <input id="board-image" name="image" type="file"
+                 accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" required>
+          <span class="capture-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32">
+              <path d="M5.5 9.5V5.5h4M22.5 5.5h4v4M26.5 22.5v4h-4M9.5 26.5h-4v-4"/>
+              <path d="M9 11.5h14v10H9zM11.5 19l3.2-3 2.4 2 2.2-2 2.2 2.5"/>
+            </svg>
+          </span>
+          <strong>Choose or drop a photo</strong>
+          <span>The professor’s ink becomes an editable study canvas</span>
+        </label>
+        <div class="capture-actions">
+          <label class="button button-primary" for="board-image">Photo library</label>
+          <label class="button button-secondary" for="camera-image">Take photo</label>
+          <input id="camera-image" type="file" accept="image/*" capture="environment">
+        </div>
+        <p class="format-note">JPG, PNG, or WEBP · 16 MB maximum</p>
+      </div>
 
-      function setInputSource(input) {
-        standardInput.name = input === standardInput ? 'image' : '';
-        cameraInput.name = input === cameraInput ? 'image' : '';
-        standardInput.required = input === standardInput;
-        cameraInput.required = input === cameraInput;
-      }
+      <div class="selection-state" id="upload-selected" hidden>
+        <figure class="selection-preview">
+          <img id="selection-image" alt="">
+          <figcaption>
+            <strong id="file-title"></strong>
+            <span id="file-detail"></span>
+          </figcaption>
+        </figure>
+        <div class="selection-actions capture-confirm" id="capture-confirm">
+          <button class="text-action" id="cancel-selection" type="button">Cancel</button>
+          <button class="button button-secondary" id="replace-selection" type="button">Replace</button>
+          <button class="button button-primary" id="upload-submit" type="submit">Process board</button>
+        </div>
+      </div>
 
-      function showSelection(file, input) {
-        if (!file || !file.type.startsWith('image/')) return;
-        setInputSource(input);
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        previewUrl = URL.createObjectURL(file);
-        preview.src = previewUrl;
-        preview.alt = `Selected whiteboard photo: ${file.name}`;
-        fileTitle.textContent = file.name;
-        fileDetail.textContent = `${(file.size / 1048576).toFixed(1)} MB`;
-        idle.hidden = true;
-        selected.hidden = false;
-        processing.hidden = true;
-      }
+      <div class="processing-state" id="processing" role="status" aria-live="polite" hidden>
+        <div class="processing-head">
+          <div>
+            <p class="tool-label">Processing on this server</p>
+            <h2>Building your study canvas</h2>
+          </div>
+          <time id="processing-time">00:00</time>
+        </div>
+        <div class="activity-track" aria-hidden="true"><span></span></div>
+        <ol class="processing-sequence" aria-label="Processing pipeline order">
+          <li>Prepare image</li>
+          <li>Detect board</li>
+          <li>Correct perspective</li>
+          <li>Enhance board</li>
+          <li>Analyze ink</li>
+          <li>Build vector geometry</li>
+        </ol>
+        <p>Your current boards stay untouched until this photo finishes processing.</p>
+      </div>
+    </form>
+  </dialog>
 
-      function clearSelection() {
-        standardInput.value = '';
-        cameraInput.value = '';
-        standardInput.name = 'image';
-        cameraInput.removeAttribute('name');
-        standardInput.required = true;
-        cameraInput.required = false;
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        previewUrl = undefined;
-        preview.removeAttribute('src');
-        selected.hidden = true;
-        idle.hidden = false;
-      }
+  <dialog id="name-dialog">
+    <form class="dialog-form" id="name-form" method="dialog">
+      <h2 id="name-dialog-title">Name</h2>
+      <p id="name-dialog-help"></p>
+      <label class="field">Name
+        <input id="name-dialog-input" name="name" maxlength="80" required autocomplete="off">
+      </label>
+      <div class="dialog-actions">
+        <button class="button button-ghost" value="cancel" type="submit">Cancel</button>
+        <button class="button button-primary" id="name-dialog-submit" value="ok" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
 
-      standardInput.addEventListener('change', () => showSelection(standardInput.files[0], standardInput));
-      cameraInput.addEventListener('change', () => showSelection(cameraInput.files[0], cameraInput));
-      document.querySelector('#cancel-selection').addEventListener('click', clearSelection);
-      document.querySelector('#replace-selection').addEventListener('click', () => standardInput.click());
+  <dialog id="move-dialog">
+    <form class="dialog-form" id="move-form" method="dialog">
+      <h2>Move board</h2>
+      <p>Choose a folder, or keep the board at the top level.</p>
+      <label class="field">Folder
+        <select id="move-folder"></select>
+      </label>
+      <div class="dialog-actions">
+        <button class="button button-ghost" value="cancel" type="submit">Cancel</button>
+        <button class="button button-primary" value="ok" type="submit">Move</button>
+      </div>
+    </form>
+  </dialog>
 
-      ['dragenter', 'dragover'].forEach(type => dropZone.addEventListener(type, event => {
-        event.preventDefault();
-        dropZone.classList.add('is-dragging');
-      }));
-      ['dragleave', 'drop'].forEach(type => dropZone.addEventListener(type, event => {
-        event.preventDefault();
-        dropZone.classList.remove('is-dragging');
-      }));
-      dropZone.addEventListener('drop', event => {
-        const file = event.dataTransfer.files[0];
-        if (!file || !file.type.startsWith('image/')) return;
-        const transfer = new DataTransfer();
-        transfer.items.add(file);
-        standardInput.files = transfer.files;
-        showSelection(file, standardInput);
-      });
-
-      form.addEventListener('submit', event => {
-        const activeInput = standardInput.name ? standardInput : cameraInput;
-        if (!activeInput.files.length) {
-          event.preventDefault();
-          clearSelection();
-          return;
-        }
-        selected.hidden = true;
-        processing.hidden = false;
-        form.setAttribute('aria-busy', 'true');
-        const started = Date.now();
-        const timer = document.querySelector('#processing-time');
-        window.setInterval(() => {
-          const seconds = Math.floor((Date.now() - started) / 1000);
-          timer.textContent = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
-        }, 250);
-      });
-    })();
-  </script>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script src="{{ url_for('static', filename='library.js') }}" defer></script>
 </body>
 </html>

@@ -14,6 +14,7 @@ import shutil
 import time
 import xml.etree.ElementTree as ET
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +34,24 @@ from flask import (
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
 
+from lecture import (
+    attach_source_board,
+    compose_imported_id,
+    default_source_board,
+    folder_board_ids,
+    folder_by_id,
+    imported_id_prefix,
+    lecture_member_payload,
+    mark_study_guide_stale,
+    normalize_folder,
+    public_lecture_context,
+    public_study_guide,
+    sync_folder_board_order,
+    translate_editor_objects,
+    uniquify_object_id,
+    validate_source_boards,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 BOARDS_DIR = BASE_DIR / "boards"
@@ -45,7 +64,7 @@ BOARD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 FOLDER_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 ASSET_NAMES = {
     "original", "corrected", "master", "analysis", "mask", "digitized",
-    "comparison", "detection", "confidence",
+    "comparison", "detection", "confidence", "thumbnail",
 }
 SAFE_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".json"}
 STROKE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -56,6 +75,7 @@ MAX_USER_STROKES = 2_000
 MAX_POINTS_PER_STROKE = 10_000
 MAX_TOTAL_USER_POINTS = 200_000
 MAX_EDITOR_OBJECTS = 3_000
+MAX_IMPORTED_TRANSFORMS = 60_000
 MAX_EDITOR_POINTS = 300_000
 MAX_ERASURES_PER_STROKE = 500
 MAX_TEXT_LENGTH = 20_000
@@ -77,6 +97,29 @@ app.config.update(
 )
 BOARDS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_dotenv() -> None:
+    path = BASE_DIR / ".env"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip().strip("'").strip('"')
+        if str(os.environ.get(key) or "").strip():
+            continue
+        os.environ[key] = value
+
+
+load_dotenv()
 
 
 def require_board_id(board_id: str) -> Path:
@@ -135,6 +178,65 @@ def update_metadata(board_dir: Path, metadata: dict[str, Any]) -> None:
     atomic_json(metadata_path(board_dir), metadata)
 
 
+def default_board_title(folder_name: str | None = None) -> str:
+    stamp = f"{datetime.now():%b} {datetime.now().day}"
+    if folder_name:
+        return f"{folder_name} — {stamp}"
+    return f"New Whiteboard — {stamp}"
+
+
+def unique_board_name(library: dict[str, Any], name: str, folder_id: str | None) -> str:
+    existing = {
+        str(entry.get("name"))
+        for entry in library.get("boards", {}).values()
+        if isinstance(entry, dict) and entry.get("folder_id") == folder_id
+    }
+    if name not in existing:
+        return name
+    for index in range(2, 80):
+        candidate = f"{name} ({index})"
+        if candidate not in existing:
+            return candidate
+    return f"{name} {secrets.token_hex(2)}"
+
+
+def unique_folder_name(library: dict[str, Any], name: str) -> str:
+    existing = {
+        str(folder.get("name", "")).casefold()
+        for folder in library.get("folders", [])
+        if isinstance(folder, dict)
+    }
+    if name.casefold() not in existing:
+        return name
+    for index in range(2, 80):
+        candidate = f"{name} ({index})"
+        if candidate.casefold() not in existing:
+            return candidate
+    return f"{name} {secrets.token_hex(2)}"
+
+
+def folder_name_for(library: dict[str, Any], folder_id: str | None) -> str | None:
+    if not folder_id:
+        return None
+    for folder in library.get("folders", []):
+        if isinstance(folder, dict) and folder.get("id") == folder_id:
+            name = folder.get("name")
+            return name if isinstance(name, str) and name.strip() else None
+    return None
+
+
+def looks_like_source_filename(value: str) -> bool:
+    stem = Path(value).stem.strip()
+    compact = re.sub(r"[\s_\-]+", "", stem)
+    return bool(
+        re.fullmatch(
+            r"(IMG|DSC|DCIM|Screenshot|image|photo|PXL|PIC)\d*.*",
+            compact,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def validate_display_name(value: Any, label: str = "Name") -> str:
     if not isinstance(value, str):
         raise ValueError(f"{label} is required.")
@@ -161,9 +263,14 @@ def read_library() -> dict[str, Any]:
         abort(500, description="Board library is unavailable.")
     if not isinstance(value, dict):
         abort(500, description="Board library is invalid.")
+    folders = value.get("folders") if isinstance(value.get("folders"), list) else []
     return {
         "schema_version": 1,
-        "folders": value.get("folders") if isinstance(value.get("folders"), list) else [],
+        "folders": [
+            normalize_folder(folder)
+            for folder in folders
+            if isinstance(folder, dict)
+        ],
         "boards": value.get("boards") if isinstance(value.get("boards"), dict) else {},
     }
 
@@ -263,11 +370,15 @@ def default_editor_state(metadata: dict[str, Any]) -> dict[str, Any]:
             }
         )
     return {
-        "schema_version": 2,
+        "schema_version": 4,
         "revision": 0,
         "updated_at": metadata.get("user_ink_updated_at"),
         "viewport": {"x": 0, "y": 0, "width": width, "height": height},
         "objects": objects,
+        "groups": [],
+        "imported_transforms": {},
+        "source_boards": [],
+        "merged_board_ids": [],
     }
 
 
@@ -341,8 +452,7 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
             text = item.get("text", "")
             if not isinstance(text, str) or len(text) > MAX_TEXT_LENGTH:
                 raise ValueError(f"Object {index} text is invalid.")
-            clean_objects.append(
-                {
+            clean_text: dict[str, Any] = {
                     "id": object_id,
                     "type": "text",
                     "text": text,
@@ -361,13 +471,13 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
                     "width": finite_number(
                         item.get("width"),
                         f"Object {index}.width",
-                        minimum=10,
+                        minimum=4,
                         maximum=MAX_WORLD_COORDINATE,
                     ),
                     "height": finite_number(
                         item.get("height"),
                         f"Object {index}.height",
-                        minimum=10,
+                        minimum=4,
                         maximum=MAX_WORLD_COORDINATE,
                     ),
                     "font_size": finite_number(
@@ -379,7 +489,32 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
                     "color": color.lower(),
                     "translation": translation,
                 }
+            role = item.get("role") or item.get("kind")
+            if role in {"ai_practice_problem", "practice_problem"}:
+                clean_text["role"] = "ai_practice_problem"
+            wrap_width = item.get("wrap_width", item.get("wrapWidth"))
+            if wrap_width is not None and wrap_width != "":
+                clean_text["wrap_width"] = finite_number(
+                    wrap_width,
+                    f"Object {index}.wrap_width",
+                    minimum=4,
+                    maximum=MAX_WORLD_COORDINATE,
+                )
+            problem_id = item.get("practice_problem_id") or item.get("practiceProblemId")
+            if isinstance(problem_id, str) and STROKE_ID_RE.fullmatch(problem_id):
+                clean_text["practice_problem_id"] = problem_id
+            source_id = item.get("source_study_interaction_id") or item.get(
+                "sourceStudyInteractionId"
             )
+            if isinstance(source_id, str) and source_id:
+                clean_text["source_study_interaction_id"] = source_id[:32]
+            generated_at = item.get("generated_at", item.get("generatedAt"))
+            if generated_at is not None and generated_at != "":
+                clean_text["generated_at"] = finite_number(
+                    generated_at, f"Object {index}.generated_at"
+                )
+            attach_object_source_fields(clean_text, item)
+            clean_objects.append(clean_text)
             continue
         points = validate_point_list(
             item.get("points"), f"Object {index} points", MAX_POINTS_PER_STROKE
@@ -423,8 +558,7 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
             )
         if total_points > MAX_EDITOR_POINTS:
             raise ValueError(f"At most {MAX_EDITOR_POINTS} total points are allowed.")
-        clean_objects.append(
-            {
+        clean_stroke = {
                 "id": object_id,
                 "type": object_type,
                 "color": color.lower(),
@@ -432,9 +566,22 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
                 "opacity": opacity,
                 "points": points,
                 "translation": translation,
+                "scaleX": finite_number(
+                    item.get("scaleX", 1),
+                    f"Object {index}.scaleX",
+                    minimum=0.01,
+                    maximum=100,
+                ),
+                "scaleY": finite_number(
+                    item.get("scaleY", 1),
+                    f"Object {index}.scaleY",
+                    minimum=0.01,
+                    maximum=100,
+                ),
                 "erasures": erasures,
             }
-        )
+        attach_object_source_fields(clean_stroke, item)
+        clean_objects.append(clean_stroke)
     groups = value.get("groups", [])
     if not isinstance(groups, list) or len(groups) > MAX_EDITOR_OBJECTS:
         raise ValueError(f"groups must contain at most {MAX_EDITOR_OBJECTS} items.")
@@ -483,8 +630,12 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
         seen_group_ids.add(group_id)
         known_ids.add(group_id)
     imported_transforms = value.get("imported_transforms", {})
-    if not isinstance(imported_transforms, dict) or len(imported_transforms) > MAX_EDITOR_OBJECTS:
-        raise ValueError("imported_transforms must be an object.")
+    if imported_transforms is None:
+        imported_transforms = {}
+    if not isinstance(imported_transforms, dict) or len(imported_transforms) > MAX_IMPORTED_TRANSFORMS:
+        raise ValueError(
+            f"imported_transforms must be an object with at most {MAX_IMPORTED_TRANSFORMS} entries."
+        )
     clean_imported_transforms: dict[str, dict[str, float]] = {}
     for object_id, transform in imported_transforms.items():
         if not isinstance(object_id, str) or not STROKE_ID_RE.fullmatch(object_id):
@@ -500,14 +651,49 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
                                     minimum=0.01, maximum=100),
             "scaleY": finite_number(transform.get("scaleY", 1), "imported transform scaleY",
                                     minimum=0.01, maximum=100),
+            "deleted": bool(transform.get("deleted", False)),
         }
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "viewport": clean_viewport,
         "objects": clean_objects,
         "groups": clean_groups,
         "imported_transforms": clean_imported_transforms,
+        "source_boards": validate_source_boards(value.get("source_boards")),
+        "merged_board_ids": clean_merged_board_ids(value.get("merged_board_ids")),
     }
+
+
+def attach_object_source_fields(clean: dict[str, Any], item: dict[str, Any]) -> None:
+    board_id = item.get("board_id") or item.get("boardId")
+    if isinstance(board_id, str) and BOARD_ID_RE.fullmatch(board_id):
+        clean["board_id"] = board_id
+    origin = item.get("origin") or item.get("source_kind") or item.get("sourceKind")
+    if origin in {"imported", "student", "ai_practice", "study"}:
+        clean["origin"] = origin
+    elif clean.get("role") == "ai_practice_problem":
+        clean["origin"] = "ai_practice"
+    created_at = item.get("created_at", item.get("createdAt"))
+    if created_at is not None and created_at != "":
+        try:
+            clean["created_at"] = float(created_at)
+        except (TypeError, ValueError):
+            pass
+    folder_id = item.get("folder_id") or item.get("folderId")
+    if isinstance(folder_id, str) and FOLDER_ID_RE.fullmatch(folder_id):
+        clean["folder_id"] = folder_id
+
+
+def clean_merged_board_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    seen: set[str] = set()
+    clean: list[str] = []
+    for item in value[:40]:
+        if isinstance(item, str) and BOARD_ID_RE.fullmatch(item) and item not in seen:
+            seen.add(item)
+            clean.append(item)
+    return clean
 
 
 def decode_image(data: bytes) -> np.ndarray:
@@ -1043,6 +1229,17 @@ def run_downstream(
         metadata.get("id", "unknown"),
     )
     update_metadata(board_dir, metadata)
+    try:
+        from study.service import persist_thumbnail
+
+        persist_thumbnail(
+            metadata,
+            board_dir,
+            combined_svg=combined_svg,
+            update_metadata=update_metadata,
+        )
+    except Exception:
+        LOGGER.info("THUMBNAIL SKIPPED board=%s", metadata.get("id", "unknown"))
     LOGGER.info(
         "SAVE ARTIFACTS COMPLETE board=%s total=%.3fs",
         metadata.get("id", "unknown"),
@@ -1137,13 +1334,26 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
     strokes = metadata.get("user_strokes", [])
     if not isinstance(strokes, list):
         strokes = []
+    library = read_library()
+    catalog = library["boards"].get(board_id)
+    catalog_name = catalog.get("name") if isinstance(catalog, dict) else None
+    folder_id = None
+    if isinstance(catalog, dict) and catalog.get("folder_id") in folder_ids(library):
+        folder_id = catalog.get("folder_id")
+    elif metadata.get("folder_id") in folder_ids(library):
+        folder_id = metadata.get("folder_id")
+    board_name = (
+        catalog_name
+        or metadata.get("name")
+        or default_board_title(folder_name_for(library, folder_id))
+    )
     data = {
         "id": board_id,
         "board_id": board_id,
-        "name": metadata.get("name") or Path(
-            str(metadata.get("source", {}).get("filename", "Untitled board"))
-        ).stem,
-        "folder_id": metadata.get("folder_id"),
+        "name": board_name,
+        "title": board_name,
+        "folder_id": folder_id,
+        "folder_name": folder_name_for(library, folder_id),
         "status": status,
         "needs_corners": status == "needs_corners",
         "assets": assets,
@@ -1159,7 +1369,320 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
     }
     if isinstance(metadata.get("normalized_corners"), list):
         data["normalized_corners"] = metadata["normalized_corners"]
+    lecture = lecture_payload_for_board(board_id, metadata, library)
+    if lecture:
+        data.update(lecture)
     return data
+
+
+def lecture_payload_for_board(
+    board_id: str,
+    metadata: dict[str, Any],
+    library: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    library = library or read_library()
+    catalog = library["boards"].get(board_id)
+    folder_id = None
+    if isinstance(catalog, dict) and catalog.get("folder_id") in folder_ids(library):
+        folder_id = catalog.get("folder_id")
+    elif metadata.get("folder_id") in folder_ids(library):
+        folder_id = metadata.get("folder_id")
+    if not folder_id:
+        return {}
+    folder = folder_by_id(library, folder_id)
+    if folder is None:
+        return {}
+    host_id, editor = ensure_lecture_workspace(library, folder_id)
+    folder = folder_by_id(library, folder_id) or folder
+    placements = []
+    if isinstance(editor, dict):
+        try:
+            placements = validate_source_boards(editor.get("source_boards"))
+        except ValueError:
+            placements = []
+    by_id = {item["board_id"]: item for item in placements}
+    members = []
+    for member_id in folder_board_ids(library, folder_id):
+        member_dir = BOARDS_DIR / member_id
+        if not member_dir.is_dir():
+            continue
+        try:
+            member_meta = read_metadata(member_dir) if member_id != board_id else metadata
+        except Exception:
+            continue
+        member_catalog = library["boards"].get(member_id)
+        assets = member_meta.get("assets") if isinstance(member_meta.get("assets"), dict) else {}
+        master_name = assets.get("master")
+        svg_name = assets.get("svg")
+        master_url = None
+        if isinstance(master_name, str) and master_name in asset_paths(member_meta):
+            master_url = url_for("board_file", board_id=member_id, asset=master_name)
+        if isinstance(svg_name, str) and svg_name in asset_paths(member_meta):
+            svg_url = url_for("board_file", board_id=member_id, asset=svg_name)
+        else:
+            svg_url = url_for("board_svg", board_id=member_id)
+        members.append(
+            lecture_member_payload(
+                board_id=member_id,
+                metadata=member_meta,
+                catalog=member_catalog if isinstance(member_catalog, dict) else None,
+                placement=by_id.get(member_id),
+                svg_url=svg_url,
+                master_url=master_url,
+            )
+        )
+    guide = public_study_guide(folder.get("study_guide"))
+    return {
+        "folder_id": folder_id,
+        "folder_name": folder.get("name"),
+        "workspace_board_id": host_id or folder.get("workspace_board_id") or board_id,
+        "is_lecture": True,
+        "is_workspace": board_id == (host_id or folder.get("workspace_board_id") or board_id),
+        "lecture_boards": members,
+        "source_boards": placements,
+        "lecture_context": public_lecture_context(folder.get("lecture_context")),
+        "study_guide": guide,
+        "study_guide_stale": bool(guide and guide.get("stale")),
+    }
+
+
+def write_editor_state(board_dir: Path, editor: dict[str, Any]) -> dict[str, Any]:
+    clean = validate_editor_state(editor)
+    current = {}
+    try:
+        current = json.loads(editor_path(board_dir).read_text(encoding="utf-8"))
+        if not isinstance(current, dict):
+            current = {}
+    except (OSError, json.JSONDecodeError, FileNotFoundError):
+        current = {}
+    clean["revision"] = int(current.get("revision") or editor.get("revision") or 0)
+    clean["updated_at"] = time.time()
+    atomic_json(editor_path(board_dir), clean)
+    return clean
+
+
+def merge_member_into_host(
+    host_editor: dict[str, Any],
+    member_editor: dict[str, Any],
+    placement: dict[str, Any],
+    member_id: str,
+) -> None:
+    dx = float(placement.get("x") or 0)
+    dy = float(placement.get("y") or 0)
+    seen = {
+        str(item.get("id"))
+        for item in (host_editor.get("objects") or [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    prefix = imported_id_prefix(member_id, None) or f"{member_id[:8]}_"
+    incoming = translate_editor_objects(
+        [item for item in (member_editor.get("objects") or []) if isinstance(item, dict)],
+        dx,
+        dy,
+    )
+    for item in incoming:
+        original = str(item.get("id") or "")
+        if not original:
+            continue
+        next_id = uniquify_object_id(original, seen, prefix)
+        item["id"] = next_id
+        item["board_id"] = member_id
+        if not item.get("origin"):
+            item["origin"] = "student"
+        seen.add(next_id)
+        host_editor.setdefault("objects", []).append(item)
+    host_transforms = host_editor.get("imported_transforms")
+    if not isinstance(host_transforms, dict):
+        host_transforms = {}
+        host_editor["imported_transforms"] = host_transforms
+    member_transforms = member_editor.get("imported_transforms")
+    if not isinstance(member_transforms, dict):
+        member_transforms = {}
+    for object_id, transform in member_transforms.items():
+        if not isinstance(object_id, str) or not isinstance(transform, dict):
+            continue
+        prefixed = compose_imported_id(member_id, object_id, "host")
+        host_transforms[prefixed] = {
+            "x": float(transform.get("x") or 0),
+            "y": float(transform.get("y") or 0),
+            "scaleX": float(transform.get("scaleX") or 1),
+            "scaleY": float(transform.get("scaleY") or 1),
+            "deleted": bool(transform.get("deleted")),
+        }
+    host_editor.setdefault("merged_board_ids", [])
+    if member_id not in host_editor["merged_board_ids"]:
+        host_editor["merged_board_ids"].append(member_id)
+
+
+def merge_member_study(host_dir: Path, member_dir: Path, placement: dict[str, Any]) -> None:
+    from study.storage import read_study_state, write_study_state
+
+    host_state = read_study_state(host_dir)
+    member_state = read_study_state(member_dir)
+    existing = {
+        str(item.get("id"))
+        for item in host_state.get("interactions") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    dx = float(placement.get("x") or 0)
+    dy = float(placement.get("y") or 0)
+    added = []
+    for item in member_state.get("interactions") or []:
+        if not isinstance(item, dict) or not item.get("id") or item["id"] in existing:
+            continue
+        copy = dict(item)
+        bbox = copy.get("selection_bbox")
+        if isinstance(bbox, dict):
+            try:
+                copy["selection_bbox"] = {
+                    **bbox,
+                    "x": float(bbox.get("x") or 0) + dx,
+                    "y": float(bbox.get("y") or 0) + dy,
+                }
+            except (TypeError, ValueError):
+                pass
+        if copy.get("anchor_x") is not None:
+            try:
+                copy["anchor_x"] = float(copy["anchor_x"]) + dx
+            except (TypeError, ValueError):
+                pass
+        if copy.get("anchor_y") is not None:
+            try:
+                copy["anchor_y"] = float(copy["anchor_y"]) + dy
+            except (TypeError, ValueError):
+                pass
+        added.append(copy)
+        existing.add(str(copy["id"]))
+    if added:
+        host_state["interactions"] = [*added, *(host_state.get("interactions") or [])]
+        write_study_state(host_dir, host_state, atomic_json)
+
+
+def ensure_lecture_workspace(
+    library: dict[str, Any],
+    folder_id: str,
+    *,
+    persist: bool = True,
+) -> tuple[str | None, dict[str, Any] | None]:
+    ordered = sync_folder_board_order(library, folder_id)
+    folder = folder_by_id(library, folder_id)
+    if folder is None or not ordered:
+        return None, None
+    host_id = folder.get("workspace_board_id") or ordered[0]
+    if not BOARD_ID_RE.fullmatch(str(host_id or "")):
+        return None, None
+    host_dir = BOARDS_DIR / host_id
+    if not host_dir.is_dir():
+        return None, None
+    try:
+        host_meta = read_metadata(host_dir)
+    except Exception:
+        return host_id, None
+    if str((host_meta.get("pipeline") or {}).get("status")) != "ready":
+        return host_id, None
+    editor = read_editor_state(host_dir, host_meta)
+    try:
+        boards = validate_source_boards(editor.get("source_boards"))
+    except ValueError:
+        boards = []
+    known = {item["board_id"] for item in boards}
+    changed = False
+    if host_id not in known:
+        boards = [default_source_board(host_id, host_meta), *boards]
+        known.add(host_id)
+        changed = True
+    merged = set(editor.get("merged_board_ids") or [])
+    for member_id in ordered:
+        if member_id == host_id:
+            continue
+        member_dir = BOARDS_DIR / member_id
+        if not member_dir.is_dir():
+            continue
+        try:
+            member_meta = read_metadata(member_dir)
+        except Exception:
+            continue
+        if str((member_meta.get("pipeline") or {}).get("status")) != "ready":
+            continue
+        if member_id not in known:
+            editor = attach_source_board(
+                host_editor={**editor, "source_boards": boards},
+                host_id=host_id,
+                new_board_id=member_id,
+                new_metadata=member_meta,
+                host_metadata=host_meta,
+            )
+            boards = editor["source_boards"]
+            known.add(member_id)
+            changed = True
+            mark_study_guide_stale(folder)
+            folder["lecture_context"] = None
+        if member_id not in merged:
+            member_editor = read_editor_state(member_dir, member_meta)
+            placement = next((item for item in boards if item["board_id"] == member_id), None)
+            if placement:
+                merge_member_into_host(editor, member_editor, placement, member_id)
+                try:
+                    merge_member_study(host_dir, member_dir, placement)
+                except Exception:
+                    LOGGER.info("STUDY MERGE SKIPPED member=%s", member_id)
+                merged.add(member_id)
+                editor["merged_board_ids"] = list(merged)
+                changed = True
+    editor["source_boards"] = boards
+    folder["workspace_board_id"] = host_id
+    folder["board_order"] = ordered
+    if persist and changed:
+        try:
+            write_editor_state(host_dir, editor)
+        except ValueError:
+            LOGGER.exception("LECTURE WORKSPACE SAVE FAILED host=%s", host_id)
+        write_library(library)
+    return host_id, editor
+
+
+def attach_imported_board(workspace_id: str, new_board_id: str) -> str:
+    if workspace_id == new_board_id:
+        return workspace_id
+    workspace_dir = require_board_id(workspace_id)
+    new_dir = require_board_id(new_board_id)
+    workspace_meta = read_metadata(workspace_dir)
+    new_meta = read_metadata(new_dir)
+    library = read_library()
+    catalog = library["boards"].get(workspace_id)
+    folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else workspace_meta.get("folder_id")
+    editor = read_editor_state(workspace_dir, workspace_meta)
+    editor = attach_source_board(
+        host_editor=editor,
+        host_id=workspace_id,
+        new_board_id=new_board_id,
+        new_metadata=new_meta,
+        host_metadata=workspace_meta,
+    )
+    merged = set(editor.get("merged_board_ids") or [])
+    merged.add(new_board_id)
+    editor["merged_board_ids"] = list(merged)
+    write_editor_state(workspace_dir, editor)
+    if isinstance(folder_id, str) and folder_id in folder_ids(library):
+        new_entry = library["boards"].get(new_board_id)
+        if isinstance(new_entry, dict):
+            new_entry["folder_id"] = folder_id
+        new_meta["folder_id"] = folder_id
+        update_metadata(new_dir, new_meta)
+        folder = folder_by_id(library, folder_id)
+        if folder:
+            sync_folder_board_order(library, folder_id)
+            mark_study_guide_stale(folder)
+            folder["lecture_context"] = None
+        write_library(library)
+    return workspace_id
+
+
+def workspace_redirect_url(workspace_id: str, imported_id: str | None = None) -> str:
+    url = url_for("board", board_id=workspace_id)
+    if imported_id:
+        return f"{url}?imported={imported_id}"
+    return url
 
 
 def validate_user_strokes(value: Any, width: int, height: int) -> list[dict[str, Any]]:
@@ -1212,6 +1735,73 @@ def validate_user_strokes(value: Any, width: int, height: int) -> list[dict[str,
     return validated
 
 
+def append_professor_svg(
+    professor: ET.Element,
+    *,
+    board_dir: Path,
+    metadata: dict[str, Any],
+    imported_transforms: dict[str, Any],
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+    id_prefix: str = "",
+    namespace: str = "http://www.w3.org/2000/svg",
+) -> None:
+    svg_name = metadata.get("assets", {}).get("svg")
+    if not isinstance(svg_name, str) or Path(svg_name).name != svg_name:
+        return
+    try:
+        source = ET.fromstring((board_dir / svg_name).read_bytes())
+    except (OSError, ET.ParseError):
+        return
+    board_wrap = professor
+    if origin_x or origin_y:
+        board_wrap = ET.SubElement(
+            professor,
+            f"{{{namespace}}}g",
+            {
+                "transform": f"translate({origin_x:.4f} {origin_y:.4f})",
+                "data-source-board": metadata.get("id") or board_dir.name,
+            },
+        )
+    for child in source:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag in {"script", "foreignObject"}:
+            continue
+        copied = deepcopy(child)
+        original_id = copied.get("id")
+        object_id = original_id
+        if isinstance(original_id, str) and id_prefix:
+            object_id = f"{id_prefix}{original_id}"[:64]
+            copied.set("id", object_id)
+            copied.set("data-source-id", original_id)
+        transform = None
+        if isinstance(object_id, str):
+            transform = imported_transforms.get(object_id)
+        if transform is None and isinstance(original_id, str):
+            transform = imported_transforms.get(original_id)
+        x_value = y_value = 0.0
+        scale_x = scale_y = 1.0
+        if isinstance(transform, dict):
+            if transform.get("deleted"):
+                continue
+            x_value = float(transform.get("x", 0) or 0)
+            y_value = float(transform.get("y", 0) or 0)
+            scale_x = float(transform.get("scaleX", 1) or 1)
+            scale_y = float(transform.get("scaleY", 1) or 1)
+        if x_value or y_value or scale_x != 1 or scale_y != 1:
+            parts = [f"translate({x_value:.4f} {y_value:.4f})"]
+            if scale_x != 1 or scale_y != 1:
+                parts.append(f"scale({scale_x:.4f} {scale_y:.4f})")
+            wrapper = ET.SubElement(
+                board_wrap,
+                f"{{{namespace}}}g",
+                {"transform": " ".join(parts)},
+            )
+            wrapper.append(copied)
+        else:
+            board_wrap.append(copied)
+
+
 def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
     dimensions = metadata.get("dimensions", {})
     width = int(dimensions.get("width") or metadata.get("source", {}).get("width") or 1)
@@ -1220,20 +1810,54 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
     ET.register_namespace("", namespace)
     root = ET.Element(
         f"{{{namespace}}}svg",
-        {"width": str(width), "height": str(height), "viewBox": f"0 0 {width} {height}"},
+        {
+            "width": str(width),
+            "height": str(height),
+            "viewBox": f"0 0 {width} {height}",
+            "overflow": "visible",
+        },
     )
     professor = ET.SubElement(root, f"{{{namespace}}}g", {"id": "professor-ink"})
-    svg_name = metadata.get("assets", {}).get("svg")
-    if isinstance(svg_name, str) and Path(svg_name).name == svg_name:
-        try:
-            source = ET.fromstring((board_dir / svg_name).read_bytes())
-            for child in source:
-                if child.tag.rsplit("}", 1)[-1] not in {"script", "foreignObject"}:
-                    professor.append(deepcopy(child))
-        except (OSError, ET.ParseError):
-            pass
-    user = ET.SubElement(root, f"{{{namespace}}}g", {"id": "user-ink"})
     editor = read_editor_state(board_dir, metadata)
+    imported_transforms = editor.get("imported_transforms", {})
+    if not isinstance(imported_transforms, dict):
+        imported_transforms = {}
+    host_id = str(metadata.get("id") or board_dir.name)
+    source_boards = []
+    try:
+        source_boards = validate_source_boards(editor.get("source_boards"))
+    except ValueError:
+        source_boards = []
+    if source_boards:
+        for placement in source_boards:
+            member_id = placement["board_id"]
+            member_dir = BOARDS_DIR / member_id if BOARD_ID_RE.fullmatch(member_id) else None
+            if member_dir is None or not member_dir.is_dir():
+                continue
+            try:
+                member_meta = read_metadata(member_dir) if member_id != host_id else metadata
+            except Exception:
+                continue
+            prefix = imported_id_prefix(member_id, host_id)
+            append_professor_svg(
+                professor,
+                board_dir=member_dir,
+                metadata=member_meta,
+                imported_transforms=imported_transforms,
+                origin_x=float(placement.get("x") or 0),
+                origin_y=float(placement.get("y") or 0),
+                id_prefix=prefix,
+                namespace=namespace,
+            )
+    else:
+        append_professor_svg(
+            professor,
+            board_dir=board_dir,
+            metadata=metadata,
+            imported_transforms=imported_transforms,
+            namespace=namespace,
+        )
+    user = ET.SubElement(root, f"{{{namespace}}}g", {"id": "user-ink"})
     objects = editor.get("objects", [])
     if not objects:
         objects = [
@@ -1253,10 +1877,14 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
         if not isinstance(item, dict):
             continue
         translation = item.get("translation", {})
+        scale_x = float(item.get("scaleX", 1) or 1)
+        scale_y = float(item.get("scaleY", 1) or 1)
         transform = (
             f'translate({float(translation.get("x", 0)):.4f} '
             f'{float(translation.get("y", 0)):.4f})'
         )
+        if scale_x != 1 or scale_y != 1:
+            transform = f"{transform} scale({scale_x:.4f} {scale_y:.4f})"
         if item.get("type") == "text":
             text = ET.SubElement(
                 user,
@@ -1414,17 +2042,43 @@ def upload() -> Response | tuple[str, int]:
         ), 400
 
     library = read_library()
-    try:
-        requested_name = request.form.get("name")
-        board_name = validate_display_name(
-            requested_name if requested_name and requested_name.strip() else Path(uploaded.filename).stem,
-            "Board name",
-        )
-    except ValueError as exc:
-        return str(exc), 400
     requested_folder = request.form.get("folder_id", "").strip() or None
+    workspace_board_id = request.form.get("workspace_board_id", "").strip() or None
+    if workspace_board_id and not BOARD_ID_RE.fullmatch(workspace_board_id):
+        workspace_board_id = None
     if requested_folder is not None and requested_folder not in folder_ids(library):
-        return "The selected folder does not exist.", 400
+        return render_template(
+            "index.html",
+            upload_error="The selected folder does not exist.",
+        ), 400
+    if workspace_board_id:
+        workspace_entry = library["boards"].get(workspace_board_id)
+        if not isinstance(workspace_entry, dict):
+            return render_template(
+                "index.html",
+                upload_error="The lecture workspace could not be found.",
+            ), 400
+        if not requested_folder:
+            requested_folder = workspace_entry.get("folder_id")
+    requested_name = (request.form.get("name") or "").strip()
+    try:
+        if requested_name and not looks_like_source_filename(requested_name):
+            board_name = validate_display_name(requested_name, "Board name")
+        elif requested_folder:
+            next_order = len(folder_board_ids(library, requested_folder)) + 1
+            board_name = unique_board_name(
+                library,
+                f"Whiteboard {next_order}",
+                requested_folder,
+            )
+        else:
+            board_name = unique_board_name(
+                library,
+                default_board_title(folder_name_for(library, requested_folder)),
+                requested_folder,
+            )
+    except ValueError as exc:
+        return render_template("index.html", upload_error=str(exc)), 400
 
     board_id = secrets.token_hex(16)
     board_dir = BOARDS_DIR / board_id
@@ -1436,6 +2090,7 @@ def upload() -> Response | tuple[str, int]:
         "id": board_id,
         "name": board_name,
         "folder_id": requested_folder,
+        "workspace_board_id": workspace_board_id,
         "created_at": time.time(),
         "updated_at": time.time(),
         "source": {
@@ -1455,6 +2110,21 @@ def upload() -> Response | tuple[str, int]:
         "created_at": metadata["created_at"],
         "updated_at": metadata["updated_at"],
     }
+    if requested_folder:
+        folder = folder_by_id(library, requested_folder)
+        if folder:
+            sync_folder_board_order(library, requested_folder)
+            host = folder.get("workspace_board_id")
+            if (
+                not workspace_board_id
+                and isinstance(host, str)
+                and BOARD_ID_RE.fullmatch(host)
+                and host != board_id
+            ):
+                workspace_board_id = host
+                metadata["workspace_board_id"] = host
+            mark_study_guide_stale(folder)
+            folder["lecture_context"] = None
     write_library(library)
 
     started = time.perf_counter()
@@ -1487,23 +2157,24 @@ def upload() -> Response | tuple[str, int]:
     atomic_image(board_dir / "board_detection.jpg", detection_overlay)
     metadata["assets"]["detection"] = "board_detection.jpg"
     metadata["assets"]["confidence"] = "board_detection.jpg"
-    if corners is None or confidence < DETECTION_CONFIDENCE_THRESHOLD:
-        metadata["pipeline"]["status"] = "needs_corners"
-        # A usable master exists even before the user supplies corners.
-        atomic_image(board_dir / "master.png", image)
-        metadata["assets"]["master"] = "master.png"
-        metadata["dimensions"] = {"width": int(image.shape[1]), "height": int(image.shape[0])}
-        update_metadata(board_dir, metadata)
-        LOGGER.info(
-            "TOTAL COMPLETE board=%s state=needs_corners elapsed=%.3fs",
-            board_id,
-            time.perf_counter() - upload_started,
-        )
-        return redirect(url_for("board", board_id=board_id))
-
-    run_downstream(board_dir, metadata, image, corners)
+    height, width = image.shape[:2]
+    if corners is not None:
+        metadata["suggested_corners"] = corners.tolist()
+        metadata["normalized_corners"] = [
+            {
+                "x": float(np.clip(point[0] / max(width - 1, 1), 0, 1)),
+                "y": float(np.clip(point[1] / max(height - 1, 1), 0, 1)),
+            }
+            for point in corners
+        ]
+    metadata["pipeline"]["status"] = "needs_corners"
+    # A usable master exists even before the user supplies corners.
+    atomic_image(board_dir / "master.png", image)
+    metadata["assets"]["master"] = "master.png"
+    metadata["dimensions"] = {"width": int(width), "height": int(height)}
+    update_metadata(board_dir, metadata)
     LOGGER.info(
-        "TOTAL COMPLETE board=%s state=ready elapsed=%.3fs",
+        "TOTAL COMPLETE board=%s state=needs_corners elapsed=%.3fs",
         board_id,
         time.perf_counter() - upload_started,
     )
@@ -1514,9 +2185,19 @@ def upload() -> Response | tuple[str, int]:
 def board(board_id: str) -> str | Response:
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
-    board_data = frontend_board_data(board_id, metadata)
     accepts = request.accept_mimetypes
-    if accepts["application/json"] > accepts["text/html"]:
+    wants_json = accepts["application/json"] > accepts["text/html"]
+    status = str((metadata.get("pipeline") or {}).get("status") or "")
+    if not wants_json and status == "ready" and request.args.get("raw") != "1":
+        library = read_library()
+        catalog = library["boards"].get(board_id)
+        folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
+        if isinstance(folder_id, str) and folder_id in folder_ids(library):
+            host_id, _ = ensure_lecture_workspace(library, folder_id)
+            if host_id and host_id != board_id:
+                return redirect(url_for("board", board_id=host_id))
+    board_data = frontend_board_data(board_id, metadata)
+    if wants_json:
         return jsonify(board_data)
     return render_template("board.html", board_id=board_id, board_data=board_data)
 
@@ -1557,15 +2238,34 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
     metadata.setdefault("pipeline", {})["status"] = "processing"
     update_metadata(board_dir, metadata)
     LOGGER.info("MANUAL CORNERS ACCEPTED board=%s", board_id)
-    run_downstream(board_dir, metadata, image, corners)
+    try:
+        run_downstream(board_dir, metadata, image, corners)
+    except Exception:
+        LOGGER.exception("WHITEBOARD PROCESSING FAILED board=%s", board_id)
+        metadata.setdefault("pipeline", {})["status"] = "failed"
+        update_metadata(board_dir, metadata)
+        if request.is_json:
+            return jsonify(error="Whiteboard processing failed."), 500
+        return "Whiteboard processing failed.", 500
     LOGGER.info(
         "TOTAL COMPLETE board=%s state=ready manual=true elapsed=%.3fs",
         board_id,
         time.perf_counter() - request_started,
     )
+    workspace_id = metadata.get("workspace_board_id")
+    redirect_id = board_id
+    imported_id = None
+    if isinstance(workspace_id, str) and BOARD_ID_RE.fullmatch(workspace_id) and workspace_id != board_id:
+        try:
+            attach_imported_board(workspace_id, board_id)
+            redirect_id = workspace_id
+            imported_id = board_id
+        except Exception:
+            LOGGER.exception("LECTURE ATTACH FAILED workspace=%s board=%s", workspace_id, board_id)
+    next_url = workspace_redirect_url(redirect_id, imported_id)
     if request.is_json:
-        return jsonify(id=board_id, status="ready", url=url_for("board", board_id=board_id))
-    return redirect(url_for("board", board_id=board_id))
+        return jsonify(id=board_id, status="ready", url=next_url, workspace_id=redirect_id)
+    return redirect(next_url)
 
 
 @app.post("/board/<board_id>/save")
@@ -1652,7 +2352,21 @@ def get_library() -> Response:
             folder_id = None
         dimensions = metadata.get("dimensions", {})
         assets = metadata.get("assets", {})
-        master = assets.get("master") if isinstance(assets, dict) else None
+        thumbnail = assets.get("thumbnail") if isinstance(assets, dict) else None
+        svg_name = assets.get("svg") if isinstance(assets, dict) else None
+        allowed = asset_paths(metadata)
+        if isinstance(thumbnail, str) and thumbnail in allowed:
+            thumbnail_url = url_for("board_file", board_id=board_id, asset=thumbnail)
+        elif isinstance(svg_name, str) and svg_name in allowed:
+            thumbnail_url = url_for("board_file", board_id=board_id, asset=svg_name)
+        else:
+            thumbnail_url = None
+        workspace_id = None
+        if folder_id:
+            folder = folder_by_id(library, folder_id)
+            if folder:
+                workspace_id = folder.get("workspace_board_id")
+        open_id = workspace_id if workspace_id and BOARD_ID_RE.fullmatch(str(workspace_id)) else board_id
         boards.append(
             {
                 "id": board_id,
@@ -1663,22 +2377,43 @@ def get_library() -> Response:
                 "updated_at": metadata.get("updated_at"),
                 "width": dimensions.get("width") if isinstance(dimensions, dict) else None,
                 "height": dimensions.get("height") if isinstance(dimensions, dict) else None,
-                "thumbnail_url": (
-                    url_for("board_file", board_id=board_id, asset=master)
-                    if isinstance(master, str) and master in asset_paths(metadata)
-                    else None
-                ),
-                "url": url_for("board", board_id=board_id),
+                "thumbnail_url": thumbnail_url,
+                "url": url_for("board", board_id=open_id),
+                "workspace_board_id": workspace_id,
             }
         )
-    folders = [
-        folder
-        for folder in library["folders"]
-        if isinstance(folder, dict)
-        and isinstance(folder.get("id"), str)
-        and FOLDER_ID_RE.fullmatch(folder["id"])
-        and isinstance(folder.get("name"), str)
-    ]
+    folders = []
+    for folder in library["folders"]:
+        if not (
+            isinstance(folder, dict)
+            and isinstance(folder.get("id"), str)
+            and FOLDER_ID_RE.fullmatch(folder["id"])
+            and isinstance(folder.get("name"), str)
+        ):
+            continue
+        folder = normalize_folder(folder)
+        member_ids = folder_board_ids(library, folder["id"])
+        guide = public_study_guide(folder.get("study_guide"))
+        workspace_id = folder.get("workspace_board_id")
+        if not (isinstance(workspace_id, str) and BOARD_ID_RE.fullmatch(workspace_id)):
+            workspace_id = member_ids[0] if member_ids else None
+        folders.append(
+            {
+                "id": folder["id"],
+                "name": folder["name"],
+                "created_at": folder.get("created_at"),
+                "updated_at": folder.get("updated_at"),
+                "workspace_board_id": workspace_id,
+                "board_order": member_ids,
+                "whiteboard_count": len(member_ids),
+                "lecture_context": public_lecture_context(folder.get("lecture_context")),
+                "study_guide": guide,
+                "study_guide_stale": bool(guide and guide.get("stale")),
+                "url": url_for("board", board_id=workspace_id)
+                if isinstance(workspace_id, str) and BOARD_ID_RE.fullmatch(workspace_id)
+                else None,
+            }
+        )
     return jsonify(schema_version=1, folders=folders, boards=boards)
 
 
@@ -1695,7 +2430,12 @@ def create_folder() -> Response | tuple[Response, int]:
         for folder in library["folders"]
     ):
         return jsonify(error="A folder with that name already exists."), 409
-    folder = {"id": secrets.token_hex(8), "name": name, "created_at": time.time()}
+    folder = normalize_folder({
+        "id": secrets.token_hex(8),
+        "name": name,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    })
     library["folders"].append(folder)
     write_library(library)
     return jsonify(folder=folder), 201
@@ -1769,6 +2509,147 @@ def delete_folder(folder_id: str) -> Response | tuple[Response, int]:
     return jsonify(status="deleted", id=folder_id, deleted_boards=len(board_ids))
 
 
+@app.get("/api/folders/<folder_id>/lecture")
+def get_lecture(folder_id: str) -> Response | tuple[Response, int]:
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    library = read_library()
+    folder = folder_by_id(library, folder_id)
+    if folder is None:
+        abort(404)
+    host_id, _ = ensure_lecture_workspace(library, folder_id)
+    folder = folder_by_id(library, folder_id) or folder
+    guide = public_study_guide(folder.get("study_guide"))
+    members = []
+    for member_id in folder_board_ids(library, folder_id):
+        member_dir = BOARDS_DIR / member_id
+        if not member_dir.is_dir():
+            continue
+        try:
+            members.append(frontend_board_data(member_id, read_metadata(member_dir)))
+        except Exception:
+            continue
+    return jsonify(
+        folder={
+            "id": folder["id"],
+            "name": folder["name"],
+            "workspace_board_id": host_id or folder.get("workspace_board_id"),
+            "board_order": folder.get("board_order") or [],
+        },
+        boards=members,
+        lecture_context=public_lecture_context(folder.get("lecture_context")),
+        study_guide=guide,
+        study_guide_stale=bool(guide and guide.get("stale")),
+    )
+
+
+@app.post("/api/folders/<folder_id>/analyze")
+def analyze_lecture_route(folder_id: str) -> Response | tuple[Response, int]:
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    from study.ai import StudyAIError
+    from study.service import ensure_lecture_ai_context
+
+    library = read_library()
+    folder = folder_by_id(library, folder_id)
+    if folder is None:
+        abort(404)
+    force = False
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        force = bool(payload.get("force"))
+    try:
+        context = ensure_lecture_ai_context(
+            folder_id=folder_id,
+            library=library,
+            atomic_json=atomic_json,
+            write_library=write_library,
+            force=force,
+        )
+    except StudyAIError as exc:
+        if exc.status == 503:
+            return jsonify(status="unavailable", context=None)
+        return jsonify(error=str(exc)), exc.status
+    return jsonify(status="ready" if context else "skipped", context=public_lecture_context(context))
+
+
+@app.post("/api/folders/<folder_id>/study-guide")
+def generate_study_guide_route(folder_id: str) -> Response | tuple[Response, int]:
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    from study.ai import StudyAIError
+    from study.service import generate_lecture_study_guide
+
+    library = read_library()
+    folder = folder_by_id(library, folder_id)
+    if folder is None:
+        abort(404)
+    try:
+        guide = generate_lecture_study_guide(
+            folder_id=folder_id,
+            library=library,
+            atomic_json=atomic_json,
+            write_library=write_library,
+        )
+    except StudyAIError as exc:
+        return jsonify(error=str(exc)), exc.status
+    return jsonify(study_guide=public_study_guide(guide), study_guide_stale=False)
+
+
+@app.post("/api/boards/<board_id>/lecture/ensure-folder")
+def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int]:
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    library = read_library()
+    catalog = library["boards"].setdefault(
+        board_id,
+        {
+            "name": metadata.get("name") or default_board_title(),
+            "folder_id": metadata.get("folder_id"),
+            "created_at": metadata.get("created_at") or time.time(),
+            "updated_at": time.time(),
+        },
+    )
+    folder_id = catalog.get("folder_id")
+    if folder_id in folder_ids(library):
+        host_id, _ = ensure_lecture_workspace(library, folder_id)
+        folder = folder_by_id(library, folder_id)
+        return jsonify(
+            folder=folder,
+            workspace_board_id=host_id or board_id,
+            created=False,
+        )
+    try:
+        name = validate_display_name(str(catalog.get("name") or metadata.get("name") or "Lecture"))
+    except ValueError:
+        name = default_board_title()
+    existing = {
+        str(folder.get("name", "")).casefold()
+        for folder in library["folders"]
+        if isinstance(folder, dict)
+    }
+    if name.casefold() in existing:
+        try:
+            name = validate_display_name(unique_folder_name(library, name))
+        except ValueError:
+            name = f"Lecture {secrets.token_hex(2)}"
+    folder = normalize_folder({
+        "id": secrets.token_hex(8),
+        "name": name,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "workspace_board_id": board_id,
+        "board_order": [board_id],
+    })
+    library["folders"].append(folder)
+    catalog["folder_id"] = folder["id"]
+    metadata["folder_id"] = folder["id"]
+    update_metadata(board_dir, metadata)
+    write_library(library)
+    ensure_lecture_workspace(library, folder["id"])
+    return jsonify(folder=folder, workspace_board_id=board_id, created=True)
+
+
 @app.patch("/api/boards/<board_id>")
 def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
     board_dir = require_board_id(board_id)
@@ -1816,6 +2697,145 @@ def delete_board(board_id: str) -> Response:
     library["boards"].pop(board_id, None)
     write_library(library)
     return jsonify(status="deleted", id=board_id)
+
+
+@app.get("/api/boards/<board_id>/study")
+def list_study_interactions(board_id: str) -> Response:
+    from study.storage import public_interaction, read_study_state
+
+    board_dir = require_board_id(board_id)
+    state = read_study_state(board_dir)
+    return jsonify(
+        interactions=[
+            public_interaction(item)
+            for item in state["interactions"]
+            if isinstance(item, dict)
+        ]
+    )
+
+
+@app.post("/api/boards/<board_id>/study/analyze")
+def analyze_board_context_route(board_id: str) -> Response | tuple[Response, int]:
+    from study.ai import StudyAIError
+    from study.service import ensure_board_ai_context
+    from study.storage import public_board_context
+
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    library = read_library()
+    catalog = library["boards"].get(board_id)
+    folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
+    try:
+        context = ensure_board_ai_context(
+            board_id=board_id,
+            board_dir=board_dir,
+            metadata=metadata,
+            board_title=str(
+                (catalog.get("name") if isinstance(catalog, dict) else None)
+                or metadata.get("name")
+                or "Untitled board"
+            ),
+            folder_name=folder_name_for(library, folder_id if isinstance(folder_id, str) else None),
+            folder_id=folder_id if isinstance(folder_id, str) else None,
+            atomic_json=atomic_json,
+        )
+    except StudyAIError as exc:
+        if exc.status == 503:
+            return jsonify(status="unavailable", context=None)
+        return jsonify(error=str(exc)), exc.status
+    public = public_board_context(context)
+    return jsonify(status="ready" if public else "skipped", context=public)
+
+
+@app.post("/api/boards/<board_id>/study/explain")
+def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
+    from study.ai import StudyAIError
+    from study.service import explain_board
+
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    library = read_library()
+    catalog = library["boards"].get(board_id)
+    folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
+    try:
+        interaction = explain_board(
+            board_id=board_id,
+            board_dir=board_dir,
+            metadata=metadata,
+            editor=read_editor_state(board_dir, metadata),
+            payload=payload,
+            board_title=str(
+                (catalog.get("name") if isinstance(catalog, dict) else None)
+                or metadata.get("name")
+                or "Untitled board"
+            ),
+            folder_name=folder_name_for(library, folder_id if isinstance(folder_id, str) else None),
+            folder_id=folder_id if isinstance(folder_id, str) else None,
+            library=library,
+            combined_svg=combined_svg,
+            atomic_json=atomic_json,
+        )
+    except StudyAIError as exc:
+        return jsonify(error=str(exc)), exc.status
+    return jsonify(
+        interaction=interaction,
+        studyInteractionId=interaction.get("id"),
+        requestId=payload.get("requestId") or payload.get("studyInteractionId"),
+        followUpEnabled=True,
+    )
+
+
+@app.post("/api/boards/<board_id>/study/<interaction_id>/followup")
+def follow_up_route(board_id: str, interaction_id: str) -> Response | tuple[Response, int]:
+    from study.ai import StudyAIError
+    from study.service import follow_up_board
+
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    try:
+        library = read_library()
+        catalog = library["boards"].get(board_id)
+        folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
+        interaction = follow_up_board(
+            board_id=board_id,
+            board_dir=board_dir,
+            metadata=metadata,
+            editor=read_editor_state(board_dir, metadata),
+            interaction_id=interaction_id,
+            payload=payload,
+            folder_id=folder_id if isinstance(folder_id, str) else None,
+            library=library,
+            combined_svg=combined_svg,
+            atomic_json=atomic_json,
+        )
+    except StudyAIError as exc:
+        return jsonify(error=str(exc)), exc.status
+    body = {
+        "interaction": interaction,
+        "studyInteractionId": interaction.get("id"),
+        "requestId": payload.get("requestId"),
+        "followUpEnabled": True,
+        "activeFollowUpId": interaction.get("activeFollowUpId"),
+    }
+    if interaction.get("type") in {"practice_problem", "practice_problems"} or payload.get("action") in {
+        "practice_problems",
+        "practice_problem",
+        "problems",
+    }:
+        follows = interaction.get("followUps") or []
+        last = follows[-1] if follows else {}
+        problems = interaction.get("problems") or last.get("problems") or []
+        problem = interaction.get("problem") or last.get("problem") or last.get("answer") or ""
+        body["type"] = "practice_problems"
+        body["problem"] = problem
+        body["problems"] = problems
+    return jsonify(body)
 
 
 @app.get("/board/<board_id>/asset/<asset_name>")

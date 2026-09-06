@@ -28,6 +28,7 @@
 
   function toast(message, isError = false) {
     const element = $("#toast");
+    if (!element) return;
     clearTimeout(toastTimer);
     element.textContent = message;
     element.style.background = isError ? "#9b321f" : "";
@@ -53,11 +54,11 @@
   }
 
   function formatDate(value) {
-    if (!value) return "No recent activity";
+    if (!value) return "";
     const date = new Date(typeof value === "number" && value < 1e12 ? value * 1000 : value);
     return Number.isNaN(date.valueOf())
-      ? "Saved board"
-      : `Updated ${new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(date)}`;
+      ? ""
+      : new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
   }
 
   function button(label, action, itemId, className = "") {
@@ -72,42 +73,55 @@
 
   function folderCard(folder) {
     const card = document.createElement("article");
-    card.className = "library-card folder-card";
-    const icon = document.createElement("span");
-    icon.className = "card-icon";
-    icon.textContent = "▰";
-    icon.setAttribute("aria-hidden", "true");
-    const title = document.createElement("h3");
-    title.textContent = itemName(folder, "Untitled folder");
+    card.className = "folder-chip";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "folder-open";
+    open.dataset.action = "open-folder";
+    open.dataset.id = folder.id;
     const count = state.boards.filter(board => itemFolderId(board) === folder.id).length;
-    const detail = document.createElement("p");
-    detail.textContent = `${count} board${count === 1 ? "" : "s"}`;
-    const spacer = document.createElement("span");
-    spacer.className = "card-spacer";
+    open.innerHTML = `<strong></strong><span></span>`;
+    open.querySelector("strong").textContent = itemName(folder, "Untitled folder");
+    const stale = folder.study_guide_stale ? " · study guide may be outdated" : "";
+    open.querySelector("span").textContent = `${count} whiteboard${count === 1 ? "" : "s"}${stale}`;
     const actions = document.createElement("div");
-    actions.className = "card-actions";
+    actions.className = "chip-actions";
     actions.append(
-      button("Open", "open-folder", folder.id, "open-action"),
       button("Rename", "rename-folder", folder.id),
       button("Delete", "delete-folder", folder.id, "danger-action"),
     );
-    card.append(icon, title, detail, spacer, actions);
+    card.append(open, actions);
     return card;
   }
 
   function boardCard(board) {
     const card = document.createElement("article");
-    card.className = "library-card";
-    const icon = document.createElement("span");
-    icon.className = "card-icon";
-    icon.textContent = "▤";
-    icon.setAttribute("aria-hidden", "true");
+    card.className = "board-card";
+    const thumb = document.createElement("a");
+    thumb.className = "board-thumb";
+    thumb.href = board.url || `/board/${encodeURIComponent(board.id)}`;
+    thumb.setAttribute("aria-label", `Open ${itemName(board, "board")}`);
+    if (board.thumbnail_url) {
+      const img = document.createElement("img");
+      img.src = board.thumbnail_url;
+      img.alt = "";
+      img.loading = "lazy";
+      thumb.append(img);
+    } else {
+      const placeholder = document.createElement("span");
+      placeholder.className = "thumb-placeholder";
+      placeholder.textContent = "Whiteboard";
+      thumb.append(placeholder);
+    }
+    const body = document.createElement("div");
+    body.className = "board-card-body";
     const title = document.createElement("h3");
-    title.textContent = itemName(board, "Untitled board");
+    const order = whiteboardOrder(board);
+    title.textContent = order
+      ? `${order} — ${itemName(board, "Whiteboard")}`
+      : itemName(board, "Untitled whiteboard");
     const detail = document.createElement("p");
     detail.textContent = formatDate(board.updated_at || board.created_at);
-    const spacer = document.createElement("span");
-    spacer.className = "card-spacer";
     const actions = document.createElement("div");
     actions.className = "card-actions";
     const open = document.createElement("a");
@@ -120,21 +134,34 @@
       button("Move", "move-board", board.id),
       button("Delete", "delete-board", board.id, "danger-action"),
     );
-    card.append(icon, title, detail, spacer, actions);
+    body.append(title, detail, actions);
+    card.append(thumb, body);
     return card;
   }
 
   function renderFolderOptions() {
-    const selects = [$("#upload-folder"), $("#move-folder")];
-    selects.forEach(select => {
-      const current = select.value;
-      select.replaceChildren(new Option("Root", ""));
-      [...state.folders]
-        .sort((a, b) => itemName(a, "").localeCompare(itemName(b, "")))
-        .forEach(folder => select.add(new Option(itemName(folder, "Untitled folder"), folder.id)));
-      if ([...select.options].some(option => option.value === current)) select.value = current;
-    });
-    $("#upload-folder").value = state.folderId || "";
+    const select = $("#move-folder");
+    if (!select) return;
+    const current = select.value;
+    select.replaceChildren(new Option("No folder", ""));
+    [...state.folders]
+      .sort((a, b) => itemName(a, "").localeCompare(itemName(b, "")))
+      .forEach(folder => select.add(new Option(itemName(folder, "Untitled folder"), folder.id)));
+    if ([...select.options].some(option => option.value === current)) select.value = current;
+  }
+
+  function whiteboardOrder(board) {
+    const folder = state.folders.find(item => item.id === itemFolderId(board));
+    const order = folder?.board_order || folder?.boardOrder || [];
+    const index = order.indexOf(board.id);
+    return index >= 0 ? index + 1 : null;
+  }
+
+  function visibleBoards() {
+    if (state.folderId) {
+      return state.boards.filter(board => itemFolderId(board) === state.folderId);
+    }
+    return [...state.boards].sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0));
   }
 
   function render() {
@@ -142,38 +169,68 @@
     const grid = $("#library-grid");
     const status = $("#library-status");
     const path = $("#library-path");
+    const folderRow = $("#folder-row");
+    const foldersSection = $("#folders-section");
     const activeFolder = state.folders.find(folder => folder.id === state.folderId);
+    const folderField = $("#upload-folder-id");
+    if (folderField) folderField.value = state.folderId || "";
+    const workspaceField = $("#upload-workspace-id");
+    if (workspaceField) {
+      workspaceField.value = activeFolder?.workspace_board_id || activeFolder?.workspaceBoardId || "";
+    }
+    const newBoard = $("#new-board-button");
+    if (newBoard) newBoard.textContent = state.folderId ? "+ Import Whiteboard" : "New Board";
+
     const rootButton = document.createElement("button");
     rootButton.type = "button";
     rootButton.className = "path-button";
     rootButton.dataset.action = "open-root";
-    rootButton.textContent = "All boards";
+    rootButton.textContent = "My Lectures";
     path.replaceChildren(rootButton);
     if (activeFolder) {
-      path.append("›");
+      path.append(" › ");
       const current = document.createElement("strong");
       current.textContent = itemName(activeFolder, "Untitled folder");
       path.append(current);
     }
 
-    grid.replaceChildren();
+    folderRow.replaceChildren();
     if (!state.folderId) {
       [...state.folders]
         .sort((a, b) => itemName(a, "").localeCompare(itemName(b, "")))
-        .forEach(folder => grid.append(folderCard(folder)));
+        .forEach(folder => folderRow.append(folderCard(folder)));
+      foldersSection.hidden = false;
+    } else {
+      foldersSection.hidden = true;
     }
-    [...state.boards]
-      .filter(board => itemFolderId(board) === state.folderId)
-      .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0))
-      .forEach(board => grid.append(boardCard(board)));
+    if (!state.folderId && !state.folders.length) foldersSection.hidden = true;
 
-    const isEmpty = !grid.childElementCount;
+    const boards = visibleBoards();
+    grid.replaceChildren();
+    boards.forEach(board => grid.append(boardCard(board)));
+    $("#boards-title").textContent = activeFolder
+      ? "Whiteboards"
+      : "Recent whiteboards";
+
+    const actions = $("#lecture-actions");
+    const stale = $("#folder-guide-stale");
+    const openLecture = $("#open-lecture");
+    if (actions) {
+      actions.hidden = !activeFolder;
+      if (stale) stale.hidden = !(activeFolder?.study_guide_stale || activeFolder?.studyGuideStale);
+      if (openLecture) {
+        const workspace = activeFolder?.workspace_board_id || activeFolder?.url;
+        openLecture.hidden = !boards.length;
+        openLecture.dataset.url = activeFolder?.url || (boards[0]?.url || "");
+      }
+    }
+
+    const isEmpty = !boards.length;
     status.className = "library-message";
-    status.removeAttribute("role");
     status.setAttribute("role", "status");
     status.textContent = activeFolder
-      ? "This folder is empty. Choose it above when uploading a board."
-      : "No boards or folders yet. Upload a photo to create your first board.";
+      ? "This lecture has no whiteboards yet. Import a photographed board to start."
+      : "No lectures yet. Create a lecture, then import photographed whiteboards.";
     status.hidden = !isEmpty;
     grid.hidden = isEmpty;
   }
@@ -233,7 +290,7 @@
     } catch (error) {
       if (error.status !== 409) throw error;
       const count = state.boards.filter(board => itemFolderId(board) === folder.id).length;
-      if (!confirm(`“${name}” is not empty (${count || "one or more"} boards). Delete the folder and every board inside it? This cannot be undone.`)) return;
+      if (!confirm(`“${name}” still contains ${count || "one or more"} boards. Delete the folder and every board inside it? This cannot be undone.`)) return;
       await request(`/api/folders/${encodeURIComponent(folder.id)}?recursive=1`, { method: "DELETE" });
     }
     toast(`Deleted ${name}.`);
@@ -255,9 +312,21 @@
     $("#move-dialog").showModal();
   }
 
+  function openCapture() {
+    $("#capture-dialog").showModal();
+  }
+
+  function closeCapture() {
+    if ($("#processing")?.hidden === false) return;
+    $("#capture-dialog").close();
+    clearSelection();
+  }
+
   async function handleLibraryAction(event) {
     const target = event.target.closest("[data-action]");
     if (!target) return;
+    event.preventDefault();
+    event.stopPropagation();
     const { action, id } = target.dataset;
     const folder = state.folders.find(item => item.id === id);
     const board = state.boards.find(item => item.id === id);
@@ -269,10 +338,10 @@
         state.folderId = folder.id;
         render();
       } else if (action === "rename-folder" && folder) {
-        openNameDialog("Rename folder", "Use a short, recognizable name.", itemName(folder, ""), name =>
+        openNameDialog("Rename lecture", "Use a short course or lecture name.", itemName(folder, ""), name =>
           request(`/api/folders/${encodeURIComponent(folder.id)}`, { method: "PATCH", body: JSON.stringify({ name }) }));
       } else if (action === "rename-board" && board) {
-        openNameDialog("Rename board", "The board URL and saved work will stay the same.", itemName(board, ""), name =>
+        openNameDialog("Rename board", "The saved canvas stays the same.", itemName(board, ""), name =>
           request(`/api/boards/${encodeURIComponent(board.id)}`, { method: "PATCH", body: JSON.stringify({ name }) }));
       } else if (action === "move-board" && board) {
         openMoveDialog(board);
@@ -290,68 +359,129 @@
     return file && ["image/png", "image/jpeg", "image/webp"].includes(file.type);
   }
 
-  function showFile(file) {
+  function setInputSource(input) {
+    const standardInput = $("#board-image");
+    const cameraInput = $("#camera-image");
+    standardInput.name = input === standardInput ? "image" : "";
+    cameraInput.name = input === cameraInput ? "image" : "";
+    standardInput.required = input === standardInput;
+    cameraInput.required = input === cameraInput;
+  }
+
+  function showSelection(file, input) {
     if (!isAcceptedImage(file)) {
       toast("Choose a PNG, JPEG, or WebP image.", true);
       return;
     }
+    setInputSource(input);
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     previewUrl = URL.createObjectURL(file);
     $("#file-title").textContent = file.name;
-    $("#file-detail").textContent = `${(file.size / 1048576).toFixed(1)} MB · Ready to process`;
-    $("#upload-preview").src = previewUrl;
-    $("#upload-preview").hidden = false;
-    $("#drop-zone").classList.add("has-file");
-    if (!$("#upload-name").value.trim()) {
-      $("#upload-name").value = file.name.replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ").trim();
-    }
+    $("#file-detail").textContent = `${(file.size / 1048576).toFixed(1)} MB`;
+    $("#selection-image").src = previewUrl;
+    $("#selection-image").alt = `Selected whiteboard photo: ${file.name}`;
+    $("#upload-idle").hidden = true;
+    $("#upload-selected").hidden = false;
+    $("#processing").hidden = true;
+  }
+
+  function clearSelection() {
+    const standardInput = $("#board-image");
+    const cameraInput = $("#camera-image");
+    standardInput.value = "";
+    cameraInput.value = "";
+    standardInput.name = "image";
+    cameraInput.removeAttribute("name");
+    standardInput.required = true;
+    cameraInput.required = false;
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = undefined;
+    $("#selection-image").removeAttribute("src");
+    $("#upload-selected").hidden = true;
+    $("#upload-idle").hidden = false;
+    $("#processing").hidden = true;
   }
 
   function bindUpload() {
     const form = $("#upload-form");
-    const input = $("#board-image");
-    const zone = $("#drop-zone");
-    input.addEventListener("change", () => showFile(input.files[0]));
-    ["dragenter", "dragover"].forEach(type => zone.addEventListener(type, event => {
+    const standardInput = $("#board-image");
+    const cameraInput = $("#camera-image");
+    const dropZone = $("#drop-zone");
+    standardInput.addEventListener("change", () => showSelection(standardInput.files[0], standardInput));
+    cameraInput.addEventListener("change", () => showSelection(cameraInput.files[0], cameraInput));
+    $("#cancel-selection").addEventListener("click", clearSelection);
+    $("#replace-selection").addEventListener("click", () => standardInput.click());
+    ["dragenter", "dragover"].forEach(type => dropZone.addEventListener(type, event => {
       event.preventDefault();
-      zone.classList.add("is-dragging");
+      dropZone.classList.add("is-dragging");
     }));
-    ["dragleave", "drop"].forEach(type => zone.addEventListener(type, event => {
+    ["dragleave", "drop"].forEach(type => dropZone.addEventListener(type, event => {
       event.preventDefault();
-      zone.classList.remove("is-dragging");
+      dropZone.classList.remove("is-dragging");
     }));
-    zone.addEventListener("drop", event => {
+    dropZone.addEventListener("drop", event => {
       const file = event.dataTransfer.files[0];
-      if (!isAcceptedImage(file)) {
-        toast("Choose a PNG, JPEG, or WebP image.", true);
-        return;
-      }
+      if (!isAcceptedImage(file)) return;
       const transfer = new DataTransfer();
       transfer.items.add(file);
-      input.files = transfer.files;
-      showFile(file);
+      standardInput.files = transfer.files;
+      showSelection(file, standardInput);
     });
     form.addEventListener("submit", event => {
-      if (!isAcceptedImage(input.files[0])) {
+      const activeInput = standardInput.name ? standardInput : cameraInput;
+      if (!isAcceptedImage(activeInput.files[0])) {
         event.preventDefault();
         toast("Choose a board photo before continuing.", true);
         return;
       }
+      $("#upload-selected").hidden = true;
       $("#processing").hidden = false;
-      $("#upload-submit").disabled = true;
-      $("#upload-submit span").textContent = "Processing…";
-      zone.setAttribute("aria-busy", "true");
+      form.setAttribute("aria-busy", "true");
+      const started = Date.now();
+      const timer = $("#processing-time");
+      window.setInterval(() => {
+        const seconds = Math.floor((Date.now() - started) / 1000);
+        timer.textContent = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+      }, 250);
     });
   }
 
   function bindLibrary() {
     $("#library-grid").addEventListener("click", handleLibraryAction);
+    $("#folder-row").addEventListener("click", handleLibraryAction);
     $("#library-path").addEventListener("click", handleLibraryAction);
     $("#refresh-library").addEventListener("click", loadLibrary);
     $("#create-folder").addEventListener("click", () => {
-      openNameDialog("Create folder", "Folders keep related boards together.", "", name =>
+      openNameDialog("Create lecture", "A lecture holds every whiteboard from one class session.", "", name =>
         request("/api/folders", { method: "POST", body: JSON.stringify({ name }) }));
     });
+    $("#new-board-button").addEventListener("click", openCapture);
+    $("#import-lecture-board")?.addEventListener("click", openCapture);
+    $("#open-lecture")?.addEventListener("click", () => {
+      const url = $("#open-lecture")?.dataset.url;
+      if (url) location.assign(url);
+    });
+    $("#generate-folder-guide")?.addEventListener("click", async () => {
+      if (!state.folderId) return;
+      try {
+        toast("Generating study guide…");
+        const payload = await request(`/api/folders/${encodeURIComponent(state.folderId)}/study-guide`, {
+          method: "POST",
+          body: "{}",
+        });
+        const guide = payload.study_guide || payload.studyGuide;
+        if (guide?.content) {
+          const preview = guide.content.replace(/\s+/g, " ").slice(0, 180);
+          toast(payload.study_guide_stale ? "Study guide may be outdated." : `Study guide ready. ${preview}`);
+        } else {
+          toast("Study guide generated.");
+        }
+        await loadLibrary();
+      } catch (error) {
+        toast(error.message || "Couldn't generate a study guide right now.", true);
+      }
+    });
+    $("#close-capture").addEventListener("click", closeCapture);
     $("#name-form").addEventListener("submit", submitName);
     $("#move-form").addEventListener("submit", async event => {
       event.preventDefault();
@@ -376,4 +506,5 @@
   bindUpload();
   bindLibrary();
   loadLibrary();
+  if (new URLSearchParams(location.search).has("new")) openCapture();
 })();
