@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Canvas engine bench</title>
+</head>
+<body>
+  <pre id="out">running…</pre>
+  <script src="./canvas-engine.js"></script>
+  <script>
+    (async () => {
+      const engine = window.BoardEngine;
+      const result = await engine.measureTransformLoop({ frames: 90, paths: 900 });
+      const payload = JSON.stringify(result, null, 2);
+      document.getElementById("out").textContent = payload;
+      document.title = `bench ${Math.round(result.transformFps)} vs ${Math.round(result.viewBoxFps)}`;
+      console.info("[bench] transform-vs-viewbox", result);
+    })();
+  </script>
+</body>
+</html>

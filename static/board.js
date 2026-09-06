@@ -17,9 +17,10 @@
   const boardRoute = boardId ? `/board/${encodeURIComponent(boardId)}` : location.pathname;
   const editorApi = `/api/boards/${encodeURIComponent(boardId)}/editor`;
   const HISTORY_LIMIT = 80;
-  const MIN_ZOOM = 0.08;
-  const MAX_ZOOM = 24;
-  const PINCH_ZOOM_SLOP = 12;
+  const MIN_ZOOM = globalThis.BoardEngine?.MIN_ZOOM || 0.04;
+  const MAX_ZOOM = globalThis.BoardEngine?.MAX_ZOOM || 64;
+  const PINCH_ZOOM_SLOP = 16;
+  const DISPLAY_CELL = 240;
   const TOOLS = new Set(["select", "pen", "highlighter", "object-eraser", "pixel-eraser"]);
 
   const assetAliases = {
@@ -87,6 +88,26 @@
     pendingStudyQuestion: "",
     pendingStudyAction: "",
     cameraGesture: "idle",
+    cameraRaf: 0,
+    cameraHudAt: 0,
+    viewportBox: { width: 0, height: 0 },
+    lastTool: "select",
+    clipboard: null,
+    cachedSelectionUnion: null,
+    displayLevel: "full",
+    lastPenTap: null,
+    geometryCache: null,
+    spatial: null,
+    displayCells: new Map(),
+    commandTotal: 0,
+    visibleCount: 0,
+    culledCount: 0,
+    svgNodeCount: 0,
+    cullTimer: 0,
+    navigating: false,
+    fingerTap: null,
+    perf: null,
+    twoFingerTap: null,
     sourceBoards: [],
     lecture: {
       folderId: "",
@@ -116,6 +137,15 @@
         localStorage.getItem("boardlift-study-debug") === "1";
     } catch (_) { return false; }
   })();
+  const DEBUG_PERF = (() => {
+    try {
+      return DEBUG_EDITOR ||
+        /(?:\?|&|#)perf=1\b/.test(`${location.search}${location.hash}`) ||
+        localStorage.getItem("boardlift-perf") === "1";
+    } catch (_) { return false; }
+  })();
+  const Engine = globalThis.BoardEngine || {};
+  const LOD = Engine.LEVEL || { FULL: "full", INTERACTION: "interaction", NAVIGATION: "navigation" };
 
   function editorLog(event, detail) {
     if (!DEBUG_EDITOR) return;
@@ -202,9 +232,18 @@
 
   function legacyStroke(stroke) {
     if (!stroke) return null;
-    const points = Array.isArray(stroke.points) ? stroke.points.map(point => ({
-      x: Number(point.x ?? point[0]), y: Number(point.y ?? point[1])
-    })).filter(point => Number.isFinite(point.x) && Number.isFinite(point.y)) : [];
+    const points = Array.isArray(stroke.points) ? stroke.points.map(point => {
+      const next = {
+        x: Number(point.x ?? point[0]), y: Number(point.y ?? point[1])
+      };
+      const pressure = Number(point.p ?? point.pressure);
+      if (Number.isFinite(pressure)) next.p = clamp(pressure, 0, 1);
+      const tiltX = Number(point.tiltX);
+      const tiltY = Number(point.tiltY);
+      if (Number.isFinite(tiltX)) next.tiltX = tiltX;
+      if (Number.isFinite(tiltY)) next.tiltY = tiltY;
+      return next;
+    }).filter(point => Number.isFinite(point.x) && Number.isFinite(point.y)) : [];
     if (!points.length && typeof stroke.d !== "string") return null;
     return {
       id: stroke.id || uid("stroke"),
@@ -254,6 +293,30 @@
         generatedAt: Number(object.generatedAt || object.generated_at) || 0,
         boardId: object.boardId || object.board_id || "",
         origin: object.origin || (role === "ai_practice_problem" ? "ai_practice" : ""),
+        folderId: object.folderId || object.folder_id || "",
+        createdAt: Number(object.createdAt || object.created_at) || 0
+      };
+    }
+    if (object.type === "path") {
+      const d = typeof object.d === "string" ? object.d : "";
+      if (!d) return null;
+      return {
+        id: object.id || uid("path"),
+        type: "path",
+        d,
+        color: object.color || object.fill || "#183153",
+        fill: object.fill || object.color || "#183153",
+        width: Math.max(0, Number(object.width) || 0),
+        opacity: Number.isFinite(Number(object.opacity)) ? Number(object.opacity) : 1,
+        tx: Number(object.tx ?? object.translation?.x) || 0,
+        ty: Number(object.ty ?? object.translation?.y) || 0,
+        sx: Number(object.sx ?? object.scaleX ?? object.scale?.x) || 1,
+        sy: Number(object.sy ?? object.scaleY ?? object.scale?.y) || 1,
+        bbox: object.bbox && typeof object.bbox === "object" ? object.bbox : null,
+        sourceD: d,
+        sourceRevision: 1,
+        boardId: object.boardId || object.board_id || "",
+        origin: object.origin || "student",
         folderId: object.folderId || object.folder_id || "",
         createdAt: Number(object.createdAt || object.created_at) || 0
       };
@@ -362,7 +425,8 @@
   function validCamera(camera) {
     return camera && [camera.x, camera.y, camera.width, camera.height]
       .every(value => Number.isFinite(Number(value))) &&
-      Number(camera.width) > 0 && Number(camera.height) > 0;
+      Number(camera.width) > 0 && Number(camera.height) > 0 &&
+      Number(camera.width) !== Infinity && Number(camera.height) !== Infinity;
   }
 
   function isManualMode(data) {
@@ -625,6 +689,8 @@
       node.dataset.objectId = id;
       node.dataset.boardId = board.boardId;
       node.style.pointerEvents = "visiblePainted";
+      const sourceD = node.getAttribute("d") || "";
+      node.dataset.sourceD = sourceD;
       wrapper.append(node);
       host.append(wrapper);
       let box = { x: 0, y: 0, width: 0, height: 0 };
@@ -635,6 +701,10 @@
         color_class: node.getAttribute("data-ink") || "",
         tx, ty, sx, sy, deleted,
         node: wrapper, path: node, locked: false,
+        sourceD,
+        sourceRevision: 1,
+        commandCount: Engine.commandCount ? Engine.commandCount(sourceD) : 0,
+        displayLevel: LOD.FULL,
         boardId: board.boardId,
         boardOrder: board.boardOrder,
         originX: board.x,
@@ -664,7 +734,11 @@
     }
     state.importedObjects = objects;
     state.importedMarkup = layer.innerHTML;
+    state.commandTotal = objects.reduce((sum, item) => sum + (item.commandCount || 0), 0);
     renderBoardPapers(boards);
+    rebuildSpatialIndex();
+    buildImportedDisplay();
+    prepareDerivedGeometry();
   }
 
   function renderBoardPapers(boards = lectureBoardsFromData()) {
@@ -715,34 +789,143 @@
     return rect.width > 0 && rect.height > 0 ? rect.width / rect.height : state.width / state.height;
   }
 
+  function cameraBasis() {
+    const bounds = lectureContentBounds();
+    return Math.max(state.width, bounds.width, 1);
+  }
+
   function cameraZoom(camera = state.camera, rect = sceneRect()) {
+    if (Engine.cameraZoom) return Engine.cameraZoom(camera, rect);
     return rect.width > 0 ? rect.width / camera.width : state.width / camera.width;
   }
 
   function clampCameraSize(width) {
-    const bounds = lectureContentBounds();
-    const basis = Math.max(state.width, bounds.width);
-    return clamp(width, basis / MAX_ZOOM, basis / MIN_ZOOM);
+    return clamp(width, cameraBasis() / MAX_ZOOM, cameraBasis() / MIN_ZOOM);
   }
 
   function cameraWithAspect(camera, aspect = sceneAspect()) {
+    if (Engine.sanitizeCamera) {
+      return Engine.sanitizeCamera(camera, {
+        width: sceneRect().width,
+        height: sceneRect().width / (aspect || 1),
+        left: 0,
+        top: 0
+      }, { minZoom: MIN_ZOOM, maxZoom: MAX_ZOOM, basis: cameraBasis() });
+    }
     const width = clampCameraSize(camera.width);
     const height = width / (aspect || 1);
-    return { x: camera.x, y: camera.y, width, height };
+    const x = Number.isFinite(camera.x) ? camera.x : 0;
+    const y = Number.isFinite(camera.y) ? camera.y : 0;
+    return { x, y, width, height };
   }
 
-  function cameraPanZoom(camera = state.camera) {
-    return { panX: camera.x, panY: camera.y, zoom: cameraZoom(camera) };
+  function cameraPanZoom(camera = state.camera, rect = sceneRect()) {
+    if (Engine.cameraAsPanZoom) return Engine.cameraAsPanZoom(camera, rect);
+    return { panX: camera.x, panY: camera.y, zoom: cameraZoom(camera, rect) };
   }
 
-  function applyCamera() {
+  function syncViewportBox(rect = sceneRect()) {
+    const svg = $("#world-scene");
+    if (!svg || !rect.width || !rect.height) return rect;
+    const width = Math.max(1, rect.width);
+    const height = Math.max(1, rect.height);
+    const current = svg.getAttribute("viewBox") || "";
+    const next = `0 0 ${width} ${height}`;
+    if (current !== next) svg.setAttribute("viewBox", next);
+    state.viewportBox = { width, height };
+    return rect;
+  }
+
+  function updateHitfill(camera = state.camera) {
+    const hit = $("#canvas-hitfill");
+    if (!hit) return;
+    const zoom = Math.max(MIN_ZOOM, cameraZoom(camera));
+    const margin = Math.max(180, 220 / zoom);
+    hit.setAttribute("x", String(camera.x - margin));
+    hit.setAttribute("y", String(camera.y - margin));
+    hit.setAttribute("width", String(camera.width + margin * 2));
+    hit.setAttribute("height", String(camera.height + margin * 2));
+  }
+
+  function applyCameraPlane(camera = state.camera, rect = sceneRect()) {
+    const world = $("#camera-world");
+    const html = $("#canvas-html-world");
+    if (Engine.applySceneTransform) {
+      const mapped = Engine.applySceneTransform(world, html, camera, rect);
+      updateHitfill(camera);
+      return mapped;
+    }
+    const zoom = cameraZoom(camera, rect);
+    if (world) {
+      world.style.transform = "none";
+      world.setAttribute("transform", `translate(${-camera.x * zoom} ${-camera.y * zoom}) scale(${zoom})`);
+    }
+    if (html) {
+      html.style.transform = `scale(${zoom}) translate(${-camera.x}px, ${-camera.y}px)`;
+      html.style.transformOrigin = "0 0";
+    }
+    updateHitfill(camera);
+    return { zoom };
+  }
+
+  function setNavigating(active) {
+    state.navigating = Boolean(active);
+    const world = $("#camera-world");
+    world?.classList.toggle("is-navigating", state.navigating);
+    if (world && cameraZoom() > 4) world.style.willChange = "auto";
+    if (state.perf) state.perf.level = "full";
+  }
+
+  function updateZoomLabel(camera = state.camera) {
+    const label = $("#zoom-label");
+    if (label) label.textContent = `${Math.round(cameraZoom(camera) * 100)}%`;
+  }
+
+  function applyCamera({ hud = true, overlays = true } = {}) {
     const camera = state.camera = cameraWithAspect(state.camera);
-    $("#world-scene").setAttribute("viewBox", `${camera.x} ${camera.y} ${camera.width} ${camera.height}`);
-    $("#zoom-label").textContent = `${Math.round(cameraZoom(camera) * 100)}%`;
-    syncHtmlOverlayCamera();
-    syncStudyMarkerAnchors();
-    syncStudyMarkerScale();
-    positionExplainButton();
+    syncViewportBox();
+    applyCameraPlane(camera);
+    if (hud) updateZoomLabel(camera);
+    if (overlays) {
+      syncStudyMarkerScale();
+      positionExplainButton();
+    } else {
+      positionExplainButton({ cheap: true });
+    }
+    if (state.perf) {
+      state.perf.zoom = cameraZoom(camera);
+      state.perf.gesture = state.cameraGesture || state.interaction?.kind || "idle";
+      state.perf.pointers = state.activePointerIds.size;
+    }
+    if (state.navigating) refreshViewportCull({ moving: true });
+  }
+
+  function scheduleIncomingReveal() {
+    scheduleViewportCull();
+  }
+
+  function scheduleCameraFrame({ hud = false, overlays = false } = {}) {
+    if (state.cameraRaf) {
+      state.cameraFlushHud = state.cameraFlushHud || hud;
+      state.cameraFlushOverlays = state.cameraFlushOverlays || overlays;
+      return;
+    }
+    state.cameraFlushHud = hud;
+    state.cameraFlushOverlays = overlays;
+    state.cameraRaf = requestAnimationFrame(() => {
+      state.cameraRaf = 0;
+      const moving = state.navigating || ["pan", "pinch"].includes(state.cameraGesture);
+      const hudNow = state.cameraFlushHud || !moving || (nowMs() - (state.cameraHudAt || 0) > 80);
+      applyCamera({
+        hud: hudNow,
+        overlays: state.cameraFlushOverlays || !moving
+      });
+      if (hudNow) state.cameraHudAt = nowMs();
+    });
+  }
+
+  function nowMs() {
+    return performance.now();
   }
 
   function defaultCamera() {
@@ -783,6 +966,7 @@
 
   function syncCameraAspect() {
     refreshSceneRect();
+    syncViewportBox();
     const cam = state.camera;
     const aspect = sceneAspect();
     if (!aspect || !cam.width) return;
@@ -792,20 +976,28 @@
     applyCamera();
   }
 
-  /* Screen ↔ canvas uses the authoritative camera, never ad-hoc CTM math. */
+  /* Screen ↔ canvas uses one camera matrix: screen = canvas * zoom + pan. */
   function screenToCanvas(clientX, clientY, camera = state.camera, rect = sceneRect()) {
+    if (Engine.screenToCanvas && rect.width && rect.height) {
+      return Engine.screenToCanvas(clientX, clientY, camera, rect);
+    }
     if (!rect.width || !rect.height) return { x: camera.x, y: camera.y };
+    const zoom = cameraZoom(camera, rect);
     return {
-      x: camera.x + (clientX - rect.left) * camera.width / rect.width,
-      y: camera.y + (clientY - rect.top) * camera.height / rect.height
+      x: camera.x + (clientX - rect.left) / zoom,
+      y: camera.y + (clientY - rect.top) / zoom
     };
   }
 
   function canvasToScreen(x, y, camera = state.camera, rect = sceneRect()) {
+    if (Engine.canvasToScreen && rect.width && rect.height) {
+      return Engine.canvasToScreen(x, y, camera, rect);
+    }
     if (!rect.width || !rect.height) return { x: rect.left, y: rect.top };
+    const zoom = cameraZoom(camera, rect);
     return {
-      x: rect.left + (x - camera.x) * rect.width / camera.width,
-      y: rect.top + (y - camera.y) * rect.height / camera.height
+      x: rect.left + (x - camera.x) * zoom,
+      y: rect.top + (y - camera.y) * zoom
     };
   }
 
@@ -818,15 +1010,16 @@
     const rect = sceneRect();
     const old = state.camera;
     const focus = screenToCanvas(clientX, clientY, old, rect);
-    const newWidth = clampCameraSize(old.width / factor);
-    const newHeight = newWidth / sceneAspect(rect);
-    state.camera = {
-      x: focus.x - (clientX - rect.left) * newWidth / rect.width,
-      y: focus.y - (clientY - rect.top) * newHeight / rect.height,
-      width: newWidth,
-      height: newHeight
-    };
-    applyCamera();
+    const next = cameraWithAspect({
+      x: old.x, y: old.y, width: old.width / factor, height: old.height / factor
+    });
+    state.camera = cameraWithAspect({
+      x: focus.x - (clientX - rect.left) * next.width / rect.width,
+      y: focus.y - (clientY - rect.top) * next.height / rect.height,
+      width: next.width,
+      height: next.height
+    });
+    scheduleCameraFrame({ hud: true, overlays: true });
   }
 
   function snapshot() {
@@ -857,6 +1050,7 @@
         else object.node.removeAttribute("display");
       }
     });
+    buildImportedDisplay();
   }
 
   /* History stores bounded before-action snapshots, not individual pointer samples. */
@@ -870,7 +1064,21 @@
     return true;
   }
 
+  function flushPendingHistory() {
+    if (!state.pendingHistory.length) return;
+    const entries = state.pendingHistory.splice(0).map(item => (
+      typeof item === "function" ? item() : item
+    ));
+    entries.forEach(snapshotEntry => {
+      state.history.push(snapshotEntry);
+      if (state.history.length > HISTORY_LIMIT) state.history.shift();
+    });
+    if (entries.length) state.future = [];
+    updateHistoryButtons();
+  }
+
   function undo() {
+    flushPendingHistory();
     if (!state.history.length) return;
     state.future.push(snapshot());
     restore(state.history.pop());
@@ -881,6 +1089,7 @@
   }
 
   function redo() {
+    flushPendingHistory();
     if (!state.future.length) return;
     state.history.push(snapshot());
     restore(state.future.pop());
@@ -924,6 +1133,19 @@
           folder_id: object.folderId || state.lecture.folderId || undefined,
           created_at: object.createdAt || undefined,
           translation: { x: 0, y: 0 }
+        };
+      }
+      if (object.type === "path") {
+        return {
+          id: object.id, type: "path", d: object.d || object.sourceD,
+          color: object.color, fill: object.fill || object.color,
+          width: object.width || 0, opacity: object.opacity,
+          translation: { x: object.tx || 0, y: object.ty || 0 },
+          scaleX: object.sx || 1, scaleY: object.sy || 1,
+          board_id: object.boardId || undefined,
+          origin: object.origin || "student",
+          folder_id: object.folderId || state.lecture.folderId || undefined,
+          created_at: object.createdAt || undefined
         };
       }
       return {
@@ -1078,10 +1300,20 @@
   }
 
   function objectBounds(object) {
-    if (object?.type === "group") return groupBounds(object);
-    if (object?.type === "imported") return transformedBounds(importedWorldBounds(object), object.id);
+    if (!object) return { x: 0, y: 0, width: 0, height: 0 };
+    if (object._worldBounds) return object._worldBounds;
+    if (object?.type === "group") return cacheWorldBounds(object, groupBounds(object));
+    if (object?.type === "imported") return cacheWorldBounds(object, transformedBounds(importedWorldBounds(object), object.id));
     if (object.type === "text") {
-      return transformedBounds({ x: object.x, y: object.y, width: object.width, height: object.height }, object.id);
+      return cacheWorldBounds(object, transformedBounds({ x: object.x, y: object.y, width: object.width, height: object.height }, object.id));
+    }
+    if (object.type === "path" && object.bbox) {
+      return cacheWorldBounds(object, transformedBounds({
+        x: object.bbox.x * (object.sx || 1) + (object.tx || 0),
+        y: object.bbox.y * (object.sy || 1) + (object.ty || 0),
+        width: (object.bbox.width || 0) * Math.abs(object.sx || 1),
+        height: (object.bbox.height || 0) * Math.abs(object.sy || 1)
+      }, object.id));
     }
     const points = object.points || [];
     if (points.length) {
@@ -1092,24 +1324,421 @@
       const xs = points.map(point => point.x * sx + tx);
       const ys = points.map(point => point.y * sy + ty);
       const pad = (object.width / 2) * Math.max(Math.abs(sx), Math.abs(sy));
-      return transformedBounds({
+      return cacheWorldBounds(object, transformedBounds({
         x: Math.min(...xs) - pad,
         y: Math.min(...ys) - pad,
         width: Math.max(...xs) - Math.min(...xs) + pad * 2,
         height: Math.max(...ys) - Math.min(...ys) + pad * 2
-      }, object.id);
+      }, object.id));
     }
     const rendered = $(`[data-object-id="${CSS.escape(object.id)}"]`);
     if (rendered) {
       try {
         const box = rendered.getBBox();
-        return transformedBounds({
+        return cacheWorldBounds(object, transformedBounds({
           x: box.x + (object.tx || 0), y: box.y + (object.ty || 0),
           width: box.width, height: box.height
-        }, object.id);
+        }, object.id));
       } catch (_) { /* Detached SVG nodes have no box. */ }
     }
-    return { x: 0, y: 0, width: 0, height: 0 };
+    return cacheWorldBounds(object, { x: 0, y: 0, width: 0, height: 0 });
+  }
+
+  function cacheWorldBounds(object, box) {
+    object._worldBounds = box;
+    return box;
+  }
+
+  function invalidateWorldBounds(object) {
+    if (!object) return;
+    object._worldBounds = null;
+    object._eraseBounds = null;
+    state.boundsEpoch = (state.boundsEpoch || 0) + 1;
+    state.cachedSelectionUnion = null;
+    if (state.spatial && object.id) state.spatial.remove(object.id);
+    if (object.type === "group") {
+      object.children.map(findObject).forEach(invalidateWorldBounds);
+    }
+  }
+
+  function ensureSpatial() {
+    if (state.spatial || !Engine.SpatialHash) return state.spatial;
+    const bounds = lectureContentBounds();
+    const cell = Math.max(160, Math.min(512, Math.round(Math.max(bounds.width, bounds.height) / 12)));
+    state.spatial = new Engine.SpatialHash(cell);
+    return state.spatial;
+  }
+
+  function indexObject(object) {
+    const spatial = ensureSpatial();
+    if (!spatial || !object || object.deleted) return;
+    const box = objectBounds(object);
+    if (box.width || box.height) spatial.upsert(object.id, box);
+  }
+
+  function rebuildSpatialIndex() {
+    if (!Engine.SpatialHash) return;
+    const bounds = lectureContentBounds();
+    const cell = Math.max(160, Math.min(512, Math.round(Math.max(bounds.width, bounds.height) / 12)));
+    state.spatial = new Engine.SpatialHash(cell);
+    allObjects().forEach(indexObject);
+    state.groups.forEach(indexObject);
+  }
+
+  function querySpatial(box, pad = 0) {
+    const area = pad ? { x: box.x - pad, y: box.y - pad, width: box.width + pad * 2, height: box.height + pad * 2 } : box;
+    if (!state.spatial) return allObjects().map(object => ({ id: object.id, box: objectBounds(object) }));
+    return state.spatial.query(area);
+  }
+
+  function viewportCanvasRect(marginPx = 96) {
+    const zoom = Math.max(0.01, cameraZoom());
+    const margin = marginPx / zoom;
+    const camera = state.camera;
+    return {
+      x: camera.x - margin,
+      y: camera.y - margin,
+      width: camera.width + margin * 2,
+      height: camera.height + margin * 2
+    };
+  }
+
+  function restoreSourcePath(object) {
+    if (!object?.path || !object.sourceD) return;
+    if (object.path.getAttribute("d") !== object.sourceD) {
+      object.path.setAttribute("d", object.sourceD);
+    }
+    object.displayLevel = LOD.FULL;
+  }
+
+  function applyObjectDisplayLevel(object) {
+    restoreSourcePath(object);
+  }
+
+  function isIdentityImported(object) {
+    return Math.abs(object.tx || 0) < 1e-6 && Math.abs(object.ty || 0) < 1e-6 &&
+      Math.abs((object.sx || 1) - 1) < 1e-6 && Math.abs((object.sy || 1) - 1) < 1e-6;
+  }
+
+  function importedNeedsPromote(object) {
+    if (!object || object.deleted || state.selected.has(object.id) || !isIdentityImported(object)) {
+      return Boolean(object);
+    }
+    let parent = parentGroup(object.id);
+    while (parent) {
+      const transform = parent.transform || {};
+      if (transform.x || transform.y ||
+        Math.abs((transform.scaleX || 1) - 1) > 1e-6 ||
+        Math.abs((transform.scaleY || 1) - 1) > 1e-6 ||
+        transform.rotation) {
+        return true;
+      }
+      parent = parentGroup(parent.id);
+    }
+    return false;
+  }
+
+  function importedDisplayHost(object) {
+    return object.path?.parentElement?.parentElement ||
+      object.node?.parentElement ||
+      $("#imported-layer");
+  }
+
+  function ensureDisplayLayer(host) {
+    if (!host) return null;
+    let layer = host.querySelector(":scope > .display-cache");
+    if (!layer) {
+      layer = svgEl("g", { class: "display-cache", "pointer-events": "none" });
+      host.insertBefore(layer, host.firstChild || null);
+    }
+    return layer;
+  }
+
+  function displayPathForObject(object) {
+    return object.sourceD || "";
+  }
+
+  function hideImportedLogical(object, hidden) {
+    if (!object?.node) return;
+    if (hidden) {
+      object.logicalParent = object.node.parentElement || object.logicalParent || importedDisplayHost(object);
+      if (object.node.parentElement) object.node.remove();
+      object.node.setAttribute("data-batched", "1");
+      object.batched = true;
+    } else {
+      const parent = object.logicalParent || importedDisplayHost(object);
+      if (parent && !object.node.isConnected) parent.append(object.node);
+      object.node.removeAttribute("data-batched");
+      if (!object.deleted) object.node.removeAttribute("display");
+      object.batched = false;
+    }
+  }
+
+  function rebuildDisplayCell(cellKey) {
+    const cell = state.displayCells.get(cellKey);
+    if (!cell) return;
+    const layer = cell.layer;
+    if (!layer) return;
+    [...layer.querySelectorAll(`[data-display-cell="${CSS.escape(cellKey)}"]`)].forEach(node => node.remove());
+    const members = cell.ids
+      .map(id => state.importedObjects.find(item => item.id === id))
+      .filter(object => object && !object.deleted && !object.promoted && object.sourceD);
+    const groups = new Map();
+    members.forEach(object => {
+      const style = Engine.visualStyleKey
+        ? Engine.visualStyleKey(object.path || object)
+        : `${object.color_class || object.color}|evenodd|1|0`;
+      if (!groups.has(style)) groups.set(style, []);
+      groups.get(style).push({
+        ...object,
+        bbox: object.bbox,
+        sourceD: displayPathForObject(object)
+      });
+    });
+    let nodes = 0;
+    groups.forEach((items, style) => {
+      const [, rule, opacity, strokeWidth] = style.split("|");
+      const representative = items[0]?.path;
+      const fill = items.reduce((best, item) => {
+        const value = item.path?.getAttribute("fill") || item.color || "";
+        const hex = String(value).match(/^#([0-9a-f]{6})$/i);
+        if (!hex) return best;
+        const n = parseInt(hex[1], 16);
+        const lum = 0.3 * ((n >> 16) & 255) + 0.59 * ((n >> 8) & 255) + 0.11 * (n & 255);
+        if (!best.value || lum < best.lum) return { value, lum };
+        return best;
+      }, { value: representative?.getAttribute("fill") || items[0]?.color || "#183153", lum: 999 }).value;
+      const stroke = representative?.getAttribute("stroke") || "none";
+      const simple = [];
+      const holed = [];
+      items.forEach(item => {
+        const parts = Engine.subpathCount ? Engine.subpathCount(item.sourceD) : 1;
+        if (parts > 1) holed.push(item);
+        else simple.push(item);
+      });
+      const bins = [];
+      if (simple.length) bins.push(simple);
+      holed.forEach(item => bins.push([item]));
+      bins.forEach((bin, index) => {
+        const d = Engine.combinePathData ? Engine.combinePathData(bin) : bin.map(item => item.sourceD).join(" ");
+        if (!d) return;
+        const path = svgEl("path", {
+          class: "display-batch",
+          "data-display-cell": cellKey,
+          "data-batch-index": String(index),
+          d,
+          fill: fill || "#183153",
+          "fill-rule": bin.length > 1 ? "nonzero" : (representative?.getAttribute("fill-rule") || rule || "evenodd"),
+          "fill-opacity": opacity || "1",
+          "pointer-events": "none"
+        });
+        if (stroke && stroke !== "none") {
+          path.setAttribute("stroke", stroke);
+          path.setAttribute("stroke-width", strokeWidth || representative?.getAttribute("stroke-width") || "1");
+        }
+        layer.append(path);
+        nodes += 1;
+      });
+    });
+    cell.nodeCount = nodes;
+    cell.bounds = Engine.cellBounds
+      ? Engine.cellBounds(cellKey, DISPLAY_CELL)
+      : { x: 0, y: 0, width: DISPLAY_CELL, height: DISPLAY_CELL };
+    if (members.length) {
+      const boxes = members.map(object => object.bbox).filter(Boolean);
+      if (boxes.length) {
+        const x = Math.min(...boxes.map(box => box.x));
+        const y = Math.min(...boxes.map(box => box.y));
+        const right = Math.max(...boxes.map(box => box.x + box.width));
+        const bottom = Math.max(...boxes.map(box => box.y + box.height));
+        cell.bounds = { x, y, width: right - x, height: bottom - y };
+      }
+    }
+  }
+
+  function assignImportedCell(object) {
+    const local = object.bbox || { x: 0, y: 0, width: 1, height: 1 };
+    return Engine.displayCellKey
+      ? Engine.displayCellKey(local, DISPLAY_CELL)
+      : "0:0";
+  }
+
+  function promoteImported(object, { rebuild = true } = {}) {
+    if (!object || object.type !== "imported") return;
+    restoreSourcePath(object);
+    object.promoted = true;
+    hideImportedLogical(object, false);
+    if (object.deleted) object.node?.setAttribute("display", "none");
+    const key = object.cellKey;
+    if (key && state.displayCells.has(key)) {
+      const cell = state.displayCells.get(key);
+      cell.ids = cell.ids.filter(id => id !== object.id);
+      if (rebuild) rebuildDisplayCell(key);
+    }
+  }
+
+  function demoteImported(object, { rebuild = true } = {}) {
+    if (!object || object.deleted || !isIdentityImported(object) || state.selected.has(object.id)) return;
+    object.promoted = false;
+    const host = importedDisplayHost(object);
+    const layer = ensureDisplayLayer(host);
+    const key = assignImportedCell(object);
+    object.cellKey = key;
+    if (!state.displayCells.has(key)) {
+      state.displayCells.set(key, { key, ids: [], layer, bounds: null, nodeCount: 0 });
+    }
+    const cell = state.displayCells.get(key);
+    cell.layer = layer;
+    if (!cell.ids.includes(object.id)) cell.ids.push(object.id);
+    hideImportedLogical(object, true);
+    if (rebuild) rebuildDisplayCell(key);
+  }
+
+  function buildImportedDisplay() {
+    state.displayCells = new Map();
+    state.importedObjects.forEach(object => {
+      restoreSourcePath(object);
+      object.promoted = false;
+      object.batched = false;
+      object.cellKey = "";
+    });
+    const dirty = new Set();
+    state.importedObjects.forEach(object => {
+      if (object.deleted || !object.sourceD) return;
+      if (!isIdentityImported(object) || state.selected.has(object.id)) {
+        promoteImported(object, { rebuild: false });
+        return;
+      }
+      demoteImported(object, { rebuild: false });
+      if (object.cellKey) dirty.add(object.cellKey);
+    });
+    dirty.forEach(rebuildDisplayCell);
+    refreshViewportCull({ moving: false });
+  }
+
+  function syncImportedDisplay() {
+    const dirty = new Set();
+    state.importedObjects.forEach(object => {
+      const interactive = importedNeedsPromote(object);
+      if (interactive && (object.batched || !object.promoted)) {
+        promoteImported(object, { rebuild: false });
+        if (object.cellKey) dirty.add(object.cellKey);
+      } else if (!interactive && object.promoted) {
+        demoteImported(object, { rebuild: false });
+        if (object.cellKey) dirty.add(object.cellKey);
+      }
+    });
+    dirty.forEach(rebuildDisplayCell);
+  }
+
+  function worldBoxForDisplayCell(cell) {
+    const first = cell.ids.map(id => state.importedObjects.find(item => item.id === id)).find(Boolean);
+    const originX = first?.originX || 0;
+    const originY = first?.originY || 0;
+    const map = first?.map || { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+    const box = cell.bounds || { x: 0, y: 0, width: DISPLAY_CELL, height: DISPLAY_CELL };
+    return {
+      x: originX + (box.x - map.x) * map.scaleX,
+      y: originY + (box.y - map.y) * map.scaleY,
+      width: box.width * map.scaleX,
+      height: box.height * map.scaleY
+    };
+  }
+
+  function refreshViewportCull({ moving = false } = {}) {
+    const selected = state.selected;
+    const view = viewportCanvasRect(moving ? 280 : 160);
+    const hit = Engine.intersects || intersects;
+    let visible = 0;
+    let culled = 0;
+    let svgNodes = 0;
+    state.displayCells.forEach(cell => {
+      const box = worldBoxForDisplayCell(cell);
+      const near = hit(box, view);
+      const key = cell.key;
+      const nodes = key && cell.layer
+        ? [...cell.layer.querySelectorAll(`[data-display-cell="${CSS.escape(key)}"]`)]
+        : [];
+      nodes.forEach(node => {
+        if (near) {
+          node.removeAttribute("visibility");
+          node.removeAttribute("data-culled");
+          svgNodes += 1;
+        } else {
+          node.setAttribute("visibility", "hidden");
+          node.setAttribute("data-culled", "1");
+        }
+      });
+      if (near) visible += cell.ids.length;
+      else culled += cell.ids.length;
+    });
+    state.importedObjects.forEach(object => {
+      if (object.deleted || object.batched) return;
+      const box = objectBounds(object);
+      const near = selected.has(object.id) || hit(box, view);
+      if (!near) {
+        if (object.node?.getAttribute("data-culled") !== "1") {
+          object.node?.setAttribute("data-culled", "1");
+          object.node?.setAttribute("visibility", "hidden");
+        }
+        culled += 1;
+        return;
+      }
+      if (object.node?.getAttribute("data-culled") === "1") {
+        object.node.removeAttribute("data-culled");
+        object.node.removeAttribute("visibility");
+      }
+      visible += 1;
+      svgNodes += 1;
+    });
+    state.visibleCount = visible;
+    state.culledCount = culled;
+    state.svgNodeCount = svgNodes + state.objects.length;
+    state.displayLevel = LOD.FULL;
+    if (state.perf) {
+      state.perf.visible = visible;
+      state.perf.culled = culled;
+      state.perf.svgObjects = state.svgNodeCount;
+      state.perf.pathCommands = state.commandTotal;
+      state.perf.level = "full";
+    }
+  }
+
+  function prepareDerivedGeometry() {
+    if (!Engine.GeometryCache) return;
+    state.geometryCache ||= new Engine.GeometryCache();
+    const objects = state.importedObjects.filter(object =>
+      !object.deleted && object.sourceD && (object.commandCount || 0) > 90
+    );
+    let index = 0;
+    const step = deadline => {
+      const budget = typeof deadline?.timeRemaining === "function" ? deadline.timeRemaining() : 8;
+      const start = nowMs();
+      while (index < objects.length && nowMs() - start < Math.max(4, budget)) {
+        const object = objects[index++];
+        state.geometryCache.ensure(object, LOD.FULL, 1);
+        state.geometryCache.ensure(object, LOD.PERCEPTUAL || "perceptual", 1);
+      }
+      if (index < objects.length) {
+        if (Engine.idle) Engine.idle(step);
+        else setTimeout(() => step({ timeRemaining: () => 8 }), 16);
+      }
+    };
+    if (Engine.idle) Engine.idle(step);
+    else setTimeout(() => step({ timeRemaining: () => 8 }), 0);
+  }
+
+  function scheduleViewportCull() {
+    if (state.cullRaf) return;
+    state.cullRaf = requestAnimationFrame(() => {
+      state.cullRaf = 0;
+      refreshViewportCull({ moving: state.navigating });
+    });
+  }
+
+  function scheduleViewportMaintenance() {
+    clearTimeout(state.cullTimer);
+    state.cullTimer = setTimeout(() => refreshViewportCull({ moving: false }), 90);
   }
 
   function allObjects() {
@@ -1182,11 +1811,11 @@
     return inside;
   }
 
-  function lassoSelectsObject(object, polygon) {
+  function lassoSelectsObject(object, polygon, lassoBounds = null) {
     if (polygon.length < 3 || isBoardFillingObject(object)) return false;
     const bounds = objectBounds(object);
-    const lassoBounds = unionBounds([{ type: "stroke", points: polygon, width: 0 }]);
-    if (!intersects(bounds, lassoBounds)) return false;
+    const area = lassoBounds || unionBounds([{ type: "stroke", points: polygon, width: 0 }]);
+    if (!intersects(bounds, area)) return false;
     const samples = ["text", "imported", "group"].includes(object.type)
       ? [
           { x: bounds.x, y: bounds.y },
@@ -1286,13 +1915,7 @@
   }
 
   function syncHtmlOverlayCamera() {
-    const world = $("#canvas-html-world");
-    if (!world) return;
-    const camera = state.camera;
-    const rect = sceneRect();
-    const scaleX = camera.width ? rect.width / camera.width : 1;
-    const scaleY = camera.height ? rect.height / camera.height : 1;
-    world.style.transform = `scale(${scaleX}, ${scaleY}) translate(${-camera.x}px, ${-camera.y}px)`;
+    applyCameraPlane(state.camera, sceneRect());
   }
 
   function applyHtmlOverlayBox(el, object) {
@@ -1500,24 +2123,60 @@
     return group;
   }
 
+  function renderPath(object) {
+    const group = svgEl("g", {
+      "data-object-id": object.id,
+      transform: objectTransformValue(object.tx, object.ty, object.sx, object.sy)
+    });
+    const path = svgEl("path", {
+      d: object.d || object.sourceD || "",
+      fill: object.fill || object.color || "#183153",
+      "fill-opacity": object.opacity ?? 1,
+      stroke: "none",
+      "pointer-events": "visiblePainted"
+    });
+    if (object.width) {
+      path.setAttribute("stroke", object.color || object.fill || "#183153");
+      path.setAttribute("stroke-width", String(object.width));
+    }
+    group.append(path);
+    return group;
+  }
+
   function selectedItems() {
     return [...state.selected].map(findObject).filter(Boolean);
   }
 
   function selectedUnionBounds() {
+    const selectionKey = `${state.boundsEpoch || 0}:${[...state.selected].join(",")}`;
+    if (state.cachedSelectionUnion && state.cachedSelectionKey === selectionKey) {
+      return state.cachedSelectionUnion;
+    }
     const items = selectedItems();
-    if (!items.length) return null;
+    if (!items.length) {
+      state.cachedSelectionUnion = null;
+      state.cachedSelectionKey = "";
+      return null;
+    }
     const bounds = items.map(objectBounds);
     const left = Math.min(...bounds.map(box => box.x));
     const top = Math.min(...bounds.map(box => box.y));
     const right = Math.max(...bounds.map(box => box.x + box.width));
     const bottom = Math.max(...bounds.map(box => box.y + box.height));
     const pad = Math.max(4, state.camera.width / 400);
-    return {
+    const union = {
       x: left - pad, y: top - pad,
       width: Math.max(1, right - left + pad * 2),
       height: Math.max(1, bottom - top + pad * 2)
     };
+    state.cachedSelectionUnion = union;
+    state.cachedSelectionKey = selectionKey;
+    return union;
+  }
+
+  function invalidateSelectionUnion() {
+    state.cachedSelectionUnion = null;
+    state.cachedSelectionKey = "";
   }
 
   function pointInRect(point, box) {
@@ -1565,6 +2224,7 @@
     const defs = $("#scene-defs");
     const user = $("#user-layer");
     const interaction = $("#interaction-layer");
+    state.perf?.markRender?.();
     defs.replaceChildren();
     user.replaceChildren();
     interaction.replaceChildren();
@@ -1572,6 +2232,8 @@
     state.objects.filter(object => !childIds.has(object.id)).forEach(object => user.append(renderNode(object.id)));
     state.groups.filter(group => !childIds.has(group.id)).forEach(group => user.append(renderNode(group.id)));
     renderImportedTransforms();
+    syncImportedDisplay();
+    refreshViewportCull({ moving: false });
     syncLiveOverlay();
     renderSelection();
     renderStudyMarkers();
@@ -1679,6 +2341,10 @@
       const stamp = sample.timeStamp;
       if (Number.isFinite(stamp) && stamp < (interaction.lastSampleAt ?? -1)) return;
       const next = screenToCanvas(sample.clientX, sample.clientY, camera, rect);
+      const pressure = Number(sample.pressure);
+      if (Number.isFinite(pressure) && pressure > 0) next.p = pressure;
+      if (Number.isFinite(Number(sample.tiltX))) next.tiltX = Number(sample.tiltX);
+      if (Number.isFinite(Number(sample.tiltY))) next.tiltY = Number(sample.tiltY);
       if (Number.isFinite(stamp) && stamp === interaction.lastSampleAt) {
         const prev = interaction.points.at(-1);
         if (prev && prev.x === next.x && prev.y === next.y) return;
@@ -1777,6 +2443,11 @@
           point.x = point.x * transform.scaleX + transform.x;
           point.y = point.y * transform.scaleY + transform.y;
         });
+      } else if (object.type === "path") {
+        object.tx = (object.tx || 0) * transform.scaleX + transform.x;
+        object.ty = (object.ty || 0) * transform.scaleY + transform.y;
+        object.sx = (object.sx || 1) * transform.scaleX;
+        object.sy = (object.sy || 1) * transform.scaleY;
       } else if (object.type === "imported") {
         object.tx = (object.tx || 0) * transform.scaleX + transform.x;
         object.ty = (object.ty || 0) * transform.scaleY + transform.y;
@@ -1815,7 +2486,9 @@
     }
     const object = findObject(id);
     if (!object || object.type === "imported") return svgEl("g");
-    return object.type === "text" ? renderText(object) : renderStroke(object);
+    if (object.type === "text") return renderText(object);
+    if (object.type === "path") return renderPath(object);
+    return renderStroke(object);
   }
 
   function importedTransformValue(object) {
@@ -1833,6 +2506,7 @@
   function applyImportedTransform(object) {
     if (!object?.node) return;
     object.node.setAttribute("transform", importedTransformValue(object));
+    if (importedNeedsPromote(object) && object.batched) promoteImported(object);
   }
 
   function renderImportedTransforms() {
@@ -1971,9 +2645,15 @@
     editorLog("POINTER CANCEL", { reason, kind: interaction?.kind || null });
   }
 
+  function maybePencilDoubleTap() {
+    /* Safari does not expose Apple Pencil hardware double-tap to the web. */
+    return false;
+  }
+
   function setTool(tool) {
     if (!TOOLS.has(tool)) return;
     const previous = state.tool;
+    if (previous !== tool) state.lastTool = previous;
     if (state.interaction) {
       const kind = state.interaction.kind;
       if (kind === "draw" || kind === "pixel" || kind === "lasso" || kind === "object-erase") {
@@ -1996,11 +2676,14 @@
 
   function applyColorToSelection(color) {
     const targets = state.objects.filter(object =>
-      state.selected.has(object.id) && ["stroke", "highlighter", "text"].includes(object.type)
+      state.selected.has(object.id) && ["stroke", "highlighter", "text", "path"].includes(object.type)
     );
     if (!targets.length) return;
     const before = snapshot();
-    targets.forEach(object => { object.color = color; });
+    targets.forEach(object => {
+      object.color = color;
+      if (object.type === "path") object.fill = color;
+    });
     commitLogicalAction(before);
     renderScene();
   }
@@ -2017,8 +2700,68 @@
     });
   }
 
+  function beginFingerTap(event) {
+    if (event.pointerType !== "touch") return;
+    if (!state.fingerTap) {
+      state.fingerTap = {
+        startedAt: nowMs(),
+        origins: new Map(),
+        maxFingers: 0,
+        maxTravel: 0,
+        maxDistDelta: 0,
+        lastDistance: 0
+      };
+    }
+    const tap = state.fingerTap;
+    tap.origins.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    tap.maxFingers = Math.max(tap.maxFingers, tap.origins.size);
+    if (tap.origins.size >= 2) {
+      const points = [...tap.origins.values()];
+      tap.lastDistance = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
+    }
+  }
+
+  function noteFingerTapMove(event) {
+    const tap = state.fingerTap;
+    if (!tap || event.pointerType !== "touch") return;
+    const origin = tap.origins.get(event.pointerId);
+    if (origin) {
+      tap.maxTravel = Math.max(tap.maxTravel, Math.hypot(event.clientX - origin.x, event.clientY - origin.y));
+    }
+    if (tap.origins.size >= 2) {
+      const points = [...state.pointers.values()].filter(pointer => pointer.type === "touch");
+      if (points.length >= 2) {
+        const distance = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
+        if (tap.lastDistance) {
+          tap.maxDistDelta = Math.max(tap.maxDistDelta, Math.abs(distance - tap.lastDistance));
+        }
+        tap.lastDistance = distance;
+      }
+    }
+  }
+
+  function finishFingerTap() {
+    const tap = state.fingerTap;
+    state.fingerTap = null;
+    if (!tap) return false;
+    const duration = nowMs() - tap.startedAt;
+    if (duration > 320 || tap.maxTravel > 16 || tap.maxDistDelta > 18) return false;
+    if (tap.maxFingers === 2) {
+      undo();
+      editorLog("TOUCH UNDO", { duration, travel: tap.maxTravel });
+      return true;
+    }
+    if (tap.maxFingers >= 3) {
+      redo();
+      editorLog("TOUCH REDO", { duration, travel: tap.maxTravel });
+      return true;
+    }
+    return false;
+  }
+
   function endCameraGesture(reason = "idle") {
     const wasCamera = state.interaction && ["pan", "pinch"].includes(state.interaction.kind);
+    if (wasCamera && touchPointers().length === 0) finishFingerTap();
     if (wasCamera) {
       logCamera("END", { reason, ...cameraPanZoom() });
       markChanged();
@@ -2026,6 +2769,9 @@
     if (wasCamera) state.interaction = null;
     state.cameraGesture = "idle";
     $("#world-scene")?.classList.remove("is-panning");
+    setNavigating(false);
+    applyCamera({ hud: true, overlays: true });
+    scheduleViewportMaintenance();
   }
 
   function beginPan(event) {
@@ -2042,6 +2788,7 @@
       sceneRect: sceneRect()
     };
     $("#world-scene").classList.add("is-panning");
+    setNavigating(true);
     logCamera("START", {
       kind: "pan", pointerId: event.pointerId, pointerType: event.pointerType
     });
@@ -2061,6 +2808,7 @@
       sceneRect: sceneRect()
     };
     $("#world-scene").classList.add("is-panning");
+    setNavigating(true);
     logCamera("START", { kind: "pan", pointerId, pointerType: "touch", reason: "pinch-to-pan" });
   }
 
@@ -2083,6 +2831,7 @@
       zoomLatched: false
     };
     $("#world-scene").classList.add("is-panning");
+    setNavigating(true);
     logCamera("START", { kind: "pinch", initialDistance: distance });
   }
 
@@ -2108,13 +2857,13 @@
     const rect = interaction.sceneRect || sceneRect();
     const start = interaction.camera;
     if (!rect.width || !rect.height) return;
-    state.camera = {
+    state.camera = cameraWithAspect({
       x: start.x - (clientX - interaction.client.x) * start.width / rect.width,
       y: start.y - (clientY - interaction.client.y) * start.height / rect.height,
       width: start.width,
       height: start.height
-    };
-    applyCamera();
+    });
+    scheduleCameraFrame();
   }
 
   function applyPinchCamera() {
@@ -2132,24 +2881,40 @@
       x: (points[0].x + points[1].x) / 2,
       y: (points[0].y + points[1].y) / 2
     };
+    interaction.lastMidpoint = midpoint;
     if (!interaction.zoomLatched &&
       Math.abs(currentDistance - interaction.distance) >= PINCH_ZOOM_SLOP) {
       interaction.zoomLatched = true;
     }
-    const factor = interaction.zoomLatched
-      ? currentDistance / interaction.distance
-      : 1;
-    const width = clampCameraSize(start.width / factor);
-    const height = width / sceneAspect(rect);
-    const origin = interaction.midpoint;
-    const focus = screenToCanvas(origin.x, origin.y, start, rect);
-    state.camera = {
-      x: focus.x - (midpoint.x - rect.left) * width / rect.width,
-      y: focus.y - (midpoint.y - rect.top) * height / rect.height,
-      width,
-      height
-    };
-    applyCamera();
+    const next = Engine.pinchCamera
+      ? Engine.pinchCamera({
+        startCamera: start,
+        startDistance: interaction.distance,
+        startMidpoint: interaction.midpoint,
+        currentDistance,
+        currentMidpoint: midpoint,
+        rect,
+        zoomLatched: interaction.zoomLatched,
+        minZoom: MIN_ZOOM,
+        maxZoom: MAX_ZOOM,
+        basis: cameraBasis()
+      })
+      : null;
+    if (next) {
+      state.camera = cameraWithAspect(next);
+    } else {
+      const factor = interaction.zoomLatched ? currentDistance / interaction.distance : 1;
+      const width = clampCameraSize(start.width / factor);
+      const height = width / sceneAspect(rect);
+      const focus = screenToCanvas(interaction.midpoint.x, interaction.midpoint.y, start, rect);
+      state.camera = cameraWithAspect({
+        x: focus.x - (midpoint.x - rect.left) * width / rect.width,
+        y: focus.y - (midpoint.y - rect.top) * height / rect.height,
+        width,
+        height
+      });
+    }
+    scheduleCameraFrame();
   }
 
   function forgetTouchPointers() {
@@ -2191,6 +2956,7 @@
     state.interaction = null;
     releaseCapturedPointer();
     $("#world-scene")?.classList.remove("is-panning");
+    setNavigating(false);
     refreshSceneRect();
     studyLog("GESTURE RESET", {
       reason,
@@ -2221,7 +2987,12 @@
 
   function hitObject(event) {
     const target = event.target.closest?.("[data-group-id],[data-object-id]");
-    return target?.dataset.groupId || target?.dataset.objectId || "";
+    const direct = target?.dataset.groupId || target?.dataset.objectId || "";
+    if (direct && findObject(direct) && !isBoardFillingObject(findObject(direct))) return direct;
+    const point = screenToCanvas(event.clientX, event.clientY);
+    const hits = objectsAtPoint(point, Math.max(2, 4 / cameraZoom()));
+    const object = hits.find(item => !item.deleted && !isBoardFillingObject(item));
+    return object?.id || "";
   }
 
   function hitResizeHandle(event) {
@@ -2303,12 +3074,19 @@
   }
 
   function objectsAtPoint(point, radius = 0) {
-    return allObjects().filter(object => {
-      if (object.deleted || isBoardFillingObject(object)) return false;
-      const bounds = objectBounds(object);
-      return point.x >= bounds.x - radius && point.x <= bounds.x + bounds.width + radius &&
-        point.y >= bounds.y - radius && point.y <= bounds.y + bounds.height + radius;
+    const box = { x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2 };
+    const candidates = querySpatial(box, Math.max(8, radius));
+    const found = [];
+    candidates.forEach(item => {
+      const object = findObject(item.id);
+      if (!object || object.deleted || isBoardFillingObject(object)) return;
+      const bounds = item.box || objectBounds(object);
+      if (point.x >= bounds.x - radius && point.x <= bounds.x + bounds.width + radius &&
+        point.y >= bounds.y - radius && point.y <= bounds.y + bounds.height + radius) {
+        found.push(object);
+      }
     });
+    return found;
   }
 
   function appendUserObject(object) {
@@ -2341,6 +3119,7 @@
       createdAt: Date.now() / 1000
     };
     state.objects = previousObjects.concat(object);
+    indexObject(object);
     const live = $("#live-ink");
     if (live?.getAttribute("d")) {
       const group = svgEl("g", { "data-object-id": object.id });
@@ -2446,7 +3225,11 @@
       });
     }
     rememberPointer(event);
+    beginFingerTap(event);
     state.penHud.downs += 1;
+    if (event.pointerType !== "touch") {
+      try { $("#world-scene")?.focus({ preventScroll: true }); } catch (_) {}
+    }
     editorLog("PEN DOWN", {
       pointerId: event.pointerId,
       pointerType: event.pointerType,
@@ -2479,7 +3262,54 @@
     };
     const point = screenToCanvas(event.clientX, event.clientY, liveCamera, liveRect);
     const tool = state.tool;
+    if ((tool === "pen" || tool === "highlighter") && maybePencilDoubleTap(event)) {
+      releaseCapturedPointer(event.pointerId);
+      return;
+    }
     if (tool === "pen" || tool === "highlighter") {
+      const handle = hitResizeHandle(event);
+      const union = selectedUnionBounds();
+      if (handle && union && state.selected.size) {
+        state.interaction = {
+          kind: "resize",
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          captureToken,
+          startedAt: event.timeStamp,
+          tool,
+          handle,
+          origin: resizeOrigin(handle, union),
+          startBounds: union,
+          start: point,
+          current: point,
+          before: snapshot(),
+          startTransforms: captureItemTransforms(selectedItems()),
+          sceneRect: liveRect,
+          startCamera: liveCamera,
+          moved: false
+        };
+        return;
+      }
+      if (union && state.selected.size && pointInRect(point, union) && !event.shiftKey) {
+        state.interaction = {
+          kind: "move",
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          captureToken,
+          startedAt: event.timeStamp,
+          tool,
+          start: point,
+          current: point,
+          startScreen: { x: event.clientX, y: event.clientY },
+          startCanvas: point,
+          startCamera: clone(state.camera),
+          sceneRect: liveRect,
+          startTransforms: captureItemTransforms(selectedItems()),
+          before: snapshot(),
+          moved: false
+        };
+        return;
+      }
       const interaction = {
         kind: "draw",
         pointerId: event.pointerId,
@@ -2489,8 +3319,10 @@
         lastSampleAt: event.timeStamp,
         tool,
         start: point,
+        startScreen: { x: event.clientX, y: event.clientY },
         current: point,
-        points: [point],
+        points: [Object.assign({}, point, Number.isFinite(event.pressure) && event.pressure > 0
+          ? { p: event.pressure } : {})],
         rawCount: 1,
         renderedCount: 0,
         usedRaw: false,
@@ -2686,6 +3518,7 @@
       state.pointers.set(event.pointerId, {
         x: event.clientX, y: event.clientY, type: event.pointerType
       });
+      noteFingerTapMove(event);
     }
     const interaction = state.interaction;
     if (!interaction) return;
@@ -2835,6 +3668,10 @@
         `translate(${transform.x || 0} ${transform.y || 0}) scale(${transform.scaleX || 1} ${transform.scaleY || 1}) rotate(${transform.rotation || 0})`);
       return;
     }
+    if (object.type === "path") {
+      node.setAttribute("transform", objectTransformValue(object.tx, object.ty, object.sx, object.sy));
+      return;
+    }
     if (object.type === "text") {
       node.setAttribute("transform", `translate(${object.x} ${object.y})`);
       const hit = node.querySelector("rect.text-hit, rect");
@@ -2914,11 +3751,7 @@
   }
 
   function invalidateEraseBounds(object) {
-    if (!object) return;
-    object._eraseBounds = null;
-    if (object.type === "group") {
-      object.children.map(findObject).forEach(invalidateEraseBounds);
-    }
+    invalidateWorldBounds(object);
   }
 
   function transformedStrokePoint(object, point) {
@@ -2955,11 +3788,20 @@
   function eraseAlongSegment(from, to) {
     const erasedIds = state.interaction?.erasedIds;
     const radius = Math.max(4, (state.eraserSize || 16) / 2);
+    const minX = Math.min(from.x, to.x) - radius;
+    const minY = Math.min(from.y, to.y) - radius;
+    const segmentBox = {
+      x: minX, y: minY,
+      width: Math.abs(to.x - from.x) + radius * 2,
+      height: Math.abs(to.y - from.y) + radius * 2
+    };
     const hits = [];
-    for (const object of allObjects()) {
-      if (erasedIds?.has(object.id)) continue;
+    querySpatial(segmentBox, radius).forEach(item => {
+      if (erasedIds?.has(item.id)) return;
+      const object = findObject(item.id);
+      if (!object) return;
       if (objectHitsEraserSegment(object, from, to, radius)) hits.push(object);
-    }
+    });
     hits.forEach(object => eraseWholeObject(object.id));
   }
 
@@ -2986,7 +3828,9 @@
       if (isBoardFillingObject(imported) || imported.deleted) return false;
       rememberEraseUndo();
       imported.deleted = true;
+      promoteImported(imported);
       imported.node?.setAttribute("display", "none");
+      state.spatial?.remove(id);
       state.selected.delete(id);
       markObjectErased(id);
       editorLog("OBJECT ERASE", { id, type: "imported" });
@@ -3009,6 +3853,7 @@
     state.selected.delete(id);
     $(`[data-object-id="${CSS.escape(id)}"]`)?.remove();
     removeHtmlOverlayItem(id);
+    state.spatial?.remove(id);
     markObjectErased(id);
     editorLog("OBJECT ERASE", { id, type: object.type });
     return true;
@@ -3016,7 +3861,9 @@
 
   function refreshUserObject(object) {
     const existing = $(`[data-object-id="${CSS.escape(object.id)}"]`);
-    const node = object.type === "text" ? renderText(object) : renderStroke(object);
+    const node = object.type === "text" ? renderText(object)
+      : object.type === "path" ? renderPath(object)
+      : renderStroke(object);
     if (existing) existing.replaceWith(node);
     else $("#user-layer")?.append(node);
     upsertHtmlOverlayItem(object);
@@ -3174,6 +4021,7 @@
             if (item.type === "text") fitTextObject(item);
           });
         }
+        selectedItems().forEach(indexObject);
         commitLogicalAction(interaction.before);
         editorLog("OBJECT TRANSFORM", {
           action: interaction.kind,
@@ -3196,8 +4044,10 @@
       }
       needsScene = true;
     } else if (interaction.kind === "lasso") {
+      const lassoBounds = unionBounds([{ type: "stroke", points: interaction.points, width: 0 }]);
+      const candidateIds = new Set(querySpatial(lassoBounds, 12).map(item => item.id));
       const ids = topLevelItems()
-        .filter(object => lassoSelectsObject(object, interaction.points))
+        .filter(object => candidateIds.has(object.id) && lassoSelectsObject(object, interaction.points, lassoBounds))
         .map(object => object.id);
       ids.forEach(id => state.selected.add(id));
       editorLog("SELECTION END", { count: ids.length, ids });
@@ -3307,30 +4157,135 @@
     renderScene();
   }
 
+  function isTextEntryTarget(target) {
+    if (!target || typeof target.closest !== "function") return false;
+    return Boolean(target.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']"));
+  }
+
+  function cloneSelectable(object) {
+    if (!object || object.deleted) return null;
+    if (object.type === "imported") {
+      const d = object.sourceD || object.path?.getAttribute("d") || "";
+      if (!d) return null;
+      return {
+        id: uid("path"),
+        type: "path",
+        d,
+        sourceD: d,
+        sourceRevision: 1,
+        color: object.color || "#183153",
+        fill: object.color || "#183153",
+        width: 0,
+        opacity: 1,
+        tx: object.tx || 0,
+        ty: object.ty || 0,
+        sx: object.sx || 1,
+        sy: object.sy || 1,
+        bbox: object.bbox ? { ...object.bbox } : null,
+        origin: "student",
+        folderId: state.lecture.folderId || "",
+        createdAt: Date.now() / 1000
+      };
+    }
+    if (object.type === "group") return null;
+    return clone(object);
+  }
+
+  function copySelection() {
+    const items = selectedItems().filter(item => !item.deleted && !isBoardFillingObject(item));
+    if (!items.length) return;
+    state.clipboard = items.map(cloneSelectable).filter(Boolean).map(object => {
+      object.id = uid(object.type === "text" ? "text" : object.type === "path" ? "path" : "stroke");
+      return object;
+    });
+    editorLog("COPY", { count: state.clipboard.length });
+  }
+
+  function pasteClipboard({ offset = true } = {}) {
+    if (!state.clipboard?.length) return;
+    const before = snapshot();
+    const zoom = Math.max(0.01, cameraZoom());
+    const dx = offset ? 18 / zoom : 0;
+    const dy = offset ? 18 / zoom : 0;
+    const created = state.clipboard.map(item => {
+      const object = clone(item);
+      object.id = uid(object.type === "text" ? "text" : object.type === "path" ? "path" : "stroke");
+      if (object.type === "text") {
+        object.x += dx;
+        object.y += dy;
+      } else {
+        object.tx = (object.tx || 0) + dx;
+        object.ty = (object.ty || 0) + dy;
+      }
+      return object;
+    });
+    created.forEach(object => {
+      state.objects.push(object);
+      appendUserObject(object);
+      indexObject(object);
+    });
+    state.selected = new Set(created.map(object => object.id));
+    commitLogicalAction(before);
+    renderScene();
+    editorLog("PASTE", { count: created.length });
+  }
+
+  function duplicateSelection() {
+    copySelection();
+    pasteClipboard({ offset: true });
+  }
+
+  function selectAllObjects() {
+    state.selected = new Set(
+      topLevelItems()
+        .filter(object => !object.deleted && !isBoardFillingObject(object))
+        .map(object => object.id)
+    );
+    invalidateSelectionUnion();
+    renderScene();
+  }
+
   function handleKeyDown(event) {
-    if (event.target.matches?.("input, textarea, select")) return;
+    if (isTextEntryTarget(event.target)) return;
     if (event.code === "Space") {
       state.spaceDown = true;
       event.preventDefault();
     }
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+    const meta = event.ctrlKey || event.metaKey;
+    const key = String(event.key || "").toLowerCase();
+    const code = event.code || "";
+    if (meta && (key === "z" || code === "KeyZ")) {
       event.preventDefault();
+      event.stopPropagation();
       event.shiftKey ? redo() : undo();
-    } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") {
+    } else if (meta && (key === "y" || code === "KeyY")) {
       event.preventDefault();
       redo();
-    } else if ((event.key === "Delete" || event.key === "Backspace") && state.tool === "select") {
+    } else if (meta && (key === "c" || code === "KeyC")) {
+      event.preventDefault();
+      copySelection();
+    } else if (meta && (key === "v" || code === "KeyV")) {
+      event.preventDefault();
+      pasteClipboard();
+    } else if (meta && (key === "d" || code === "KeyD")) {
+      event.preventDefault();
+      duplicateSelection();
+    } else if (meta && (key === "a" || code === "KeyA")) {
+      event.preventDefault();
+      selectAllObjects();
+    } else if ((event.key === "Delete" || event.key === "Backspace") && state.selected.size) {
       event.preventDefault();
       deleteSelection();
-    } else if (event.key === "Enter" && state.tool === "select" && state.selected.size === 1) {
+    } else if (event.key === "Enter" && state.selected.size === 1) {
       const object = findObject([...state.selected][0]);
       if (object?.type === "text") {
         event.preventDefault();
         editTextObject(object.id);
       }
     } else if (event.key === "Escape") {
+      if (state.interaction) cancelTransientInteraction("escape");
       state.selected.clear();
-      closeStudySheet();
+      invalidateSelectionUnion();
       renderScene();
     }
   }
@@ -3558,7 +4513,7 @@
     return lectureBoardsFromData().length > 1;
   }
 
-  function positionExplainButton() {
+  function positionExplainButton({ cheap = false } = {}) {
     const cluster = $("#selection-actions");
     const button = $("#explain-button");
     if (!cluster || !button) return;
@@ -3573,12 +4528,14 @@
       cluster.hidden = true;
       return;
     }
-    const check = selectionHasPracticeWork();
-    const multi = lectureHasMultipleBoards();
-    $("#explain-across-button").hidden = check || !multi;
-    $("#where-from-button").hidden = check || !multi;
-    $("#check-work-button").hidden = !check;
-    button.hidden = false;
+    if (!cheap) {
+      const check = selectionHasPracticeWork();
+      const multi = lectureHasMultipleBoards();
+      $("#explain-across-button").hidden = check || !multi;
+      $("#where-from-button").hidden = check || !multi;
+      $("#check-work-button").hidden = !check;
+      button.hidden = false;
+    }
     const frameBox = frame.getBoundingClientRect();
     const left = canvasToScreen(union.x, union.y, state.camera, rect);
     const right = canvasToScreen(union.x + union.width, union.y, state.camera, rect);
@@ -4352,6 +5309,9 @@
       markChanged();
     });
     $("#home-button")?.addEventListener("click", resetView);
+    $("#toolbar-study-notes")?.addEventListener("click", () => $("#study-notes-button")?.click());
+    $("#toolbar-new-board")?.addEventListener("click", () => $("#import-whiteboard")?.click());
+    bindGesturesHelp();
     if (typeof ResizeObserver === "function") {
       const observer = new ResizeObserver(() => syncCameraAspect());
       observer.observe($("#world-scene"));
@@ -4403,7 +5363,7 @@
       zoomAt(Math.exp(-event.deltaY * .0015), event.clientX, event.clientY);
       markChanged();
     }, { passive: false });
-    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
     window.addEventListener("keyup", event => {
       if (event.code === "Space") state.spaceDown = false;
     });
@@ -4412,12 +5372,91 @@
     bindImport();
   }
 
+  function bindGesturesHelp() {
+    const dialog = $("#gestures-help");
+    const button = $("#gestures-help-button");
+    if (!dialog || !button) return;
+    button.addEventListener("click", () => {
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else dialog.setAttribute("open", "");
+      button.setAttribute("aria-expanded", "true");
+    });
+    dialog.addEventListener("close", () => button.setAttribute("aria-expanded", "false"));
+  }
+
+  function initPerfOverlay() {
+    if (!DEBUG_PERF || !Engine.PerfMonitor) return;
+    state.perf = new Engine.PerfMonitor();
+    state.perf.enable(true);
+    globalThis.__boardPerf = {
+      snapshot: () => state.perf.snapshot(),
+      measure: options => Engine.measureTransformLoop(options),
+      reset: () => state.perf.resetWorst(),
+      stats: () => ({
+        imported: state.importedObjects.length,
+        user: state.objects.length,
+        commands: state.commandTotal,
+        visible: state.visibleCount,
+        culled: state.culledCount
+      })
+    };
+  }
+
+  function mountStressScene() {
+    const params = new URLSearchParams(location.search);
+    const count = Number(params.get("stress") || 0);
+    if (!count) return;
+    const layer = $("#imported-layer");
+    if (!layer) return;
+    const objects = [];
+    for (let index = 0; index < count; index++) {
+      const x = 40 + (index * 47) % Math.max(200, state.width - 80);
+      const y = 40 + (index * 31) % Math.max(200, state.height - 80);
+      const d = `M ${x} ${y} c 12 0 18 16 32 2 c 14 -12 28 6 40 -2 c 10 -6 22 10 28 0`;
+      const id = `stress-${String(index).padStart(4, "0")}`;
+      const wrapper = svgEl("g", {
+        class: "imported-object",
+        "data-object-id": id,
+        transform: "translate(0 0)"
+      });
+      const path = svgEl("path", {
+        id, d, fill: index % 2 ? "#183153" : "#2563eb",
+        "data-object-id": id
+      });
+      wrapper.append(path);
+      layer.append(wrapper);
+      objects.push({
+        id, type: "imported",
+        bbox: { x, y, width: 100, height: 36 },
+        color: path.getAttribute("fill"),
+        color_class: "",
+        tx: 0, ty: 0, sx: 1, sy: 1, deleted: false,
+        node: wrapper, path,
+        sourceD: d, sourceRevision: 1,
+        commandCount: 3, displayLevel: LOD.FULL,
+        boardId, originX: 0, originY: 0,
+        map: { x: 0, y: 0, scaleX: 1, scaleY: 1 }
+      });
+    }
+    state.importedObjects = state.importedObjects.concat(objects);
+    state.commandTotal += objects.length * 3;
+    rebuildSpatialIndex();
+    buildImportedDisplay();
+    prepareDerivedGeometry();
+    editorLog("STRESS SCENE", { count });
+  }
+
   function escapeXML(value) {
     return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;")
       .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
   function exportObject(object) {
+    if (object.type === "path") {
+      const transform = (object.tx || object.ty || (object.sx || 1) !== 1 || (object.sy || 1) !== 1)
+        ? ` transform="${objectTransformValue(object.tx, object.ty, object.sx, object.sy)}"` : "";
+      return `<path id="${escapeXML(object.id)}" d="${escapeXML(object.d || object.sourceD || "")}" fill="${escapeXML(object.fill || object.color)}" fill-opacity="${Number(object.opacity ?? 1)}"${transform}/>`;
+    }
     if (object.type === "text") {
       const wrapped = wrapPlainLines(object.text, object.fontSize, intendedWrapWidth(object));
       const tspans = wrapped.lines.map((line, index) =>
@@ -4466,6 +5505,8 @@
       const clone = path.cloneNode(true);
       clone.removeAttribute("style");
       clone.removeAttribute("data-object-id");
+      const source = object.sourceD || path.dataset.sourceD;
+      if (source) clone.setAttribute("d", source);
       return `<g id="${escapeXML(object.id)}-object" transform="${objectTransformValue(object.tx, object.ty, object.sx, object.sy)}">${clone.outerHTML}</g>`;
     }).join("");
   }
@@ -4577,20 +5618,46 @@
     if ($("#pen-debug")) $("#pen-debug").hidden = !DEBUG_EDITOR;
     const caption = $("#canvas-dimensions");
     if (caption) caption.textContent = "Study canvas";
-    $("#world-scene").setAttribute("viewBox", `0 0 ${state.width} ${state.height}`);
     $("#world-scene").setAttribute("preserveAspectRatio", "none");
     refreshSceneRect();
+    syncViewportBox();
     bindEditor();
+    initPerfOverlay();
     await loadEditor();
     state.objects.forEach(object => {
       if (object.type === "text") fitTextObject(object);
     });
     await loadImportedSVG();
+    mountStressScene();
     await loadStudyInteractions();
     renderStudyGuidePanel();
     ensureBoardContext();
     state.selected.clear();
     syncCameraAspect();
+    const viewPreset = new URLSearchParams(location.search).get("view");
+    if (viewPreset === "out") {
+      state.camera = cameraWithAspect({
+        ...state.camera,
+        width: state.camera.width / 0.42,
+        height: state.camera.height / 0.42
+      });
+    } else if (viewPreset === "in") {
+      const cx = state.camera.x + state.camera.width * 0.35;
+      const cy = state.camera.y + state.camera.height * 0.38;
+      const width = state.camera.width / 2.4;
+      const height = state.camera.height / 2.4;
+      state.camera = cameraWithAspect({
+        x: cx - width * 0.35, y: cy - height * 0.38, width, height
+      });
+    } else if (viewPreset === "extreme") {
+      const cx = state.camera.x + state.camera.width * 0.4;
+      const cy = state.camera.y + state.camera.height * 0.4;
+      const width = state.camera.width / 12;
+      const height = state.camera.height / 12;
+      state.camera = cameraWithAspect({
+        x: cx - width * 0.4, y: cy - height * 0.4, width, height
+      });
+    }
     applyCamera();
     renderScene();
     refreshSceneRect();
@@ -4608,6 +5675,52 @@
       user: state.objects.length,
       selected: [...state.selected]
     });
+    if (new URLSearchParams(location.search).get("bench") === "1") {
+      requestAnimationFrame(() => setTimeout(() => runCameraBench(), 400));
+    }
+  }
+
+  async function runCameraBench(frames = 90) {
+    const start = { ...state.camera };
+    const samples = [];
+    let last = nowMs();
+    let index = 0;
+    await new Promise(resolve => {
+      const tick = () => {
+        const t = nowMs();
+        samples.push(t - last);
+        last = t;
+        state.camera.x = start.x + Math.sin(index / 7) * 120;
+        state.camera.y = start.y + Math.cos(index / 9) * 80;
+        applyCamera({ hud: false, overlays: false });
+        index += 1;
+        if (index >= frames) resolve();
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+    Object.assign(state.camera, start);
+    applyCamera({ hud: true, overlays: true });
+    const sorted = samples.slice(1).sort((a, b) => a - b);
+    const avg = sorted.reduce((a, b) => a + b, 0) / Math.max(1, sorted.length);
+    const result = {
+      frames: sorted.length,
+      avgMs: avg,
+      fps: 1000 / avg,
+      p95Ms: sorted[Math.floor(sorted.length * 0.95)] || avg,
+      worstMs: sorted[sorted.length - 1] || avg,
+      imported: state.importedObjects.length,
+      user: state.objects.length,
+      commands: state.commandTotal
+    };
+    console.info("[bench] camera", result);
+    const node = document.createElement("pre");
+    node.id = "bench-result";
+    node.textContent = JSON.stringify(result);
+    node.hidden = true;
+    document.body.append(node);
+    document.title = `bench ${Math.round(result.fps)}fps ${result.imported}obj`;
+    return result;
   }
 
   async function start() {

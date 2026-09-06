@@ -74,11 +74,18 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Zm10-12 3 3"/></svg>
               <span>Pen</span>
             </button>
-            <button class="tool-button" data-tool="select" type="button" aria-pressed="false" title="Select or lasso">
+            <button class="tool-button" data-tool="select" type="button" aria-pressed="false" title="Lasso">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5c3 2 7 2 10 0M6 10c4 2 8 2 12 0M7 15c3 2 7 2 10 0"/></svg>
               <span>Lasso</span>
             </button>
-            <button class="tool-button" data-tool="object-eraser" type="button" aria-pressed="false" title="Delete whole objects"><span>Object erase</span></button>
-            <button class="tool-button" data-tool="pixel-eraser" type="button" aria-pressed="false" title="Erase parts of strokes"><span>Pixel erase</span></button>
+            <button class="tool-button" data-tool="object-eraser" type="button" aria-pressed="false" title="Object eraser">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 15 13 7l4 4-8 8H5v-4Z"/><path d="m13 7 2.5-2.5a2 2 0 0 1 3 3L16 10"/></svg>
+              <span>Object erase</span>
+            </button>
+            <button class="tool-button" data-tool="pixel-eraser" type="button" aria-pressed="false" title="Pixel eraser">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16h16M7 16l3-8h4l3 8"/><path d="M9 12h6"/></svg>
+              <span>Pixel erase</span>
+            </button>
           </div>
           <div class="tool-divider"></div>
           <div class="color-tools" aria-label="Ink color">
@@ -123,6 +130,13 @@
               <path d="M19.8 11.6H10a5 5 0 1 0 0 10"/>
             </svg>
           </button>
+          <button class="icon-button" id="toolbar-study-notes" type="button" title="Study Notes" aria-label="Study Notes">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.8h12A1.2 1.2 0 0 1 19.2 6v14.2L12 16.4l-7.2 3.8V6A1.2 1.2 0 0 1 6 4.8Z"/></svg>
+          </button>
+          <button class="icon-button" id="toolbar-new-board" type="button" title="New Board" aria-label="New Board">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <button class="icon-button" id="gestures-help-button" type="button" title="Gestures" aria-label="Gestures help" aria-expanded="false" aria-controls="gestures-help">?</button>
           <select id="export-scope" class="compact-select" hidden aria-hidden="true">
             <option value="content" selected>Fit content</option>
             <option value="full">Full board</option>
@@ -133,26 +147,28 @@
         <div class="board-viewport" id="board-viewport">
           <div class="board-frame primary-frame" id="primary-frame">
             <svg id="world-scene" xmlns="http://www.w3.org/2000/svg" role="application"
-                 aria-label="Editable study canvas" data-tool="pen"
+                 aria-label="Editable study canvas" data-tool="pen" tabindex="0"
                  preserveAspectRatio="none">
               <defs id="scene-defs"></defs>
-              <rect id="canvas-hitfill" x="-100000" y="-100000" width="200000" height="200000"
-                    fill="transparent" pointer-events="all"></rect>
-              <g id="master-layer" hidden>
-                <rect id="board-bounds" x="0" y="0" fill="none" stroke="#eceae4" pointer-events="none"></rect>
-                <image id="master-image" x="0" y="0" preserveAspectRatio="none" pointer-events="none"></image>
+              <g id="camera-world">
+                <rect id="canvas-hitfill" x="-100000" y="-100000" width="200000" height="200000"
+                      fill="transparent" pointer-events="all"></rect>
+                <g id="master-layer" hidden>
+                  <rect id="board-bounds" x="0" y="0" fill="none" stroke="#eceae4" pointer-events="none"></rect>
+                  <image id="master-image" x="0" y="0" preserveAspectRatio="none" pointer-events="none"></image>
+                </g>
+                <g id="board-papers" aria-hidden="true"></g>
+                <rect id="board-paper" x="0" y="0" fill="#f7f6f2" pointer-events="none"></rect>
+                <rect id="board-paper-edge" x="0" y="0" fill="none" stroke="#e4e1d8" pointer-events="none"></rect>
+                <g id="imported-layer" aria-label="Professor notes"></g>
+                <g id="user-layer" aria-label="Your notes"></g>
+                <g id="study-layer" aria-label="Study notes"></g>
+                <g id="live-ink-layer" pointer-events="none">
+                  <path id="live-ink" fill="none" stroke-linecap="round" stroke-linejoin="round"
+                        pointer-events="none" visibility="hidden"></path>
+                </g>
+                <g id="interaction-layer" aria-hidden="true"></g>
               </g>
-              <g id="board-papers" aria-hidden="true"></g>
-              <rect id="board-paper" x="0" y="0" fill="#f7f6f2" pointer-events="none"></rect>
-              <rect id="board-paper-edge" x="0" y="0" fill="none" stroke="#e4e1d8" pointer-events="none"></rect>
-              <g id="imported-layer" aria-label="Professor notes"></g>
-              <g id="user-layer" aria-label="Your notes"></g>
-              <g id="study-layer" aria-label="Study notes"></g>
-              <g id="live-ink-layer" pointer-events="none">
-                <path id="live-ink" fill="none" stroke-linecap="round" stroke-linejoin="round"
-                      pointer-events="none" visibility="hidden"></path>
-              </g>
-              <g id="interaction-layer" aria-hidden="true"></g>
             </svg>
             <div id="canvas-html-overlay" class="canvas-html-overlay" aria-hidden="true">
               <div id="canvas-html-world" class="canvas-html-world"></div>
@@ -222,10 +238,54 @@
     <input id="import-camera" type="file" accept="image/*" capture="environment">
   </form>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <dialog class="gestures-help" id="gestures-help">
+    <form method="dialog">
+      <header>
+        <h2>Gestures</h2>
+        <button class="icon-button" type="submit" aria-label="Close gestures help">×</button>
+      </header>
+      <div class="gestures-help-body">
+        <section>
+          <h3>Apple Pencil</h3>
+          <ul>
+            <li>Draw</li>
+            <li>Lasso with the Lasso tool</li>
+            <li>Tap to select</li>
+            <li>Drag a selection to move</li>
+            <li>Corner handles to resize</li>
+            <li>Scribble with Object erase</li>
+          </ul>
+        </section>
+        <section>
+          <h3>Finger</h3>
+          <ul>
+            <li>One finger = Pan</li>
+            <li>Two fingers = Pan / Pinch Zoom</li>
+            <li>Two-finger tap = Undo</li>
+            <li>Three-finger tap = Redo</li>
+          </ul>
+        </section>
+        <section>
+          <h3>Keyboard</h3>
+          <ul>
+            <li>⌘Z = Undo</li>
+            <li>⌘⇧Z = Redo</li>
+            <li>⌘C = Copy</li>
+            <li>⌘V = Paste</li>
+            <li>⌘D = Duplicate</li>
+            <li>Delete = Delete</li>
+            <li>⌘A = Select All</li>
+            <li>Escape = Deselect</li>
+          </ul>
+        </section>
+      </div>
+    </form>
+  </dialog>
 
   <script id="board-data" type="application/json">{{ board_data|default(board|default(data|default({}, true), true), true)|tojson }}</script>
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js" crossorigin="anonymous"></script>
   <script src="{{ url_for('static', filename='study-render.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='canvas-engine.js') }}" defer></script>
   <script src="{{ url_for('static', filename='board.js') }}" defer></script>
 </body>
 </html>

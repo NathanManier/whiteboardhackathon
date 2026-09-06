@@ -212,6 +212,35 @@ class EditorApiTests(unittest.TestCase):
         markup = self.client.get(f"/board/{self.board_id}/svg").get_data(as_text=True)
         self.assertNotIn('id="black-abc123def456"', markup)
 
+    def test_path_objects_and_pressure_round_trip(self):
+        state = self.editor_state()
+        state["objects"].append(
+            {
+                "id": "path-one",
+                "type": "path",
+                "d": "M 10 10 L 40 12 L 38 40 Z",
+                "color": "#183153",
+                "translation": {"x": -40, "y": 20},
+                "scaleX": 1,
+                "scaleY": 1,
+            }
+        )
+        state["objects"][0]["points"] = [
+            {"x": -20, "y": 15, "p": 0.42},
+            {"x": 1250, "y": 900, "p": 0.8},
+        ]
+        saved = self.client.put(f"/api/boards/{self.board_id}/editor", json=state)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        loaded = self.client.get(f"/api/boards/{self.board_id}/editor").get_json()["editor"]
+        path = next(item for item in loaded["objects"] if item["id"] == "path-one")
+        self.assertEqual(path["type"], "path")
+        self.assertIn("M 10 10", path["d"])
+        self.assertEqual(path["translation"]["x"], -40)
+        self.assertAlmostEqual(loaded["objects"][0]["points"][0]["p"], 0.42)
+        markup = self.client.get(f"/board/{self.board_id}/svg").get_data(as_text=True)
+        self.assertIn('id="path-one"', markup)
+        self.assertIn("M 10 10 L 40 12 L 38 40 Z", markup)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,6 +78,7 @@ MAX_EDITOR_OBJECTS = 3_000
 MAX_IMPORTED_TRANSFORMS = 60_000
 MAX_EDITOR_POINTS = 300_000
 MAX_ERASURES_PER_STROKE = 500
+MAX_PATH_D_CHARS = 400_000
 MAX_TEXT_LENGTH = 20_000
 MAX_WORLD_COORDINATE = 10_000_000.0
 MAX_DEBUG_RASTER_DIMENSION = 1600
@@ -320,7 +321,7 @@ def validate_world_point(value: Any, label: str) -> dict[str, float]:
         x_value, y_value = value
     else:
         raise ValueError(f"{label} must contain x and y.")
-    return {
+    point = {
         "x": finite_number(
             x_value,
             f"{label}.x",
@@ -334,6 +335,11 @@ def validate_world_point(value: Any, label: str) -> dict[str, float]:
             maximum=MAX_WORLD_COORDINATE,
         ),
     }
+    if isinstance(value, dict):
+        pressure = value.get("p", value.get("pressure"))
+        if pressure is not None and pressure != "":
+            point["p"] = finite_number(pressure, f"{label}.p", minimum=0, maximum=1)
+    return point
 
 
 def validate_point_list(value: Any, label: str, maximum: int) -> list[dict[str, float]]:
@@ -439,7 +445,7 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
             raise ValueError(f"Object id {object_id} is duplicated.")
         seen_ids.add(object_id)
         object_type = item.get("type")
-        if object_type not in {"stroke", "highlighter", "text"}:
+        if object_type not in {"stroke", "highlighter", "text", "path"}:
             raise ValueError(f"Object {index} has an invalid type.")
         color = item.get("color")
         if not isinstance(color, str) or not COLOR_RE.fullmatch(color):
@@ -515,6 +521,41 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
                 )
             attach_object_source_fields(clean_text, item)
             clean_objects.append(clean_text)
+            continue
+        if object_type == "path":
+            path_data = item.get("d", "")
+            if not isinstance(path_data, str) or not path_data or len(path_data) > MAX_PATH_D_CHARS:
+                raise ValueError(f"Object {index} path data is invalid.")
+            if "<" in path_data or "javascript:" in path_data.lower():
+                raise ValueError(f"Object {index} path data is invalid.")
+            clean_path = {
+                "id": object_id,
+                "type": "path",
+                "d": path_data,
+                "color": color.lower(),
+                "fill": color.lower(),
+                "opacity": finite_number(
+                    item.get("opacity", 1),
+                    f"Object {index}.opacity",
+                    minimum=0.01,
+                    maximum=1,
+                ),
+                "translation": translation,
+                "scaleX": finite_number(
+                    item.get("scaleX", 1),
+                    f"Object {index}.scaleX",
+                    minimum=0.01,
+                    maximum=100,
+                ),
+                "scaleY": finite_number(
+                    item.get("scaleY", 1),
+                    f"Object {index}.scaleY",
+                    minimum=0.01,
+                    maximum=100,
+                ),
+            }
+            attach_object_source_fields(clean_path, item)
+            clean_objects.append(clean_path)
             continue
         points = validate_point_list(
             item.get("points"), f"Object {index} points", MAX_POINTS_PER_STROKE
@@ -1910,6 +1951,19 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
                     },
                 )
                 span.text = line
+            continue
+        if item.get("type") == "path" and isinstance(item.get("d"), str) and item.get("d"):
+            ET.SubElement(
+                user,
+                f"{{{namespace}}}path",
+                {
+                    "id": str(item.get("id", "")),
+                    "d": str(item.get("d")),
+                    "fill": str(item.get("fill") or item.get("color") or "#183153"),
+                    "fill-opacity": str(item.get("opacity", 1)),
+                    "transform": transform,
+                },
+            )
             continue
         points = item.get("points")
         if not isinstance(points, list) or not points:
