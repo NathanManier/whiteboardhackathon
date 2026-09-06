@@ -38,7 +38,18 @@
   ).split(" "));
   const CHEMISTRY_CANDIDATE = /(?:\{\})?\^\{?\d+\}?[A-Z][A-Za-z0-9_{}^()+\-\\=]*|(?:\d+(?=[A-Z]))?[A-Z][A-Za-z0-9_{}^()+\-\\=]*/g;
   const IGNORED_BARE_MATH_PARENTS = new Set(["CODE", "PRE", "SCRIPT", "STYLE", "TEXTAREA", "A"]);
+  const SUBSCRIPT_CHARS = {
+    "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄",
+    "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+    "+": "₊", "-": "₋", "(": "₍", ")": "₎"
+  };
+  const SUPERSCRIPT_CHARS = {
+    "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+    "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+    "+": "⁺", "-": "⁻", "(": "⁽", ")": "⁾"
+  };
   let markdownParser = null;
+  const loggedNotationFallbacks = new Set();
 
   function unescapeLegacyNewlines(value) {
     return String(value ?? "")
@@ -93,6 +104,25 @@
       .replace(/\{\}/g, "")
       .replace(/\{(\d+)\}/g, "$1")
       .replace(/\s+/g, "");
+  }
+
+  function unicodeScript(value, alphabet) {
+    const text = String(value ?? "");
+    return [...text].every(char => alphabet[char]) ? [...text].map(char => alphabet[char]).join("") : "";
+  }
+
+  function canonicalizeTrailingChemicalCharge(value) {
+    const source = String(value ?? "");
+    if (source.includes("^") || !/[+-]$/.test(source)) return source;
+    const sign = source.slice(-1);
+    const body = source.slice(0, -1);
+    const compact = simplifiedChemistry(body);
+    const parsed = parseChemicalSequence(compact, 0);
+    if (parsed.index !== compact.length || !parsed.elements) return source;
+    if (parsed.elements === 1 && /\d+$/.test(body)) {
+      return body.replace(/(\d+)$/, "^$1") + sign;
+    }
+    return `${body}^${sign}`;
   }
 
   function parseChemicalSequence(text, cursor, stop = "") {
@@ -168,13 +198,13 @@
   }
 
   function mhchemSource(value) {
-    return String(value ?? "")
+    return canonicalizeTrailingChemicalCharge(String(value ?? "")
       .replace(/\\(?:longrightarrow|Longrightarrow|rightarrow)/g, "->")
       .replace(/\\rightleftharpoons/g, "<=>")
       .replace(/\\leftrightarrow/g, "<->")
       .replace(/\\leftarrow/g, "<-")
       .replace(/\\equiv/g, "#")
-      .replace(/\\cdot/g, "*");
+      .replace(/\\cdot/g, "*"));
   }
 
   function normalizeBareChemistryCommands(value) {
@@ -306,8 +336,157 @@
     };
   }
 
+  function escapeMarkup(value) {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function unwrapWholeCommand(value, name) {
+    const source = String(value ?? "").trim();
+    const prefix = `\\${name}{`;
+    if (!source.startsWith(prefix)) return null;
+    const open = prefix.length - 1;
+    const end = skipBalanced(source, open);
+    return end === source.length ? source.slice(open + 1, end - 1) : null;
+  }
+
+  function stripMathDelimiters(value) {
+    const source = String(value ?? "").trim();
+    if (source.startsWith("$$") && source.endsWith("$$") && source.length >= 4) {
+      return source.slice(2, -2).trim();
+    }
+    if (source.startsWith("$") && source.endsWith("$") && source.length >= 2) {
+      return source.slice(1, -1).trim();
+    }
+    if ((source.startsWith("\\(") && source.endsWith("\\)")) ||
+        (source.startsWith("\\[") && source.endsWith("\\]"))) {
+      return source.slice(2, -2).trim();
+    }
+    return source;
+  }
+
+  function replaceSimpleFractions(value) {
+    let text = String(value ?? "");
+    const fraction = /\\(?:dfrac|tfrac|frac)\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g;
+    for (let pass = 0; pass < 8 && fraction.test(text); pass += 1) {
+      fraction.lastIndex = 0;
+      text = text.replace(fraction, (_, top, bottom) => `(${top})/(${bottom})`);
+    }
+    fraction.lastIndex = 0;
+    return text;
+  }
+
+  function replaceExplicitScripts(value) {
+    return String(value ?? "")
+      .replace(/_\{([0-9()+\-]+)\}/g, (match, script) => unicodeScript(script, SUBSCRIPT_CHARS) || match)
+      .replace(/_([0-9])/g, (match, script) => unicodeScript(script, SUBSCRIPT_CHARS) || match)
+      .replace(/\^\{([0-9()+\-]+)\}/g, (match, script) => unicodeScript(script, SUPERSCRIPT_CHARS) || match)
+      .replace(/\^([0-9]+[+-]?|[+-])/g, (match, script) => unicodeScript(script, SUPERSCRIPT_CHARS) || match);
+  }
+
+  function chemistryUnicodeFallback(value) {
+    let text = canonicalizeTrailingChemicalCharge(String(value ?? "").trim())
+      .replace(/\\(?:longrightarrow|Longrightarrow|rightarrow|to)\b/g, "→")
+      .replace(/\\(?:rightleftharpoons|leftrightarrow)\b/g, "⇌")
+      .replace(/\\leftarrow\b/g, "←")
+      .replace(/\\equiv\b/g, "≡")
+      .replace(/\\cdot\b/g, "·")
+      .replace(/->/g, "→")
+      .replace(/<=>|<->/g, "⇌")
+      .replace(/_\{\((aq|s|l|g)\)\}/gi, "($1)")
+      .replace(/_\((aq|s|l|g)\)/gi, "($1)");
+    text = replaceExplicitScripts(text);
+    return text
+      .replace(/([A-Za-z)])(\d+)/g, (_, atom, digits) =>
+        atom + (unicodeScript(digits, SUBSCRIPT_CHARS) || digits))
+      .replace(/\{\}/g, "")
+      .replace(/\{([0-9]+)\}/g, "$1");
+  }
+
+  /*
+   * Presentation-only fallback. Canonical Markdown/TeX remains untouched in
+   * storage; this function only produces readable text after a local renderer
+   * failure. Unknown commands are preserved instead of being fabricated.
+   */
+  function readableNotationFallback(value) {
+    let source = stripMathDelimiters(value);
+    const chemistry = unwrapWholeCommand(source, "ce");
+    if (chemistry != null) return chemistryUnicodeFallback(mhchemSource(chemistry));
+    const units = unwrapWholeCommand(source, "pu");
+    if (units != null) source = units;
+    if (isChemicalCandidate(source)) return chemistryUnicodeFallback(source);
+    let text = replaceSimpleFractions(source)
+      .replace(/\\sqrt\s*\{([^{}]*)\}/g, "√($1)")
+      .replace(/\\left\b|\\right\b/g, "")
+      .replace(/\\(?:longrightarrow|Longrightarrow|rightarrow|to)\b/g, "→")
+      .replace(/\\(?:rightleftharpoons|leftrightarrow)\b/g, "⇌")
+      .replace(/\\leftarrow\b/g, "←")
+      .replace(/\\times\b/g, "×")
+      .replace(/\\cdot\b/g, "·")
+      .replace(/\\pm\b/g, "±")
+      .replace(/\\mp\b/g, "∓")
+      .replace(/\\leq\b/g, "≤")
+      .replace(/\\geq\b/g, "≥")
+      .replace(/\\neq\b/g, "≠")
+      .replace(/\\approx\b/g, "≈")
+      .replace(/\\infty\b/g, "∞")
+      .replace(/\\log\b/g, "log")
+      .replace(/\\ln\b/g, "ln");
+    text = replaceExplicitScripts(text);
+    return text || String(value ?? "");
+  }
+
+  function looksLikeCurrencyPair(content) {
+    return /^\s*\d+(?:[.,]\d{2})?\s+(?:and|or|to)\b/i.test(content);
+  }
+
+  function readableContentFallback(value) {
+    let text = coerceStudyMarkdown(value);
+    text = text
+      .replace(/\$\$([\s\S]*?)\$\$/g, (_, notation) => readableNotationFallback(notation))
+      .replace(/\\\(([\s\S]*?)\\\)/g, (_, notation) => readableNotationFallback(notation))
+      .replace(/\\\[([\s\S]*?)\\\]/g, (_, notation) => readableNotationFallback(notation))
+      .replace(/\$([^$\n]+)\$/g, (match, notation) =>
+        looksLikeCurrencyPair(notation) ? match : readableNotationFallback(notation));
+    return text.replace(/\\(?:ce|pu)\{([^{}\n]*)\}/g, (_, notation) =>
+      readableNotationFallback(notation));
+  }
+
+  function notationFallbackMarkup(source, options = {}) {
+    const tag = options.display ? "div" : "span";
+    const fallback = readableNotationFallback(source);
+    logNotationFallback(
+      unwrapWholeCommand(source, "ce") != null || isChemicalCandidate(source)
+        ? "chemistry" : "math"
+    );
+    return `<${tag} class="study-notation-fallback">${escapeMarkup(fallback)}</${tag}>`;
+  }
+
+  function logNotationFallback(type) {
+    if (loggedNotationFallbacks.has(type)) return;
+    loggedNotationFallbacks.add(type);
+    console.warn("NOTATION_RENDER_FALLBACK", { type });
+  }
+
   function renderKatexMarkup(tex, options = {}) {
     const source = String(tex ?? "").trim();
+    const chemistryFirst = !source.startsWith("\\ce{") &&
+      !source.includes("_") &&
+      isChemicalCandidate(source);
+    if (chemistryFirst) {
+      try {
+        return globalThis.katex.renderToString(
+          `\\ce{${mhchemSource(source)}}`,
+          katexOptions(options)
+        );
+      } catch (_) {
+        // Standard KaTeX or the readable fallback may still handle the source.
+      }
+    }
     try {
       return globalThis.katex.renderToString(source, katexOptions(options));
     } catch (_) {
@@ -315,11 +494,10 @@
         try {
           return globalThis.katex.renderToString(`\\ce{${mhchemSource(source)}}`, katexOptions(options));
         } catch (_) {
-          // Fall through to a non-source placeholder; never expose raw TeX.
+          // Preserve the expression as readable text below.
         }
       }
-      const tag = options.display ? "div" : "span";
-      return `<${tag} class="study-math-error" role="img" aria-label="Notation could not be displayed">Notation unavailable</${tag}>`;
+      return notationFallbackMarkup(source, options);
     }
   }
 
@@ -495,12 +673,11 @@
           globalThis.katex.renderToString(tex, { ...katexOptions(options), throwOnError: true });
         } catch (_) {
           fragment.append(document.createTextNode(text.slice(cursor, start)));
-          const unavailable = document.createElement("span");
-          unavailable.className = "study-math-error";
-          unavailable.setAttribute("role", "img");
-          unavailable.setAttribute("aria-label", "Notation could not be displayed");
-          unavailable.textContent = "Notation unavailable";
-          fragment.append(unavailable);
+          const fallback = document.createElement("span");
+          fallback.className = "study-notation-fallback";
+          fallback.textContent = readableNotationFallback(tex);
+          fragment.append(fallback);
+          logNotationFallback("bare-math");
           cursor = end;
           BARE_MATH_START.lastIndex = end;
           changed = true;
@@ -554,8 +731,8 @@
       const rendered = renderSource(source, options, false);
       wrap.append(...rendered.childNodes);
     } catch (error) {
-      wrap.classList.add("ai-rich-text-error");
-      wrap.textContent = "This response could not be formatted. Please try again.";
+      wrap.classList.add("ai-rich-text-fallback");
+      wrap.textContent = readableContentFallback(source);
       console.error("AI rich-text rendering failed", error);
     }
     return wrap;
@@ -568,8 +745,8 @@
       const rendered = renderSource(source, options, true);
       wrap.append(...rendered.childNodes);
     } catch (error) {
-      wrap.classList.add("ai-rich-text-error");
-      wrap.textContent = String(source ?? "");
+      wrap.classList.add("ai-rich-text-fallback");
+      wrap.textContent = readableContentFallback(source);
       console.error("AI inline rendering failed", error);
     }
     return wrap;
@@ -598,6 +775,8 @@
 
   globalThis.coerceStudyMarkdown = coerceStudyMarkdown;
   globalThis.normalizeChemistryMarkdown = normalizeChemistryMarkdown;
+  globalThis.readableNotationFallback = readableNotationFallback;
+  globalThis.readableContentFallback = readableContentFallback;
   globalThis.renderStudyKatexMarkup = renderKatexMarkup;
   globalThis.renderStudyMarkdown = renderStudyMarkdown;
   globalThis.renderStudyInline = renderStudyInline;

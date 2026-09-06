@@ -271,7 +271,8 @@ class StudyApiTests(unittest.TestCase):
         chemistry = r"Balance $\ce{H2SO4 -> 2H+ + SO4^2-}$."
         parsed_chemistry = parse_practice_problem(json.dumps({"problem": chemistry}))
         self.assertEqual(parsed_chemistry["problem"], chemistry)
-        self.assertIn(r"\ce{SO4^2-}", LATEX_NOTATION_RULES)
+        self.assertIn(r"$SO_4^{2-}$", LATEX_NOTATION_RULES)
+        self.assertIn(r"$2H_2 + O_2 \rightarrow 2H_2O$", LATEX_NOTATION_RULES)
         self.assertIn("Do not use Markdown code fences", LATEX_NOTATION_RULES)
 
         transported = r"## Result\n\nUse $\nabla f \neq 0$.\n\nDone."
@@ -811,6 +812,24 @@ class StudyApiTests(unittest.TestCase):
             parse_practice_problems(
                 '{"problems": [{"problem": "Duplicate"}, {"problem": "Duplicate"}]}'
             )
+
+    def test_practice_parser_never_rejects_problems_for_notation(self):
+        from study.ai import parse_practice_problems
+
+        result = parse_practice_problems(json.dumps({
+            "problems": [
+                {"problem": r"What is the charge of $SO_4^{2-}$?"},
+                {"problem": r"Interpret $\unsupportedcommand{H_2O}$ and malformed $\frac$."},
+            ]
+        }))
+
+        self.assertEqual(len(result["problems"]), 2)
+        self.assertEqual(
+            result["problems"][0]["problem"],
+            r"What is the charge of $SO_4^{2-}$?",
+        )
+        self.assertIn(r"\unsupportedcommand{H_2O}", result["problems"][1]["problem"])
+        self.assertIn(r"\frac", result["problems"][1]["problem"])
 
     def test_study_visual_cache_invalidates_with_editor_revision(self):
         from study.service import (

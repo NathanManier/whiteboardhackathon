@@ -52,14 +52,14 @@ Do not invent labels, equations, or symbols that cannot be seen.
 """
 
 LATEX_NOTATION_RULES = """
-Notation MUST render. Put every mathematical or chemical expression in $...$, $$...$$, \\(...\\), or \\[...\\]. Never leave intended notation as bare LaTeX in prose.
+Prefer widely supported standard LaTeX. Put mathematical or chemical expressions in $...$, $$...$$, \\(...\\), or \\[...\\] when practical, while keeping the surrounding prose outside the delimiters.
 - Square/nth roots: $\\sqrt{x+1}$ or $\\sqrt[n]{x}$. Never write the √ character, sqrt(), or \\sqrt without braces.
 - Fractions: $\\frac{a}{b}$. Never a/b when the problem is algebraic.
 - Exponents/subscripts: $x^{2}$, $a_{n}$. Always use braces for multi-character scripts.
 - Complex numbers: $a+bi$, $re^{i\\theta}$, or $\\mathbb{C}$.
-- Use chemistry-aware mhchem notation inside math delimiters for chemical formulas, ions, reactions, states, hydrates, isotopes, and bonds.
-- Chemistry examples: $\\ce{H2O}$, $\\ce{SO4^2-}$, $\\ce{Ca^2+}$, $\\ce{2H2 + O2 -> 2H2O}$, $\\ce{N2 + 3H2 <=> 2NH3}$, $\\ce{NaCl(aq)}$, $\\ce{CuSO4 * 5H2O}$, and $\\ce{^{14}C}$.
-- In mhchem, formula numbers are subscripts and ionic charges follow ^. Never write ambiguous chemistry such as SO4^2- outside delimiters.
+- For chemistry, prefer standard LaTeX forms such as $H_2O$, $SO_4^{2-}$, $Ca^{2+}$, $2H_2 + O_2 \\rightarrow 2H_2O$, and $N_2 + 3H_2 \\rightleftharpoons 2NH_3$.
+- The confirmed chemistry command $\\ce{...}$ may be used when it makes a complex formula, state, hydrate, isotope, or bond clearer, for example $\\ce{NaCl(aq)}$ or $\\ce{CuSO4 * 5H2O}$.
+- Avoid obscure, custom, or renderer-specific commands. Do not require one exact chemistry syntax when ordinary standard LaTeX is sufficient.
 - For ordinary math use standard LaTeX, for example $pH=-\\log[H^+]$ and $K_a=\\frac{[H^+][A^-]}{[HA]}$.
 - Do not put prose inside math delimiters. Do not use Markdown code fences around notation.
 - JSON transport may escape backslashes, but after JSON parse every command must contain one backslash: $\\sqrt{x}$ and $\\ce{H2O}$, not doubled-backslash text.

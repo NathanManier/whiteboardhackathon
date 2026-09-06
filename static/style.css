@@ -1600,13 +1600,13 @@ dialog::backdrop { background: rgba(10, 19, 31, .54); }
   max-width: 100%;
   vertical-align: baseline;
 }
-.study-math-error {
+.study-notation-fallback {
   font-family: "Times New Roman", serif;
-  font-style: italic;
   overflow-wrap: anywhere;
 }
-.ai-rich-text-error {
-  color: #ffb09f;
+.ai-rich-text-fallback {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .study-user-q, .study-ai-label {
   margin: 0 0 8px;

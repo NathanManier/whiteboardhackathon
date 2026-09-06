@@ -107,6 +107,34 @@ class EditorApiTests(unittest.TestCase):
         )
         self.assertEqual(stale.status_code, 409)
 
+    def test_practice_problem_notation_source_round_trips_unchanged(self):
+        state = self.editor_state()
+        source = r"What is the charge of $SO_4^{2-}$?"
+        state["objects"][1]["text"] = source
+        state["objects"][1]["source_markdown"] = source
+        state["objects"][1]["x"] = -125
+        state["objects"][1]["width"] = 460
+
+        saved_response = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=state
+        )
+        self.assertEqual(
+            saved_response.status_code,
+            200,
+            saved_response.get_data(as_text=True),
+        )
+        saved = saved_response.get_json()["editor"]["objects"][1]
+        self.assertEqual(saved["text"], source)
+        self.assertEqual(saved["source_markdown"], source)
+        self.assertEqual(saved["role"], "ai_practice_problem")
+        self.assertEqual(saved["x"], -125)
+        self.assertEqual(saved["width"], 460)
+
+        loaded = self.client.get(f"/api/boards/{self.board_id}/editor").get_json()
+        reloaded = loaded["editor"]["objects"][1]
+        self.assertEqual(reloaded["source_markdown"], source)
+        self.assertEqual(reloaded["practice_problem_id"], "prob-one")
+
     def test_combined_svg_renders_new_objects_and_eraser_masks(self):
         saved = self.client.put(
             f"/api/boards/{self.board_id}/editor", json=self.editor_state()
