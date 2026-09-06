@@ -56,13 +56,15 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertGreater(x3, x + 700)
         self.assertEqual(y3, 0)
 
-    def test_folder_workspace_places_multiple_boards(self):
+    def test_folder_lists_three_boards_as_independent_scenes(self):
         folder = self.client.post("/api/folders", json={"name": "Physics — Cross Products"}).get_json()["folder"]
         folder_id = folder["id"]
         host_id = "a" * 32
         second_id = "b" * 32
+        third_id = "c" * 32
         self._ready_board(host_id, "Whiteboard 1", folder_id, 800, 600)
         self._ready_board(second_id, "Whiteboard 2", folder_id, 700, 500)
+        self._ready_board(third_id, "Whiteboard 3", folder_id, 640, 480)
         library = board_app.read_library()
         library["boards"][host_id] = {
             "name": "Whiteboard 1",
@@ -76,26 +78,261 @@ class LectureWorkspaceTests(unittest.TestCase):
             "created_at": 2,
             "updated_at": 2,
         }
+        library["boards"][third_id] = {
+            "name": "Whiteboard 3",
+            "folder_id": folder_id,
+            "created_at": 3,
+            "updated_at": 3,
+        }
         board_app.write_library(library)
         host, editor = board_app.ensure_lecture_workspace(board_app.read_library(), folder_id)
         self.assertEqual(host, host_id)
         boards = validate_source_boards(editor["source_boards"])
-        self.assertEqual([item["board_id"] for item in boards], [host_id, second_id])
+        self.assertEqual([item["board_id"] for item in boards], [host_id])
         self.assertEqual(boards[0]["x"], 0)
-        self.assertGreater(boards[1]["x"], boards[0]["width"])
-        self.assertEqual(boards[1]["board_order"], 2)
         data = self.client.get(
             f"/board/{host_id}", headers={"Accept": "application/json"}
         ).get_json()
         self.assertTrue(data["is_lecture"])
         self.assertEqual(data["workspace_board_id"], host_id)
-        self.assertEqual(len(data["lecture_boards"]), 2)
-        self.assertGreater(data["lecture_boards"][1]["x"], data["lecture_boards"][0]["width"])
+        self.assertEqual(data["active_board_id"], host_id)
+        self.assertEqual(len(data["lecture_boards"]), 3)
+        self.assertEqual(data["source_boards"][0]["board_id"], host_id)
         html = self.client.get(f"/board/{second_id}")
-        self.assertEqual(html.status_code, 302)
-        self.assertIn(host_id, html.headers["Location"])
-        raw = self.client.get(f"/board/{second_id}?raw=1")
-        self.assertEqual(raw.status_code, 200)
+        self.assertEqual(html.status_code, 200)
+        self.assertNotIn("Location", html.headers)
+        second = self.client.get(
+            f"/board/{second_id}", headers={"Accept": "application/json"}
+        ).get_json()
+        self.assertEqual(second["active_board_id"], second_id)
+        self.assertEqual(second["workspace_board_id"], second_id)
+        self.assertEqual(second["source_boards"][0]["board_id"], second_id)
+        third = self.client.get(
+            f"/board/{third_id}", headers={"Accept": "application/json"}
+        ).get_json()
+        self.assertEqual(third["active_board_id"], third_id)
+        self.assertEqual(third["source_boards"][0]["board_id"], third_id)
+
+    def test_legacy_merged_host_is_migrated_without_touching_member_scene(self):
+        folder = self.client.post("/api/folders", json={"name": "Isolated Lecture"}).get_json()["folder"]
+        host_id = "a" * 32
+        second_id = "b" * 32
+        host_dir = self._ready_board(host_id, "Whiteboard 1", folder["id"])
+        second_dir = self._ready_board(second_id, "Whiteboard 2", folder["id"])
+        library = board_app.read_library()
+        library["boards"][host_id] = {
+            "name": "Whiteboard 1", "folder_id": folder["id"],
+            "created_at": 1, "updated_at": 1,
+        }
+        library["boards"][second_id] = {
+            "name": "Whiteboard 2", "folder_id": folder["id"],
+            "created_at": 2, "updated_at": 2,
+        }
+        lecture = board_app.folder_by_id(library, folder["id"])
+        lecture["workspace_board_id"] = host_id
+        lecture["board_order"] = [host_id, second_id]
+        board_app.write_library(library)
+        board_app.atomic_json(
+            host_dir / "editor.json",
+            {
+                "schema_version": 4,
+                "revision": 7,
+                "viewport": {"x": 0, "y": 0, "width": 800, "height": 600},
+                "objects": [
+                    {
+                        "id": "host-stroke", "type": "stroke", "color": "#111111",
+                        "width": 4, "opacity": 1, "translation": {"x": 0, "y": 0},
+                        "points": [{"x": 10, "y": 10}, {"x": 20, "y": 20}],
+                    },
+                    {
+                        "id": "member-copy", "type": "stroke", "color": "#222222",
+                        "width": 4, "opacity": 1, "translation": {"x": 900, "y": 0},
+                        "points": [{"x": 10, "y": 10}, {"x": 20, "y": 20}],
+                        "board_id": second_id,
+                    },
+                ],
+                "groups": [],
+                "imported_transforms": {
+                    "ink-host": {"x": 4, "y": 0, "scaleX": 1, "scaleY": 1},
+                    f"{second_id[:8]}_ink-member": {
+                        "x": 9, "y": 0, "scaleX": 1, "scaleY": 1,
+                    },
+                },
+                "source_boards": [
+                    {
+                        "board_id": host_id, "board_order": 1, "x": 0, "y": 0,
+                        "width": 800, "height": 600, "label": "Whiteboard 1",
+                    },
+                    {
+                        "board_id": second_id, "board_order": 2, "x": 900, "y": 0,
+                        "width": 700, "height": 500, "label": "Whiteboard 2",
+                    },
+                ],
+                "merged_board_ids": [second_id],
+            },
+        )
+        board_app.atomic_json(
+            second_dir / "editor.json",
+            {
+                "schema_version": 4,
+                "revision": 3,
+                "viewport": {"x": 0, "y": 0, "width": 700, "height": 500},
+                "objects": [
+                    {
+                        "id": "member-original", "type": "stroke", "color": "#222222",
+                        "width": 4, "opacity": 1, "translation": {"x": 0, "y": 0},
+                        "points": [{"x": 10, "y": 10}, {"x": 20, "y": 20}],
+                    }
+                ],
+                "groups": [], "imported_transforms": {},
+                "source_boards": [], "merged_board_ids": [],
+            },
+        )
+
+        host_editor = self.client.get(f"/api/boards/{host_id}/editor").get_json()["editor"]
+        second_editor = self.client.get(f"/api/boards/{second_id}/editor").get_json()["editor"]
+        self.assertEqual([item["id"] for item in host_editor["objects"]], ["host-stroke"])
+        self.assertEqual(host_editor["objects"][0]["board_id"], host_id)
+        self.assertNotIn(f"{second_id[:8]}_ink-member", host_editor["imported_transforms"])
+        self.assertEqual(host_editor["source_boards"][0]["board_id"], host_id)
+        self.assertEqual(host_editor["merged_board_ids"], [])
+        self.assertEqual([item["id"] for item in second_editor["objects"]], ["member-original"])
+        self.assertEqual(second_editor["objects"][0]["board_id"], second_id)
+
+        persisted_host = json.loads((host_dir / "editor.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["id"] for item in persisted_host["objects"]], ["host-stroke"])
+        host_svg = self.client.get(f"/board/{host_id}/svg").get_data(as_text=True)
+        second_svg = self.client.get(f"/board/{second_id}/svg").get_data(as_text=True)
+        self.assertIn(f"ink-{host_id[:8]}", host_svg)
+        self.assertNotIn(f"ink-{second_id[:8]}", host_svg)
+        self.assertIn(f"ink-{second_id[:8]}", second_svg)
+        self.assertNotIn(f"ink-{host_id[:8]}", second_svg)
+
+    def test_editor_rejects_object_owned_by_another_board(self):
+        board_id = "c" * 32
+        self._ready_board(board_id)
+        response = self.client.put(
+            f"/api/boards/{board_id}/editor",
+            json={
+                "schema_version": 4,
+                "revision": 0,
+                "viewport": {"x": 0, "y": 0, "width": 800, "height": 600},
+                "objects": [{
+                    "id": "foreign-stroke", "type": "stroke", "color": "#111111",
+                    "width": 4, "opacity": 1, "translation": {"x": 0, "y": 0},
+                    "points": [{"x": 1, "y": 1}, {"x": 2, "y": 2}],
+                    "board_id": "d" * 32,
+                }],
+                "groups": [], "imported_transforms": {}, "source_boards": [],
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("different board", response.get_json()["error"])
+
+    def test_study_interactions_are_filtered_to_the_requested_board(self):
+        board_id = "e" * 32
+        foreign_id = "f" * 32
+        board_dir = self._ready_board(board_id)
+        board_app.atomic_json(
+            board_dir / "study.json",
+            {
+                "schema_version": 2,
+                "board_ai_context": None,
+                "interactions": [
+                    {
+                        "id": "1111111111111111",
+                        "board_id": board_id,
+                        "question": "Local",
+                        "title": "Local",
+                        "answer": "Local answer",
+                    },
+                    {
+                        "id": "2222222222222222",
+                        "board_id": foreign_id,
+                        "question": "Foreign",
+                        "title": "Foreign",
+                        "answer": "Foreign answer",
+                    },
+                ],
+            },
+        )
+        payload = self.client.get(f"/api/boards/{board_id}/study").get_json()
+        self.assertEqual(
+            [item["id"] for item in payload["interactions"]],
+            ["1111111111111111"],
+        )
+        self.assertEqual(payload["interactions"][0]["boardId"], board_id)
+        persisted = json.loads((board_dir / "study.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [item["id"] for item in persisted["interactions"]],
+            ["1111111111111111"],
+        )
+
+    def test_strokes_practice_problems_and_camera_round_trip_per_board(self):
+        first_id = "1" * 32
+        second_id = "2" * 32
+        self._ready_board(first_id, "Board A")
+        self._ready_board(second_id, "Board B")
+
+        def scene(board_id, stroke_id, problem_id, camera_x):
+            return {
+                "schema_version": 4,
+                "revision": 0,
+                "viewport": {
+                    "x": camera_x, "y": 5, "width": 800, "height": 600,
+                },
+                "objects": [
+                    {
+                        "id": stroke_id, "type": "stroke", "color": "#111111",
+                        "width": 4, "opacity": 1, "translation": {"x": 0, "y": 0},
+                        "points": [{"x": 10, "y": 10}, {"x": 20, "y": 20}],
+                        "board_id": board_id, "origin": "student",
+                    },
+                    {
+                        "id": problem_id, "type": "text", "text": f"Problem {board_id[0]}",
+                        "x": 40, "y": 40, "width": 200, "height": 40,
+                        "font_size": 24, "color": "#183153",
+                        "translation": {"x": 0, "y": 0},
+                        "role": "ai_practice_problem",
+                        "practice_problem_id": f"prob-{board_id[0]}",
+                        "board_id": board_id, "origin": "ai_practice",
+                    },
+                ],
+                "groups": [],
+                "imported_transforms": {},
+                "source_boards": [],
+            }
+
+        self.assertEqual(
+            self.client.put(
+                f"/api/boards/{first_id}/editor",
+                json=scene(first_id, "stroke-a", "problem-a", 11),
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.put(
+                f"/api/boards/{second_id}/editor",
+                json=scene(second_id, "stroke-b", "problem-b", 222),
+            ).status_code,
+            200,
+        )
+
+        for _ in range(3):
+            first = self.client.get(f"/api/boards/{first_id}/editor").get_json()["editor"]
+            second = self.client.get(f"/api/boards/{second_id}/editor").get_json()["editor"]
+            self.assertEqual(
+                [item["id"] for item in first["objects"]],
+                ["stroke-a", "problem-a"],
+            )
+            self.assertEqual(
+                [item["id"] for item in second["objects"]],
+                ["stroke-b", "problem-b"],
+            )
+            self.assertTrue(all(item["board_id"] == first_id for item in first["objects"]))
+            self.assertTrue(all(item["board_id"] == second_id for item in second["objects"]))
+            self.assertEqual(first["viewport"]["x"], 11)
+            self.assertEqual(second["viewport"]["x"], 222)
 
     def test_explain_does_not_receive_other_folder_lecture_context(self):
         folder_a = self.client.post("/api/folders", json={"name": "Physics Lecture"}).get_json()["folder"]

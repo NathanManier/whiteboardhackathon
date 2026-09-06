@@ -130,7 +130,8 @@
     },
     pendingImportedId: "",
     activeLectureBoardId: boardId,
-    importingBoard: false
+    importingBoard: false,
+    switchingBoard: false
   };
 
   /* Authoritative high-frequency Pencil buffer. Never wait on React/save/render. */
@@ -353,11 +354,14 @@
     const needsMigration = objects.some(object => !object?.id) || (schema > 0 && schema < 2);
     const camera = source.viewport || source.camera;
     state.revision = Math.max(0, Number(source.revision) || 0);
-    state.objects = objects.map(normalizeObject).filter(Boolean);
+    state.objects = objects
+      .map(normalizeObject)
+      .filter(object => object && (!object.boardId || object.boardId === boardId))
+      .map(object => ({ ...object, boardId }));
     state.groups = Array.isArray(source.groups) ? source.groups.map(normalizeGroup).filter(Boolean) : [];
     state.importedTransforms = source.imported_transforms && typeof source.imported_transforms === "object"
       ? source.imported_transforms : {};
-    state.sourceBoards = normalizeSourceBoards(source.source_boards || source.sourceBoards || state.data.source_boards);
+    state.sourceBoards = [activeSceneBoard()];
     state.camera = validCamera(camera) ? {
       x: Number(camera.x), y: Number(camera.y),
       width: Number(camera.width), height: Number(camera.height)
@@ -405,6 +409,23 @@
     }];
   }
 
+  function activeSceneBoard(data = state.data) {
+    const member = lectureBoardsFromData(data).find(item => item.boardId === boardId);
+    return {
+      ...(member || {}),
+      boardId,
+      boardOrder: Number(member?.boardOrder) || 1,
+      x: 0,
+      y: 0,
+      width: state.width,
+      height: state.height,
+      label: member?.label || "Whiteboard",
+      name: member?.name || data.name || data.title || "Whiteboard",
+      svgUrl: professorSvgUrl(boardId),
+      status: member?.status || data.status || "ready"
+    };
+  }
+
   function applyLectureData(data = state.data) {
     state.lecture.folderId = data.folder_id || data.folderId || "";
     state.lecture.folderName = data.folder_name || data.folderName || "";
@@ -412,9 +433,8 @@
     state.lecture.isLecture = Boolean(data.is_lecture || data.isLecture || state.lecture.folderId);
     state.lecture.studyGuide = data.study_guide || data.studyGuide || null;
     state.lecture.stale = Boolean(data.study_guide_stale || data.studyGuideStale || state.lecture.studyGuide?.stale);
-    if (!state.sourceBoards.length) {
-      state.sourceBoards = normalizeSourceBoards(data.source_boards || lectureBoardsFromData(data));
-    }
+    state.activeLectureBoardId = boardId;
+    state.sourceBoards = [activeSceneBoard(data)];
     const kicker = $("#lecture-kicker");
     if (kicker) {
       kicker.textContent = state.lecture.isLecture ? "Lecture workspace" : "Study canvas";
@@ -747,15 +767,11 @@
   async function loadImportedSVG() {
     const layer = $("#imported-layer");
     layer.replaceChildren();
-    const boards = lectureBoardsFromData();
-    if (!state.sourceBoards.length) {
-      state.sourceBoards = boards.map(item => ({
-        boardId: item.boardId, boardOrder: item.boardOrder, x: item.x, y: item.y,
-        width: item.width, height: item.height, label: item.label
-      }));
-    }
+    const boards = [activeSceneBoard()];
+    state.sourceBoards = boards;
     state.importedMap = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
     const objects = [];
+    editorLog("BOARD LOAD START", { board: boardId });
     for (const board of boards) {
       const markup = await fetchBoardSvg(board);
       if (!markup) continue;
@@ -768,6 +784,11 @@
     rebuildSpatialIndex();
     buildImportedDisplay();
     prepareDerivedGeometry();
+    editorLog("BOARD SCENE APPLY", {
+      board: boardId,
+      imported: state.importedObjects.length,
+      user: state.objects.length
+    });
   }
 
   function renderBoardPapers(boards = lectureBoardsFromData()) {
@@ -1164,7 +1185,7 @@
           practice_problem_id: object.practiceProblemId || undefined,
           source_study_interaction_id: object.sourceStudyInteractionId || undefined,
           generated_at: object.generatedAt || undefined,
-          board_id: object.boardId || undefined,
+          board_id: boardId,
           origin: object.origin || undefined,
           folder_id: object.folderId || state.lecture.folderId || undefined,
           created_at: object.createdAt || undefined,
@@ -1178,7 +1199,7 @@
           width: object.width || 0, opacity: object.opacity,
           translation: { x: object.tx || 0, y: object.ty || 0 },
           scaleX: object.sx || 1, scaleY: object.sy || 1,
-          board_id: object.boardId || undefined,
+          board_id: boardId,
           origin: object.origin || "student",
           folder_id: object.folderId || state.lecture.folderId || undefined,
           created_at: object.createdAt || undefined
@@ -1192,7 +1213,7 @@
         erasures: (object.erasures || []).map(erasure => ({
           points: erasure.points, width: erasure.width
         })),
-        board_id: object.boardId || undefined,
+        board_id: boardId,
         origin: object.origin || "student",
         folder_id: object.folderId || state.lecture.folderId || undefined,
         created_at: object.createdAt || undefined
@@ -1208,12 +1229,12 @@
         [object.id, { x: object.tx || 0, y: object.ty || 0,
           scaleX: object.sx || 1, scaleY: object.sy || 1,
           deleted: Boolean(object.deleted) }])),
-      source_boards: (state.sourceBoards.length ? state.sourceBoards : lectureBoardsFromData()).map(item => ({
-        board_id: item.boardId,
-        board_order: item.boardOrder,
-        x: item.x, y: item.y, width: item.width, height: item.height,
-        label: item.label
-      }))
+      source_boards: [{
+        board_id: boardId,
+        board_order: 1,
+        x: 0, y: 0, width: state.width, height: state.height,
+        label: activeSceneBoard().label
+      }]
     };
   }
 
@@ -1780,7 +1801,12 @@
   }
 
   function allObjects() {
-    return [...state.objects, ...state.importedObjects.filter(object => !object.deleted)];
+    return [
+      ...state.objects.filter(object => !object.boardId || object.boardId === boardId),
+      ...state.importedObjects.filter(object =>
+        !object.deleted && (!object.boardId || object.boardId === boardId)
+      )
+    ];
   }
 
   function findObject(id) {
@@ -3538,6 +3564,7 @@
       color: interaction.color, width: committedWidth,
       opacity: interaction.opacity, tx: 0, ty: 0, sx: 1, sy: 1, erasures: [],
       ink: interaction.ink || interaction.tool || "pen",
+      boardId,
       origin: "student",
       folderId: state.lecture.folderId || "",
       createdAt: Date.now() / 1000
@@ -5520,6 +5547,7 @@
         practiceProblemId: metaProblems[index]?.id || uid("prob").slice(0, 20),
         sourceStudyInteractionId: interaction?.id || "",
         generatedAt: Date.now() / 1000,
+        boardId,
         origin: "ai_practice",
         folderId: state.lecture.folderId || "",
         createdAt: Date.now() / 1000
@@ -5830,28 +5858,36 @@
     }
   }
 
-  function viewBoard(boardIdToView) {
+  async function viewBoard(boardIdToView) {
     const board = lectureBoardsFromData().find(item => item.boardId === boardIdToView)
       || state.sourceBoards.find(item => item.boardId === boardIdToView);
-    if (!board) return;
-    state.activeLectureBoardId = board.boardId;
-    const rect = sceneRect();
-    const aspect = sceneAspect(rect);
-    const pad = Math.max(board.width, board.height) * 0.08;
-    let width = board.width + pad * 2;
-    let height = width / aspect;
-    if (height < board.height + pad * 2) {
-      height = board.height + pad * 2;
-      width = height * aspect;
+    if (!board || board.boardId === boardId || state.switchingBoard) return;
+    state.switchingBoard = true;
+    editorLog("BOARD SWITCH", { from: boardId, to: board.boardId });
+    try {
+      closeTextEditor(true);
+      await flushEditorSave();
+      if (state.dirty) {
+        toast("Save this board before switching.", true);
+        state.switchingBoard = false;
+        return;
+      }
+      cancelTransientInteraction("board-switch");
+      state.selected.clear();
+      state.history = [];
+      state.future = [];
+      state.clipboard = null;
+      state.studyRequestToken += 1;
+      state.pendingStudyId = null;
+      state.activeStudyId = null;
+      state.interaction = null;
+      state.pointers.clear();
+      state.activePointerIds.clear();
+      location.assign(`/board/${encodeURIComponent(board.boardId)}`);
+    } catch (error) {
+      state.switchingBoard = false;
+      toast(error.message || "Could not switch boards.", true);
     }
-    state.camera = {
-      x: board.x + board.width / 2 - width / 2,
-      y: board.y + board.height / 2 - height / 2,
-      width,
-      height
-    };
-    applyCamera();
-    syncLectureNavigation();
   }
 
   function syncLectureNavigation() {
@@ -5862,9 +5898,9 @@
       .sort((left, right) => left.boardOrder - right.boardOrder);
     nav.hidden = !state.lecture.isLecture || !boards.length;
     if (nav.hidden) return;
-    let index = boards.findIndex(board => board.boardId === state.activeLectureBoardId);
+    let index = boards.findIndex(board => board.boardId === boardId);
     if (index < 0) index = 0;
-    state.activeLectureBoardId = boards[index].boardId;
+    state.activeLectureBoardId = boardId;
     const label = boards[index].label || `Whiteboard ${index + 1}`;
     $("#board-position").textContent = `${label} · ${index + 1} of ${boards.length}`;
     $("#previous-board").disabled = index === 0;
@@ -5912,7 +5948,7 @@
     const folderField = $("#import-folder-id");
     const workspaceField = $("#import-workspace-id");
     if (folderField) folderField.value = state.lecture.folderId || "";
-    if (workspaceField) workspaceField.value = state.lecture.workspaceId || boardId;
+    if (workspaceField) workspaceField.value = boardId;
     syncLectureNavigation();
     dialog?.showModal();
   }
@@ -5979,12 +6015,12 @@
     $("#take-board-photo")?.addEventListener("click", () => chooseFile(camera));
     $("#previous-board")?.addEventListener("click", () => {
       const boards = lectureBoardsFromData().sort((left, right) => left.boardOrder - right.boardOrder);
-      const index = boards.findIndex(board => board.boardId === state.activeLectureBoardId);
+      const index = boards.findIndex(board => board.boardId === boardId);
       if (index > 0) viewBoard(boards[index - 1].boardId);
     });
     $("#next-board")?.addEventListener("click", () => {
       const boards = lectureBoardsFromData().sort((left, right) => left.boardOrder - right.boardOrder);
-      const index = boards.findIndex(board => board.boardId === state.activeLectureBoardId);
+      const index = boards.findIndex(board => board.boardId === boardId);
       if (index >= 0 && index < boards.length - 1) viewBoard(boards[index + 1].boardId);
     });
     syncLectureNavigation();
@@ -6628,9 +6664,8 @@
     renderScene();
     refreshSceneRect();
     const imported = new URLSearchParams(location.search).get("imported");
-    if (imported) {
+    if (imported && imported !== boardId) {
       state.pendingImportedId = imported;
-      state.activeLectureBoardId = imported;
       viewBoard(imported);
       const chip = $("#view-new-board");
       if (chip) chip.hidden = true;

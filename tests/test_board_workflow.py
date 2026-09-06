@@ -203,6 +203,7 @@ class BoardWorkflowTests(unittest.TestCase):
         folder_entry["workspace_board_id"] = host_id
         folder_entry["board_order"] = [host_id]
         board_app.write_library(library)
+        host_before = self.client.get(f"/api/boards/{host_id}/editor").get_json()["editor"]
 
         with patch("app.detect_corners", return_value=(self.corners, 0.0)):
             created = self.upload(
@@ -222,16 +223,26 @@ class BoardWorkflowTests(unittest.TestCase):
             )
         self.assertEqual(finished.status_code, 200, finished.get_data(as_text=True))
         payload = finished.get_json()
-        self.assertEqual(payload["workspace_id"], host_id)
-        self.assertIn(f"imported={new_id}", payload["url"])
+        self.assertEqual(payload["workspace_id"], new_id)
+        self.assertEqual(payload["url"], f"/board/{new_id}")
         refreshed = self.client.get("/api/library").get_json()
         refreshed_folder = next(item for item in refreshed["folders"] if item["id"] == folder["id"])
         self.assertEqual(refreshed_folder["board_order"], [host_id, new_id])
         host_editor = self.client.get(f"/api/boards/{host_id}/editor").get_json()["editor"]
         self.assertEqual(
             [item["board_id"] for item in host_editor["source_boards"]],
-            [host_id, new_id],
+            [host_id],
         )
+        self.assertEqual(host_editor, host_before)
+        new_editor = self.client.get(f"/api/boards/{new_id}/editor").get_json()["editor"]
+        self.assertEqual(
+            [item["board_id"] for item in new_editor["source_boards"]],
+            [new_id],
+        )
+        listing = self.client.get("/api/library").get_json()
+        listed = {item["id"]: item for item in listing["boards"]}
+        self.assertEqual(listed[host_id]["url"], f"/board/{host_id}")
+        self.assertEqual(listed[new_id]["url"], f"/board/{new_id}")
 
     def test_board_frontend_uses_only_the_canonical_corner_route_and_separate_pickers(self):
         source = (Path(__file__).parents[1] / "static" / "board.js").read_text(encoding="utf-8")
@@ -246,6 +257,16 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertIn('capture="environment"', template)
         self.assertIn('id="import-image"', template)
         self.assertNotIn("?_method=PUT", source)
+
+    def test_board_frontend_switches_routes_and_mounts_only_the_active_scene(self):
+        source = (Path(__file__).parents[1] / "static" / "board.js").read_text(encoding="utf-8")
+        self.assertIn("const boards = [activeSceneBoard()];", source)
+        self.assertIn("location.assign(`/board/${encodeURIComponent(board.boardId)}`)", source)
+        self.assertIn("await flushEditorSave()", source)
+        self.assertIn("cancelTransientInteraction(\"board-switch\")", source)
+        self.assertIn("state.selected.clear()", source)
+        self.assertIn("board_id: boardId", source)
+        self.assertNotIn("for (const board of lectureBoardsFromData())", source)
 
     def test_board_management_route_methods_match_frontend_contract(self):
         tracked = {

@@ -77,9 +77,20 @@ def read_study_state(board_dir: Path) -> dict[str, Any]:
     interactions = value.get("interactions")
     if not isinstance(interactions, list):
         interactions = []
+    owned_interactions = []
+    for item in interactions:
+        if not isinstance(item, dict):
+            continue
+        owner = item.get("board_id") or item.get("boardId")
+        if isinstance(owner, str) and owner and owner != board_dir.name:
+            continue
+        owned = dict(item)
+        owned.pop("boardId", None)
+        owned["board_id"] = board_dir.name
+        owned_interactions.append(owned)
     return {
         "schema_version": 2,
-        "interactions": interactions[:MAX_INTERACTIONS],
+        "interactions": owned_interactions[:MAX_INTERACTIONS],
         "board_ai_context": stored_board_context(value.get("board_ai_context")),
     }
 
@@ -88,12 +99,23 @@ def write_study_state(board_dir: Path, value: dict[str, Any], atomic_json) -> No
     interactions = value.get("interactions") if isinstance(value, dict) else []
     if not isinstance(interactions, list):
         interactions = []
+    owned_interactions = []
+    for item in interactions:
+        if not isinstance(item, dict):
+            continue
+        owner = item.get("board_id") or item.get("boardId")
+        if isinstance(owner, str) and owner and owner != board_dir.name:
+            continue
+        owned = dict(item)
+        owned.pop("boardId", None)
+        owned["board_id"] = board_dir.name
+        owned_interactions.append(owned)
     context = value.get("board_ai_context") if isinstance(value, dict) else None
     atomic_json(
         study_path(board_dir),
         {
             "schema_version": 2,
-            "interactions": interactions[:MAX_INTERACTIONS],
+            "interactions": owned_interactions[:MAX_INTERACTIONS],
             "board_ai_context": stored_board_context(context),
         },
     )

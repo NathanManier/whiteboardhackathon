@@ -43,20 +43,15 @@ except ImportError:  # pragma: no cover - production and supported dev platforms
     fcntl = None
 
 from lecture import (
-    attach_source_board,
-    compose_imported_id,
     default_source_board,
     folder_board_ids,
     folder_by_id,
-    imported_id_prefix,
     lecture_member_payload,
     mark_study_guide_stale,
     normalize_folder,
     public_lecture_context,
     public_study_guide,
     sync_folder_board_order,
-    translate_editor_objects,
-    uniquify_object_id,
     validate_source_boards,
 )
 
@@ -442,8 +437,10 @@ def default_editor_state(metadata: dict[str, Any]) -> dict[str, Any]:
                 "points": stroke["points"],
                 "translation": {"x": 0, "y": 0},
                 "erasures": [],
+                "board_id": metadata.get("id"),
             }
         )
+    board_id = str(metadata.get("id") or "")
     return {
         "schema_version": 4,
         "revision": 0,
@@ -452,12 +449,87 @@ def default_editor_state(metadata: dict[str, Any]) -> dict[str, Any]:
         "objects": objects,
         "groups": [],
         "imported_transforms": {},
-        "source_boards": [],
+        "source_boards": (
+            [default_source_board(board_id, metadata)]
+            if BOARD_ID_RE.fullmatch(board_id)
+            else []
+        ),
         "merged_board_ids": [],
     }
 
 
-def read_editor_state(board_dir: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+def isolate_editor_state(
+    board_dir: Path,
+    metadata: dict[str, Any],
+    value: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Return one board-owned scene, removing legacy lecture-host contamination."""
+    board_id = board_dir.name
+    isolated = deepcopy(value)
+    try:
+        previous_sources = validate_source_boards(isolated.get("source_boards"))
+    except ValueError:
+        previous_sources = []
+    foreign_ids = {
+        item["board_id"]
+        for item in previous_sources
+        if item["board_id"] != board_id
+    }
+    foreign_ids.update(
+        item
+        for item in clean_merged_board_ids(isolated.get("merged_board_ids"))
+        if item != board_id
+    )
+
+    objects = []
+    foreign_object_ids: set[str] = set()
+    for item in isolated.get("objects") or []:
+        if not isinstance(item, dict):
+            continue
+        owner = item.get("board_id") or item.get("boardId")
+        if isinstance(owner, str) and owner and owner != board_id:
+            if isinstance(item.get("id"), str):
+                foreign_object_ids.add(item["id"])
+            continue
+        owned = dict(item)
+        owned.pop("boardId", None)
+        owned["board_id"] = board_id
+        objects.append(owned)
+    isolated["objects"] = objects
+
+    foreign_prefixes = tuple(f"{item[:8]}_" for item in sorted(foreign_ids))
+    groups = [
+        group
+        for group in (isolated.get("groups") or [])
+        if isinstance(group, dict)
+        and isinstance(group.get("children"), list)
+        and not any(
+            child in foreign_object_ids
+            or (foreign_prefixes and str(child).startswith(foreign_prefixes))
+            for child in group["children"]
+        )
+    ]
+    isolated["groups"] = groups
+
+    transforms = isolated.get("imported_transforms")
+    if not isinstance(transforms, dict):
+        transforms = {}
+    isolated["imported_transforms"] = {
+        object_id: transform
+        for object_id, transform in transforms.items()
+        if not foreign_prefixes or not str(object_id).startswith(foreign_prefixes)
+    }
+    isolated["source_boards"] = [default_source_board(board_id, metadata)]
+    isolated["merged_board_ids"] = []
+    return isolated, isolated != value
+
+
+def read_editor_state(
+    board_dir: Path,
+    metadata: dict[str, Any],
+    *,
+    persist_isolation: bool = False,
+) -> dict[str, Any]:
     try:
         value = json.loads(editor_path(board_dir).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -466,10 +538,18 @@ def read_editor_state(board_dir: Path, metadata: dict[str, Any]) -> dict[str, An
         abort(500, description="Editable board state is unavailable.")
     if not isinstance(value, dict):
         abort(500, description="Editable board state is invalid.")
-    return value
+    isolated, changed = isolate_editor_state(board_dir, metadata, value)
+    if persist_isolation and changed:
+        atomic_json(editor_path(board_dir), isolated)
+        LOGGER.info(
+            "BOARD ISOLATION MIGRATED board=%s objects=%d",
+            board_dir.name,
+            len(isolated.get("objects") or []),
+        )
+    return isolated
 
 
-def validate_editor_state(value: Any) -> dict[str, Any]:
+def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[str, Any]:
     """Validate the scene while allowing objects beyond the immutable master bounds."""
     if not isinstance(value, dict):
         raise ValueError("Editor state must be an object.")
@@ -695,6 +775,14 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
             }
         attach_object_source_fields(clean_stroke, item)
         clean_objects.append(clean_stroke)
+    if board_id is not None:
+        if not BOARD_ID_RE.fullmatch(board_id):
+            raise ValueError("The editor board id is invalid.")
+        for index, item in enumerate(clean_objects):
+            owner = item.get("board_id")
+            if owner and owner != board_id:
+                raise ValueError(f"Object {index} belongs to a different board.")
+            item["board_id"] = board_id
     groups = value.get("groups", [])
     if not isinstance(groups, list) or len(groups) > MAX_EDITOR_OBJECTS:
         raise ValueError(f"groups must contain at most {MAX_EDITOR_OBJECTS} items.")
@@ -772,8 +860,16 @@ def validate_editor_state(value: Any) -> dict[str, Any]:
         "objects": clean_objects,
         "groups": clean_groups,
         "imported_transforms": clean_imported_transforms,
-        "source_boards": validate_source_boards(value.get("source_boards")),
-        "merged_board_ids": clean_merged_board_ids(value.get("merged_board_ids")),
+        "source_boards": (
+            validate_source_boards(value.get("source_boards"))
+            if board_id is None
+            else []
+        ),
+        "merged_board_ids": (
+            clean_merged_board_ids(value.get("merged_board_ids"))
+            if board_id is None
+            else []
+        ),
     }
 
 
@@ -1515,17 +1611,9 @@ def lecture_payload_for_board(
     folder = folder_by_id(library, folder_id)
     if folder is None:
         return {}
-    host_id, editor = ensure_lecture_workspace(library, folder_id)
-    folder = folder_by_id(library, folder_id) or folder
-    placements = []
-    if isinstance(editor, dict):
-        try:
-            placements = validate_source_boards(editor.get("source_boards"))
-        except ValueError:
-            placements = []
-    by_id = {item["board_id"]: item for item in placements}
+    ordered_ids = folder_board_ids(library, folder_id)
     members = []
-    for member_id in folder_board_ids(library, folder_id):
+    for index, member_id in enumerate(ordered_ids, start=1):
         member_dir = BOARDS_DIR / member_id
         if not member_dir.is_dir():
             continue
@@ -1544,12 +1632,15 @@ def lecture_payload_for_board(
             svg_url = url_for("board_file", board_id=member_id, asset=svg_name)
         else:
             svg_url = url_for("board_svg", board_id=member_id)
+        placement = default_source_board(member_id, member_meta)
+        placement["board_order"] = index
+        placement["label"] = f"Whiteboard {index}"
         members.append(
             lecture_member_payload(
                 board_id=member_id,
                 metadata=member_meta,
                 catalog=member_catalog if isinstance(member_catalog, dict) else None,
-                placement=by_id.get(member_id),
+                placement=placement,
                 svg_url=svg_url,
                 master_url=master_url,
             )
@@ -1558,11 +1649,13 @@ def lecture_payload_for_board(
     return {
         "folder_id": folder_id,
         "folder_name": folder.get("name"),
-        "workspace_board_id": host_id or folder.get("workspace_board_id") or board_id,
+        "workspace_board_id": board_id,
+        "lecture_workspace_board_id": folder.get("workspace_board_id") or ordered_ids[0],
+        "active_board_id": board_id,
         "is_lecture": True,
-        "is_workspace": board_id == (host_id or folder.get("workspace_board_id") or board_id),
+        "is_workspace": True,
         "lecture_boards": members,
-        "source_boards": placements,
+        "source_boards": [default_source_board(board_id, metadata)],
         "lecture_context": public_lecture_context(folder.get("lecture_context")),
         "study_guide": guide,
         "study_guide_stale": bool(guide and guide.get("stale")),
@@ -1570,7 +1663,9 @@ def lecture_payload_for_board(
 
 
 def write_editor_state(board_dir: Path, editor: dict[str, Any]) -> dict[str, Any]:
-    clean = validate_editor_state(editor)
+    clean = validate_editor_state(editor, board_id=board_dir.name)
+    clean["source_boards"] = [default_source_board(board_dir.name, read_metadata(board_dir))]
+    clean["merged_board_ids"] = []
     current = {}
     try:
         current = json.loads(editor_path(board_dir).read_text(encoding="utf-8"))
@@ -1584,109 +1679,13 @@ def write_editor_state(board_dir: Path, editor: dict[str, Any]) -> dict[str, Any
     return clean
 
 
-def merge_member_into_host(
-    host_editor: dict[str, Any],
-    member_editor: dict[str, Any],
-    placement: dict[str, Any],
-    member_id: str,
-) -> None:
-    dx = float(placement.get("x") or 0)
-    dy = float(placement.get("y") or 0)
-    seen = {
-        str(item.get("id"))
-        for item in (host_editor.get("objects") or [])
-        if isinstance(item, dict) and item.get("id")
-    }
-    prefix = imported_id_prefix(member_id, None) or f"{member_id[:8]}_"
-    incoming = translate_editor_objects(
-        [item for item in (member_editor.get("objects") or []) if isinstance(item, dict)],
-        dx,
-        dy,
-    )
-    for item in incoming:
-        original = str(item.get("id") or "")
-        if not original:
-            continue
-        next_id = uniquify_object_id(original, seen, prefix)
-        item["id"] = next_id
-        item["board_id"] = member_id
-        if not item.get("origin"):
-            item["origin"] = "student"
-        seen.add(next_id)
-        host_editor.setdefault("objects", []).append(item)
-    host_transforms = host_editor.get("imported_transforms")
-    if not isinstance(host_transforms, dict):
-        host_transforms = {}
-        host_editor["imported_transforms"] = host_transforms
-    member_transforms = member_editor.get("imported_transforms")
-    if not isinstance(member_transforms, dict):
-        member_transforms = {}
-    for object_id, transform in member_transforms.items():
-        if not isinstance(object_id, str) or not isinstance(transform, dict):
-            continue
-        prefixed = compose_imported_id(member_id, object_id, "host")
-        host_transforms[prefixed] = {
-            "x": float(transform.get("x") or 0),
-            "y": float(transform.get("y") or 0),
-            "scaleX": float(transform.get("scaleX") or 1),
-            "scaleY": float(transform.get("scaleY") or 1),
-            "deleted": bool(transform.get("deleted")),
-        }
-    host_editor.setdefault("merged_board_ids", [])
-    if member_id not in host_editor["merged_board_ids"]:
-        host_editor["merged_board_ids"].append(member_id)
-
-
-def merge_member_study(host_dir: Path, member_dir: Path, placement: dict[str, Any]) -> None:
-    from study.storage import read_study_state, write_study_state
-
-    host_state = read_study_state(host_dir)
-    member_state = read_study_state(member_dir)
-    existing = {
-        str(item.get("id"))
-        for item in host_state.get("interactions") or []
-        if isinstance(item, dict) and item.get("id")
-    }
-    dx = float(placement.get("x") or 0)
-    dy = float(placement.get("y") or 0)
-    added = []
-    for item in member_state.get("interactions") or []:
-        if not isinstance(item, dict) or not item.get("id") or item["id"] in existing:
-            continue
-        copy = dict(item)
-        bbox = copy.get("selection_bbox")
-        if isinstance(bbox, dict):
-            try:
-                copy["selection_bbox"] = {
-                    **bbox,
-                    "x": float(bbox.get("x") or 0) + dx,
-                    "y": float(bbox.get("y") or 0) + dy,
-                }
-            except (TypeError, ValueError):
-                pass
-        if copy.get("anchor_x") is not None:
-            try:
-                copy["anchor_x"] = float(copy["anchor_x"]) + dx
-            except (TypeError, ValueError):
-                pass
-        if copy.get("anchor_y") is not None:
-            try:
-                copy["anchor_y"] = float(copy["anchor_y"]) + dy
-            except (TypeError, ValueError):
-                pass
-        added.append(copy)
-        existing.add(str(copy["id"]))
-    if added:
-        host_state["interactions"] = [*added, *(host_state.get("interactions") or [])]
-        write_study_state(host_dir, host_state, atomic_json)
-
-
 def ensure_lecture_workspace(
     library: dict[str, Any],
     folder_id: str,
     *,
     persist: bool = True,
 ) -> tuple[str | None, dict[str, Any] | None]:
+    """Keep lecture ordering metadata without combining member board scenes."""
     ordered = sync_folder_board_order(library, folder_id)
     folder = folder_by_id(library, folder_id)
     if folder is None or not ordered:
@@ -1701,71 +1700,16 @@ def ensure_lecture_workspace(
         host_meta = read_metadata(host_dir)
     except Exception:
         return host_id, None
-    if str((host_meta.get("pipeline") or {}).get("status")) != "ready":
-        return host_id, None
-    editor = read_editor_state(host_dir, host_meta)
-    try:
-        boards = validate_source_boards(editor.get("source_boards"))
-    except ValueError:
-        boards = []
-    known = {item["board_id"] for item in boards}
-    changed = False
-    if host_id not in known:
-        boards = [default_source_board(host_id, host_meta), *boards]
-        known.add(host_id)
-        changed = True
-    merged = set(editor.get("merged_board_ids") or [])
-    for member_id in ordered:
-        if member_id == host_id:
-            continue
-        member_dir = BOARDS_DIR / member_id
-        if not member_dir.is_dir():
-            continue
-        try:
-            member_meta = read_metadata(member_dir)
-        except Exception:
-            continue
-        if str((member_meta.get("pipeline") or {}).get("status")) != "ready":
-            continue
-        if member_id not in known:
-            editor = attach_source_board(
-                host_editor={**editor, "source_boards": boards},
-                host_id=host_id,
-                new_board_id=member_id,
-                new_metadata=member_meta,
-                host_metadata=host_meta,
-            )
-            boards = editor["source_boards"]
-            known.add(member_id)
-            changed = True
-            mark_study_guide_stale(folder)
-            folder["lecture_context"] = None
-        if member_id not in merged:
-            member_editor = read_editor_state(member_dir, member_meta)
-            placement = next((item for item in boards if item["board_id"] == member_id), None)
-            if placement:
-                merge_member_into_host(editor, member_editor, placement, member_id)
-                try:
-                    merge_member_study(host_dir, member_dir, placement)
-                except Exception:
-                    LOGGER.info("STUDY MERGE SKIPPED member=%s", member_id)
-                merged.add(member_id)
-                editor["merged_board_ids"] = list(merged)
-                changed = True
-    editor["source_boards"] = boards
     folder["workspace_board_id"] = host_id
     folder["board_order"] = ordered
-    if persist and changed:
-        try:
-            write_editor_state(host_dir, editor)
-        except ValueError:
-            LOGGER.exception("LECTURE WORKSPACE SAVE FAILED host=%s", host_id)
+    if persist:
         write_library(library)
-    return host_id, editor
+    return host_id, read_editor_state(host_dir, host_meta, persist_isolation=persist)
 
 
 @locked_board_operation
 def attach_imported_board(workspace_id: str, new_board_id: str) -> str:
+    """Associate a new board with the lecture; never copy either board's scene."""
     if workspace_id == new_board_id:
         return workspace_id
     workspace_dir = require_board_id(workspace_id)
@@ -1775,18 +1719,6 @@ def attach_imported_board(workspace_id: str, new_board_id: str) -> str:
     library = read_library()
     catalog = library["boards"].get(workspace_id)
     folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else workspace_meta.get("folder_id")
-    editor = read_editor_state(workspace_dir, workspace_meta)
-    editor = attach_source_board(
-        host_editor=editor,
-        host_id=workspace_id,
-        new_board_id=new_board_id,
-        new_metadata=new_meta,
-        host_metadata=workspace_meta,
-    )
-    merged = set(editor.get("merged_board_ids") or [])
-    merged.add(new_board_id)
-    editor["merged_board_ids"] = list(merged)
-    write_editor_state(workspace_dir, editor)
     if isinstance(folder_id, str) and folder_id in folder_ids(library):
         new_entry = library["boards"].get(new_board_id)
         if isinstance(new_entry, dict):
@@ -1799,14 +1731,7 @@ def attach_imported_board(workspace_id: str, new_board_id: str) -> str:
             mark_study_guide_stale(folder)
             folder["lecture_context"] = None
         write_library(library)
-    return workspace_id
-
-
-def workspace_redirect_url(workspace_id: str, imported_id: str | None = None) -> str:
-    url = url_for("board", board_id=workspace_id)
-    if imported_id:
-        return f"{url}?imported={imported_id}"
-    return url
+    return new_board_id
 
 
 def validate_user_strokes(value: Any, width: int, height: int) -> list[dict[str, Any]]:
@@ -1946,41 +1871,13 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
     imported_transforms = editor.get("imported_transforms", {})
     if not isinstance(imported_transforms, dict):
         imported_transforms = {}
-    host_id = str(metadata.get("id") or board_dir.name)
-    source_boards = []
-    try:
-        source_boards = validate_source_boards(editor.get("source_boards"))
-    except ValueError:
-        source_boards = []
-    if source_boards:
-        for placement in source_boards:
-            member_id = placement["board_id"]
-            member_dir = BOARDS_DIR / member_id if BOARD_ID_RE.fullmatch(member_id) else None
-            if member_dir is None or not member_dir.is_dir():
-                continue
-            try:
-                member_meta = read_metadata(member_dir) if member_id != host_id else metadata
-            except Exception:
-                continue
-            prefix = imported_id_prefix(member_id, host_id)
-            append_professor_svg(
-                professor,
-                board_dir=member_dir,
-                metadata=member_meta,
-                imported_transforms=imported_transforms,
-                origin_x=float(placement.get("x") or 0),
-                origin_y=float(placement.get("y") or 0),
-                id_prefix=prefix,
-                namespace=namespace,
-            )
-    else:
-        append_professor_svg(
-            professor,
-            board_dir=board_dir,
-            metadata=metadata,
-            imported_transforms=imported_transforms,
-            namespace=namespace,
-        )
+    append_professor_svg(
+        professor,
+        board_dir=board_dir,
+        metadata=metadata,
+        imported_transforms=imported_transforms,
+        namespace=namespace,
+    )
     user = ET.SubElement(root, f"{{{namespace}}}g", {"id": "user-ink"})
     objects = editor.get("objects", [])
     if not objects:
@@ -2134,21 +2031,8 @@ def upload_failure(message: str, status: int) -> tuple[str, int] | tuple[Respons
 
 
 def board_destination(board_id: str, metadata: dict[str, Any]) -> tuple[str, str]:
-    workspace_id = metadata.get("workspace_board_id")
-    redirect_id = board_id
-    imported_id = None
-    if (
-        isinstance(workspace_id, str)
-        and BOARD_ID_RE.fullmatch(workspace_id)
-        and workspace_id != board_id
-    ):
-        try:
-            attach_imported_board(workspace_id, board_id)
-            redirect_id = workspace_id
-            imported_id = board_id
-        except Exception:
-            LOGGER.exception("LECTURE ATTACH FAILED workspace=%s board=%s", workspace_id, board_id)
-    return redirect_id, workspace_redirect_url(redirect_id, imported_id)
+    # The lecture is metadata only. A completed import opens its own scene.
+    return board_id, url_for("board", board_id=board_id)
 
 
 def upload_success(
@@ -2390,15 +2274,6 @@ def board(board_id: str) -> str | Response:
     metadata = read_metadata(board_dir)
     accepts = request.accept_mimetypes
     wants_json = accepts["application/json"] > accepts["text/html"]
-    status = str((metadata.get("pipeline") or {}).get("status") or "")
-    if not wants_json and status == "ready" and request.args.get("raw") != "1":
-        library = read_library()
-        catalog = library["boards"].get(board_id)
-        folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
-        if isinstance(folder_id, str) and folder_id in folder_ids(library):
-            host_id, _ = ensure_lecture_workspace(library, folder_id)
-            if host_id and host_id != board_id:
-                return redirect(url_for("board", board_id=host_id))
     board_data = frontend_board_data(board_id, metadata)
     if wants_json:
         return jsonify(board_data)
@@ -2497,8 +2372,13 @@ def save_board(board_id: str) -> Response | tuple[Response, int]:
 def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
-    current = read_editor_state(board_dir, metadata)
+    current = read_editor_state(board_dir, metadata, persist_isolation=True)
     if request.method == "GET":
+        LOGGER.info(
+            "BOARD LOAD COMPLETE board=%s objects=%d",
+            board_id,
+            len(current.get("objects") or []),
+        )
         return jsonify(editor=current)
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
@@ -2512,15 +2392,23 @@ def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
                 error="This board was changed in another tab.",
                 editor=current,
             ), 409
-        clean = validate_editor_state(raw_state)
+        clean = validate_editor_state(raw_state, board_id=board_id)
     except (TypeError, ValueError) as exc:
         return jsonify(error=str(exc)), 400
+    clean["source_boards"] = [default_source_board(board_id, metadata)]
+    clean["merged_board_ids"] = []
     clean["revision"] = current_revision + 1
     clean["updated_at"] = time.time()
     atomic_json(editor_path(board_dir), clean)
     metadata["editor_schema_version"] = 2
     metadata["editor_updated_at"] = clean["updated_at"]
     update_metadata(board_dir, metadata)
+    LOGGER.info(
+        "BOARD OBJECT SAVE board=%s objects=%d imported=%d",
+        board_id,
+        len(clean.get("objects") or []),
+        len(clean.get("imported_transforms") or {}),
+    )
     return jsonify(id=board_id, status="saved", editor=clean)
 
 
@@ -2567,7 +2455,6 @@ def get_library() -> Response:
             folder = folder_by_id(library, folder_id)
             if folder:
                 workspace_id = folder.get("workspace_board_id")
-        open_id = workspace_id if workspace_id and BOARD_ID_RE.fullmatch(str(workspace_id)) else board_id
         boards.append(
             {
                 "id": board_id,
@@ -2579,7 +2466,7 @@ def get_library() -> Response:
                 "width": dimensions.get("width") if isinstance(dimensions, dict) else None,
                 "height": dimensions.get("height") if isinstance(dimensions, dict) else None,
                 "thumbnail_url": thumbnail_url,
-                "url": url_for("board", board_id=open_id),
+                "url": url_for("board", board_id=board_id),
                 "workspace_board_id": workspace_id,
             }
         )
@@ -2925,11 +2812,13 @@ def delete_board(board_id: str) -> Response:
 
 
 @app.get("/api/boards/<board_id>/study")
+@locked_board_operation
 def list_study_interactions(board_id: str) -> Response:
-    from study.storage import public_interaction, read_study_state
+    from study.storage import public_interaction, read_study_state, write_study_state
 
     board_dir = require_board_id(board_id)
     state = read_study_state(board_dir)
+    write_study_state(board_dir, state, atomic_json)
     return jsonify(
         interactions=[
             public_interaction(item)
