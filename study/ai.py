@@ -1425,8 +1425,9 @@ def analyze_board(
         system=BOARD_CONTEXT_SYSTEM,
         user_text="\n".join(lines),
         images={"selected": master_image},
+        parser=_parse_board_context,
     )
-    return _parse_board_context(result.get("answer") or "")
+    return result
 
 
 def explain_selection(**kwargs: Any) -> dict[str, str]:
@@ -1461,6 +1462,9 @@ def analyze_lecture(
         user_text="\n".join(lines),
         images=images or {},
         max_tokens=1_400,
+        # Lecture analysis returns summary/key_topics JSON, not explanation
+        # JSON with an "answer" field. Preserve the raw JSON for its parser.
+        parser=lambda raw: {"answer": raw},
     )
     value = _load_json_object(result.get("answer") or "")
     if not value:
