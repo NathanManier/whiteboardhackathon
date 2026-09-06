@@ -5688,7 +5688,7 @@
         const saved = payload.folder?.name || name.trim();
         state.lecture.folderName = saved;
         $("#board-name").textContent = saved;
-        document.title = `${saved} · Digital Whiteboard`;
+        document.title = `${saved} · V-Board`;
         toast("Lecture renamed.");
         return;
       }
@@ -5699,7 +5699,7 @@
       });
       const saved = payload.board?.name || name.trim();
       $("#board-name").textContent = saved;
-      document.title = `${saved} · Digital Whiteboard`;
+      document.title = `${saved} · V-Board`;
       toast("Board renamed.");
     } catch (error) {
       toast(error.message || "Could not rename this lecture.", true);
@@ -6643,7 +6643,7 @@
     applyLectureData(state.data);
     const title = state.lecture.folderName || state.data.title || state.data.name || `Board ${boardId || ""}`.trim();
     $("#board-name").textContent = title;
-    document.title = `${title} · Digital Whiteboard`;
+    document.title = `${title} · V-Board`;
     state.masterUrl = findAsset("enhanced") || findAsset("corrected");
     const paper = $("#board-paper");
     const edge = $("#board-paper-edge");
