@@ -237,7 +237,7 @@ class StudyApiTests(unittest.TestCase):
         result = parse_practice_problem(
             '{"problem": "Find a \\\\times b.\\n\\nSolution: <0,0,1>"}'
         )
-        self.assertEqual(result["problem"], "Find a $\\times$ b.")
+        self.assertEqual(result["problem"], "Find a \\times b.")
         self.assertNotIn("Solution", result["problem"])
         two = parse_practice_problems(
             '{"type": "practice_problems", "problems": ['
@@ -250,21 +250,20 @@ class StudyApiTests(unittest.TestCase):
         self.assertEqual(two["problems"][1]["problem"], "Convert 1010 to decimal.")
         self.assertNotIn("Solution", two["problems"][1]["problem"])
 
-    def test_normalize_study_math_wraps_roots_and_complex_numbers(self):
-        from study.ai import normalize_study_math
+    def test_ai_parsers_preserve_source_markdown_and_latex(self):
+        from study.ai import _parse_model_json, parse_practice_problem
 
-        self.assertIn("$\\sqrt{2x+1}$", normalize_study_math(r"Evaluate \sqrt{2x+1}"))
-        self.assertIn("$\\sqrt{x+1}$", normalize_study_math("Evaluate √(x+1)"))
-        combined = normalize_study_math(r"Compute \\frac{1}{2} + \\sqrt{3}")
-        self.assertIn("\\frac{1}{2}", combined)
-        self.assertIn("\\sqrt{3}", combined)
-        self.assertEqual(normalize_study_math(r"Keep $\sqrt{x}$"), r"Keep $\sqrt{x}$")
-        self.assertIn("$\\mathbb{C}$", normalize_study_math(r"z belongs to \mathbb{C}"))
-        nth = normalize_study_math(r"Find \sqrt[3]{8}")
-        self.assertIn("$\\sqrt[3]{8}$", nth)
-        thin = normalize_study_math(r"Keep $\int u \\, dv$")
-        self.assertIn("\\,", thin)
-        self.assertNotIn("\\\\,", thin)
+        explanation = r"Use **energy** $E=\frac{1}{2}mv^2$ and keep \$5 as prose."
+        parsed = _parse_model_json(json.dumps({
+            "title": "Energy",
+            "answer": explanation,
+            "confidence": "high",
+        }))
+        self.assertEqual(parsed["answer"], explanation)
+
+        problem = r"Calculate the magnitude of \(\vec{F}=(3,4)\)."
+        parsed_problem = parse_practice_problem(json.dumps({"problem": problem}))
+        self.assertEqual(parsed_problem["problem"], problem)
 
     def test_parse_study_guide_uses_content_not_raw_json(self):
         from study.ai import parse_study_guide

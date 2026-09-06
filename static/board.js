@@ -1915,7 +1915,7 @@
 
   function canvasRichMarkdown(text) {
     const renderer = globalThis.renderStudyMarkdown;
-    if (typeof renderer === "function") return renderer(text, { mathOutput: "mathml" });
+    if (typeof renderer === "function") return renderer(text);
     const node = document.createElement("span");
     node.textContent = text || "";
     return node;
@@ -4860,7 +4860,14 @@
       if (typeof fill === "function") fill(title, item.title || "Explanation");
       else title.textContent = item.title || "Explanation";
       const preview = document.createElement("span");
-      preview.textContent = String(item.answer || "").replace(/\s+/g, " ").slice(0, 110);
+      const previewSource = String(item.answer || "")
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .find(line => line && !/^#{1,6}\s/.test(line) && !/^(?:\$\$|\\\[|\\\])$/.test(line))
+        || item.answer
+        || "";
+      if (typeof fill === "function") fill(preview, previewSource);
+      else preview.textContent = previewSource;
       button.append(title, preview);
       button.addEventListener("click", () => openStudyInteraction(item.id));
       list.append(button);

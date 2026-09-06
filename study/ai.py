@@ -787,7 +787,7 @@ def parse_study_guide(raw: str) -> dict[str, Any]:
         content = recover_study_guide_markdown(raw)
     else:
         content = unescape_study_newlines(content)
-    content = normalize_study_math(content.strip())
+    content = content.strip()
     title = str(value.get("title") or "Lecture Study Guide").strip()[:120]
     sources = value.get("sources") if isinstance(value.get("sources"), list) else []
     if not content:
@@ -803,7 +803,7 @@ def parse_study_guide(raw: str) -> dict[str, Any]:
 
 def _parse_model_json(raw: str) -> dict[str, str]:
     value = _load_json_object(raw)
-    answer = normalize_study_math(str(value.get("answer") or raw or "").strip())
+    answer = str(value.get("answer") or raw or "").strip()
     title = str(value.get("title") or "Explanation").strip()[:120]
     confidence = str(value.get("confidence") or "medium").strip().lower()
     if confidence not in {"high", "medium", "low"}:
@@ -821,208 +821,6 @@ SOLUTION_SPLIT_RE = re.compile(
     r"\n\s*(?:solution|answer(?:\s*key)?|final answer|worked solution)\s*[:\-–]",
     re.IGNORECASE,
 )
-_TEX_ONE_ARG = {
-    "sqrt", "vec", "hat", "bar", "dot", "ddot", "tilde", "overline", "underline",
-    "mathbf", "mathrm", "mathbb", "mathcal", "mathit", "mathsf", "mathtt",
-    "text", "textrm", "textbf", "textit", "texttt", "operatorname", "boxed",
-}
-_TEX_TWO_ARG = {
-    "frac", "dfrac", "tfrac", "binom", "dbinom", "tbinom", "overset", "underset",
-}
-
-
-def _skip_braced(text: str, index: int) -> int:
-    if index >= len(text) or text[index] != "{":
-        return index
-    depth = 0
-    for cursor in range(index, len(text)):
-        if text[cursor] == "{":
-            depth += 1
-        elif text[cursor] == "}":
-            depth -= 1
-            if depth == 0:
-                return cursor + 1
-    return len(text)
-
-
-def _skip_optional(text: str, index: int) -> int:
-    if index >= len(text) or text[index] != "[":
-        return index
-    end = text.find("]", index)
-    return len(text) if end < 0 else end + 1
-
-
-def _tex_command_end(text: str, start: int) -> int:
-    if start >= len(text) or text[start] != "\\":
-        return start
-    index = start + 1
-    if index >= len(text):
-        return index
-    if not text[index].isalpha():
-        return index + 1
-    while index < len(text) and text[index].isalpha():
-        index += 1
-    name = text[start + 1 : index]
-    index = _skip_optional(text, index)
-    while index < len(text) and text[index] == " ":
-        index += 1
-    if name in _TEX_ONE_ARG:
-        index = _skip_optional(text, index)
-        while index < len(text) and text[index] == " ":
-            index += 1
-        if index < len(text) and text[index] == "{":
-            index = _skip_braced(text, index)
-        elif index < len(text) and not text[index].isspace() and text[index] not in "$\\":
-            index += 1
-    elif name in _TEX_TWO_ARG:
-        while index < len(text) and text[index] == " ":
-            index += 1
-        if index < len(text) and text[index] == "{":
-            index = _skip_braced(text, index)
-        while index < len(text) and text[index] == " ":
-            index += 1
-        if index < len(text) and text[index] == "{":
-            index = _skip_braced(text, index)
-    elif name == "left":
-        if index < len(text) and text[index] == "\\":
-            index = _tex_command_end(text, index)
-        elif index < len(text):
-            index += 1
-        right = text.find("\\right", index)
-        if right >= 0:
-            index = _tex_command_end(text, right)
-    while index < len(text) and text[index] in "^_":
-        index += 1
-        if index < len(text) and text[index] == "{":
-            index = _skip_braced(text, index)
-        elif index < len(text):
-            index += 1
-    return index
-
-
-def _unescape_tex_backslashes(text: str) -> str:
-    previous = None
-    current = text
-    pattern = re.compile(r"\\{2,}([A-Za-z]+|[()\[\],;:! ])")
-    while current != previous:
-        previous = current
-        current = pattern.sub(r"\\\1", current)
-    return current
-
-
-def _unicode_to_tex(text: str) -> str:
-    text = re.sub(r"√\s*\(([^()]*)\)", r"\\sqrt{\1}", text)
-    text = re.sub(r"√\s*\{([^{}]*)\}", r"\\sqrt{\1}", text)
-    text = re.sub(r"√([A-Za-z0-9]+)", r"\\sqrt{\1}", text)
-    replacements = {
-        "∜": r"\sqrt[4]",
-        "∛": r"\sqrt[3]",
-        "√": r"\sqrt",
-        "∞": r"\infty",
-        "×": r"\times",
-        "·": r"\cdot",
-        "±": r"\pm",
-        "≤": r"\leq",
-        "≥": r"\geq",
-        "≠": r"\neq",
-        "→": r"\to",
-        "ℂ": r"\mathbb{C}",
-        "ℝ": r"\mathbb{R}",
-        "ℕ": r"\mathbb{N}",
-        "ℤ": r"\mathbb{Z}",
-    }
-    for source, dest in replacements.items():
-        text = text.replace(source, dest)
-    text = re.sub(r"\bsqrt\s*\(([^()]*)\)", r"\\sqrt{\1}", text)
-    return text
-
-
-def _wrap_bare_tex(text: str) -> str:
-    out: list[str] = []
-    index = 0
-    mode: str | None = None
-    length = len(text)
-    while index < length:
-        if mode is None:
-            if text.startswith("$$", index):
-                mode = "ddollar"
-                out.append("$$")
-                index += 2
-                continue
-            if text.startswith("\\[", index):
-                mode = "bracket"
-                out.append("\\[")
-                index += 2
-                continue
-            if text.startswith("\\(", index):
-                mode = "paren"
-                out.append("\\(")
-                index += 2
-                continue
-            if text[index] == "$":
-                mode = "dollar"
-                out.append("$")
-                index += 1
-                continue
-            if text[index] == "\\" and index + 1 < length and text[index + 1].isalpha():
-                name_end = index + 1
-                while name_end < length and text[name_end].isalpha():
-                    name_end += 1
-                name = text[index + 1 : name_end]
-                if name in {"n", "t", "r"} and (name_end >= length or not text[name_end].isalpha()):
-                    out.append("\n" if name == "n" or name == "r" else "\t")
-                    index = name_end
-                    continue
-                end = _tex_command_end(text, index)
-                cursor = end
-                while True:
-                    scan = cursor
-                    while scan < length and text[scan] == " ":
-                        scan += 1
-                    if scan < length and text[scan] in "+-*=<>,/":
-                        scan += 1
-                        while scan < length and text[scan] == " ":
-                            scan += 1
-                    if scan < length and text[scan] == "\\" and scan + 1 < length and text[scan + 1].isalpha():
-                        cursor = _tex_command_end(text, scan)
-                        continue
-                    break
-                out.append("$" + text[index:cursor] + "$")
-                index = cursor
-                continue
-            out.append(text[index])
-            index += 1
-            continue
-        if mode == "ddollar" and text.startswith("$$", index):
-            out.append("$$")
-            index += 2
-            mode = None
-            continue
-        if mode == "bracket" and text.startswith("\\]", index):
-            out.append("\\]")
-            index += 2
-            mode = None
-            continue
-        if mode == "paren" and text.startswith("\\)", index):
-            out.append("\\)")
-            index += 2
-            mode = None
-            continue
-        if mode == "dollar" and text[index] == "$":
-            out.append("$")
-            index += 1
-            mode = None
-            continue
-        out.append(text[index])
-        index += 1
-    return "".join(out)
-
-
-def normalize_study_math(text: str) -> str:
-    cleaned = _unicode_to_tex(_unescape_tex_backslashes(str(text or "")))
-    return _wrap_bare_tex(cleaned)
-
-
 def clean_practice_problem_text(text: str) -> str:
     cleaned = str(text or "").strip()
     if cleaned.startswith("```"):
@@ -1030,7 +828,7 @@ def clean_practice_problem_text(text: str) -> str:
         cleaned = re.sub(r"\s*```$", "", cleaned)
     cleaned = PREAMBLE_RE.sub("", cleaned).strip()
     cleaned = SOLUTION_SPLIT_RE.split(cleaned, maxsplit=1)[0].strip()
-    return normalize_study_math(cleaned)
+    return cleaned
 
 
 def _problem_entry(value: Any, fallback_id: str) -> dict[str, str] | None:

@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b1018">
   <title>Study canvas · Digital Whiteboard</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" crossorigin="anonymous">
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}">
 </head>
 <body class="workspace-page">
   <header class="workspace-header">
@@ -331,8 +331,11 @@
   </dialog>
 
   <script id="board-data" type="application/json">{{ board_data|default(board|default(data|default({}, true), true), true)|tojson }}</script>
-  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js" crossorigin="anonymous"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/mhchem.min.js" crossorigin="anonymous"></script>
+  <script defer src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}"></script>
+  <script defer src="{{ url_for('static', filename='vendor/katex/mhchem.min.js') }}"></script>
+  <script defer src="{{ url_for('static', filename='vendor/markdown-it/markdown-it.min.js') }}"></script>
+  <script defer src="{{ url_for('static', filename='vendor/markdown-it-texmath/texmath.js') }}"></script>
+  <script defer src="{{ url_for('static', filename='vendor/dompurify/purify.min.js') }}"></script>
   <script src="{{ url_for('static', filename='study-render.js') }}" defer></script>
   <script src="{{ url_for('static', filename='canvas-engine.js') }}" defer></script>
   <script src="{{ url_for('static', filename='pencil-tools.js') }}" defer></script>

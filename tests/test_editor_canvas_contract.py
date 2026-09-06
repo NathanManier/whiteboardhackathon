@@ -62,6 +62,11 @@ class EditorCanvasContractTests(unittest.TestCase):
         self.assertIn("setStudyHeading", board)
         self.assertIn("fillStudyRichText", board)
 
+    def test_library_toast_does_not_leak_study_guide_source(self):
+        source = (ROOT / "static" / "library.js").read_text(encoding="utf-8")
+        self.assertIn('toast(payload.study_guide_stale ? "Study guide may be outdated." : "Study guide ready.")', source)
+        self.assertNotIn("guide.content.replace", source)
+
     def test_study_guide_sheet_is_resizable_and_has_progress(self):
         html = (ROOT / "templates" / "board.html").read_text(encoding="utf-8")
         board = (ROOT / "static" / "board.js").read_text(encoding="utf-8")
@@ -71,8 +76,15 @@ class EditorCanvasContractTests(unittest.TestCase):
         self.assertIn("function openStudyGuideSheet", board)
         self.assertIn("function onStudyGuideButton", board)
         self.assertIn("function coerceStudyMarkdown", render)
-        self.assertIn("function stashMath", render)
-        self.assertIn("function mergeSplitMathSpans", render)
+        self.assertIn("globalThis.markdownit", render)
+        self.assertIn("globalThis.texmath", render)
+        self.assertIn("globalThis.DOMPurify", render)
+        self.assertIn('delimiters: ["dollars", "brackets", "beg_end"]', render)
+        self.assertIn("trust: false", render)
+        self.assertIn("vendor/katex/katex.min.js", html)
+        self.assertIn("vendor/markdown-it/markdown-it.min.js", html)
+        self.assertIn("vendor/markdown-it-texmath/texmath.js", html)
+        self.assertIn("vendor/dompurify/purify.min.js", html)
         self.assertIn("mhchem.min.js", html)
 
     def test_study_render_keeps_chemistry_trig_and_headings(self):

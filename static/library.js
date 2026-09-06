@@ -483,8 +483,7 @@
         });
         const guide = payload.study_guide || payload.studyGuide;
         if (guide?.content) {
-          const preview = guide.content.replace(/\s+/g, " ").slice(0, 180);
-          toast(payload.study_guide_stale ? "Study guide may be outdated." : `Study guide ready. ${preview}`);
+          toast(payload.study_guide_stale ? "Study guide may be outdated." : "Study guide ready.");
         } else {
           toast("Study guide generated.");
         }

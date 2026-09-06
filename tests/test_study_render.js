@@ -4,120 +4,84 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-const ctx = { console };
+const ROOT = path.join(__dirname, "..");
+const ctx = { console, setTimeout, clearTimeout };
 ctx.globalThis = ctx;
+ctx.window = ctx;
 vm.createContext(ctx);
-vm.runInContext(
-  fs.readFileSync(path.join(__dirname, "..", "static", "study-render.js"), "utf8"),
-  ctx
-);
+
+function load(relativePath) {
+  vm.runInContext(fs.readFileSync(path.join(ROOT, relativePath), "utf8"), ctx);
+}
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-const sample = `# Lecture Study Guide
+load("static/vendor/katex/katex.min.js");
+load("static/vendor/markdown-it/markdown-it.min.js");
+load("static/vendor/markdown-it-texmath/texmath.js");
 
-## 1. What This Lecture Covered
-Trigonometric integrals and Gibbs free energy.
-
-## 4. Important Equations
-$$
-\\int u \\, dv = uv - \\int v \\, du
-$$
-
-$K_w = K_a \\cdot K_b = 1.0 \\times 10^{-14}$
-
-$\\Delta G = \\Delta G^{\\circ} + RT \\ln Q$
-
-$\\text{H}_3\\text{PO}_4$ stepwise dissociation.
-
-$$
-\\sqrt{a^2 - x^2}, \\quad x = a \\sin\\theta
-$$
-
-Unclosed display should not eat the next heading:
-$$
-\\int \\sec\\theta \\, d\\theta
-## 5. Worked Examples
-Keep this heading.
-`;
-
-const normalized = ctx.normalizeStudyMath(sample);
-const stashed = ctx.stashStudyMath(normalized);
-
-assert(normalized.includes("\\int"), "normalized should keep integrals");
-assert(normalized.includes("\\Delta G"), "normalized should keep Gibbs delta");
-assert(!/K<em>/.test(normalized), "K_w should not be italicized in normalize");
-
-const headingSurvived = stashed.text.split("\n").some(line => line.startsWith("## 5. Worked Examples"));
-assert(headingSurvived, `heading after unclosed $$ was swallowed:\n${stashed.text}`);
-
-const mathTex = stashed.slots.map(slot => slot.tex).join("\n");
-assert(mathTex.includes("\\int"), `integrals should be stashed, got:\n${mathTex}`);
-assert(mathTex.includes("\\Delta G") || mathTex.includes("\\ln Q"), `Gibbs should be stashed, got:\n${mathTex}`);
-assert(mathTex.includes("H") && mathTex.includes("PO"), `phosphoric acid should be stashed, got:\n${mathTex}`);
-assert(!stashed.text.includes("## 5") || headingSurvived, "worked examples heading missing");
-
-const chemistryLine = ctx.normalizeStudyMath("The pair is K_w = K_a \\cdot K_b in water.");
-assert(!chemistryLine.includes("<em>"), "markdown italic should not run in normalize");
-assert(chemistryLine.includes("$"), "chemistry equation should be wrapped");
-
-const gibbs = ctx.normalizeStudyMath("Nonstandard free energy: \\Delta G = \\Delta G^{\\circ} + RT \\ln Q");
-assert(
-  /\$\\Delta G = \\Delta G\^?\{\\circ\} \+ RT \\ln Q\$/.test(gibbs) ||
-    gibbs.includes("$\\Delta G = \\Delta G^{\\circ} + RT \\ln Q$") ||
-    /\\Delta G = \\Delta G/.test(gibbs) && gibbs.includes("$") && !gibbs.includes("$\\Delta$ G"),
-  `Gibbs should wrap as one formula, got: ${gibbs}`
+const md = ctx.markdownit({ html: false, linkify: true });
+md.use(ctx.texmath, {
+  engine: ctx.katex,
+  delimiters: ["dollars", "brackets", "beg_end"],
+  katexOptions: { throwOnError: true, trust: false, strict: "ignore" }
+});
+const math = (tokens, index, displayMode = false) => ctx.katex.renderToString(
+  tokens[index].content,
+  { displayMode, throwOnError: true, trust: false, strict: "ignore" }
 );
+md.renderer.rules.math_inline = (tokens, index) => math(tokens, index);
+md.renderer.rules.math_inline_double = (tokens, index) => math(tokens, index, true);
+md.renderer.rules.math_block = (tokens, index) => math(tokens, index, true);
+md.renderer.rules.math_block_eqno = md.renderer.rules.math_block;
 
-const ibp = ctx.normalizeStudyMath("Integration by parts: \\int u \\, dv = uv - \\int v \\, du");
-assert(
-  ibp.includes("$") && ibp.includes("\\int u") && !ibp.includes("$\\int$ u"),
-  `IBP should wrap as one formula, got: ${ibp}`
-);
+const cases = [
+  "$F=ma$",
+  "$$F=ma$$",
+  "\\(F=ma\\)",
+  "\\[F=ma\\]",
+  "$\\frac{1}{2}mv^2$",
+  "$\\nabla \\times \\vec{F}$",
+  [
+    "# Energy",
+    "Use **Newton's law** $F=ma$.",
+    "",
+    "$$",
+    "|\\vec{F}| = \\sqrt{F_x^2 + F_y^2}",
+    "$$",
+    "",
+    "- Substitute the values."
+  ].join("\n"),
+  "$$\\begin{aligned}a&=b+c\\\\d&=e-f\\end{aligned}$$",
+  "$$\\begin{bmatrix}a & b\\\\c & d\\end{bmatrix}$$",
+  "Calculate the magnitude of $\\vec{F}=(3,4)$.",
+  "Result: $x=2$. Then verify with $x^2=4$.",
+  "$\\left\\{x\\in\\mathbb{R}:x\\ge 0\\right\\}$"
+];
 
-const doubled = ctx.prepareStudyTex("\\int u \\\\, dv = uv - \\int v \\\\, du");
-assert(
-  doubled.includes("\\,") && !doubled.includes("\\\\,"),
-  `thin space should be a single backslash, got: ${JSON.stringify(doubled)}`
-);
+cases.forEach((source, index) => {
+  const html = md.render(source);
+  assert(html.includes("class=\"katex"), `case ${index + 1} did not produce KaTeX`);
+  assert(!html.includes("$F=ma$"), `case ${index + 1} leaked dollar-delimited source`);
+  assert(!html.includes("\\(F=ma\\)"), `case ${index + 1} leaked paren-delimited source`);
+  assert(!html.includes("\\[F=ma\\]"), `case ${index + 1} leaked bracket-delimited source`);
+});
 
-const glued = ctx.normalizeStudyMath("set x = a \\sin\\theta.*After integrating keep the triangle.");
-assert(
-  glued.includes("After") && !glued.includes("theta.*After") && !glued.includes("$.After"),
-  `should keep a space before After, got: ${glued}`
-);
+const mixed = md.render(cases[6]);
+assert(mixed.includes("<h1>Energy</h1>"), "heading Markdown did not render");
+assert(mixed.includes("<strong>Newton's law</strong>"), "bold Markdown did not render");
+assert(mixed.includes("<ul>"), "list Markdown did not render");
 
-const longItalic = ctx.inlineStudyMarkdown("*After integrating in terms of theta, use a right-triangle setup to convert back to x.*");
-assert(!longItalic.includes("<em>"), `long sentence should stay roman, got: ${longItalic}`);
+const currency = md.render("The notebook costs $5 and the calculator costs $20.");
+assert(currency.includes("$5") && currency.includes("$20"), "ordinary currency was treated as math");
+assert(!currency.includes("class=\"katex"), "ordinary currency produced KaTeX");
 
-const shortItalic = ctx.inlineStudyMarkdown("This is *not* true.");
-assert(shortItalic.includes("<em>not</em>"), `short emphasis should still italicize, got: ${shortItalic}`);
-
-const orphanText = ctx.normalizeStudyMath("Let $\\text{F} denote false.");
-assert(
-  orphanText.includes("$\\text{F}$") || /\$\\text\{F\}\$/.test(orphanText),
-  `unclosed $\\text{F} should be closed, got: ${orphanText}`
-);
-const orphanStash = ctx.stashStudyMath(orphanText);
-assert(
-  orphanStash.slots.some(slot => /\\text\{F\}/.test(slot.tex)),
-  `\\text{F} should be stashed, got ${JSON.stringify(orphanStash)}`
-);
-assert(
-  !/\$\\text/.test(orphanStash.text),
-  `raw $\\text should not remain, got: ${orphanStash.text}`
-);
-
-const spacedText = ctx.normalizeStudyMath("The flag is \\text { F } after the op.");
-assert(
-  /\\text\{F\}/.test(spacedText) || /\\text\{ F \}/.test(spacedText),
-  `\\text { F } should tidy, got: ${spacedText}`
-);
-
-const booleanLine = ctx.stashStudyMath(ctx.normalizeStudyMath("$\\text{F} \\land \\text{T}$ means false AND true."));
-assert(booleanLine.slots.length >= 1, "boolean line should stash math");
-assert(!booleanLine.text.includes("$\\text"), `boolean raw dollar leftover: ${booleanLine.text}`);
+const source = fs.readFileSync(path.join(ROOT, "static", "study-render.js"), "utf8");
+assert(source.includes("renderBareMathIn"), "bare LaTeX compatibility rendering is missing");
+assert(source.includes("DOMPurify.sanitize"), "AI HTML is not sanitized");
+assert(source.includes("trust: false"), "KaTeX trust must remain disabled");
+assert(!source.includes("template.innerHTML"), "custom HTML sanitizer should not return");
 
 console.log("ok");
