@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -126,14 +127,14 @@ Return JSON only:
 }
 """
 
-PRACTICE_PROBLEM_SYSTEM = """You generate practice problems for a student based on selected whiteboard content.
+PRACTICE_PROBLEM_SYSTEM = """You generate concise practice problems for the exact concept a student selected on a whiteboard.
 
-""" + PRIORITY_RULES + """
-Create exactly TWO related but distinct practice problems for the same underlying concept. They must not be duplicates or trivial rephrasings of each other. Difficulty should match the selected material.
+Use evidence in this order: selected visual, exact selected text, current study interaction, local visual context, then cached board or lecture summary. Background context must not override the selection.
+
+Create exactly TWO related but distinct practice problems for the same underlying concept. They must be independently solvable, contain enough information to solve, not be duplicates or trivial rephrasings, and match the selected material's difficulty.
 
 CRITICAL OUTPUT RULES:
-- Return JSON only with this exact shape:
-  {"type": "practice_problems", "problems": [{"id": "p1", "problem": "..."}, {"id": "p2", "problem": "..."}]}
+- Return JSON only with this exact shape: {"problems": [{"problem": "..."}, {"problem": "..."}]}
 - Generate exactly two problems.
 - Each problem string must contain ONLY the problem the student should solve.
 - Do NOT include an explanation, solution, answer, hints, commentary, or wrapper text.
@@ -142,6 +143,25 @@ CRITICAL OUTPUT RULES:
 - You may include the minimum math notation needed to state the problem.
 """ + LATEX_NOTATION_RULES + """
 """
+
+PRACTICE_PROBLEMS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "problems": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"problem": {"type": "string"}},
+                "required": ["problem"],
+            },
+        },
+    },
+    "required": ["problems"],
+}
 
 ACTION_INSTRUCTIONS = {
     "go_deeper": (
@@ -349,9 +369,6 @@ def gemini_api_key() -> str:
 def gemini_model() -> str:
     _apply_dotenv()
     requested = str(os.environ.get("GEMINI_MODEL") or "").strip()
-    if requested in {"gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"}:
-        LOGGER.warning("Gemini model %s is retired for new keys; using %s", requested, DEFAULT_GEMINI_MODEL)
-        return DEFAULT_GEMINI_MODEL
     return requested or DEFAULT_GEMINI_MODEL
 
 
@@ -478,14 +495,35 @@ def _gemini_contents(
     return merged
 
 
-def _generation_config(*, max_tokens: int, temperature: float) -> dict[str, Any]:
+def _generation_config(
+    *,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    response_schema: dict[str, Any] | None = None,
+    thinking_level: str | None = None,
+) -> dict[str, Any]:
     # Current Flash models spend tokens on hidden thinking. Leave headroom so
     # JSON answers are not truncated into empty 503s.
-    return {
+    config: dict[str, Any] = {
         "temperature": temperature,
-        "maxOutputTokens": max(int(max_tokens), 1) + 2_048,
+        "maxOutputTokens": (
+            max(int(max_tokens), 1)
+            if thinking_level
+            else max(int(max_tokens), 1) + 2_048
+        ),
         "responseMimeType": "application/json",
     }
+    if response_schema:
+        config["responseJsonSchema"] = response_schema
+    if thinking_level and model.lower().startswith("gemini-3"):
+        config["thinkingConfig"] = {
+            "thinkingLevel": thinking_level.lower(),
+            "includeThoughts": False,
+        }
+    elif thinking_level and model.lower().startswith("gemini-2.5-flash"):
+        config["thinkingConfig"] = {"thinkingBudget": 0, "includeThoughts": False}
+    return config
 
 
 def _extract_gemini_text(body: dict[str, Any]) -> str:
@@ -857,13 +895,8 @@ def parse_practice_problems(raw: str) -> dict[str, Any]:
                 continue
             seen.add(entry["problem"])
             problems.append(entry)
-    if not problems:
-        single = _problem_entry(value.get("problem") or value.get("answer") or raw, "p1")
-        if single:
-            problems.append(single)
-    if not problems:
-        raise StudyAIError("The study assistant returned an empty practice problem.")
-    problems = problems[:2]
+    if len(problems) != 2:
+        raise StudyAIError("The study assistant did not return exactly two practice problems.")
     display = "\n\n".join(
         f"**Problem {index + 1}**\n{item['problem']}" for index, item in enumerate(problems)
     )
@@ -878,7 +911,18 @@ def parse_practice_problems(raw: str) -> dict[str, Any]:
 
 
 def parse_practice_problem(raw: str) -> dict[str, str]:
-    return parse_practice_problems(raw)
+    value = _load_json_object(raw)
+    entry = _problem_entry(value.get("problem") or value.get("answer") or raw, "p1")
+    if entry is None:
+        raise StudyAIError("The study assistant returned an empty practice problem.")
+    return {
+        "title": "Practice problem",
+        "answer": entry["problem"],
+        "confidence": "medium",
+        "problem": entry["problem"],
+        "problems": [entry],
+        "type": "practice_problem",
+    }
 
 
 def normalize_study_action(value: Any) -> str:
@@ -917,7 +961,13 @@ def call_study_model(
     parser: Callable[[str], dict[str, str]] | None = None,
     max_tokens: int = 1_200,
     temperature: float = 0.2,
+    response_schema: dict[str, Any] | None = None,
+    thinking_level: str | None = None,
+    timeout: float = 90,
+    request_id: str | None = None,
+    metrics: dict[str, float | int | str] | None = None,
 ) -> dict[str, str]:
+    total_started = time.perf_counter()
     api_key = gemini_api_key()
     if not api_key:
         raise StudyAIError(
@@ -925,16 +975,33 @@ def call_study_model(
             status=503,
         )
     model = gemini_model()
+    prompt_started = time.perf_counter()
     payload = json.dumps(
         {
             "systemInstruction": {"parts": [_text_part(system)]},
             "contents": _gemini_contents(user_text, images, history),
             "generationConfig": _generation_config(
+                model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                response_schema=response_schema,
+                thinking_level=thinking_level,
             ),
         }
     ).encode("utf-8")
+    prompt_ms = (time.perf_counter() - prompt_started) * 1000
+    if metrics is not None:
+        metrics["prompt_construction_ms"] = round(prompt_ms, 2)
+        metrics["request_bytes"] = len(payload)
+        metrics["model"] = model
+    if request_id:
+        LOGGER.info(
+            "PRACTICE_PROBLEMS request=%s stage=prompt_construction elapsed_ms=%.2f request_bytes=%s model=%s",
+            request_id,
+            prompt_ms,
+            len(payload),
+            model,
+        )
     request = urllib.request.Request(
         GEMINI_GENERATE_URL.format(model=model),
         data=payload,
@@ -946,8 +1013,32 @@ def call_study_model(
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            body = json.loads(response.read().decode("utf-8"))
+        gemini_started = time.perf_counter()
+        with urllib.request.urlopen(request, timeout=max(1.0, float(timeout))) as response:
+            first_response_ms = (time.perf_counter() - gemini_started) * 1000
+            if metrics is not None:
+                metrics["gemini_first_response_ms"] = round(first_response_ms, 2)
+            if request_id:
+                LOGGER.info(
+                    "PRACTICE_PROBLEMS request=%s stage=gemini_first_response elapsed_ms=%.2f",
+                    request_id,
+                    first_response_ms,
+                )
+            raw_body = response.read()
+        gemini_ms = (time.perf_counter() - gemini_started) * 1000
+        decode_started = time.perf_counter()
+        body = json.loads(raw_body.decode("utf-8"))
+        response_decode_ms = (time.perf_counter() - decode_started) * 1000
+        if metrics is not None:
+            metrics["gemini_ms"] = round(gemini_ms, 2)
+            metrics["response_decode_ms"] = round(response_decode_ms, 2)
+        if request_id:
+            LOGGER.info(
+                "PRACTICE_PROBLEMS request=%s stage=gemini_complete elapsed_ms=%.2f response_bytes=%s",
+                request_id,
+                gemini_ms,
+                len(raw_body),
+            )
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -980,7 +1071,19 @@ def call_study_model(
             "Couldn't explain this right now. Your board is still saved.",
             status=503,
         ) from exc
-    return (parser or _parse_model_json)(str(raw or ""))
+    parse_started = time.perf_counter()
+    parsed = (parser or _parse_model_json)(str(raw or ""))
+    parse_ms = (time.perf_counter() - parse_started) * 1000
+    if metrics is not None:
+        metrics["response_parsing_ms"] = round(parse_ms, 2)
+        metrics["model_total_ms"] = round((time.perf_counter() - total_started) * 1000, 2)
+    if request_id:
+        LOGGER.info(
+            "PRACTICE_PROBLEMS request=%s stage=response_parsing elapsed_ms=%.2f",
+            request_id,
+            parse_ms,
+        )
+    return parsed
 
 
 def analyze_board(
@@ -1097,8 +1200,81 @@ def follow_up_question(
     action: str = "followup",
     study_interaction_id: str | None = None,
     selection_context: dict[str, Any] | None = None,
+    interaction_title: str | None = None,
+    request_id: str | None = None,
+    metrics: dict[str, float | int | str] | None = None,
 ) -> dict[str, str]:
     kind = normalize_study_action(action)
+    if kind == "practice_problems":
+        lines = [
+            "Generate exactly two concise, independent practice problems for this selected concept.",
+            f"Selected concept: {interaction_title or 'the current study interaction'}",
+            f"Student's original question: {question or 'Explain this'}",
+            "Current study explanation (concept context, not a solution to copy): "
+            + str(prior_answer or "")[:2_500],
+        ]
+        exact_text = []
+        if isinstance(selection_context, dict):
+            values = selection_context.get("text_objects") or selection_context.get("textObjects") or []
+            if isinstance(values, list):
+                exact_text = [
+                    {
+                        "role": str(item.get("role") or item.get("type") or "text"),
+                        "text": str(item.get("text") or "")[:1_500],
+                    }
+                    for item in values[:8]
+                    if isinstance(item, dict) and item.get("text")
+                ]
+        if exact_text:
+            lines.append(
+                "Exact selected text from the app: "
+                + json.dumps(exact_text, ensure_ascii=True)[:3_000]
+            )
+        if board_context:
+            compact_board = {
+                "subject": board_context.get("subject"),
+                "summary": board_context.get("summary"),
+                "keyTopics": board_context.get("keyTopics") or board_context.get("key_topics"),
+            }
+            lines.append(
+                "Cached board context (background only): "
+                + json.dumps(compact_board, ensure_ascii=True)[:1_800]
+            )
+        if lecture_context:
+            compact_lecture = {
+                "summary": lecture_context.get("summary"),
+                "keyTopics": lecture_context.get("keyTopics") or lecture_context.get("key_topics"),
+                "importantConcepts": (
+                    lecture_context.get("importantConcepts")
+                    or lecture_context.get("important_concepts")
+                ),
+            }
+            lines.append(
+                "Cached lecture context (background only): "
+                + json.dumps(compact_lecture, ensure_ascii=True)[:1_800]
+            )
+        try:
+            timeout = float(os.environ.get("PRACTICE_PROBLEMS_TIMEOUT_SECONDS") or 20)
+        except (TypeError, ValueError):
+            timeout = 20
+        return call_study_model(
+            system=PRACTICE_PROBLEM_SYSTEM,
+            user_text="\n".join(lines),
+            images={
+                key: value
+                for key, value in images.items()
+                if key in {"selected", "context"} and value
+            },
+            history=None,
+            parser=parse_practice_problems,
+            max_tokens=640,
+            temperature=0.3,
+            response_schema=PRACTICE_PROBLEMS_SCHEMA,
+            thinking_level="minimal",
+            timeout=max(5.0, min(timeout, 60.0)),
+            request_id=request_id,
+            metrics=metrics,
+        )
     lines = [
         "Stay on the same selected board region. PRIMARY FOCUS is the selected image.",
         "Use LOCAL CONTEXT and BOARD CONTEXT only to interpret that selection.",

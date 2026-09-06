@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import re
+import time
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from pathlib import Path
@@ -554,7 +555,10 @@ def render_study_images(
     selected_ids: list[str],
     selection_bbox: dict[str, float] | None,
     board_size: dict[str, float],
+    include_overview: bool = True,
+    timings: dict[str, float | int | str] | None = None,
 ) -> dict[str, Any]:
+    preparation_started = time.perf_counter()
     ET.register_namespace("", SVG_NS)
     root = ET.fromstring(scene_svg)
     fallback = {
@@ -571,6 +575,9 @@ def render_study_images(
     geometry = union_boxes(object_boxes) or selection_bbox or content_bounds(selected_root, overview_box)
     render_box = pad_bbox(geometry)
     context_box = expand_bbox(render_box)
+    if timings is not None:
+        timings["visual_preparation_ms"] = round((time.perf_counter() - preparation_started) * 1000, 2)
+    rendering_started = time.perf_counter()
     selected_png = rasterize_svg_bytes(
         ET.tostring(crop_scene(selected_root, render_box, SELECTED_MAX), encoding="utf-8"),
         SELECTED_MAX,
@@ -579,15 +586,27 @@ def render_study_images(
         ET.tostring(crop_scene(root, context_box, CONTEXT_MAX), encoding="utf-8"),
         CONTEXT_MAX,
     )
-    overview_png = rasterize_svg_bytes(
-        ET.tostring(crop_scene(root, overview_box, OVERVIEW_MAX), encoding="utf-8"),
-        OVERVIEW_MAX,
+    overview_png = (
+        rasterize_svg_bytes(
+            ET.tostring(crop_scene(root, overview_box, OVERVIEW_MAX), encoding="utf-8"),
+            OVERVIEW_MAX,
+        )
+        if include_overview
+        else b""
     )
+    if timings is not None:
+        timings["image_rendering_ms"] = round((time.perf_counter() - rendering_started) * 1000, 2)
+    encoding_started = time.perf_counter()
+    selected_data = encode_png(selected_png)
+    context_data = encode_jpeg(context_png)
+    overview_data = encode_jpeg(overview_png) if overview_png else ""
     selected_image = Image.open(io.BytesIO(selected_png))
+    if timings is not None:
+        timings["image_encoding_ms"] = round((time.perf_counter() - encoding_started) * 1000, 2)
     return {
-        "selected": encode_png(selected_png),
-        "context": encode_jpeg(context_png),
-        "overview": encode_jpeg(overview_png),
+        "selected": selected_data,
+        "context": context_data,
+        "overview": overview_data,
         "selection_bbox": geometry,
         "context_bbox": context_box,
         "overview_bbox": overview_box,

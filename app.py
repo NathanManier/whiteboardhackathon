@@ -2847,29 +2847,62 @@ def follow_up_route(board_id: str, interaction_id: str) -> Response | tuple[Resp
     from study.ai import StudyAIError
     from study.service import follow_up_board
 
-    board_dir = require_board_id(board_id)
-    metadata = read_metadata(board_dir)
+    route_started = time.perf_counter()
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify(error="A JSON request body is required."), 415
+    action = str(payload.get("action") or payload.get("kind") or "").strip().lower()
+    practice = action in {"practice_problems", "practice_problem", "problems"}
+    request_id = str(payload.get("requestId") or interaction_id)
+    if not re.fullmatch(r"[0-9a-f]{16}", request_id):
+        request_id = interaction_id
+    timings: dict[str, float | int | str] = {}
+    if practice:
+        LOGGER.info(
+            "PRACTICE_PROBLEMS request=%s stage=backend_request_received elapsed_ms=0.00",
+            request_id,
+        )
+    context_started = time.perf_counter()
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
     try:
         library = read_library()
         catalog = library["boards"].get(board_id)
         folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
+        editor = read_editor_state(board_dir, metadata)
+        if practice:
+            timings["route_context_reads_ms"] = round(
+                (time.perf_counter() - context_started) * 1000,
+                2,
+            )
         interaction = follow_up_board(
             board_id=board_id,
             board_dir=board_dir,
             metadata=metadata,
-            editor=read_editor_state(board_dir, metadata),
+            editor=editor,
             interaction_id=interaction_id,
             payload=payload,
             folder_id=folder_id if isinstance(folder_id, str) else None,
             library=library,
             combined_svg=combined_svg,
             atomic_json=atomic_json,
+            timings=timings if practice else None,
+            request_started=route_started,
         )
     except StudyAIError as exc:
-        return jsonify(error=str(exc)), exc.status
+        if practice and exc.status >= 500:
+            LOGGER.exception(
+                "PRACTICE_PROBLEMS request=%s stage=failed total_ms=%.2f",
+                request_id,
+                (time.perf_counter() - route_started) * 1000,
+            )
+        error_response = jsonify(error=str(exc), retryable=exc.status >= 500)
+        if practice:
+            error_response.headers["Server-Timing"] = (
+                f'total;dur={(time.perf_counter() - route_started) * 1000:.2f}'
+            )
+            error_response.headers["X-Practice-Problems-Request-Id"] = request_id
+        return error_response, exc.status
     body = {
         "interaction": interaction,
         "studyInteractionId": interaction.get("id"),
@@ -2889,7 +2922,34 @@ def follow_up_route(board_id: str, interaction_id: str) -> Response | tuple[Resp
         body["type"] = "practice_problems"
         body["problem"] = problem
         body["problems"] = problems
-    return jsonify(body)
+    response = jsonify(body)
+    if practice:
+        timings["total_ms"] = round((time.perf_counter() - route_started) * 1000, 2)
+        server_timing_names = {
+            "route_context_reads_ms": "reads",
+            "context_gathering_ms": "context",
+            "selected_visual_ms": "visual",
+            "scene_build_ms": "scene",
+            "image_rendering_ms": "render",
+            "image_encoding_ms": "encode",
+            "prompt_construction_ms": "prompt",
+            "gemini_ms": "gemini",
+            "response_parsing_ms": "parse",
+            "persistence_ms": "persist",
+            "total_ms": "total",
+        }
+        response.headers["Server-Timing"] = ", ".join(
+            f"{server_timing_names[key]};dur={float(value):.2f}"
+            for key, value in timings.items()
+            if key in server_timing_names and isinstance(value, (int, float))
+        )
+        response.headers["X-Practice-Problems-Request-Id"] = request_id
+        LOGGER.info(
+            "PRACTICE_PROBLEMS request=%s stage=frontend_response_ready timings=%s",
+            request_id,
+            json.dumps(timings, sort_keys=True, separators=(",", ":")),
+        )
+    return response
 
 
 @app.get("/board/<board_id>/asset/<asset_name>")

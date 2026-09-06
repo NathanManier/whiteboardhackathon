@@ -4720,15 +4720,36 @@
   }
 
   async function requestStudy(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: { Accept: "application/json", ...(options.headers || {}) }
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(payload.error || payload.message || "Couldn't explain this right now. Your board is still saved.");
+    const { timeoutMs = 0, ...fetchOptions } = options;
+    const controller = timeoutMs > 0 ? new AbortController() : null;
+    const timer = controller
+      ? window.setTimeout(() => controller.abort(), timeoutMs)
+      : 0;
+    try {
+      const response = await fetch(url, {
+        ...fetchOptions,
+        signal: controller?.signal || fetchOptions.signal,
+        headers: { Accept: "application/json", ...(fetchOptions.headers || {}) }
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || payload.message || "Couldn't explain this right now. Your board is still saved.");
+      }
+      if (payload && typeof payload === "object") {
+        payload.clientTiming = {
+          serverTiming: response.headers.get("Server-Timing") || "",
+          requestId: response.headers.get("X-Practice-Problems-Request-Id") || ""
+        };
+      }
+      return payload;
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error("Practice problem generation timed out. Please retry.");
+      }
+      throw error;
+    } finally {
+      if (timer) window.clearTimeout(timer);
     }
-    return payload;
   }
 
   function newStudyRequestId() {
@@ -4802,8 +4823,20 @@
   function appendGenerating(parent) {
     const status = document.createElement("p");
     status.className = "study-generating";
-    status.textContent = "Generating...";
+    status.textContent = state.pendingStudyAction === "practice_problems"
+      ? "Generating 2 practice problems…"
+      : "Generating…";
     parent.append(status);
+  }
+
+  function appendStudyRetry(parent, action, question) {
+    if (!parent) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "study-canvas-action study-retry-action";
+    button.textContent = "Retry";
+    button.addEventListener("click", () => sendStudyAction({ action, question }));
+    parent.append(button);
   }
 
   function upsertStudyInteraction(interaction) {
@@ -4883,7 +4916,7 @@
     button.type = "button";
     button.className = "study-canvas-action";
     button.textContent = problems.length > 1 ? "Add to Canvas" : "Add to Canvas";
-    button.addEventListener("click", () => addPracticeProblemsToCanvas(problems, follow));
+    button.addEventListener("click", () => addPracticeProblemsToCanvas(problems.slice(0, 2), follow));
     parent.append(button);
   }
 
@@ -5316,17 +5349,42 @@
 
   async function sendStudyAction({ action = "followup", question = "" } = {}) {
     const interactionId = state.activeStudyId;
-    if (state.explaining || !interactionId) return;
+    if (state.explaining || !interactionId) {
+      if (action === "practice_problems" && state.explaining) {
+        studyLog("PRACTICE_PROBLEMS", { stage: "duplicate_click_ignored" });
+      }
+      return;
+    }
+    const started = performance.now();
     const requestId = newStudyRequestId();
     const token = ++state.studyRequestToken;
     const displayQuestion = action === "followup" ? question : actionLabel(action);
+    if (action === "practice_problems") {
+      studyLog("PRACTICE_PROBLEMS", {
+        stage: "frontend_click",
+        requestId,
+        interactionId
+      });
+    }
     state.pendingStudyQuestion = displayQuestion;
     state.pendingStudyAction = action;
     setStudyBusy(true);
     setStudyStatus("");
+    if (action === "practice_problems") {
+      $("#study-kicker").textContent = "Generating practice";
+      setStudyHeading("Practice Problems");
+    }
     const current = state.studyInteractions.find(item => item.id === interactionId);
     if (current) renderStudyConversation(current, { scrollToLatest: true });
+    let failure = null;
     try {
+      if (action === "practice_problems") {
+        studyLog("PRACTICE_PROBLEMS", {
+          stage: "request_start",
+          requestId,
+          elapsedMs: Math.round((performance.now() - started) * 100) / 100
+        });
+      }
       const payload = await requestStudy(
         studyApi(`/study/${encodeURIComponent(interactionId)}/followup`),
         {
@@ -5337,9 +5395,18 @@
             question,
             requestId,
             studyInteractionId: interactionId
-          })
+          }),
+          timeoutMs: action === "practice_problems" ? 25000 : 0
         }
       );
+      if (action === "practice_problems") {
+        studyLog("PRACTICE_PROBLEMS", {
+          stage: "frontend_response_received",
+          requestId,
+          elapsedMs: Math.round((performance.now() - started) * 100) / 100,
+          serverTiming: payload.clientTiming?.serverTiming || ""
+        });
+      }
       const interaction = payload.interaction || payload;
       if (!interaction?.id) throw new Error("Couldn't explain this right now. Your board is still saved.");
       upsertStudyInteraction(interaction);
@@ -5352,13 +5419,28 @@
       openStudyInteraction(interaction.id, { scrollToLatest: true });
       if (action === "practice_problems" && (payload.problems || payload.problem || interaction.problem)) {
         setStudyStatus("Practice problems ready. Add them to the canvas if you want to solve them here.");
+        studyLog("PRACTICE_PROBLEMS", {
+          stage: "frontend_render",
+          requestId,
+          problems: Array.isArray(payload.problems) ? payload.problems.length : 0,
+          totalMs: Math.round((performance.now() - started) * 100) / 100
+        });
       } else {
         setStudyStatus("");
       }
       renderStudyList();
     } catch (error) {
       if (token !== state.studyRequestToken && state.activeStudyId !== interactionId) return;
+      failure = error;
       setStudyStatus(error.message || "Couldn't explain this right now. Your board is still saved.", true);
+      if (action === "practice_problems") {
+        studyLog("PRACTICE_PROBLEMS", {
+          stage: "failed",
+          requestId,
+          elapsedMs: Math.round((performance.now() - started) * 100) / 100,
+          error: error?.message || String(error)
+        });
+      }
     } finally {
       state.pendingStudyQuestion = "";
       state.pendingStudyAction = "";
@@ -5366,6 +5448,7 @@
       const latest = state.studyInteractions.find(item => item.id === interactionId);
       if (latest && state.activeStudyId === interactionId) {
         renderStudyConversation(latest, { scrollToLatest: true });
+        if (failure) appendStudyRetry($("#study-body"), action, question);
       }
     }
   }
@@ -5386,6 +5469,7 @@
         return String(item || "").trim();
       })
       .filter(Boolean);
+    statements.splice(2);
     if (!statements.length) return;
     const interaction = state.studyInteractions.find(item => item.id === state.activeStudyId);
     const ids = interaction?.selectedObjectIds || [...state.selected];

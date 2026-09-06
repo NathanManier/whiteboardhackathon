@@ -185,6 +185,9 @@ class StudyApiTests(unittest.TestCase):
         payload = follow.get_json()
         self.assertEqual(payload["type"], "practice_problems")
         self.assertEqual(len(payload["problems"]), 2)
+        problem_ids = [item["id"] for item in payload["problems"]]
+        self.assertEqual(len(set(problem_ids)), 2)
+        self.assertTrue(all(problem_id.startswith(payload["activeFollowUpId"]) for problem_id in problem_ids))
         self.assertEqual(
             payload["problems"][0]["problem"],
             "Find the cross product of a = <1, 0, 0> and b = <0, 1, 0>.",
@@ -627,7 +630,7 @@ class StudyApiTests(unittest.TestCase):
         with patch.dict("os.environ", {"GEMINI_MODEL": ""}, clear=False):
             self.assertEqual(gemini_model(), "gemini-3.6-flash")
         with patch.dict("os.environ", {"GEMINI_MODEL": "gemini-2.5-flash"}, clear=False):
-            self.assertEqual(gemini_model(), "gemini-3.6-flash")
+            self.assertEqual(gemini_model(), "gemini-2.5-flash")
 
         class FakeResponse:
             def __enter__(self):
@@ -701,6 +704,116 @@ class StudyApiTests(unittest.TestCase):
         self.assertNotIn("image_url", serialized)
         self.assertNotIn("chat/completions", captured["url"])
         self.assertNotIn("gpt-4o", serialized)
+
+    def test_practice_model_uses_one_compact_structured_minimal_thinking_request(self):
+        from study.ai import follow_up_question
+
+        captured: dict = {"calls": 0}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "candidates": [{
+                        "content": {
+                            "parts": [{
+                                "text": json.dumps({
+                                    "problems": [
+                                        {"problem": r"Evaluate $\int \cos^2(x)\,dx$."},
+                                        {"problem": r"Simplify $\cos^4(\theta)$ using power reduction."},
+                                    ]
+                                })
+                            }]
+                        }
+                    }]
+                }).encode("utf-8")
+
+        def fake_urlopen(request, timeout=0):
+            captured["calls"] += 1
+            captured["timeout"] = timeout
+            captured["data"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        metrics = {}
+        with patch.dict(
+            "os.environ",
+            {"GEMINI_API_KEY": "test-key", "GEMINI_MODEL": "gemini-3.6-flash"},
+            clear=False,
+        ), patch("study.ai.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = follow_up_question(
+                question="Practice Problems",
+                prior_answer="Power reduction rewrites squared trigonometric functions.",
+                history=[
+                    {"role": "user", "content": "unrelated historical question"},
+                    {"role": "assistant", "content": "unrelated historical answer"},
+                ],
+                images={
+                    "selected": "data:image/png;base64,aaa",
+                    "context": "data:image/jpeg;base64,bbb",
+                    "overview": "data:image/jpeg;base64,ccc",
+                },
+                board_context={"subject": "Trigonometry", "summary": "Power reduction."},
+                lecture_context={"summary": "Double-angle identities."},
+                action="practice_problems",
+                interaction_title="Cosine power reduction",
+                request_id="aaaaaaaaaaaaaaaa",
+                metrics=metrics,
+            )
+
+        self.assertEqual(captured["calls"], 1)
+        self.assertEqual(len(result["problems"]), 2)
+        config = captured["data"]["generationConfig"]
+        self.assertEqual(config["thinkingConfig"]["thinkingLevel"], "minimal")
+        self.assertFalse(config["thinkingConfig"]["includeThoughts"])
+        self.assertEqual(config["responseMimeType"], "application/json")
+        self.assertEqual(config["responseJsonSchema"]["properties"]["problems"]["minItems"], 2)
+        self.assertEqual(config["responseJsonSchema"]["properties"]["problems"]["maxItems"], 2)
+        self.assertEqual(config["maxOutputTokens"], 640)
+        self.assertEqual(len(captured["data"]["contents"]), 1)
+        serialized = json.dumps(captured["data"])
+        self.assertNotIn("unrelated historical", serialized)
+        self.assertNotIn('"data": "ccc"', serialized)
+        self.assertLess(metrics["request_bytes"], 20_000)
+        self.assertEqual(captured["timeout"], 20)
+
+    def test_practice_parser_requires_exactly_two_unique_problems(self):
+        from study.ai import StudyAIError, parse_practice_problems
+
+        with self.assertRaises(StudyAIError):
+            parse_practice_problems('{"problems": [{"problem": "Only one"}]}')
+        with self.assertRaises(StudyAIError):
+            parse_practice_problems(
+                '{"problems": [{"problem": "Duplicate"}, {"problem": "Duplicate"}]}'
+            )
+
+    def test_study_visual_cache_invalidates_with_editor_revision(self):
+        from study.service import (
+            cache_interaction_views,
+            cached_interaction_views,
+            visual_cache_key,
+        )
+
+        editor = {"revision": 1, "updated_at": 1, "source_boards": [], "imported_transforms": {}}
+        key = visual_cache_key(self.board_dir, self.metadata, editor)
+        cache = cache_interaction_views(
+            self.board_dir,
+            "aaaaaaaaaaaaaaaa",
+            key,
+            {
+                "selected": "data:image/png;base64,aW1hZ2U=",
+                "context": "data:image/jpeg;base64,Y29udGV4dA==",
+            },
+        )
+        interaction = {"visual_cache": cache}
+        self.assertIsNotNone(cached_interaction_views(self.board_dir, interaction, key))
+        next_key = visual_cache_key(self.board_dir, self.metadata, {**editor, "revision": 2})
+        self.assertNotEqual(key, next_key)
+        self.assertIsNone(cached_interaction_views(self.board_dir, interaction, next_key))
 
     def test_study_routes_reject_invalid_board_ids(self):
         self.assertEqual(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -55,11 +57,135 @@ CombinedSvg = Callable[[dict[str, Any], Path], bytes]
 
 _CONTEXT_LOCKS: dict[str, threading.Lock] = {}
 _CONTEXT_LOCKS_GUARD = threading.Lock()
+_VISUAL_CACHE_DIR = ".study-cache"
 
 
 def _context_lock(board_id: str) -> threading.Lock:
     with _CONTEXT_LOCKS_GUARD:
         return _CONTEXT_LOCKS.setdefault(board_id, threading.Lock())
+
+
+def _practice_log(request_id: str, stage: str, elapsed_ms: float, **details: Any) -> None:
+    suffix = " ".join(f"{key}={value}" for key, value in details.items())
+    LOGGER.info(
+        "PRACTICE_PROBLEMS request=%s stage=%s elapsed_ms=%.2f%s",
+        request_id,
+        stage,
+        elapsed_ms,
+        f" {suffix}" if suffix else "",
+    )
+
+
+def visual_cache_key(
+    board_dir: Path,
+    metadata: dict[str, Any],
+    editor: dict[str, Any],
+) -> str:
+    assets = metadata.get("assets") if isinstance(metadata.get("assets"), dict) else {}
+    source_files = []
+    board_ids = [board_dir.name]
+    for item in editor.get("source_boards") or []:
+        if isinstance(item, dict) and isinstance(item.get("board_id"), str):
+            board_ids.append(item["board_id"])
+    for source_id in sorted(set(board_ids)):
+        source_dir = board_dir.parent / source_id
+        try:
+            source_meta = json.loads((source_dir / "board.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            source_meta = {}
+        source_assets = source_meta.get("assets") if isinstance(source_meta.get("assets"), dict) else {}
+        svg_name = source_assets.get("svg") or ("board.svg" if source_id == board_dir.name else "")
+        svg_path = source_dir / str(svg_name)
+        try:
+            stat = svg_path.stat()
+            source_files.append((source_id, svg_path.name, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            source_files.append((source_id, str(svg_name), 0, 0))
+    source = {
+        "revision": int(editor.get("revision") or 0),
+        "updated_at": editor.get("updated_at"),
+        "source_boards": editor.get("source_boards") or [],
+        "imported_transforms": editor.get("imported_transforms") or {},
+        "svg": assets.get("svg"),
+        "source_files": source_files,
+    }
+    return hashlib.sha256(
+        json.dumps(source, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _decode_data_url(data_url: str) -> tuple[str, bytes] | None:
+    raw = str(data_url or "")
+    if not raw.startswith("data:image/") or ";base64," not in raw:
+        return None
+    header, encoded = raw.split(",", 1)
+    mime = header[5:].split(";", 1)[0].lower()
+    if mime not in {"image/png", "image/jpeg", "image/webp"}:
+        return None
+    try:
+        return mime, base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        return None
+
+
+def cache_interaction_views(
+    board_dir: Path,
+    interaction_id: str,
+    key: str,
+    views: dict[str, Any],
+) -> dict[str, str] | None:
+    if not STUDY_ID_RE.fullmatch(interaction_id):
+        return None
+    cache_dir = board_dir / _VISUAL_CACHE_DIR
+    cache_dir.mkdir(exist_ok=True)
+    stored: dict[str, str] = {"key": key}
+    for label in ("selected", "context"):
+        decoded = _decode_data_url(str(views.get(label) or ""))
+        if decoded is None:
+            continue
+        mime, data = decoded
+        extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[mime]
+        name = f"{interaction_id}-{key[:16]}-{label}.{extension}"
+        destination = cache_dir / name
+        temporary = cache_dir / f".{name}.{secrets.token_hex(4)}.tmp"
+        temporary.write_bytes(data)
+        temporary.replace(destination)
+        stored[label] = name
+    if "selected" not in stored:
+        return None
+    previous = views.get("_previous_cache")
+    if isinstance(previous, dict):
+        for old_name in (previous.get("selected"), previous.get("context")):
+            if isinstance(old_name, str) and old_name not in stored.values():
+                try:
+                    (cache_dir / Path(old_name).name).unlink()
+                except OSError:
+                    pass
+    return stored
+
+
+def cached_interaction_views(
+    board_dir: Path,
+    interaction: dict[str, Any],
+    key: str,
+) -> dict[str, str] | None:
+    cache = interaction.get("visual_cache")
+    if not isinstance(cache, dict) or cache.get("key") != key:
+        return None
+    result: dict[str, str] = {}
+    cache_dir = board_dir / _VISUAL_CACHE_DIR
+    for label in ("selected", "context"):
+        name = cache.get(label)
+        if not isinstance(name, str) or Path(name).name != name:
+            continue
+        path = cache_dir / name
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        result[label] = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+    return result if result.get("selected") else None
 
 
 def master_path(board_dir: Path, metadata: dict[str, Any]) -> Path | None:
@@ -493,13 +619,20 @@ def render_views(
     selected_ids: list[str],
     bbox: dict[str, float] | None,
     combined_svg: CombinedSvg,
+    include_overview: bool = True,
+    timings: dict[str, float | int | str] | None = None,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
     scene = combined_svg(metadata, board_dir)
+    if timings is not None:
+        timings["scene_build_ms"] = round((time.perf_counter() - started) * 1000, 2)
     return render_study_images(
         scene,
         selected_ids=selected_ids,
         selection_bbox=bbox,
         board_size=board_size(metadata),
+        include_overview=include_overview,
+        timings=timings,
     )
 
 
@@ -697,6 +830,13 @@ def explain_board(
         source_board_id=current_id,
         action=action,
     )
+    try:
+        key = visual_cache_key(board_dir, metadata, editor)
+        cached = cache_interaction_views(board_dir, interaction_id, key, views)
+        if cached:
+            interaction["visual_cache"] = cached
+    except OSError:
+        LOGGER.warning("Could not cache study selection board=%s interaction=%s", board_id, interaction_id)
     state["interactions"] = [interaction, *state["interactions"]][:MAX_INTERACTIONS]
     write_study_state(board_dir, state, atomic_json)
     return public_interaction(interaction)
@@ -714,7 +854,15 @@ def follow_up_board(
     atomic_json: AtomicJson,
     folder_id: str | None = None,
     library: dict[str, Any] | None = None,
+    timings: dict[str, float | int | str] | None = None,
+    request_started: float | None = None,
 ) -> dict[str, Any]:
+    total_started = request_started or time.perf_counter()
+    request_id = requested_interaction_id(payload.get("requestId")) or interaction_id
+    practice = normalize_study_action(payload.get("action") or payload.get("kind")) == "practice_problems"
+    if practice:
+        _practice_log(request_id, "backend_service_received", (time.perf_counter() - total_started) * 1000)
+    context_started = time.perf_counter()
     if not STUDY_ID_RE.fullmatch(interaction_id):
         raise StudyAIError("That explanation could not be found.", status=404)
     action = normalize_study_action(payload.get("action") or payload.get("kind"))
@@ -746,26 +894,73 @@ def follow_up_board(
         if isinstance(item, str)
     ]
     bbox = validate_bbox(interaction.get("selection_bbox"))
-    try:
-        views = render_views(
-            metadata,
-            board_dir,
-            selected_ids=expand_group_ids(
-                editor,
-                clean_selected_ids(
-                    selected_ids,
-                    known_object_ids(editor, board_dir=board_dir, metadata=metadata),
-                ),
-            ),
-            bbox=bbox,
-            combined_svg=combined_svg,
+    valid_selected_ids = expand_group_ids(
+        editor,
+        clean_selected_ids(
+            selected_ids,
+            known_object_ids(editor, board_dir=board_dir, metadata=metadata),
+        ),
+    )
+    key = visual_cache_key(board_dir, metadata, editor)
+    views = cached_interaction_views(board_dir, interaction, key) if practice else None
+    cache_hit = views is not None
+    if timings is not None:
+        timings["context_gathering_ms"] = round((time.perf_counter() - context_started) * 1000, 2)
+        timings["visual_cache_hit"] = "true" if cache_hit else "false"
+    if practice:
+        _practice_log(
+            request_id,
+            "context_gathering",
+            (time.perf_counter() - context_started) * 1000,
+            cache_hit=str(cache_hit).lower(),
         )
-    except Exception as exc:
-        raise StudyAIError(
-            "Couldn't explain this right now. Your board is still saved.",
-            status=503,
-        ) from exc
-    master_overview = encode_master_overview(master_path(board_dir, metadata) or board_dir / "master.png")
+    visual_started = time.perf_counter()
+    if views is None:
+        try:
+            views = render_views(
+                metadata,
+                board_dir,
+                selected_ids=valid_selected_ids,
+                bbox=bbox,
+                combined_svg=combined_svg,
+                include_overview=not practice,
+                timings=timings,
+            )
+        except Exception as exc:
+            raise StudyAIError(
+                "Couldn't explain this right now. Your board is still saved.",
+                status=503,
+            ) from exc
+        if practice:
+            try:
+                cache_source = {**views, "_previous_cache": interaction.get("visual_cache")}
+                cached = cache_interaction_views(board_dir, interaction_id, key, cache_source)
+                if cached:
+                    interaction["visual_cache"] = cached
+            except OSError:
+                LOGGER.warning(
+                    "Could not cache practice selection board=%s interaction=%s",
+                    board_id,
+                    interaction_id,
+                )
+    visual_ms = (time.perf_counter() - visual_started) * 1000
+    if timings is not None:
+        timings["selected_visual_ms"] = round(visual_ms, 2)
+    if practice:
+        _practice_log(
+            request_id,
+            "selected_visual",
+            visual_ms,
+            cache_hit=str(cache_hit).lower(),
+        )
+    master_overview = None
+    if not practice:
+        encode_started = time.perf_counter()
+        master_overview = encode_master_overview(
+            master_path(board_dir, metadata) or board_dir / "master.png"
+        )
+        if timings is not None:
+            timings["master_encoding_ms"] = round((time.perf_counter() - encode_started) * 1000, 2)
     lecture_pack = lecture_ai_pack(
         folder_id=folder_id,
         library=library,
@@ -780,10 +975,12 @@ def follow_up_board(
     follow_context["board_sequence"] = lecture_pack.get("sequence")
     images = {
         "selected": views["selected"],
-        "context": views["context"],
-        "overview": lecture_pack.get("current_master") or master_overview or views["overview"],
     }
-    if lecture_pack.get("images"):
+    if views.get("context"):
+        images["context"] = views["context"]
+    if not practice:
+        images["overview"] = lecture_pack.get("current_master") or master_overview or views.get("overview")
+    if not practice and lecture_pack.get("images"):
         images["lecture_boards"] = lecture_pack["images"]
     result = follow_up_question(
         question=question,
@@ -794,6 +991,9 @@ def follow_up_board(
         action=action,
         study_interaction_id=interaction_id,
         selection_context=follow_context,
+        interaction_title=str(interaction.get("title") or ""),
+        request_id=request_id if practice else None,
+        metrics=timings if practice else None,
         images=images,
     )
     follow_id = secrets.token_hex(8)
@@ -810,10 +1010,10 @@ def follow_up_board(
         problems = result.get("problems")
         clean_problems = []
         if isinstance(problems, list):
-            for item in problems[:2]:
+            for index, item in enumerate(problems[:2], start=1):
                 if isinstance(item, dict) and item.get("problem"):
                     clean_problems.append({
-                        "id": str(item.get("id") or secrets.token_hex(4)),
+                        "id": f"{follow_id}-{index}",
                         "problem": str(item.get("problem")),
                     })
         if not clean_problems and follow_entry.get("problem"):
@@ -826,13 +1026,28 @@ def follow_up_board(
     interaction["active_follow_up_id"] = follow_id
     if result.get("title") and action != "practice_problems":
         interaction["title"] = result["title"]
+    persistence_started = time.perf_counter()
     write_study_state(board_dir, state, atomic_json)
+    persistence_ms = (time.perf_counter() - persistence_started) * 1000
+    if timings is not None:
+        timings["persistence_ms"] = round(persistence_ms, 2)
+    if practice:
+        _practice_log(request_id, "persistence", persistence_ms)
     public = public_interaction(interaction)
     if follow_entry.get("kind") == "practice_problems":
         public["problem"] = follow_entry.get("problem")
         public["problems"] = follow_entry.get("problems") or []
         public["type"] = "practice_problems"
     public["activeFollowUpId"] = follow_id
+    if timings is not None:
+        timings["backend_total_ms"] = round((time.perf_counter() - total_started) * 1000, 2)
+    if practice:
+        _practice_log(
+            request_id,
+            "backend_complete",
+            (time.perf_counter() - total_started) * 1000,
+            problems=len(public.get("problems") or []),
+        )
     return public
 
 
