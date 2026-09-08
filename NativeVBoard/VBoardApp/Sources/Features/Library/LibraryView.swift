@@ -4,6 +4,7 @@ struct LibraryView: View {
     @EnvironmentObject private var api: APIClient
     @State private var library: LibraryResponse?
     @State private var error: String?
+    @State private var launchBoard: LibraryBoard?
 
     var body: some View {
         NavigationStack {
@@ -28,7 +29,17 @@ struct LibraryView: View {
             .navigationTitle("V-Board")
             .toolbar { Button { load() } label: { Image(systemName: "arrow.clockwise") } }
             .task { load() }
+            .navigationDestination(item: $launchBoard) { BoardView(board: $0) }
         }
     }
-    private func load() { Task { do { library = try await api.library(); error = nil } catch { self.error = error.localizedDescription } } }
+    private func load() {
+        Task {
+            do {
+                let result = try await api.library(); library = result; error = nil
+                if let idIndex = ProcessInfo.processInfo.arguments.firstIndex(of: "-VBoardOpenID"), idIndex + 1 < ProcessInfo.processInfo.arguments.count {
+                    launchBoard = result.boards.first(where: { $0.id == ProcessInfo.processInfo.arguments[idIndex + 1] })
+                }
+            } catch { self.error = error.localizedDescription }
+        }
+    }
 }
