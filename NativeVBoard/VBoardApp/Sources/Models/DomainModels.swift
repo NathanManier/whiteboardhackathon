@@ -114,3 +114,32 @@ struct CanvasObject: Codable, Identifiable, Sendable {
         case sourceMarkdown = "source_markdown"
     }
 }
+
+/// Canonical Pencil data. This deliberately mirrors the server's stroke
+/// points instead of serializing UIKit/PencilKit implementation state.
+struct StrokePoint: Codable, Equatable, Sendable {
+    let x: Double
+    let y: Double
+    let pressure: Double?
+}
+
+struct UserStroke: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    var type: String = "stroke"
+    var color: String = "#183153"
+    var width: Double = 4
+    var opacity: Double = 1
+    var points: [StrokePoint]
+    var translation: WorldPoint = WorldPoint(x: 0, y: 0, pressure: nil)
+
+    func asCanvasObject(boardID: String? = nil) -> [String: Any] {
+        // This helper documents the exact server shape; EditorState remains
+        // Codable and the next persistence module will use a typed envelope.
+        var result: [String: Any] = ["id": id, "type": type, "color": color,
+                                     "width": width, "opacity": opacity,
+                                     "points": points.map { ["x": $0.x, "y": $0.y, "p": $0.pressure as Any] },
+                                     "translation": ["x": translation.x, "y": translation.y]]
+        if let boardID { result["board_id"] = boardID }
+        return result
+    }
+}

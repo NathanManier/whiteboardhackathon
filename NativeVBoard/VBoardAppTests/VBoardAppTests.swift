@@ -41,3 +41,13 @@ final class SVGDocumentTests: XCTestCase {
         XCTAssertThrowsError(try SVGPathParser.path(from: "M 0 nope"))
     }
 }
+
+final class StrokeSerializationTests: XCTestCase {
+    func testStrokeKeepsWorldCoordinatesAndPressure() throws {
+        let stroke = UserStroke(id: "pencil-1", points: [StrokePoint(x: -4.5, y: 12.25, pressure: 0.6)])
+        let data = try JSONEncoder().encode(stroke)
+        let decoded = try JSONDecoder().decode(UserStroke.self, from: data)
+        XCTAssertEqual(decoded, stroke)
+        XCTAssertEqual(decoded.points[0].pressure ?? -1, 0.6, accuracy: 0.0001)
+    }
+}
