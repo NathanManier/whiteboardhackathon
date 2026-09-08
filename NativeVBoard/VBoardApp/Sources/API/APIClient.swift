@@ -39,11 +39,19 @@ final class APIClient: ObservableObject {
 
     func library() async throws -> LibraryResponse { try await get("/api/library") }
     func board(id: String) async throws -> BoardRecord { try await get("/board/\(id)") }
-    func editor(id: String) async throws -> EditorState { try await get("/api/boards/\(id)/editor") }
+    func editor(id: String) async throws -> EditorState {
+        // Flask deliberately wraps this response as {"editor": {...}}.
+        // Decode the envelope first; decoding EditorState at the root produces
+        // keyNotFound(schema_version), which was the native board blocker.
+        let envelope: EditorEnvelope = try await get("/api/boards/\(id)/editor", label: "editor")
+        debugLog("EDITOR DECODE SUCCEEDED endpoint=/api/boards/\(id)/editor objects=\(envelope.editor.objects.count) revision=\(envelope.editor.revision)")
+        return envelope.editor
+    }
 
     func professorSVG(id: String) async throws -> String {
         let request = try request(path: "/board/\(id)/svg", accept: "image/svg+xml")
         let (data, response) = try await data(for: request)
+        debugResponse(path: "/board/\(id)/svg", method: "GET", response: response, data: data)
         try validate(response, data: data)
         guard let svg = String(data: data, encoding: .utf8) else { throw APIError.decoding("The professor SVG was not UTF-8.") }
         return svg
@@ -61,12 +69,20 @@ final class APIClient: ObservableObject {
         catch { throw APIError.decoding("Could not decode saved editor state: \(error.localizedDescription)") }
     }
 
-    private func get<T: Decodable>(_ path: String) async throws -> T {
+    private func get<T: Decodable>(_ path: String, label: String = "JSON") async throws -> T {
+        debugLog("BOARD REQUEST START label=\(label) method=GET endpoint=\(path)")
         let request = try request(path: path)
         let (data, response) = try await data(for: request)
+        debugResponse(path: path, method: "GET", response: response, data: data)
         try validate(response, data: data)
         do { return try decoder.decode(T.self, from: data) }
-        catch { throw APIError.decoding("Could not decode server response: \(error.localizedDescription)") }
+        catch let error as DecodingError {
+            logDecodingError(error, endpoint: path, method: "GET", response: response, data: data)
+            throw APIError.decoding("Could not decode \(label) response. The server returned an unexpected JSON shape.")
+        } catch {
+            debugLog("BOARD DECODE FAILED endpoint=\(path) error=\(error)")
+            throw APIError.decoding("Could not decode \(label) response.")
+        }
     }
 
     private func request(path: String, method: String = "GET", accept: String = "application/json") throws -> URLRequest {
@@ -90,6 +106,46 @@ final class APIClient: ObservableObject {
             let message = (try? decoder.decode(ServerError.self, from: data).error) ?? "Server request failed (HTTP \(http.statusCode))."
             throw APIError.server(status: http.statusCode, message: message, retryable: http.statusCode >= 500)
         }
+    }
+
+    private func debugResponse(path: String, method: String, response: URLResponse, data: Data) {
+        #if DEBUG
+        let http = response as? HTTPURLResponse
+        let contentType = http?.value(forHTTPHeaderField: "Content-Type") ?? "(missing)"
+        debugLog("BOARD RESPONSE endpoint=\(path) method=\(method) status=\(http?.statusCode ?? -1) contentType=\(contentType) bytes=\(data.count)")
+        guard !data.isEmpty else { return }
+        if let object = try? JSONSerialization.jsonObject(with: data), let pretty = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted]), let text = String(data: pretty, encoding: .utf8) {
+            debugLog("BOARD RESPONSE BODY endpoint=\(path)\n\(String(text.prefix(4096)))")
+        } else if let text = String(data: data, encoding: .utf8) {
+            debugLog("BOARD RESPONSE BODY endpoint=\(path)\n\(String(text.prefix(4096)))")
+        }
+        #endif
+    }
+
+    private func logDecodingError(_ error: DecodingError, endpoint: String, method: String, response: URLResponse, data: Data) {
+        #if DEBUG
+        let http = response as? HTTPURLResponse
+        let contentType = http?.value(forHTTPHeaderField: "Content-Type") ?? "(missing)"
+        func path(_ codingPath: [CodingKey]) -> String { codingPath.isEmpty ? "root" : codingPath.map(\.stringValue).joined(separator: ".") }
+        switch error {
+        case .keyNotFound(let key, let context):
+            debugLog("BOARD DECODE FAILED endpoint=\(endpoint) method=\(method) status=\(http?.statusCode ?? -1) contentType=\(contentType) bytes=\(data.count) error=keyNotFound key=\(key.stringValue) codingPath=\(path(context.codingPath)) description=\(context.debugDescription) underlying=\(String(describing: context.underlyingError))")
+        case .valueNotFound(let type, let context):
+            debugLog("BOARD DECODE FAILED endpoint=\(endpoint) method=\(method) status=\(http?.statusCode ?? -1) contentType=\(contentType) bytes=\(data.count) error=valueNotFound expected=\(type) codingPath=\(path(context.codingPath)) description=\(context.debugDescription) underlying=\(String(describing: context.underlyingError))")
+        case .typeMismatch(let type, let context):
+            debugLog("BOARD DECODE FAILED endpoint=\(endpoint) method=\(method) status=\(http?.statusCode ?? -1) contentType=\(contentType) bytes=\(data.count) error=typeMismatch expected=\(type) codingPath=\(path(context.codingPath)) description=\(context.debugDescription) underlying=\(String(describing: context.underlyingError))")
+        case .dataCorrupted(let context):
+            debugLog("BOARD DECODE FAILED endpoint=\(endpoint) method=\(method) status=\(http?.statusCode ?? -1) contentType=\(contentType) bytes=\(data.count) error=dataCorrupted codingPath=\(path(context.codingPath)) description=\(context.debugDescription) underlying=\(String(describing: context.underlyingError))")
+        @unknown default:
+            debugLog("BOARD DECODE FAILED endpoint=\(endpoint) method=\(method) status=\(http?.statusCode ?? -1) contentType=\(contentType) bytes=\(data.count) error=unknownDecodingError description=\(error)")
+        }
+        #endif
+    }
+
+    private func debugLog(_ message: String) {
+        #if DEBUG
+        print("[VBoard] \(message)")
+        #endif
     }
 }
 

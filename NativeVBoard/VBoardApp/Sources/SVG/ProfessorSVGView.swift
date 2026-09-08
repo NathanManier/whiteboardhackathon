@@ -4,11 +4,15 @@ import UIKit
 final class ProfessorSVGView: UIView {
     private var shapeLayers: [CAShapeLayer] = []
 
-    func display(_ document: SVGDocument, transform: WorldScreenTransform) {
+    func display(_ document: SVGDocument, transform: WorldScreenTransform, importedTransforms: [String: ObjectTransform] = [:]) {
         shapeLayers.forEach { $0.removeFromSuperlayer() }; shapeLayers.removeAll(keepingCapacity: true)
-        var cg = CGAffineTransform(translationX: transform.origin.x - CGFloat(transform.camera.x) * transform.scale, y: transform.origin.y - CGFloat(transform.camera.y) * transform.scale).scaledBy(x: transform.scale, y: transform.scale)
+        let cg = CGAffineTransform(translationX: transform.origin.x - CGFloat(transform.camera.x) * transform.scale, y: transform.origin.y - CGFloat(transform.camera.y) * transform.scale).scaledBy(x: transform.scale, y: transform.scale)
         for item in document.paths {
-            guard let path = try? SVGPathParser.path(from: item.d).copy(using: &cg) else { continue }
+            var pathTransform = cg
+            if let imported = item.id.flatMap({ importedTransforms[$0] }), imported.deleted != true {
+                pathTransform = pathTransform.translatedBy(x: CGFloat(imported.x), y: CGFloat(imported.y)).scaledBy(x: CGFloat(imported.scaleX ?? 1), y: CGFloat(imported.scaleY ?? 1))
+            } else if item.id.flatMap({ importedTransforms[$0] })?.deleted == true { continue }
+            guard let path = try? SVGPathParser.path(from: item.d).copy(using: &pathTransform) else { continue }
             let layer = CAShapeLayer(); layer.path = path; layer.fillColor = item.fill.cgColor; layer.fillRule = item.fillRule
             layer.contentsScale = window?.screen.scale ?? UIScreen.main.scale
             self.layer.addSublayer(layer); shapeLayers.append(layer)

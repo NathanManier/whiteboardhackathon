@@ -4,8 +4,10 @@ import UIKit
 struct NativeCanvasView: UIViewRepresentable {
     let document: SVGDocument
     let camera: CameraRect
-    func makeUIView(context: Context) -> InfiniteCanvasUIView { InfiniteCanvasUIView(document: document, camera: camera) }
-    func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) { uiView.update(document: document, camera: camera) }
+    let objects: [CanvasObject]
+    let importedTransforms: [String: ObjectTransform]
+    func makeUIView(context: Context) -> InfiniteCanvasUIView { InfiniteCanvasUIView(document: document, camera: camera, objects: objects, importedTransforms: importedTransforms) }
+    func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) { uiView.update(document: document, camera: camera, objects: objects, importedTransforms: importedTransforms) }
 }
 
 /// UIKit keeps gesture/input work off SwiftUI view diffing. This initial surface
@@ -19,10 +21,12 @@ final class InfiniteCanvasUIView: UIView {
     private var activeID: String?
     private var document: SVGDocument
     private var controller: CameraController
+    private var objects: [CanvasObject]
+    private var importedTransforms: [String: ObjectTransform]
     private var panStart = CGPoint.zero
 
-    init(document: SVGDocument, camera: CameraRect) {
-        self.document = document; controller = CameraController(camera: camera)
+    init(document: SVGDocument, camera: CameraRect, objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:]) {
+        self.document = document; self.objects = objects; self.importedTransforms = importedTransforms; controller = CameraController(camera: camera)
         super.init(frame: .zero); backgroundColor = .systemBackground; addSubview(professor); layer.addSublayer(userLayer)
         let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:))); pan.minimumNumberOfTouches = 1; pan.maximumNumberOfTouches = 2; pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]; addGestureRecognizer(pan)
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(didPinch(_:))); addGestureRecognizer(pinch)
@@ -30,14 +34,15 @@ final class InfiniteCanvasUIView: UIView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func layoutSubviews() { super.layoutSubviews(); professor.frame = bounds; userLayer.frame = bounds; render() }
-    func update(document: SVGDocument, camera: CameraRect) { self.document = document; controller = CameraController(camera: camera); render() }
+    func update(document: SVGDocument, camera: CameraRect, objects: [CanvasObject], importedTransforms: [String: ObjectTransform]) { self.document = document; self.objects = objects; self.importedTransforms = importedTransforms; controller = CameraController(camera: camera); render() }
     @objc private func didPan(_ gesture: UIPanGestureRecognizer) { let translation = gesture.translation(in: self); if gesture.state == .began { panStart = translation }; controller.pan(screenTranslation: CGPoint(x: translation.x - panStart.x, y: translation.y - panStart.y), viewport: bounds.size); panStart = translation; render() }
     @objc private func didPinch(_ gesture: UIPinchGestureRecognizer) { guard gesture.state == .changed else { return }; controller.zoom(by: gesture.scale, anchoredAt: gesture.location(in: self), viewport: bounds.size); gesture.scale = 1; render() }
     private func render() {
         guard bounds.width > 0, bounds.height > 0 else { return }
         let transform = WorldScreenTransform(camera: controller.camera, viewport: bounds.size)
-        professor.display(document, transform: transform)
+        professor.display(document, transform: transform, importedTransforms: importedTransforms)
         userLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        for object in objects { addObjectLayer(object, transform: transform, to: userLayer) }
         for stroke in userStrokes { addStrokeLayer(stroke, transform: transform, to: userLayer) }
         if let activeStrokeLayer { userLayer.addSublayer(activeStrokeLayer) }
     }
@@ -86,5 +91,16 @@ final class InfiniteCanvasUIView: UIView {
         let layer = CAShapeLayer(); let path = UIBezierPath()
         for (index, point) in stroke.points.enumerated() { let screen = transform.screenPoint(for: CGPoint(x: point.x + stroke.translation.x, y: point.y + stroke.translation.y)); if index == 0 { path.move(to: screen) } else { path.addLine(to: screen) } }
         layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor; layer.strokeColor = UIColor(svgHex: stroke.color).withAlphaComponent(CGFloat(stroke.opacity)).cgColor; layer.lineWidth = stroke.width * transform.scale; layer.lineCap = .round; layer.lineJoin = .round; container.addSublayer(layer)
+    }
+
+    private func addObjectLayer(_ object: CanvasObject, transform: WorldScreenTransform, to container: CALayer) {
+        if object.type == "text", let text = object.text ?? object.sourceMarkdown, let x = object.x, let y = object.y {
+            let layer = CATextLayer(); layer.string = text; layer.foregroundColor = UIColor(svgHex: object.color ?? "#183153").cgColor; layer.fontSize = object.fontSize ?? 32; layer.alignmentMode = .left; layer.contentsScale = window?.screen.scale ?? UIScreen.main.scale
+            let origin = transform.screenPoint(for: CGPoint(x: x + (object.translation?.x ?? 0), y: y + (object.translation?.y ?? 0))); layer.frame = CGRect(x: origin.x, y: origin.y, width: (object.width ?? 400) * transform.scale, height: (object.height ?? 100) * transform.scale); container.addSublayer(layer); return
+        }
+        guard let points = object.points, !points.isEmpty else { return }
+        let layer = CAShapeLayer(); let path = UIBezierPath(); let tx = object.translation?.x ?? 0; let ty = object.translation?.y ?? 0
+        for (index, point) in points.enumerated() { let screen = transform.screenPoint(for: CGPoint(x: point.x + tx, y: point.y + ty)); if index == 0 { path.move(to: screen) } else { path.addLine(to: screen) } }
+        layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor; layer.strokeColor = UIColor(svgHex: object.color ?? "#183153").withAlphaComponent(CGFloat(object.opacity ?? 1)).cgColor; layer.lineWidth = (object.width ?? 4) * transform.scale; layer.lineCap = .round; layer.lineJoin = .round; container.addSublayer(layer)
     }
 }

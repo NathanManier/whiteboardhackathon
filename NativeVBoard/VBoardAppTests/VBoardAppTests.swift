@@ -51,3 +51,27 @@ final class StrokeSerializationTests: XCTestCase {
         XCTAssertEqual(decoded.points[0].pressure ?? -1, 0.6, accuracy: 0.0001)
     }
 }
+
+final class ServerContractDecodingTests: XCTestCase {
+    func testEditorEnvelopeAndOmittedCollectionsUseServerDefaults() throws {
+        let json = """
+        {"editor":{"schema_version":4,"revision":7,"viewport":{"x":-20,"y":-10,"width":800,"height":600},"objects":[],"imported_transforms":null,"source_boards":null,"merged_board_ids":null}}
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(EditorEnvelope.self, from: json).editor
+        XCTAssertEqual(decoded.revision, 7)
+        XCTAssertEqual(decoded.viewport.x, -20)
+        XCTAssertEqual(decoded.groups.count, 0)
+        XCTAssertEqual(decoded.importedTransforms.count, 0)
+        XCTAssertEqual(decoded.sourceBoards.count, 0)
+        XCTAssertEqual(decoded.mergedBoardIDs.count, 0)
+    }
+
+    func testUnknownObjectTypeAndUnknownFieldsDoNotDropObject() throws {
+        let json = """
+        {"editor":{"schema_version":4,"revision":1,"viewport":{"x":0,"y":0,"width":100,"height":100},"objects":[{"id":"future-1","type":"ai_practice_problem","color":"#183153","points":[],"future_field":{"answer":42}}]}}
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(EditorEnvelope.self, from: json).editor
+        XCTAssertEqual(decoded.objects.count, 1)
+        XCTAssertEqual(decoded.objects[0].type, "ai_practice_problem")
+    }
+}

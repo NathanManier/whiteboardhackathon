@@ -82,21 +82,36 @@ struct EditorState: Codable, Sendable {
     var updatedAt: Double?
     var viewport: CameraRect
     var objects: [CanvasObject]
+    var groups: [EditorGroup]
     var importedTransforms: [String: ObjectTransform]
     var sourceBoards: [SourceBoard]
     var mergedBoardIDs: [String]
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version", revision
-        case updatedAt = "updated_at", viewport, objects
+        case updatedAt = "updated_at", viewport, objects, groups
         case importedTransforms = "imported_transforms"
         case sourceBoards = "source_boards"
         case mergedBoardIDs = "merged_board_ids"
     }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        revision = try c.decodeIfPresent(Int.self, forKey: .revision) ?? 0
+        updatedAt = try c.decodeIfPresent(Double.self, forKey: .updatedAt)
+        viewport = try c.decode(CameraRect.self, forKey: .viewport)
+        objects = try c.decodeIfPresent([CanvasObject].self, forKey: .objects) ?? []
+        groups = try c.decodeIfPresent([EditorGroup].self, forKey: .groups) ?? []
+        importedTransforms = try c.decodeIfPresent([String: ObjectTransform].self, forKey: .importedTransforms) ?? [:]
+        sourceBoards = try c.decodeIfPresent([SourceBoard].self, forKey: .sourceBoards) ?? []
+        mergedBoardIDs = try c.decodeIfPresent([String].self, forKey: .mergedBoardIDs) ?? []
+    }
 }
 
 struct SourceBoard: Codable, Sendable { let boardID: String; enum CodingKeys: String, CodingKey { case boardID = "board_id" } }
-struct ObjectTransform: Codable, Sendable { let x: Double; let y: Double; let scaleX: Double?; let scaleY: Double? }
+struct EditorGroup: Codable, Sendable { let id: String?; let children: [String]? }
+struct ObjectTransform: Codable, Sendable { let x: Double; let y: Double; let scaleX: Double?; let scaleY: Double?; let deleted: Bool? }
 
 struct CanvasObject: Codable, Identifiable, Sendable {
     let id: String
@@ -108,10 +123,16 @@ struct CanvasObject: Codable, Identifiable, Sendable {
     let translation: WorldPoint?
     /// Canonical source is intentionally retained untouched for future text rendering.
     let sourceMarkdown: String?
+    let text: String?
+    let x: Double?
+    let y: Double?
+    let height: Double?
+    let fontSize: Double?
 
     enum CodingKeys: String, CodingKey {
         case id, type, color, width, opacity, points, translation
-        case sourceMarkdown = "source_markdown"
+        case sourceMarkdown = "source_markdown", text, x, y, height
+        case fontSize = "font_size"
     }
 }
 
