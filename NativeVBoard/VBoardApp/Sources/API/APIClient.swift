@@ -49,9 +49,12 @@ final class APIClient: ObservableObject {
     }
 
     func professorSVG(id: String) async throws -> String {
-        let request = try request(path: "/board/\(id)/svg", accept: "image/svg+xml")
+        // `/board/<id>/svg` is the combined/export route and embeds user ink.
+        // The editor must load only immutable pipeline geometry.
+        let path = "/boards/\(id)/board.svg"
+        let request = try request(path: path, accept: "image/svg+xml")
         let (data, response) = try await data(for: request)
-        debugResponse(path: "/board/\(id)/svg", method: "GET", response: response, data: data)
+        debugResponse(path: path, method: "GET", response: response, data: data)
         try validate(response, data: data)
         guard let svg = String(data: data, encoding: .utf8) else { throw APIError.decoding("The professor SVG was not UTF-8.") }
         return svg

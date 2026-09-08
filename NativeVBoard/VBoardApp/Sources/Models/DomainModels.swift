@@ -95,6 +95,10 @@ struct EditorState: Codable, Sendable {
         case mergedBoardIDs = "merged_board_ids"
     }
 
+    init(schemaVersion: Int, revision: Int, updatedAt: Double?, viewport: CameraRect, objects: [CanvasObject], groups: [EditorGroup], importedTransforms: [String: ObjectTransform], sourceBoards: [SourceBoard], mergedBoardIDs: [String]) {
+        self.schemaVersion = schemaVersion; self.revision = revision; self.updatedAt = updatedAt; self.viewport = viewport; self.objects = objects; self.groups = groups; self.importedTransforms = importedTransforms; self.sourceBoards = sourceBoards; self.mergedBoardIDs = mergedBoardIDs
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1

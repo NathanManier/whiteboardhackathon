@@ -75,3 +75,25 @@ final class ServerContractDecodingTests: XCTestCase {
         XCTAssertEqual(decoded.objects[0].type, "ai_practice_problem")
     }
 }
+
+final class SceneCompositionTests: XCTestCase {
+    private func editor(objects: [CanvasObject] = [], transforms: [String: ObjectTransform] = [:]) -> EditorState {
+        EditorState(schemaVersion: 4, revision: 0, updatedAt: nil, viewport: CameraRect(x: 0, y: 0, width: 100, height: 100), objects: objects, groups: [], importedTransforms: transforms, sourceBoards: [], mergedBoardIDs: [])
+    }
+
+    func testCombinedExportIDsCannotCreateDuplicateWithImmutableProfessorSource() throws {
+        let svg = try SVGDocument.parse("<svg viewBox='0 0 100 100'><path id='prof-1' d='M 0 0 L 10 0 Z' fill='#183153'/></svg>")
+        let object = CanvasObject(id: "stroke-1", type: "stroke", color: "#183153", width: 4, opacity: 1, points: [WorldPoint(x: 0, y: 0, pressure: nil)], translation: nil, sourceMarkdown: nil, text: nil, x: nil, y: nil, height: nil, fontSize: nil)
+        let composition = SceneComposition.build(boardID: "board-a", document: svg, editor: editor(objects: [object]))
+        XCTAssertEqual(composition.nodes.count, 2)
+        XCTAssertTrue(composition.duplicateLogicalIDs.isEmpty)
+        XCTAssertEqual(composition, SceneComposition.build(boardID: "board-a", document: svg, editor: editor(objects: [object])))
+    }
+
+    func testDeletedImportedPathIsSuppressedAndTransformStillProducesOneNode() throws {
+        let svg = try SVGDocument.parse("<svg viewBox='0 0 100 100'><path id='prof-1' d='M 0 0 L 10 0 Z' fill='#183153'/><path id='prof-2' d='M 20 0 L 30 0 Z' fill='#183153'/></svg>")
+        let transforms = ["prof-1": ObjectTransform(x: 5, y: 6, scaleX: 2, scaleY: 2, deleted: false), "prof-2": ObjectTransform(x: 0, y: 0, scaleX: 1, scaleY: 1, deleted: true)]
+        let composition = SceneComposition.build(boardID: "board-a", document: svg, editor: editor(transforms: transforms))
+        XCTAssertEqual(composition.nodes.map(\.logicalID), ["prof-1"])
+    }
+}

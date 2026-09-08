@@ -30,6 +30,10 @@ struct BoardView: View {
             debug("BOARD OPEN SVG RESPONSE SUCCEEDED id=\(board.id) chars=\(source.utf8.count)")
             let document = try SVGDocument.parse(source)
             debug("BOARD OPEN SVG PARSE SUCCEEDED id=\(board.id) paths=\(document.paths.count)")
+            let composition = SceneComposition.build(boardID: board.id, document: document, editor: editor)
+            let uniqueIDs = Set(composition.nodes.map(\.logicalID)).count
+            let textObjects = editor.objects.filter { $0.type == "text" }.count
+            debug("BOARD SCENE BUILD board=\(board.id) professorSVGPaths=\(document.paths.count) editorObjects=\(editor.objects.count) groups=\(editor.groups.count) importedTransforms=\(editor.importedTransforms.count) softDeletedImports=\(editor.importedTransforms.values.filter { $0.deleted == true }.count) textObjects=\(textObjects) renderNodes=\(composition.nodes.count) uniqueLogicalIDs=\(uniqueIDs) duplicateLogicalIDs=\(composition.duplicateLogicalIDs)")
             state = .ready(document, editor)
             debug("BOARD OPEN FIRST SCENE READY id=\(board.id)")
         } catch let error as APIError {
