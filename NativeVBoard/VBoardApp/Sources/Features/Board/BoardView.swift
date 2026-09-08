@@ -19,8 +19,12 @@ struct BoardView: View {
     }
     private func load() async {
         do {
+            // Validate the canonical board metadata route first. The SVG and
+            // editor routes remain separate so the board stays isolated.
+            async let metadata = api.board(id: board.id)
             async let svg = api.professorSVG(id: board.id)
             async let editor = api.editor(id: board.id)
+            _ = try await metadata
             let document = try SVGDocument.parse(await svg)
             state = .ready(document, try await editor)
         } catch { state = .failed(error.localizedDescription) }
