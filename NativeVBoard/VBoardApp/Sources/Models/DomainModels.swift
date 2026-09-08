@@ -121,6 +121,8 @@ struct StrokePoint: Codable, Equatable, Sendable {
     let x: Double
     let y: Double
     let pressure: Double?
+
+    enum CodingKeys: String, CodingKey { case x, y, pressure = "p" }
 }
 
 struct UserStroke: Codable, Identifiable, Equatable, Sendable {
