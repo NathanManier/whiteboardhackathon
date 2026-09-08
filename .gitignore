@@ -12,3 +12,7 @@ uploads/*
 !uploads/.gitkeep
 boards/*
 !boards/.gitkeep
+
+# Xcode creates these per-machine project state directories on open/build.
+NativeVBoard/VBoardApp.xcodeproj/xcuserdata/
+NativeVBoard/VBoardApp.xcodeproj/project.xcworkspace/
