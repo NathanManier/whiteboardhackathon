@@ -26,8 +26,12 @@ final class APIClient: ObservableObject {
     private let baseURL: URL
 
     init(baseURL: URL? = nil, session: URLSession = .shared) {
+        // The bundled HTTPS endpoint is the production default. A Run-scheme
+        // environment value remains available for a local Flask development server.
         let configured = ProcessInfo.processInfo.environment["VBoardAPIBaseURL"]
-        self.baseURL = baseURL ?? URL(string: configured ?? "http://127.0.0.1:5000")!
+            ?? Bundle.main.object(forInfoDictionaryKey: "VBoardAPIBaseURL") as? String
+            ?? "https://chsinteract.com"
+        self.baseURL = baseURL ?? URL(string: configured)!
         self.session = session
         self.decoder = JSONDecoder()
         self.encoder = JSONEncoder()
