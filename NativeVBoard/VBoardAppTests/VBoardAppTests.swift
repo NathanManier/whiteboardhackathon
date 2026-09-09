@@ -2,6 +2,19 @@ import XCTest
 @testable import VBoardApp
 
 final class WorldScreenTransformTests: XCTestCase {
+    func testCanvasCoordinateMapperConvertsFromOffsetSourceView() {
+        let canvas = UIView(frame: CGRect(x: 40, y: 30, width: 800, height: 400))
+        let source = UIView(frame: CGRect(x: 100, y: 80, width: 200, height: 100))
+        canvas.addSubview(source)
+        let camera = CameraRect(x: -100, y: -50, width: 400, height: 200)
+        let raw = CGPoint(x: 25, y: 15)
+        let canvasPoint = source.convert(raw, to: canvas)
+        let world = CanvasCoordinateMapper.viewPointToWorld(raw, from: source, in: canvas, camera: camera)
+        let roundTrip = CanvasCoordinateMapper.worldToViewPoint(world, in: canvas, camera: camera)
+        XCTAssertEqual(roundTrip.x, canvasPoint.x, accuracy: 0.0001)
+        XCTAssertEqual(roundTrip.y, canvasPoint.y, accuracy: 0.0001)
+    }
+
     func testWorldScreenRoundTripWithNegativeCoordinates() {
         let transform = WorldScreenTransform(camera: CameraRect(x: -200, y: -100, width: 800, height: 400), viewport: CGSize(width: 1200, height: 600))
         let world = CGPoint(x: -50.25, y: 22.75)

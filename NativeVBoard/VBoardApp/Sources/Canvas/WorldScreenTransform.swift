@@ -1,4 +1,19 @@
 import CoreGraphics
+import UIKit
+
+/// The single coordinate-space boundary for canvas input and rendering.
+/// UIKit events are first converted into the root canvas view's untransformed
+/// local coordinates, then mapped through the authoritative CameraRect.
+struct CanvasCoordinateMapper {
+    static func viewPointToWorld(_ point: CGPoint, from sourceView: UIView, in canvasView: UIView, camera: CameraRect) -> CGPoint {
+        let canvasPoint = sourceView.convert(point, to: canvasView)
+        return WorldScreenTransform(camera: camera, viewport: canvasView.bounds.size).worldPoint(for: canvasPoint)
+    }
+
+    static func worldToViewPoint(_ point: CGPoint, in canvasView: UIView, camera: CameraRect) -> CGPoint {
+        WorldScreenTransform(camera: camera, viewport: canvasView.bounds.size).screenPoint(for: point)
+    }
+}
 
 struct WorldScreenTransform: Equatable {
     let camera: CameraRect
