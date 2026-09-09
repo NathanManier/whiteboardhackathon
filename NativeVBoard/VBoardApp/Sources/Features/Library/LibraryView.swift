@@ -92,14 +92,46 @@ struct LectureView: View {
     @State private var error: String?
     @State private var showImporter = false
     @State private var showGuide = false
+    @State private var showRename = false
+    @State private var showDelete = false
+    @State private var renameText = ""
+    @State private var renameBoard: LibraryBoard?
     var body: some View {
         Group {
-            if let lecture {
-                ScrollView { VStack(alignment: .leading, spacing: 22) { HStack { VStack(alignment: .leading) { Text(lecture.folder.name).font(.largeTitle.bold()); Text("Your ordered whiteboards").foregroundStyle(.secondary) }; Spacer(); Button { showImporter = true } label: { Label("Add Board", systemImage: "plus") }.buttonStyle(.borderedProminent) }.padding(.horizontal); LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 16)], spacing: 16) { ForEach(lecture.boards) { board in NavigationLink { BoardView(board: board) } label: { BoardCard(board: board) }.buttonStyle(.plain) } }.padding(.horizontal); Button { showGuide = true } label: { Label(lecture.studyGuide == nil ? "Create Study Guide" : "Open Study Guide", systemImage: "text.book.closed") }.buttonStyle(.bordered).padding(.horizontal) }.padding(.vertical, 24) }
-            } else if let error { ContentUnavailableView("Couldn’t load lecture", systemImage: "rectangle.stack.badge.exclamationmark", description: Text(error)).overlay(alignment: .bottom) { Button("Retry") { load() }.buttonStyle(.borderedProminent).padding(.bottom, 30) } } else { ProgressView("Loading lecture…") }
-        }.navigationTitle(folder.name).navigationBarTitleDisplayMode(.inline).sheet(isPresented: $showImporter) { ImportFlowView(folderID: folder.id) { _ in showImporter = false; load() } }.sheet(isPresented: $showGuide) { StudyGuideView(folderID: folder.id, guide: lecture?.studyGuide) }.task { load() }
+            if lecture != nil { loadedView }
+            else if let error { ContentUnavailableView("Couldn’t load lecture", systemImage: "rectangle.stack.badge.exclamationmark", description: Text(error)).overlay(alignment: .bottom) { Button("Retry") { load() }.buttonStyle(.borderedProminent).padding(.bottom, 30) } }
+            else { ProgressView("Loading lecture…") }
+        }.navigationTitle(folder.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { renameText = lecture?.folder.name ?? folder.name; showRename = true } label: { Label("Rename Lecture", systemImage: "pencil") }; Button(role: .destructive) { showDelete = true } label: { Label("Delete Lecture", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle") } } }.sheet(isPresented: $showImporter) { ImportFlowView(folderID: folder.id) { _ in showImporter = false; load() } }.sheet(isPresented: $showGuide) { StudyGuideView(folderID: folder.id, guide: lecture?.studyGuide) }.sheet(isPresented: $showRename) { RenamePrompt(title: "Rename Lecture", value: renameText) { value in Task { do { _ = try await api.renameLecture(id: folder.id, name: value); showRename = false; load() } catch { self.error = "That lecture name could not be saved." } } } }.sheet(item: $renameBoard) { board in RenamePrompt(title: "Rename Whiteboard", value: board.name) { value in Task { do { _ = try await api.updateBoard(id: board.id, name: value); renameBoard = nil; load() } catch { self.error = "That board name could not be saved." } } } }.alert("Delete lecture?", isPresented: $showDelete) { Button("Delete", role: .destructive) { Task { await deleteLecture() } }; Button("Cancel", role: .cancel) {} } message: { Text("A lecture can only be deleted when it is empty.") }.task { load() }
+    }
+    @ViewBuilder private var loadedView: some View {
+        if let lecture {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    HStack { VStack(alignment: .leading) { Text(lecture.folder.name).font(.largeTitle.bold()); Text("Your ordered whiteboards").foregroundStyle(.secondary) }; Spacer(); Button { showImporter = true } label: { Label("Add Board", systemImage: "plus") }.buttonStyle(.borderedProminent) }.padding(.horizontal)
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 16)], spacing: 16) {
+                        ForEach(lecture.boards) { board in
+                            NavigationLink { BoardView(board: board) } label: { BoardCard(board: board) }.buttonStyle(.plain).contextMenu { Button { renameBoard = board } label: { Label("Rename", systemImage: "pencil") }; Button(role: .destructive) { Task { await delete(board) } } label: { Label("Delete", systemImage: "trash") } }
+                        }
+                    }.padding(.horizontal)
+                    Button { showGuide = true } label: { Label(lecture.studyGuide == nil ? "Create Study Guide" : "Open Study Guide", systemImage: "text.book.closed") }.buttonStyle(.bordered).padding(.horizontal)
+                }.padding(.vertical, 24)
+            }
+        }
     }
     private func load() { Task { do { lecture = try await api.lecture(id: folder.id); error = nil } catch { self.error = "Your lecture could not be loaded." } } }
+    private func deleteLecture() async { do { try await api.deleteLecture(id: folder.id); dismissLecture() } catch { self.error = "The lecture could not be deleted. Remove its boards first." } }
+    private func delete(_ board: LibraryBoard) async { do { try await api.deleteBoard(id: board.id); load() } catch { self.error = "The whiteboard could not be deleted." } }
+    @Environment(\.dismiss) private var dismiss
+    private func dismissLecture() { dismiss() }
+}
+
+private struct RenamePrompt: View {
+    @Environment(\.dismiss) private var dismiss
+    let title: String
+    let onSave: (String) -> Void
+    @State private var value: String
+    init(title: String, value: String, onSave: @escaping (String) -> Void) { self.title = title; self.onSave = onSave; _value = State(initialValue: value) }
+    var body: some View { NavigationStack { Form { TextField("Name", text: $value) }.navigationTitle(title).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Save") { let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines); if !trimmed.isEmpty { onSave(trimmed); dismiss() } }.disabled(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } } } }
 }
 
 struct ImportFlowView: View {

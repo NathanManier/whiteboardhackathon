@@ -46,6 +46,28 @@ final class APIClient: ObservableObject {
         struct Envelope: Decodable { let folder: LectureFolder }
         return try decoder.decode(Envelope.self, from: data).folder
     }
+    func renameLecture(id: String, name: String) async throws -> LectureFolder {
+        var request = try request(path: "/api/folders/\(id)", method: "PATCH")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
+        let (data, response) = try await data(for: request); try validate(response, data: data)
+        struct Envelope: Decodable { let folder: LectureFolder }
+        return try decoder.decode(Envelope.self, from: data).folder
+    }
+    func deleteLecture(id: String, recursive: Bool = false) async throws {
+        let suffix = recursive ? "?recursive=true" : ""
+        let request = try request(path: "/api/folders/\(id)\(suffix)", method: "DELETE")
+        let (data, response) = try await data(for: request); try validate(response, data: data)
+    }
+    func updateBoard(id: String, name: String? = nil, folderID: String? = nil) async throws -> LibraryBoard {
+        var request = try request(path: "/api/boards/\(id)", method: "PATCH")
+        var payload: [String: Any] = [:]
+        if let name { payload["name"] = name }
+        if let folderID { payload["folder_id"] = folderID }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let (data, response) = try await data(for: request); try validate(response, data: data)
+        struct Envelope: Decodable { let board: LibraryBoard }
+        return try decoder.decode(Envelope.self, from: data).board
+    }
     func board(id: String) async throws -> BoardRecord { try await get("/board/\(id)") }
     func editor(id: String) async throws -> EditorState {
         // Flask deliberately wraps this response as {"editor": {...}}.
