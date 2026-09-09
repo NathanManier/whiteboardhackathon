@@ -139,6 +139,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         perfLabel.layer.cornerRadius = 6; perfLabel.layer.masksToBounds = true
         addSubview(perfLabel)
         updateInputHUD()
+        debugViewHierarchy()
         #endif
         becomeFirstResponder()
         NotificationCenter.default.addObserver(self, selector: #selector(clearTransientInput), name: UIApplication.didEnterBackgroundNotification, object: nil)
@@ -182,7 +183,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onMove = onMove; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
-        panGesture.isEnabled = true
+        // Hand owns the root touch stream directly because the simulator's
+        // indirect-pointer drag is not consistently promoted to a
+        // UIPanGestureRecognizer. Other tools keep the recognizer available
+        // exclusively for the Space-pan override.
+        panGesture.isEnabled = tool != .navigation
         controller.setCamera(camera)
         if documentChanged { professor.display(document, transform: worldTransform, importedTransforms: importedTransforms, composition: composition) }
         if objectsChanged { rebuildUserLayers() }
@@ -221,15 +226,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         switch gesture.state {
         case .began:
             interactionState = .panning; debugInputOperation("PAN BEGIN")
-            panStart = translation; panStartCamera = controller.camera; professor.beginNavigation(); updateInputHUD()
+            panStart = translation; panStartCamera = controller.camera; professor.beginNavigation(); debugPan("BEGIN", screen: translation); updateInputHUD()
         case .changed:
             controller.setCamera(panStartCamera)
             controller.pan(screenTranslation: CGPoint(x: translation.x - panStart.x, y: translation.y - panStart.y), viewport: bounds.size)
-            applyCamera(interacting: true); debugInputOperation("PAN UPDATE")
+            applyCamera(interacting: true); debugInputOperation("PAN UPDATE"); debugPan("UPDATE", screen: translation)
         case .ended, .cancelled, .failed:
             professor.endNavigation(worldTransform); applyCamera(interacting: false)
             onCameraChanged(controller.camera)
-            interactionState = .idle; debugInputOperation("PAN END"); updateInputHUD()
+            interactionState = .idle; debugInputOperation("PAN END"); debugPan("END"); updateInputHUD()
             panStart = .zero
         default: break
         }
@@ -278,8 +283,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     #if DEBUG
     private func debugInput(_ phase: String, touch: UITouch) {
-        let sourceView = touch.view ?? self
-        let raw = touch.location(in: sourceView); let screen = canvasPoint(raw, from: sourceView); let world = worldPoint(raw, from: sourceView)
+        // Indirect-pointer touches can report different `touch.view` values
+        // as they cross render sublayers. Always sample in this stable,
+        // untransformed root interaction surface instead of mixing child
+        // view origins between begin/move/end.
+        let raw = touch.location(in: self); let screen = raw; let world = worldPoint(raw, from: self)
         let roundTrip = CanvasCoordinateMapper.worldToViewPoint(world, in: self, camera: controller.camera)
         let error = hypot(roundTrip.x - screen.x, roundTrip.y - screen.y)
         activeInputSource = source(for: touch)
@@ -291,12 +299,24 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private func debugInputOperation(_ operation: String) {
         print("[VBoard] \(operation) tool=\(activeTool.rawValue) state=\(interactionState.rawValue) selected=\(selectedIDs.count)")
     }
+    private func debugPan(_ phase: String, screen: CGPoint? = nil) {
+        print("[VBoard] PAN \(phase) screen=\(String(describing: screen)) start=\(panStart) camera=\(controller.camera) state=\(interactionState.rawValue)")
+    }
+    private func debugViewHierarchy() {
+        func dump(_ view: UIView, _ depth: Int) {
+            let indent = String(repeating: "  ", count: depth)
+            print("[VBoard] VIEW_TREE \(indent)\(type(of: view)) frame=\(view.frame) bounds=\(view.bounds) transform=\(view.transform) userInteraction=\(view.isUserInteractionEnabled)")
+            for child in view.subviews { dump(child, depth + 1) }
+        }
+        dump(self, 0)
+    }
     private func updateInputHUD() {
         renderDebugHUD()
     }
     #else
     private func debugInput(_ phase: String, touch: UITouch) {}
     private func debugInputOperation(_ operation: String) {}
+    private func debugPan(_ phase: String, screen: CGPoint? = nil) {}
     private func updateInputHUD() {}
     #endif
 
@@ -360,7 +380,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
         debugInput("BEGIN", touch: touch)
-        let point = worldPoint(touch.location(in: touch.view ?? self), from: touch.view ?? self)
+        let point = worldPoint(touch.location(in: self), from: self)
+        if activeTool == .navigation {
+            let screen = touch.location(in: self)
+            panStart = screen; panStartCamera = controller.camera
+            interactionState = .panning; professor.beginNavigation(); debugInputOperation("PAN BEGIN"); debugPan("BEGIN", screen: screen); updateInputHUD(); return
+        }
         if activeTool != .pen && activeTool != .highlighter { beginEditing(at: point); return }
         guard isDrawingTouch(touch) else { super.touchesBegan(touches, with: event); return }
         interactionState = .drawing; debugInputOperation("STROKE BEGIN"); updateInputHUD()
@@ -374,7 +399,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
         debugInput("MOVE", touch: touch)
-        if activeTool != .pen && activeTool != .highlighter { continueEditing(at: worldPoint(touch.location(in: touch.view ?? self), from: touch.view ?? self)); return }
+        if activeTool == .navigation {
+            let screen = touch.location(in: self)
+            controller.setCamera(panStartCamera)
+            controller.pan(screenTranslation: CGPoint(x: screen.x - panStart.x, y: screen.y - panStart.y), viewport: bounds.size)
+            applyCamera(interacting: true); debugInputOperation("PAN UPDATE"); debugPan("UPDATE", screen: screen); return
+        }
+        if activeTool != .pen && activeTool != .highlighter { continueEditing(at: worldPoint(touch.location(in: self), from: self)); return }
         guard isDrawingTouch(touch) else { return }
         activePoints.append(contentsOf: samples(for: touch, event: event)); updateActiveStroke(); debugInputOperation("STROKE APPEND")
     }
@@ -382,8 +413,20 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
         debugInput("END", touch: touch)
+        if activeTool == .navigation {
+            // The Mac/iPad simulator may coalesce an indirect-pointer drag
+            // into only BEGIN/END callbacks. Derive the final camera from the
+            // immutable pan-start state and the root-space endpoint so that
+            // this path remains deterministic and never depends on MOVE
+            // delivery frequency.
+            let screen = touch.location(in: self)
+            controller.setCamera(panStartCamera)
+            controller.pan(screenTranslation: CGPoint(x: screen.x - panStart.x, y: screen.y - panStart.y), viewport: bounds.size)
+            professor.endNavigation(worldTransform); applyCamera(interacting: false); onCameraChanged(controller.camera)
+            interactionState = .idle; panStart = .zero; debugInputOperation("PAN END"); debugPan("END", screen: screen); updateInputHUD(); return
+        }
         if activeTool != .pen && activeTool != .highlighter {
-            finishEditing(at: worldPoint(touch.location(in: touch.view ?? self), from: touch.view ?? self)); return
+            finishEditing(at: worldPoint(touch.location(in: self), from: self)); return
         }
         guard isDrawingTouch(touch) else { return }
         activePoints.append(contentsOf: samples(for: touch, event: event))
@@ -396,6 +439,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if activeTool == .navigation {
+            professor.endNavigation(worldTransform); interactionState = .idle; panStart = .zero; updateInputHUD(); return
+        }
         if activeTool != .pen && activeTool != .highlighter { finishEditing(at: nil); return }
         if touches.contains(where: { isDrawingTouch($0) }) {
             activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil

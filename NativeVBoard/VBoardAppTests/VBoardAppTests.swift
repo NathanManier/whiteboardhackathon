@@ -23,10 +23,41 @@ final class WorldScreenTransformTests: XCTestCase {
         XCTAssertEqual(transform.worldPoint(for: screen).y, world.y, accuracy: 0.0001)
     }
 
+    func testRootCanvasRoundTripAcrossViewportShapesAndZoomLevels() {
+        let cases: [(CameraRect, CGSize, CGPoint)] = [
+            (CameraRect(x: 0, y: 0, width: 100, height: 100), CGSize(width: 1024, height: 768), CGPoint(x: 17, y: 23)),
+            (CameraRect(x: 240, y: -180, width: 400, height: 200), CGSize(width: 1366, height: 820), CGPoint(x: 901, y: 117)),
+            (CameraRect(x: -1600, y: -900, width: 80, height: 45), CGSize(width: 834, height: 1194), CGPoint(x: 412, y: 733)),
+            (CameraRect(x: -8, y: 12, width: 2400, height: 1350), CGSize(width: 1194, height: 834), CGPoint(x: 101, y: 702))
+        ]
+        for (camera, viewport, screen) in cases {
+            let transform = WorldScreenTransform(camera: camera, viewport: viewport)
+            let world = transform.worldPoint(for: screen)
+            let roundTrip = transform.screenPoint(for: world)
+            XCTAssertEqual(roundTrip.x, screen.x, accuracy: 0.000001)
+            XCTAssertEqual(roundTrip.y, screen.y, accuracy: 0.000001)
+        }
+    }
+
     func testPanMovesVisibleWorldOppositeFinger() {
         var camera = CameraController(camera: CameraRect(x: 0, y: 0, width: 100, height: 100))
         camera.pan(screenTranslation: CGPoint(x: 100, y: 0), viewport: CGSize(width: 100, height: 100))
         XCTAssertEqual(camera.camera.x, -100, accuracy: 0.0001)
+    }
+
+    func testPanUsesTotalDeltaWithoutCumulativeDrift() {
+        let start = CameraRect(x: -320, y: 140, width: 800, height: 400)
+        let viewport = CGSize(width: 1200, height: 600)
+        var camera = CameraController(camera: start)
+        camera.pan(screenTranslation: CGPoint(x: 160, y: -40), viewport: viewport)
+        let once = camera.camera
+        camera.setCamera(start)
+        camera.pan(screenTranslation: CGPoint(x: 80, y: -20), viewport: viewport)
+        camera.setCamera(start)
+        camera.pan(screenTranslation: CGPoint(x: 160, y: -40), viewport: viewport)
+        XCTAssertEqual(camera.camera, once)
+        XCTAssertEqual(camera.camera.x, start.x - 160.0 / 1.5, accuracy: 0.000001)
+        XCTAssertEqual(camera.camera.y, start.y + 40.0 / 1.5, accuracy: 0.000001)
     }
 
     func testPinchRetainsWorldAnchorAndClampsZoom() {

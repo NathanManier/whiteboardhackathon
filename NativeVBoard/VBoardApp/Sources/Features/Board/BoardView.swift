@@ -94,7 +94,14 @@ private struct BoardEditorSurface: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { id, delta in store.moveObject(id: id, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) }).ignoresSafeArea(edges: .bottom)
+            // A tool change is an interaction-boundary event. Recreate the
+            // UIKit input surface so its recognizers and responder state are
+            // never left with the previous tool, while the document/camera
+            // remain owned by BoardDocumentStore and therefore survive the
+            // handoff exactly once.
+            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { id, delta in store.moveObject(id: id, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
+                .id(activeTool)
+                .ignoresSafeArea(edges: .bottom)
             HStack(spacing: 8) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) { ForEach(CanvasTool.allCases, id: \.self) { tool in ToolButton(title: tool.title, icon: tool.icon, selected: activeTool == tool) { activeTool = tool } } }
