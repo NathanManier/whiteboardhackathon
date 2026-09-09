@@ -7,7 +7,10 @@
 | Coalesced samples | `coalescedTouches(for:)` | Code path compiled | Required |
 | Pressure | `force / maximumPossibleForce` | Code path compiled | Required |
 | Finger pan and two-finger pinch | UIKit gesture recognizers | Tested on simulator equivalents | Re-test |
-| Mouse/trackpad drawing fallback | Pending tool-mode integration | Required before release | Re-test |
+| Mouse/trackpad drawing fallback | Indirect-pointer drags use canonical `UserStroke` | Required | Re-test |
+| Selection/lasso/object erase | World-coordinate tool routing with spatial candidate reduction | Required | Re-test |
+| Local outbox/autosave | `BoardDocumentStore` Application Support snapshot | XCTest/integration pass | Re-test |
+| Practice problem persistence | `role=ai_practice_problem` editor objects | Simulator flow required | Re-test |
 | Hover, double-tap, squeeze, barrel roll | Not yet wired | N/A | Required |
 | Palm rejection and Pencil/finger latency | UIKit routing in place | N/A | Required |
 | Real camera capture | `UIImagePickerController` entry point | Falls back to photo library | Required |
