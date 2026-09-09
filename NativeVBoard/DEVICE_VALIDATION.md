@@ -7,8 +7,8 @@
 | Coalesced samples | `coalescedTouches(for:)` | Code path compiled | Required |
 | Pressure | `force / maximumPossibleForce` | Code path compiled | Required |
 | Finger pan and two-finger pinch | UIKit gesture recognizers | Tested on simulator equivalents | Re-test |
-| Mouse/trackpad drawing fallback | Indirect-pointer drags use canonical `UserStroke` | Required | Re-test |
-| Selection/lasso/object erase | World-coordinate tool routing with spatial candidate reduction | Required | Re-test |
+| Mouse/trackpad drawing fallback | Indirect-pointer drags use canonical `UserStroke` | Verified | Re-test |
+| Selection/lasso/object erase | World-coordinate tool routing with spatial candidate reduction | Verified | Re-test |
 | Local outbox/autosave | `BoardDocumentStore` Application Support snapshot | XCTest/integration pass | Re-test |
 | Practice problem persistence | `role=ai_practice_problem` editor objects | Simulator flow required | Re-test |
 | Hover, double-tap, squeeze, barrel roll | Not yet wired | N/A | Required |
@@ -18,3 +18,24 @@
 Before TestFlight, run the Pencil and camera rows on a physical iPad and
 record the OS/device combination. Basic import, upload, corner confirmation,
 processing, lecture navigation, and board rendering are simulator-testable.
+
+## Simulator input workflow
+
+The iPad simulator exercises the same canonical editor operations used by
+Pencil input. Enable **Capture Keyboard** in the Simulator toolbar when
+testing keyboard commands. Use **Hand** for deterministic mouse panning, hold
+Space for the temporary pan override, and use Cmd-Plus, Cmd-Minus, and Cmd-0
+for camera zoom/reset. Mouse drags with Pen and Highlighter create ordinary
+`CanvasObject` strokes; Select, Lasso, and Erase mutate the same document and
+outbox paths used on device.
+
+Verified on the iPad (10th generation), iOS 18.2 simulator:
+
+- [x] Mouse Pen stroke reaches the canonical editor and remains visible
+- [x] Highlighter uses the canonical stroke model
+- [x] Hand-tool pan changes and persists `CameraRect`
+- [x] Click selection and lasso selection update selected IDs
+- [x] Segment object eraser removes objects and records an undoable mutation
+- [x] DEBUG HUD reports tool, input source, interaction state, selection count
+- [ ] Space-held pan and Cmd keyboard shortcuts need a fresh keyboard-capture
+      pass after install
