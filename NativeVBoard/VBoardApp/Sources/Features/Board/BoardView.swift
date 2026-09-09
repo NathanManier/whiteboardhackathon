@@ -81,9 +81,11 @@ private struct BoardEditorSurface: View {
     @State private var showImport = false
     @State private var showStudy = false
     @State private var showShare = false
-    @State private var exportData: Data?
+    @State private var exportURL: URL?
     @State private var exportError: String?
     @State private var showConflict = false
+    @State private var activeTool: CanvasTool = .pen
+    @State private var selectedIDs = Set<String>()
 
     init(board: LibraryBoard, document: SVGDocument, editor: EditorState, composition: SceneComposition) {
         self.board = board; self.document = document; self.composition = composition
@@ -92,12 +94,12 @@ private struct BoardEditorSurface: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }).ignoresSafeArea(edges: .bottom)
-            HStack(spacing: 10) { ToolButton(title: "Pen", icon: "pencil.tip", selected: true) {}; Spacer(); Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary); Button { showStudy = true } label: { Label("Study", systemImage: "sparkles") }.buttonStyle(.borderedProminent); Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle.fill").font(.title2) }.buttonStyle(.bordered) }.padding(12).background(.regularMaterial, in: Capsule()).padding(.horizontal, 18).padding(.bottom, 12)
+            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { id, delta in store.moveObject(id: id, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }).ignoresSafeArea(edges: .bottom)
+            HStack(spacing: 8) { ForEach(CanvasTool.allCases, id: \.self) { tool in ToolButton(title: tool.title, icon: tool.icon, selected: activeTool == tool) { activeTool = tool } }; Spacer(); Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary); Button { showStudy = true } label: { Label("Study", systemImage: "sparkles") }.buttonStyle(.borderedProminent); Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle.fill").font(.title2) }.buttonStyle(.bordered) }.padding(10).background(.regularMaterial, in: Capsule()).padding(.horizontal, 14).padding(.bottom, 12)
         }.navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button { showStudy = true } label: { Image(systemName: "sparkles") } } }
         .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
-        .sheet(isPresented: $showStudy) { StudyActionsView(boardID: board.id) }
-        .sheet(isPresented: $showShare) { if let exportData { ShareSheet(items: [exportData]) } }
+        .sheet(isPresented: $showStudy) { StudyActionsView(boardID: board.id) { problems, interactionID in store.applyPracticeProblems(problems, interactionID: interactionID, api: api) } }
+        .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
         .alert("Couldn’t export board", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) { Button("OK", role: .cancel) {} } message: { Text(exportError ?? "") }
         .alert("Board changed on the server", isPresented: $showConflict) {
             Button("Keep My Changes") { Task { await store.keepLocalChanges(api: api) } }
@@ -107,8 +109,24 @@ private struct BoardEditorSurface: View {
         .task { store.restoreLocalIfPresent(server: store.editor) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
     }
-    private func export() async { do { exportData = try await api.exportSVG(boardID: board.id); showShare = true } catch { exportError = "The SVG could not be exported right now." } }
+    private func export() async {
+        do {
+            let data = try await api.exportSVG(boardID: board.id)
+            let safeName = board.name.replacingOccurrences(of: "[^A-Za-z0-9 _-]", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = (safeName.isEmpty ? "V-Board" : safeName) + ".svg"
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VBoardExports", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent(name)
+            try data.write(to: url, options: .atomic)
+            exportURL = url; showShare = true
+        } catch { exportError = "The SVG could not be exported right now." }
+    }
     private func deleteBoard() async { do { try await api.deleteBoard(id: board.id); dismiss() } catch { exportError = "The board could not be deleted." } }
+}
+
+private extension CanvasTool {
+    var title: String { rawValue == "objectEraser" ? "Erase" : rawValue.capitalized }
+    var icon: String { switch self { case .pen: return "pencil.tip"; case .select: return "cursorarrow"; case .lasso: return "lasso"; case .objectEraser: return "eraser" } }
 }
 
 private struct ToolButton: View {
@@ -123,11 +141,12 @@ private struct StudyActionsView: View {
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
     let boardID: String
+    let onPracticeProblems: ([PracticeProblem], String?) -> Void
     @State private var loading = false
     @State private var result: StudyInteractionResponse?
     @State private var error: String?
-    var body: some View { NavigationStack { VStack(spacing: 18) { if loading { ProgressView("Thinking about this board…") } else if let result { Text(result.interaction?.title ?? "Study Notes").font(.title2.bold()); ScrollView { Text(result.interaction?.answer ?? result.problem ?? "No study response was returned.").frame(maxWidth: 700, alignment: .leading).textSelection(.enabled) }; Button("Ask Again") { explain() }.buttonStyle(.bordered) } else { Image(systemName: "sparkles").font(.largeTitle).foregroundStyle(.tint); Text("Study this board").font(.title2.bold()); Text("Ask V-Board to explain the visible lecture material or create practice prompts.").multilineTextAlignment(.center).foregroundStyle(.secondary); Button("Explain") { explain() }.buttonStyle(.borderedProminent); Button("Practice Problems") { explain(action: "practice_problems") }.buttonStyle(.bordered) }; if let error { Text(error).foregroundStyle(.red) } }.padding(28).navigationTitle("Study").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } } } }
-    private func explain(action: String = "explain") { loading = true; error = nil; Task { do { result = try await api.explain(boardID: boardID, action: action); loading = false } catch { loading = false; self.error = "AI is temporarily unavailable." } } }
+    var body: some View { NavigationStack { VStack(spacing: 18) { if loading { ProgressView("Thinking about this board…") } else if let result { Text(result.interaction?.title ?? (result.problems == nil ? "Study Notes" : "Practice Problems")).font(.title2.bold()); ScrollView { Text(result.interaction?.answer ?? result.problem ?? result.problems?.map(\.text).joined(separator: "\n\n") ?? "No study response was returned.").frame(maxWidth: 700, alignment: .leading).textSelection(.enabled) }; if let problems = result.problems, !problems.isEmpty { Label("Added to your canvas", systemImage: "rectangle.on.rectangle") .foregroundStyle(.secondary); Button("Add Again") { onPracticeProblems(problems, result.interaction?.id) }.buttonStyle(.bordered) }; Button("Ask Again") { explain() }.buttonStyle(.bordered) } else { Image(systemName: "sparkles").font(.largeTitle).foregroundStyle(.tint); Text("Study this board").font(.title2.bold()); Text("Ask V-Board to explain the visible lecture material or create practice prompts.").multilineTextAlignment(.center).foregroundStyle(.secondary); Button("Explain") { explain() }.buttonStyle(.borderedProminent); Button("Practice Problems") { explain(action: "practice_problems") }.buttonStyle(.bordered) }; if let error { Text(error).foregroundStyle(.red) } }.padding(28).navigationTitle("Study").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } } } }
+    private func explain(action: String = "explain") { loading = true; error = nil; Task { do { result = try await api.explain(boardID: boardID, action: action); if action == "practice_problems", let problems = result?.problems { onPracticeProblems(problems, result?.interaction?.id) }; loading = false } catch { loading = false; self.error = "AI is temporarily unavailable." } } }
 }
 
 private struct ShareSheet: UIViewControllerRepresentable {

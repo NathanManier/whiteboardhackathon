@@ -93,6 +93,21 @@ final class ServerContractDecodingTests: XCTestCase {
         XCTAssertEqual(decoded.objects.count, 1)
         XCTAssertEqual(decoded.objects[0].type, "ai_practice_problem")
     }
+
+    func testPracticeProblemAcceptsServerProblemKeyAndCanvasMetadataRoundTrips() throws {
+        let problem = try JSONDecoder().decode(PracticeProblem.self, from: Data("{\"id\":\"p1\",\"problem\":\"Solve x^2=4\"}".utf8))
+        XCTAssertEqual(problem.id, "p1")
+        XCTAssertEqual(problem.text, "Solve x^2=4")
+        let object = CanvasObject(id: "p1", type: "text", color: "#183153", width: 200,
+                                  opacity: 1, points: nil, translation: nil,
+                                  sourceMarkdown: problem.text, text: problem.text,
+                                  x: -10, y: 5, height: 100, fontSize: 20,
+                                  role: "ai_practice_problem", sourceStudyInteractionID: "study-1")
+        let decoded = try JSONDecoder().decode(CanvasObject.self, from: JSONEncoder().encode(object))
+        XCTAssertEqual(decoded.role, "ai_practice_problem")
+        XCTAssertEqual(decoded.sourceStudyInteractionID, "study-1")
+        XCTAssertEqual(decoded.x, -10)
+    }
 }
 
 final class SceneCompositionTests: XCTestCase {

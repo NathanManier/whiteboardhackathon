@@ -1,6 +1,10 @@
 import SwiftUI
 import UIKit
 
+enum CanvasTool: String, CaseIterable, Sendable {
+    case pen, select, lasso, objectEraser
+}
+
 struct NativeCanvasView: UIViewRepresentable {
     let boardID: String
     let document: SVGDocument
@@ -9,17 +13,23 @@ struct NativeCanvasView: UIViewRepresentable {
     let importedTransforms: [String: ObjectTransform]
     let composition: SceneComposition
     var onStroke: (UserStroke) -> Void = { _ in }
+    var tool: CanvasTool = .pen
+    var onSelectionChanged: (Set<String>) -> Void = { _ in }
+    var onMove: (String, CGPoint) -> Void = { _, _ in }
+    var onDelete: (Set<String>) -> Void = { _ in }
 
     func makeUIView(context: Context) -> InfiniteCanvasUIView {
         InfiniteCanvasUIView(boardID: boardID, document: document, camera: camera,
                              objects: objects, importedTransforms: importedTransforms,
-                             composition: composition, onStroke: onStroke)
+                             composition: composition, onStroke: onStroke, tool: tool,
+                             onSelectionChanged: onSelectionChanged, onMove: onMove, onDelete: onDelete)
     }
 
     func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) {
         uiView.update(boardID: boardID, document: document, camera: camera,
                       objects: objects, importedTransforms: importedTransforms,
-                      composition: composition, onStroke: onStroke)
+                      composition: composition, onStroke: onStroke, tool: tool,
+                      onSelectionChanged: onSelectionChanged, onMove: onMove, onDelete: onDelete)
     }
 }
 
@@ -36,6 +46,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var activePoints: [StrokePoint] = []
     private var activeID: String?
     private var onStroke: (UserStroke) -> Void
+    private var activeTool: CanvasTool
+    private var onSelectionChanged: (Set<String>) -> Void
+    private var onMove: (String, CGPoint) -> Void
+    private var onDelete: (Set<String>) -> Void
+    private var selectedIDs = Set<String>()
+    private var editStart = CGPoint.zero
+    private var lastEditPoint = CGPoint.zero
+    private var lassoWorldPoints: [CGPoint] = []
+    private let interactionLayer = CAShapeLayer()
     private var boardID: String
     private var document: SVGDocument
     private var controller: CameraController
@@ -43,16 +62,21 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var importedTransforms: [String: ObjectTransform]
     private var composition: SceneComposition
     private var panStart = CGPoint.zero
+    private var panGesture: UIPanGestureRecognizer!
     #if DEBUG
     private let perfLabel = UILabel()
     #endif
 
     init(boardID: String, document: SVGDocument, camera: CameraRect,
          objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:],
-         composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in }) {
+         composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in },
+         tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
+         onMove: @escaping (String, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }) {
         self.boardID = boardID; self.document = document; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition
         self.onStroke = onStroke
+        self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
+        self.onMove = onMove; self.onDelete = onDelete
         controller = CameraController(camera: camera)
         super.init(frame: .zero)
         backgroundColor = .systemBackground
@@ -61,6 +85,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         userLayer.anchorPoint = .zero
         userLayer.position = .zero
         layer.addSublayer(userLayer)
+        interactionLayer.fillColor = UIColor.systemBlue.withAlphaComponent(0.08).cgColor
+        interactionLayer.strokeColor = UIColor.systemBlue.cgColor; interactionLayer.lineWidth = 2
+        interactionLayer.lineDashPattern = [6, 4]; interactionLayer.isHidden = true
+        layer.addSublayer(interactionLayer)
         #if DEBUG
         professor.onStats = { [weak self] stats in
             DispatchQueue.main.async { self?.updatePerformanceOverlay(stats) }
@@ -70,7 +98,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
         pan.minimumNumberOfTouches = 1; pan.maximumNumberOfTouches = 2
         pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
-        pan.delegate = self; addGestureRecognizer(pan)
+        pan.delegate = self; panGesture = pan; addGestureRecognizer(pan)
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(didPinch(_:)))
         pinch.delegate = self; addGestureRecognizer(pinch)
         rebuildUserLayers()
@@ -98,12 +126,17 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     func update(boardID: String, document: SVGDocument, camera: CameraRect,
                 objects: [CanvasObject], importedTransforms: [String: ObjectTransform],
-                composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in }) {
+                composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in },
+                tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
+                onMove: @escaping (String, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }) {
         let documentChanged = self.document != document || self.importedTransforms != importedTransforms
-        let objectsChanged = self.objects.map(\.id) != objects.map(\.id)
+        let objectsChanged = self.objects != objects
         self.boardID = boardID; self.document = document; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition
         self.onStroke = onStroke
+        self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
+        self.onMove = onMove; self.onDelete = onDelete
+        panGesture.isEnabled = tool == .pen
         controller.setCamera(camera)
         if documentChanged { professor.display(document, transform: worldTransform, importedTransforms: importedTransforms, composition: composition) }
         if objectsChanged { rebuildUserLayers() }
@@ -119,6 +152,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         let current = worldTransform
         professor.updateCamera(current, interacting: interacting)
         userLayer.setAffineTransform(current.affineTransform)
+        interactionLayer.setAffineTransform(current.affineTransform)
+        updateSelectionOverlay()
     }
 
     @objc private func didPan(_ gesture: UIPanGestureRecognizer) {
@@ -161,7 +196,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first, isDrawingTouch(touch) else { super.touchesBegan(touches, with: event); return }
+        guard let touch = touches.first else { return }
+        if activeTool != .pen { beginEditing(at: worldTransform.worldPoint(for: touch.location(in: self))); return }
+        guard isDrawingTouch(touch) else { super.touchesBegan(touches, with: event); return }
         activeID = UUID().uuidString; activePoints = samples(for: touch, event: event)
         let layer = CAShapeLayer(); layer.fillColor = UIColor.clear.cgColor
         layer.strokeColor = UIColor(svgHex: "#183153").cgColor; layer.lineWidth = 4
@@ -170,12 +207,16 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first, isDrawingTouch(touch) else { return }
+        guard let touch = touches.first else { return }
+        if activeTool != .pen { continueEditing(at: worldTransform.worldPoint(for: touch.location(in: self))); return }
+        guard isDrawingTouch(touch) else { return }
         activePoints.append(contentsOf: samples(for: touch, event: event)); updateActiveStroke()
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first, isDrawingTouch(touch) else { return }
+        guard let touch = touches.first else { return }
+        if activeTool != .pen { finishEditing(); return }
+        guard isDrawingTouch(touch) else { return }
         activePoints.append(contentsOf: samples(for: touch, event: event))
         if let activeID, !activePoints.isEmpty {
             onStroke(UserStroke(id: activeID, points: activePoints))
@@ -185,10 +226,103 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if activeTool != .pen { finishEditing(); return }
         if touches.contains(where: { isDrawingTouch($0) }) {
             activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
             activePoints.removeAll(); activeID = nil
         }
+    }
+
+    private func beginEditing(at point: CGPoint) {
+        editStart = point; lastEditPoint = point
+        if activeTool == .lasso {
+            lassoWorldPoints = [point]; updateInteractionPath()
+        } else if activeTool == .objectEraser {
+            erase(at: point)
+        } else if activeTool == .select {
+            selectedIDs = hitTestIDs(at: point)
+            onSelectionChanged(selectedIDs); updateSelectionOverlay()
+        }
+    }
+
+    private func continueEditing(at point: CGPoint) {
+        switch activeTool {
+        case .lasso:
+            lassoWorldPoints.append(point); updateInteractionPath()
+        case .select:
+            let delta = CGPoint(x: point.x - lastEditPoint.x, y: point.y - lastEditPoint.y)
+            if !selectedIDs.isEmpty, (delta.x != 0 || delta.y != 0) {
+                for id in selectedIDs { onMove(id, delta) }
+            }
+        case .objectEraser: erase(at: point)
+        case .pen: break
+        }
+        lastEditPoint = point
+    }
+
+    private func finishEditing() {
+        if activeTool == .lasso, lassoWorldPoints.count >= 3 {
+            let polygon = lassoWorldPoints
+            let bounds = polygon.reduce(into: CGRect.null) { result, point in result = result.union(CGRect(x: point.x, y: point.y, width: 0, height: 0)) }
+            let selected = Set(objects.filter { object in
+                let points = object.points?.map { CGPoint(x: $0.x + (object.translation?.x ?? 0), y: $0.y + (object.translation?.y ?? 0)) } ?? []
+                guard !points.isEmpty, points.contains(where: { bounds.contains($0) }) else { return false }
+                let inside = points.filter { polygonContains($0, polygon: polygon) }.count
+                return Double(inside) / Double(points.count) >= 0.65
+            }.map(\.id))
+            selectedIDs = selected.union(professor.ids(intersecting: bounds)); onSelectionChanged(selectedIDs); updateSelectionOverlay()
+        }
+        lassoWorldPoints.removeAll(); updateInteractionPath()
+    }
+
+    private func erase(at point: CGPoint) {
+        let hit = hitTestIDs(at: point)
+        let fresh = hit.subtracting(selectedIDs)
+        guard !fresh.isEmpty else { return }
+        selectedIDs.formUnion(fresh); onDelete(fresh); onSelectionChanged(selectedIDs)
+    }
+
+    private func hitTestIDs(at point: CGPoint) -> Set<String> {
+        var result = Set(objects.compactMap { object in
+            let points = object.points?.map { CGPoint(x: $0.x + (object.translation?.x ?? 0), y: $0.y + (object.translation?.y ?? 0)) } ?? []
+            if object.type == "text", let x = object.x, let y = object.y { return CGRect(x: x, y: y, width: object.width ?? 400, height: object.height ?? 100).contains(point) ? object.id : nil }
+            guard let first = points.first else { return nil }
+            let bounds = points.dropFirst().reduce(CGRect(x: first.x, y: first.y, width: 0, height: 0)) { $0.union(CGRect(x: $1.x, y: $1.y, width: 0, height: 0)) }.insetBy(dx: -12, dy: -12)
+            return bounds.contains(point) ? object.id : nil
+        })
+        if let professorID = professor.hitTest(point) { result.insert(professorID) }
+        return result
+    }
+
+    private func updateInteractionPath() {
+        guard !lassoWorldPoints.isEmpty else { interactionLayer.isHidden = true; return }
+        let path = UIBezierPath(); for (index, point) in lassoWorldPoints.enumerated() { if index == 0 { path.move(to: point) } else { path.addLine(to: point) } }
+        interactionLayer.path = path.cgPath; interactionLayer.isHidden = false
+    }
+
+    private func updateSelectionOverlay() {
+        guard activeTool == .select, !selectedIDs.isEmpty else { interactionLayer.isHidden = lassoWorldPoints.isEmpty; return }
+        var bounds = CGRect.null
+        for object in objects where selectedIDs.contains(object.id) {
+            let points = object.points?.map { CGPoint(x: $0.x + (object.translation?.x ?? 0), y: $0.y + (object.translation?.y ?? 0)) } ?? []
+            if let first = points.first { bounds = bounds.union(points.dropFirst().reduce(CGRect(x: first.x, y: first.y, width: 0, height: 0)) { $0.union(CGRect(x: $1.x, y: $1.y, width: 0, height: 0)) }) }
+            if let x = object.x, let y = object.y { bounds = bounds.union(CGRect(x: x, y: y, width: object.width ?? 400, height: object.height ?? 100)) }
+        }
+        guard !bounds.isNull else { return }
+        interactionLayer.path = UIBezierPath(rect: bounds.insetBy(dx: -10, dy: -10)).cgPath; interactionLayer.isHidden = false
+    }
+
+    private func polygonContains(_ point: CGPoint, polygon: [CGPoint]) -> Bool {
+        var inside = false
+        for i in polygon.indices {
+            let j = i == polygon.startIndex ? polygon.index(before: polygon.endIndex) : polygon.index(before: i)
+            let a = polygon[i], b = polygon[j]
+            let denominator = b.y - a.y
+            if abs(denominator) > CGFloat.ulpOfOne,
+               ((a.y > point.y) != (b.y > point.y)),
+               point.x < (b.x - a.x) * (point.y - a.y) / denominator + a.x { inside.toggle() }
+        }
+        return inside
     }
 
     private func samples(for touch: UITouch, event: UIEvent?) -> [StrokePoint] {

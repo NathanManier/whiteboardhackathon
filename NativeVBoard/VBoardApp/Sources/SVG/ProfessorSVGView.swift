@@ -65,6 +65,14 @@ final class ProfessorSVGView: UIView {
         refine(transform: transform)
     }
 
+    func hitTest(_ point: CGPoint, tolerance: CGFloat = 12) -> String? {
+        let candidates = index.query(CGRect(x: point.x - tolerance, y: point.y - tolerance,
+                                            width: tolerance * 2, height: tolerance * 2))
+        return candidates.first(where: { entries[$0]?.layer.path?.contains(point, using: .winding, transform: .identity) == true })
+    }
+
+    func ids(intersecting rect: CGRect) -> Set<String> { index.query(rect) }
+
     private func rebuild(document: SVGDocument, importedTransforms: [String: ObjectTransform], composition: SceneComposition?) {
         self.document = document
         self.importedTransforms = importedTransforms

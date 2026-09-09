@@ -123,6 +123,21 @@ struct PracticeProblem: Codable, Identifiable, Sendable {
     let id: String
     let text: String
     let solution: String?
+
+    enum CodingKeys: String, CodingKey { case id, text, problem, solution }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        text = try c.decodeIfPresent(String.self, forKey: .text)
+            ?? c.decodeIfPresent(String.self, forKey: .problem) ?? ""
+        solution = try c.decodeIfPresent(String.self, forKey: .solution)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id); try c.encode(text, forKey: .text)
+        try c.encodeIfPresent(solution, forKey: .solution)
+    }
 }
 
 struct EditorEnvelope: Codable, Sendable { let editor: EditorState }
@@ -168,7 +183,7 @@ struct SourceBoard: Codable, Sendable { let boardID: String; enum CodingKeys: St
 struct EditorGroup: Codable, Sendable { let id: String?; let children: [String]? }
 struct ObjectTransform: Codable, Equatable, Sendable { let x: Double; let y: Double; let scaleX: Double?; let scaleY: Double?; let deleted: Bool? }
 
-struct CanvasObject: Codable, Identifiable, Sendable {
+struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let type: String
     let color: String?
@@ -183,11 +198,34 @@ struct CanvasObject: Codable, Identifiable, Sendable {
     let y: Double?
     let height: Double?
     let fontSize: Double?
+    let role: String?
+    let sourceStudyInteractionID: String?
 
     enum CodingKeys: String, CodingKey {
         case id, type, color, width, opacity, points, translation
         case sourceMarkdown = "source_markdown", text, x, y, height
-        case fontSize = "font_size"
+        case fontSize = "font_size", role
+        case sourceStudyInteractionID = "source_study_interaction_id"
+    }
+
+    init(id: String, type: String, color: String?, width: Double?, opacity: Double?,
+         points: [WorldPoint]?, translation: WorldPoint?, sourceMarkdown: String?,
+         text: String?, x: Double?, y: Double?, height: Double?, fontSize: Double?,
+         role: String? = nil, sourceStudyInteractionID: String? = nil) {
+        self.id = id; self.type = type; self.color = color; self.width = width
+        self.opacity = opacity; self.points = points; self.translation = translation
+        self.sourceMarkdown = sourceMarkdown; self.text = text; self.x = x; self.y = y
+        self.height = height; self.fontSize = fontSize; self.role = role
+        self.sourceStudyInteractionID = sourceStudyInteractionID
+    }
+
+    func translated(by delta: CGPoint) -> CanvasObject {
+        let existing = translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
+        return CanvasObject(id: id, type: type, color: color, width: width,
+                           opacity: opacity, points: points, translation: WorldPoint(x: existing.x + delta.x, y: existing.y + delta.y, pressure: nil),
+                           sourceMarkdown: sourceMarkdown, text: text, x: x, y: y,
+                           height: height, fontSize: fontSize, role: role,
+                           sourceStudyInteractionID: sourceStudyInteractionID)
     }
 }
 

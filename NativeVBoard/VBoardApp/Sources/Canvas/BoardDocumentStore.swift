@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import CoreGraphics
 
 enum EditorPersistenceStatus: Equatable {
     case clean
@@ -65,6 +66,57 @@ final class BoardDocumentStore: ObservableObject {
                                   x: nil, y: nil, height: nil, fontSize: nil)
         var next = editor
         next.objects.append(object)
+        apply(next, api: api)
+    }
+
+    func applyPracticeProblems(_ problems: [PracticeProblem], interactionID: String? = nil, api: APIClient) {
+        let existing = Set(editor.objects.filter { $0.role == "ai_practice_problem" }.map(\.id))
+        let fresh = problems.filter { !existing.contains($0.id) }.prefix(2)
+        guard !fresh.isEmpty else { return }
+        var next = editor
+        let originX = editor.viewport.x + editor.viewport.width * 0.08
+        let originY = editor.viewport.y + editor.viewport.height * 0.12
+        for (offset, problem) in fresh.enumerated() {
+            next.objects.append(CanvasObject(id: problem.id, type: "text", color: "#183153",
+                                             width: editor.viewport.width * 0.35, opacity: 1,
+                                             points: nil, translation: nil,
+                                             sourceMarkdown: problem.text, text: problem.text,
+                                             x: originX + Double(offset) * editor.viewport.width * 0.40,
+                                             y: originY, height: editor.viewport.height * 0.28,
+                                             fontSize: 28, role: "ai_practice_problem",
+                                             sourceStudyInteractionID: interactionID))
+        }
+        apply(next, api: api)
+    }
+
+    func moveObject(id: String, by delta: CGPoint, api: APIClient) {
+        var next = editor
+        if let index = next.objects.firstIndex(where: { $0.id == id }) {
+            next.objects[index] = next.objects[index].translated(by: delta)
+        } else if let imported = next.importedTransforms[id] {
+            next.importedTransforms[id] = ObjectTransform(x: imported.x + delta.x, y: imported.y + delta.y,
+                                                          scaleX: imported.scaleX, scaleY: imported.scaleY,
+                                                          deleted: imported.deleted)
+        } else {
+            // A selected untransformed professor path is promoted to the live
+            // layer by adding its first translation without touching board.svg.
+            next.importedTransforms[id] = ObjectTransform(x: delta.x, y: delta.y, scaleX: 1, scaleY: 1, deleted: false)
+        }
+        apply(next, api: api)
+    }
+
+    func deleteObjects(ids: Set<String>, api: APIClient) {
+        guard !ids.isEmpty else { return }
+        var next = editor
+        next.objects.removeAll { ids.contains($0.id) }
+        for id in ids {
+            if let imported = next.importedTransforms[id] {
+                next.importedTransforms[id] = ObjectTransform(x: imported.x, y: imported.y,
+                                                               scaleX: imported.scaleX, scaleY: imported.scaleY, deleted: true)
+            } else {
+                next.importedTransforms[id] = ObjectTransform(x: 0, y: 0, scaleX: 1, scaleY: 1, deleted: true)
+            }
+        }
         apply(next, api: api)
     }
 
