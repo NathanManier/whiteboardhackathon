@@ -39,6 +39,13 @@ final class APIClient: ObservableObject {
 
     func library() async throws -> LibraryResponse { try await get("/api/library") }
     func lecture(id: String) async throws -> LectureResponse { try await get("/api/folders/\(id)/lecture", label: "lecture") }
+    func createLecture(name: String) async throws -> LectureFolder {
+        var request = try request(path: "/api/folders", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
+        let (data, response) = try await data(for: request); try validate(response, data: data)
+        struct Envelope: Decodable { let folder: LectureFolder }
+        return try decoder.decode(Envelope.self, from: data).folder
+    }
     func board(id: String) async throws -> BoardRecord { try await get("/board/\(id)") }
     func editor(id: String) async throws -> EditorState {
         // Flask deliberately wraps this response as {"editor": {...}}.

@@ -8,6 +8,7 @@ struct LibraryView: View {
     @State private var library: LibraryResponse?
     @State private var error: String?
     @State private var showImporter = false
+    @State private var showNewLecture = false
     @State private var launchBoard: LibraryBoard?
 
     var body: some View {
@@ -46,8 +47,9 @@ struct LibraryView: View {
                 } else { ProgressView("Loading your library…") }
             }
             .navigationTitle("V-Board")
-            .toolbar { ToolbarItem(placement: .primaryAction) { Button { showImporter = true } label: { Label("New Whiteboard", systemImage: "plus") }.buttonStyle(.borderedProminent) }; ToolbarItem(placement: .secondaryAction) { Button { load() } label: { Image(systemName: "arrow.clockwise") } } }
+            .toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { showImporter = true } label: { Label("New Whiteboard", systemImage: "photo.badge.plus") }; Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "books.vertical") } } label: { Label("Create", systemImage: "plus") }.buttonStyle(.borderedProminent) }; ToolbarItem(placement: .secondaryAction) { Button { load() } label: { Image(systemName: "arrow.clockwise") } } }
             .sheet(isPresented: $showImporter) { ImportFlowView { board in launchBoard = board; showImporter = false; load() } }
+            .sheet(isPresented: $showNewLecture) { NewLectureView { showNewLecture = false; load() } }
             .navigationDestination(item: $launchBoard) { BoardView(board: $0) }
             .task { load() }
         }
@@ -80,7 +82,7 @@ private struct LectureCard: View {
 
 private struct BoardCard: View {
     let board: LibraryBoard
-    var body: some View { VStack(alignment: .leading, spacing: 10) { RoundedRectangle(cornerRadius: 12).fill(.gray.opacity(0.14)).frame(height: 130).overlay { Image(systemName: board.status == "ready" ? "checkmark.circle" : "clock").font(.largeTitle).foregroundStyle(board.status == "ready" ? .green : .orange) }; Text(board.name).font(.headline).lineLimit(2); Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized).font(.caption).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading).padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous)) }
+    var body: some View { VStack(alignment: .leading, spacing: 10) { if let raw = board.thumbnailURL, let url = URL(string: raw, relativeTo: URL(string: "https://chsinteract.com")) { AsyncImage(url: url) { phase in switch phase { case .success(let image): image.resizable().scaledToFill(); default: Image(systemName: "photo").font(.largeTitle).foregroundStyle(.secondary) } }.frame(height: 130).clipped().clipShape(RoundedRectangle(cornerRadius: 12)) } else { RoundedRectangle(cornerRadius: 12).fill(.gray.opacity(0.14)).frame(height: 130).overlay { Image(systemName: board.status == "ready" ? "checkmark.circle" : "clock").font(.largeTitle).foregroundStyle(board.status == "ready" ? .green : .orange) } }; Text(board.name).font(.headline).lineLimit(2); Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized).font(.caption).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading).padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous)) }
 }
 
 struct LectureView: View {
@@ -160,4 +162,15 @@ private struct StudyGuideView: View {
         }.onAppear { current = guide }
     }
     private func generate() { loading = true; error = nil; Task { do { current = try await api.generateStudyGuide(folderID: folderID); loading = false } catch { loading = false; self.error = "Study Guide is temporarily unavailable." } } }
+}
+
+private struct NewLectureView: View {
+    @EnvironmentObject private var api: APIClient
+    @Environment(\.dismiss) private var dismiss
+    let onCreated: () -> Void
+    @State private var name = ""
+    @State private var saving = false
+    @State private var error: String?
+    var body: some View { NavigationStack { Form { Section("Lecture") { TextField("Lecture name", text: $name); if let error { Text(error).foregroundStyle(.red) } }; Section { Button(saving ? "Creating…" : "Create Lecture") { create() }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || saving) } }.navigationTitle("New Lecture").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } } } }
+    private func create() { saving = true; Task { do { _ = try await api.createLecture(name: name.trimmingCharacters(in: .whitespacesAndNewlines)); saving = false; onCreated() } catch { saving = false; self.error = "Couldn’t create lecture." } } }
 }
