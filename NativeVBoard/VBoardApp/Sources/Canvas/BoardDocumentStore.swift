@@ -30,10 +30,14 @@ final class BoardDocumentStore: ObservableObject {
     @Published private(set) var editor: EditorState
     @Published private(set) var status: EditorPersistenceStatus = .clean
     @Published private(set) var conflictServerEditor: EditorState?
+    private(set) var canUndo = false
+    private(set) var canRedo = false
     private let boardID: String
     private var baseRevision: Int
     private var hasRestored = false
     private var mutationGeneration = 0
+    private var undoStack: [EditorState] = []
+    private var redoStack: [EditorState] = []
     private var saveTask: Task<Void, Never>?
 
     init(boardID: String, editor: EditorState) {
@@ -48,14 +52,30 @@ final class BoardDocumentStore: ObservableObject {
         self.editor = editor
         if status == .clean { baseRevision = editor.revision }
         self.status = status
+        undoStack.removeAll(); redoStack.removeAll(); canUndo = false; canRedo = false
     }
 
     func apply(_ editor: EditorState, api: APIClient) {
+        undoStack.append(self.editor)
+        if undoStack.count > 100 { undoStack.removeFirst() }
+        redoStack.removeAll(); canUndo = true; canRedo = false
         self.editor = editor
         mutationGeneration += 1
         status = .dirty
         persistOutbox()
         scheduleSave(api: api)
+    }
+
+    func undo(api: APIClient) {
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(editor); editor = previous; mutationGeneration += 1
+        canUndo = !undoStack.isEmpty; canRedo = true; status = .dirty; persistOutbox(); scheduleSave(api: api)
+    }
+
+    func redo(api: APIClient) {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(editor); editor = next; mutationGeneration += 1
+        canUndo = true; canRedo = !redoStack.isEmpty; status = .dirty; persistOutbox(); scheduleSave(api: api)
     }
 
     func applyStroke(_ stroke: UserStroke, api: APIClient) {
