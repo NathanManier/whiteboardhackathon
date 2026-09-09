@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct BoardView: View {
     @EnvironmentObject private var api: APIClient
@@ -75,22 +76,36 @@ private struct BoardEditorSurface: View {
     @Environment(\.dismiss) private var dismiss
     let board: LibraryBoard
     let document: SVGDocument
-    let editor: EditorState
     let composition: SceneComposition
+    @StateObject private var store: BoardDocumentStore
     @State private var showImport = false
     @State private var showStudy = false
     @State private var showShare = false
     @State private var exportData: Data?
     @State private var exportError: String?
+    @State private var showConflict = false
+
+    init(board: LibraryBoard, document: SVGDocument, editor: EditorState, composition: SceneComposition) {
+        self.board = board; self.document = document; self.composition = composition
+        _store = StateObject(wrappedValue: BoardDocumentStore(boardID: board.id, editor: editor))
+    }
+
     var body: some View {
         ZStack(alignment: .bottom) {
-            NativeCanvasView(boardID: board.id, document: document, camera: editor.viewport, objects: editor.objects, importedTransforms: editor.importedTransforms, composition: composition).ignoresSafeArea(edges: .bottom)
-            HStack(spacing: 10) { ToolButton(title: "Pen", icon: "pencil.tip", selected: true) {}; Spacer(); Button { showStudy = true } label: { Label("Study", systemImage: "sparkles") }.buttonStyle(.borderedProminent); Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle.fill").font(.title2) }.buttonStyle(.bordered) }.padding(12).background(.regularMaterial, in: Capsule()).padding(.horizontal, 18).padding(.bottom, 12)
+            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }).ignoresSafeArea(edges: .bottom)
+            HStack(spacing: 10) { ToolButton(title: "Pen", icon: "pencil.tip", selected: true) {}; Spacer(); Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary); Button { showStudy = true } label: { Label("Study", systemImage: "sparkles") }.buttonStyle(.borderedProminent); Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle.fill").font(.title2) }.buttonStyle(.bordered) }.padding(12).background(.regularMaterial, in: Capsule()).padding(.horizontal, 18).padding(.bottom, 12)
         }.navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button { showStudy = true } label: { Image(systemName: "sparkles") } } }
         .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
         .sheet(isPresented: $showStudy) { StudyActionsView(boardID: board.id) }
         .sheet(isPresented: $showShare) { if let exportData { ShareSheet(items: [exportData]) } }
         .alert("Couldn’t export board", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) { Button("OK", role: .cancel) {} } message: { Text(exportError ?? "") }
+        .alert("Board changed on the server", isPresented: $showConflict) {
+            Button("Keep My Changes") { Task { await store.keepLocalChanges(api: api) } }
+            Button("Reload Server Version", role: .destructive) { store.reloadServerVersion() }
+        } message: { Text("Your local edits are preserved locally. Choose which version should remain.") }
+        .onChange(of: store.status) { status in if status == .conflict { showConflict = true } }
+        .task { store.restoreLocalIfPresent(server: store.editor) }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
     }
     private func export() async { do { exportData = try await api.exportSVG(boardID: board.id); showShare = true } catch { exportError = "The SVG could not be exported right now." } }
     private func deleteBoard() async { do { try await api.deleteBoard(id: board.id); dismiss() } catch { exportError = "The board could not be deleted." } }

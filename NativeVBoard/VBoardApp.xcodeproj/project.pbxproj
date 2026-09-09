@@ -17,6 +17,7 @@
 		A009 /* BoardView.swift */ = {isa = PBXBuildFile; fileRef = A109; };
 		A011 /* SceneComposition.swift */ = {isa = PBXBuildFile; fileRef = A111; };
 		A012 /* SpatialIndex.swift */ = {isa = PBXBuildFile; fileRef = A112; };
+		A013 /* BoardDocumentStore.swift */ = {isa = PBXBuildFile; fileRef = A113; };
 		A010 /* Tests */ = {isa = PBXBuildFile; fileRef = A110; };
 /* End PBXBuildFile section */
 /* Begin PBXFileReference section */
@@ -31,13 +32,14 @@
 		A109 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Features/Board/BoardView.swift; sourceTree = "<group>"; };
 		A111 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/SceneComposition.swift; sourceTree = "<group>"; };
 		A112 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/SpatialIndex.swift; sourceTree = "<group>"; };
+		A113 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/BoardDocumentStore.swift; sourceTree = "<group>"; };
 		A110 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VBoardAppTests.swift; sourceTree = "<group>"; };
 		B001 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 /* Begin PBXGroup section */
 		C001 = {isa = PBXGroup; children = (C002, C003, B001, B002); sourceTree = "<group>"; };
-		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A102, A103, A104, A105, A106, A107, A108, A109, A111, A112); };
+		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A102, A103, A104, A105, A106, A107, A108, A109, A111, A112, A113); };
 		C003 = {isa = PBXGroup; path = VBoardAppTests; sourceTree = "<group>"; children = (A110); };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
@@ -52,7 +54,7 @@
 		F005 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A002, A003, A004, A005, A006, A007, A008, A009, A011, A012); runOnlyForDeploymentPostprocessing = 0; };
+		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A002, A003, A004, A005, A006, A007, A008, A009, A011, A012, A013); runOnlyForDeploymentPostprocessing = 0; };
 		F004 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A010); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXFrameworksBuildPhase section */

@@ -8,17 +8,18 @@ struct NativeCanvasView: UIViewRepresentable {
     let objects: [CanvasObject]
     let importedTransforms: [String: ObjectTransform]
     let composition: SceneComposition
+    var onStroke: (UserStroke) -> Void = { _ in }
 
     func makeUIView(context: Context) -> InfiniteCanvasUIView {
         InfiniteCanvasUIView(boardID: boardID, document: document, camera: camera,
                              objects: objects, importedTransforms: importedTransforms,
-                             composition: composition)
+                             composition: composition, onStroke: onStroke)
     }
 
     func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) {
         uiView.update(boardID: boardID, document: document, camera: camera,
                       objects: objects, importedTransforms: importedTransforms,
-                      composition: composition)
+                      composition: composition, onStroke: onStroke)
     }
 }
 
@@ -34,6 +35,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private(set) var userStrokes: [UserStroke] = []
     private var activePoints: [StrokePoint] = []
     private var activeID: String?
+    private var onStroke: (UserStroke) -> Void
     private var boardID: String
     private var document: SVGDocument
     private var controller: CameraController
@@ -47,9 +49,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     init(boardID: String, document: SVGDocument, camera: CameraRect,
          objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:],
-         composition: SceneComposition) {
+         composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in }) {
         self.boardID = boardID; self.document = document; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition
+        self.onStroke = onStroke
         controller = CameraController(camera: camera)
         super.init(frame: .zero)
         backgroundColor = .systemBackground
@@ -95,11 +98,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     func update(boardID: String, document: SVGDocument, camera: CameraRect,
                 objects: [CanvasObject], importedTransforms: [String: ObjectTransform],
-                composition: SceneComposition) {
+                composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in }) {
         let documentChanged = self.document != document || self.importedTransforms != importedTransforms
         let objectsChanged = self.objects.map(\.id) != objects.map(\.id)
         self.boardID = boardID; self.document = document; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition
+        self.onStroke = onStroke
         controller.setCamera(camera)
         if documentChanged { professor.display(document, transform: worldTransform, importedTransforms: importedTransforms, composition: composition) }
         if objectsChanged { rebuildUserLayers() }
@@ -145,9 +149,19 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
 
-    // Pencil owns direct drawing. Finger touches continue to UIKit navigation.
+    // Pencil owns direct drawing. The simulator's indirect pointer path uses
+    // the same Stroke model with deterministic pressure=1 for Mac testing.
+    private func isDrawingTouch(_ touch: UITouch) -> Bool {
+        if touch.type == .pencil { return true }
+        #if targetEnvironment(simulator)
+        return touch.type == .indirectPointer
+        #else
+        return false
+        #endif
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first, touch.type == .pencil else { super.touchesBegan(touches, with: event); return }
+        guard let touch = touches.first, isDrawingTouch(touch) else { super.touchesBegan(touches, with: event); return }
         activeID = UUID().uuidString; activePoints = samples(for: touch, event: event)
         let layer = CAShapeLayer(); layer.fillColor = UIColor.clear.cgColor
         layer.strokeColor = UIColor(svgHex: "#183153").cgColor; layer.lineWidth = 4
@@ -156,23 +170,22 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first, touch.type == .pencil else { return }
+        guard let touch = touches.first, isDrawingTouch(touch) else { return }
         activePoints.append(contentsOf: samples(for: touch, event: event)); updateActiveStroke()
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first, touch.type == .pencil else { return }
+        guard let touch = touches.first, isDrawingTouch(touch) else { return }
         activePoints.append(contentsOf: samples(for: touch, event: event))
         if let activeID, !activePoints.isEmpty {
-            let stroke = UserStroke(id: activeID, points: activePoints)
-            userStrokes.append(stroke); addStrokeLayer(stroke)
+            onStroke(UserStroke(id: activeID, points: activePoints))
         }
         activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
         activePoints.removeAll(); activeID = nil
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if touches.contains(where: { $0.type == .pencil }) {
+        if touches.contains(where: { isDrawingTouch($0) }) {
             activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
             activePoints.removeAll(); activeID = nil
         }
@@ -182,7 +195,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         let source = event?.coalescedTouches(for: touch) ?? [touch]
         return source.map { item in
             let point = worldTransform.worldPoint(for: item.location(in: self))
+            #if targetEnvironment(simulator)
+            let pressure = item.type == .indirectPointer ? 1.0 : Double(item.force / max(item.maximumPossibleForce, 1))
+            #else
             let pressure = Double(item.force / max(item.maximumPossibleForce, 1))
+            #endif
             return StrokePoint(x: point.x, y: point.y, pressure: pressure)
         }
     }
