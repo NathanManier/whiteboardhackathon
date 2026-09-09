@@ -73,6 +73,10 @@ final class ProfessorSVGView: UIView {
 
     func ids(intersecting rect: CGRect) -> Set<String> { index.query(rect) }
 
+    func bounds(for id: String) -> CGRect {
+        entries[id]?.bounds ?? .null
+    }
+
     private func rebuild(document: SVGDocument, importedTransforms: [String: ObjectTransform], composition: SceneComposition?) {
         self.document = document
         self.importedTransforms = importedTransforms

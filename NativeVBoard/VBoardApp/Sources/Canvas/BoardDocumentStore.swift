@@ -89,6 +89,17 @@ final class BoardDocumentStore: ObservableObject {
         apply(next, api: api)
     }
 
+    /// Camera state is document state, but moving the viewport must not create
+    /// an undoable content operation for every pointer sample.
+    func updateViewport(_ viewport: CameraRect, api: APIClient) {
+        guard editor.viewport != viewport else { return }
+        editor.viewport = viewport
+        mutationGeneration += 1
+        status = .dirty
+        persistOutbox()
+        scheduleSave(api: api)
+    }
+
     func applyPracticeProblems(_ problems: [PracticeProblem], interactionID: String? = nil, api: APIClient) {
         let existing = Set(editor.objects.filter { $0.role == "ai_practice_problem" }.map(\.id))
         let fresh = problems.filter { !existing.contains($0.id) }.prefix(2)

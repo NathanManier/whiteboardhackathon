@@ -94,8 +94,20 @@ private struct BoardEditorSurface: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { id, delta in store.moveObject(id: id, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }).ignoresSafeArea(edges: .bottom)
-            HStack(spacing: 8) { ForEach(CanvasTool.allCases, id: \.self) { tool in ToolButton(title: tool.title, icon: tool.icon, selected: activeTool == tool) { activeTool = tool } }; Spacer(); Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary); Button { showStudy = true } label: { Label("Study", systemImage: "sparkles") }.buttonStyle(.borderedProminent); Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle.fill").font(.title2) }.buttonStyle(.bordered) }.padding(10).background(.regularMaterial, in: Capsule()).padding(.horizontal, 14).padding(.bottom, 12)
+            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { id, delta in store.moveObject(id: id, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) }).ignoresSafeArea(edges: .bottom)
+            HStack(spacing: 8) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) { ForEach(CanvasTool.allCases, id: \.self) { tool in ToolButton(title: tool.title, icon: tool.icon, selected: activeTool == tool) { activeTool = tool } } }
+                }
+                Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Button { showStudy = true } label: { Label("Study", systemImage: "sparkles") }.buttonStyle(.borderedProminent)
+                Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle.fill").font(.title2) }.buttonStyle(.bordered)
+            }.padding(10).background(.regularMaterial, in: Capsule()).padding(.horizontal, 14).padding(.bottom, 12)
+            // SwiftUI's command system is the reliable keyboard path when the
+            // simulator captures the Mac keyboard; the canvas also exposes
+            // the same commands through UIKeyCommand for device input.
+            Button("") { store.undo(api: api) }.keyboardShortcut("z", modifiers: .command).frame(width: 0, height: 0).opacity(0.001)
+            Button("") { store.redo(api: api) }.keyboardShortcut("z", modifiers: [.command, .shift]).frame(width: 0, height: 0).opacity(0.001)
         }.navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItemGroup(placement: .navigationBarTrailing) { Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo); Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo); Button { showStudy = true } label: { Image(systemName: "sparkles") } } }
         .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
         .sheet(isPresented: $showStudy) { StudyActionsView(boardID: board.id, selectedObjectIDs: Array(selectedIDs)) { problems, interactionID in store.applyPracticeProblems(problems, interactionID: interactionID, api: api) } }
@@ -125,8 +137,8 @@ private struct BoardEditorSurface: View {
 }
 
 private extension CanvasTool {
-    var title: String { rawValue == "objectEraser" ? "Erase" : rawValue.capitalized }
-    var icon: String { switch self { case .pen: return "pencil.tip"; case .select: return "cursorarrow"; case .lasso: return "lasso"; case .objectEraser: return "eraser" } }
+    var title: String { rawValue == "objectEraser" ? "Erase" : rawValue == "navigation" ? "Hand" : rawValue.capitalized }
+    var icon: String { switch self { case .navigation: return "hand.draw"; case .pen: return "pencil.tip"; case .highlighter: return "highlighter"; case .select: return "cursorarrow"; case .lasso: return "lasso"; case .objectEraser: return "eraser" } }
 }
 
 private struct ToolButton: View {
