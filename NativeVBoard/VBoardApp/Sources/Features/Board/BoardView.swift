@@ -128,7 +128,7 @@ private struct BoardEditorSurface: View {
             Button("Reload Server Version", role: .destructive) { store.reloadServerVersion() }
         } message: { Text("Your local edits are preserved locally. Choose which version should remain.") }
         .onChange(of: store.status) { status in if status == .conflict { showConflict = true } }
-        .task { store.restoreLocalIfPresent(server: store.editor); liveCamera = nil }
+        .task { store.restoreLocalIfPresent(server: store.editor) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
     }
     private func export() async {
