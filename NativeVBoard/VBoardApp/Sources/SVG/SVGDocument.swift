@@ -50,11 +50,15 @@ extension UIColor {
 /// Converts only at display time. `SVGPath.d` is never changed or regenerated.
 enum SVGPathParser {
     private static var cache: [String: CGPath] = [:]
+    private static var cacheOrder: [String] = []
     private static let lock = NSLock()
+    private static let cacheLimit = 4096
 
     static func cachedPath(from d: String, hits: () -> Void = {}, misses: () -> Void = {}) throws -> CGPath {
         lock.lock()
         if let cached = cache[d] {
+            cacheOrder.removeAll { $0 == d }
+            cacheOrder.append(d)
             lock.unlock()
             hits()
             return cached
@@ -65,6 +69,12 @@ enum SVGPathParser {
         // Another thread may have won the race; either instance is equivalent.
         let value = cache[d] ?? parsed
         cache[d] = value
+        cacheOrder.removeAll { $0 == d }
+        cacheOrder.append(d)
+        if cacheOrder.count > cacheLimit, let evicted = cacheOrder.first {
+            cacheOrder.removeFirst()
+            cache.removeValue(forKey: evicted)
+        }
         lock.unlock()
         misses()
         return value
