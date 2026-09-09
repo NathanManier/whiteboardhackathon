@@ -96,4 +96,16 @@ final class SceneCompositionTests: XCTestCase {
         let composition = SceneComposition.build(boardID: "board-a", document: svg, editor: editor(transforms: transforms))
         XCTAssertEqual(composition.nodes.map(\.logicalID), ["prof-1"])
     }
+
+    func testRepeatedStableEditorIDHasOneRenderableOwner() {
+        let object = CanvasObject(id: "stroke-1", type: "stroke", color: "#183153", width: 4, opacity: 1, points: [WorldPoint(x: 0, y: 0, pressure: nil)], translation: nil, sourceMarkdown: nil, text: nil, x: nil, y: nil, height: nil, fontSize: nil)
+        let renderable = SceneComposition.canonicalEditorObjects([object, object])
+        XCTAssertEqual(renderable.count, 1)
+        XCTAssertEqual(renderable.first?.id, "stroke-1")
+    }
+
+    func testRepeatedStableProfessorPathIDHasOneRenderableOwner() throws {
+        let document = try SVGDocument.parse("<svg viewBox='0 0 10 10'><path id='prof-1' d='M0 0L1 1Z'/><path id='prof-1' d='M2 2L3 3Z'/></svg>")
+        XCTAssertEqual(SceneComposition.canonicalProfessorPaths(document.paths).count, 1)
+    }
 }
