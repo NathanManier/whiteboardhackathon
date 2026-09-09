@@ -38,6 +38,7 @@ final class APIClient: ObservableObject {
     }
 
     func library() async throws -> LibraryResponse { try await get("/api/library") }
+    func lecture(id: String) async throws -> LectureResponse { try await get("/api/folders/\(id)/lecture", label: "lecture") }
     func board(id: String) async throws -> BoardRecord { try await get("/board/\(id)") }
     func editor(id: String) async throws -> EditorState {
         // Flask deliberately wraps this response as {"editor": {...}}.
@@ -60,6 +61,21 @@ final class APIClient: ObservableObject {
         return svg
     }
 
+    func asset(boardID: String, name: String) async throws -> Data {
+        let path = "/board/\(boardID)/asset/\(name)"
+        let request = try request(path: path, accept: "image/*")
+        let (data, response) = try await data(for: request)
+        try validate(response, data: data)
+        return data
+    }
+
+    func exportSVG(boardID: String) async throws -> Data {
+        let request = try request(path: "/board/\(boardID)/svg", accept: "image/svg+xml")
+        let (data, response) = try await data(for: request)
+        try validate(response, data: data)
+        return data
+    }
+
     func save(editor: EditorState, boardID: String) async throws -> EditorState {
         var request = try request(path: "/api/boards/\(boardID)/editor", method: "PUT")
         request.httpBody = try encoder.encode(editor)
@@ -70,6 +86,52 @@ final class APIClient: ObservableObject {
         try validate(response, data: data)
         do { return try decoder.decode(EditorEnvelope.self, from: data).editor }
         catch { throw APIError.decoding("Could not decode saved editor state: \(error.localizedDescription)") }
+    }
+
+    func upload(imageData: Data, filename: String, mimeType: String, folderID: String? = nil, name: String? = nil) async throws -> UploadResponse {
+        let boundary = "VBoard-\(UUID().uuidString)"
+        var request = try request(path: "/upload", method: "POST", accept: "application/json")
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        var body = Data()
+        func field(_ key: String, _ value: String) {
+            body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(key)\"\r\n\r\n\(value)\r\n".utf8))
+        }
+        if let folderID { field("folder_id", folderID) }
+        if let name { field("name", name) }
+        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"image\"; filename=\"\(filename)\"\r\nContent-Type: \(mimeType)\r\n\r\n".utf8))
+        body.append(imageData)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        request.httpBody = body
+        let (data, response) = try await data(for: request)
+        try validate(response, data: data)
+        do { return try decoder.decode(UploadResponse.self, from: data) }
+        catch { throw APIError.decoding("Could not decode the upload response.") }
+    }
+
+    func processCorners(boardID: String, corners: [[Double]]) async throws -> UploadResponse {
+        var request = try request(path: "/board/\(boardID)/corners", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["corners": corners])
+        let (data, response) = try await data(for: request)
+        try validate(response, data: data)
+        do { return try decoder.decode(UploadResponse.self, from: data) }
+        catch { throw APIError.decoding("Could not decode the processed board response.") }
+    }
+
+    func deleteBoard(id: String) async throws { var request = try request(path: "/api/boards/\(id)", method: "DELETE"); let (data, response) = try await data(for: request); try validate(response, data: data) }
+
+    func explain(boardID: String, action: String = "explain", selectedText: String = "") async throws -> StudyInteractionResponse {
+        var request = try request(path: "/api/boards/\(boardID)/study/explain", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["action": action, "selected_text": selectedText])
+        let (data, response) = try await data(for: request); try validate(response, data: data)
+        do { return try decoder.decode(StudyInteractionResponse.self, from: data) }
+        catch { throw APIError.decoding("Could not decode the study response.") }
+    }
+
+    func generateStudyGuide(folderID: String) async throws -> StudyGuide? {
+        var request = try request(path: "/api/folders/\(folderID)/study-guide", method: "POST")
+        request.httpBody = Data("{}".utf8)
+        let (data, response) = try await data(for: request); try validate(response, data: data)
+        return try decoder.decode([String: StudyGuide].self, from: data)["study_guide"]
     }
 
     private func get<T: Decodable>(_ path: String, label: String = "JSON") async throws -> T {

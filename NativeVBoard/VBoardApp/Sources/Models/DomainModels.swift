@@ -69,10 +69,61 @@ struct BoardRecord: Codable, Identifiable, Sendable {
     let name: String?
     let dimensions: BoardDimensions?
     let assets: BoardAssets?
+    let suggestedCorners: [[Double]]?
+    let normalizedCorners: [[String: Double]]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, dimensions, assets
+        case suggestedCorners = "suggested_corners"
+        case normalizedCorners = "normalized_corners"
+    }
 }
 
 struct BoardDimensions: Codable, Sendable { let width: Double; let height: Double }
 struct BoardAssets: Codable, Sendable { let svg: String? }
+
+struct UploadResponse: Codable, Sendable {
+    let id: String
+    let status: String
+    let url: String?
+}
+
+struct LectureResponse: Codable, Sendable {
+    let folder: LectureFolder
+    let boards: [LibraryBoard]
+    let studyGuide: StudyGuide?
+    let studyGuideStale: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case folder, boards
+        case studyGuide = "study_guide"
+        case studyGuideStale = "study_guide_stale"
+    }
+}
+
+struct StudyGuide: Codable, Sendable {
+    let title: String?
+    let content: String?
+    let stale: Bool?
+}
+
+struct StudyInteractionResponse: Codable, Sendable {
+    let interaction: StudyInteraction?
+    let problems: [PracticeProblem]?
+    let problem: String?
+}
+
+struct StudyInteraction: Codable, Sendable {
+    let title: String?
+    let answer: String?
+    let id: String?
+}
+
+struct PracticeProblem: Codable, Identifiable, Sendable {
+    let id: String
+    let text: String
+    let solution: String?
+}
 
 struct EditorEnvelope: Codable, Sendable { let editor: EditorState }
 
