@@ -86,6 +86,7 @@ private struct BoardEditorSurface: View {
     @State private var showConflict = false
     @State private var activeTool: CanvasTool = .pen
     @State private var selectedIDs = Set<String>()
+    @State private var liveCamera: CameraRect?
 
     init(board: LibraryBoard, document: SVGDocument, editor: EditorState, composition: SceneComposition) {
         self.board = board; self.document = document; self.composition = composition
@@ -94,13 +95,10 @@ private struct BoardEditorSurface: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            // A tool change is an interaction-boundary event. Recreate the
-            // UIKit input surface so its recognizers and responder state are
-            // never left with the previous tool, while the document/camera
-            // remain owned by BoardDocumentStore and therefore survive the
-            // handoff exactly once.
-            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { ids, delta in store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
-                .id(activeTool)
+            // Keep one UIKit input surface alive for the board. Tool changes
+            // update that surface in place so recognizers, responder focus,
+            // and the live camera cannot be reset by SwiftUI identity churn.
+            NativeCanvasView(boardID: board.id, document: document, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { ids, delta in store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
                 .ignoresSafeArea(edges: .bottom)
             HStack(spacing: 14) {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -130,7 +128,7 @@ private struct BoardEditorSurface: View {
             Button("Reload Server Version", role: .destructive) { store.reloadServerVersion() }
         } message: { Text("Your local edits are preserved locally. Choose which version should remain.") }
         .onChange(of: store.status) { status in if status == .conflict { showConflict = true } }
-        .task { store.restoreLocalIfPresent(server: store.editor) }
+        .task { store.restoreLocalIfPresent(server: store.editor); liveCamera = nil }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
     }
     private func export() async {

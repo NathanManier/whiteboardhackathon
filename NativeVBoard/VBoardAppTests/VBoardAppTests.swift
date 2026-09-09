@@ -67,6 +67,61 @@ final class WorldScreenTransformTests: XCTestCase {
         XCTAssertEqual(camera.camera.center.x, 50, accuracy: 0.0001)
         XCTAssertEqual(camera.camera.width, 50, accuracy: 0.0001)
     }
+
+    func testFitBoardCentersTheFullNonZeroViewBox() {
+        let board = CGRect(x: 120, y: -40, width: 1_600, height: 800)
+        let viewport = CGSize(width: 820, height: 1_106)
+        let camera = CameraResolver.fitBoard(boardRect: board, viewport: viewport)
+        let transform = WorldScreenTransform(camera: camera, viewport: viewport)
+        let boardOnScreen = CGRect(origin: transform.screenPoint(for: board.origin),
+                                   size: CGSize(width: board.width * transform.scale,
+                                                height: board.height * transform.scale))
+        XCTAssertTrue(boardOnScreen.minX >= -0.5)
+        XCTAssertTrue(boardOnScreen.maxX <= viewport.width + 0.5)
+        XCTAssertTrue(boardOnScreen.minY >= -0.5)
+        XCTAssertTrue(boardOnScreen.maxY <= viewport.height + 0.5)
+        XCTAssertEqual(camera.center.x, board.midX, accuracy: 0.0001)
+        XCTAssertEqual(camera.center.y, board.midY, accuracy: 0.0001)
+    }
+
+    func testResolverFitsInvalidOrHistoricalCamera() {
+        let board = CGRect(x: 0, y: 0, width: 1_711, height: 455)
+        let viewport = CGSize(width: 820, height: 1_106)
+        let invalid = CameraRect(x: .nan, y: .infinity, width: 0, height: -2)
+        let result = CameraResolver.resolve(persisted: invalid, boardRect: board,
+                                             contentBounds: board, viewport: viewport)
+        XCTAssertEqual(result.reason, .boardInitialFit)
+        XCTAssertEqual(result.camera, CameraResolver.fitBoard(boardRect: board, viewport: viewport))
+
+        // This was a valid landscape viewport, but it is now completely
+        // outside the board and must not teleport the portrait editor to an
+        // old off-board location.
+        let stale = CameraRect(x: 10_000, y: 10_000, width: 1_200, height: 700)
+        let staleResult = CameraResolver.resolve(persisted: stale, boardRect: board,
+                                                 contentBounds: board, viewport: viewport)
+        XCTAssertEqual(staleResult.reason, .boardInitialFit)
+    }
+
+    func testResolverPreservesIntentionalZoomWithViewportAspect() {
+        let board = CGRect(x: 0, y: 0, width: 1_000, height: 700)
+        let viewport = CGSize(width: 820, height: 1_106)
+        let fitted = CameraResolver.fitBoard(boardRect: board, viewport: viewport)
+        let zoomed = CameraRect(x: fitted.x + fitted.width * 0.22,
+                                y: fitted.y + fitted.height * 0.22,
+                                width: fitted.width * 0.35,
+                                height: fitted.height * 0.35)
+        let result = CameraResolver.resolve(persisted: zoomed, boardRect: board,
+                                            contentBounds: board, viewport: viewport)
+        XCTAssertNil(result.reason)
+        XCTAssertEqual(result.camera, zoomed)
+    }
+
+    func testPanDeltaHasNoMutationForZeroMovement() {
+        let start = CameraRect(x: -12, y: 24, width: 600, height: 400)
+        var camera = CameraController(camera: start)
+        camera.pan(screenTranslation: .zero, viewport: CGSize(width: 820, height: 1_106))
+        XCTAssertEqual(camera.camera, start)
+    }
 }
 
 final class SpatialIndexTests: XCTestCase {

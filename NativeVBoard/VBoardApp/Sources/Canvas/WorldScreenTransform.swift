@@ -15,6 +15,79 @@ struct CanvasCoordinateMapper {
     }
 }
 
+enum CameraMutationReason: String {
+    case boardInitialFit
+    case restorePersistedViewport
+    case handPan
+    case touchPan
+    case pinch
+    case keyboardZoom
+    case explicitFitBoard
+    case explicitReset
+}
+
+enum CameraResolver {
+    static func fitBoard(boardRect: CGRect, viewport: CGSize, screenPadding: CGFloat = 32) -> CameraRect {
+        guard boardRect.width > 0, boardRect.height > 0, viewport.width > 0, viewport.height > 0 else {
+            return CameraRect(x: boardRect.minX, y: boardRect.minY, width: max(boardRect.width, 1), height: max(boardRect.height, 1))
+        }
+        let aspect = viewport.width / viewport.height
+        let paddingWorld = max(boardRect.width, boardRect.height) * 0.04 + screenPadding / max(viewport.width / boardRect.width, viewport.height / boardRect.height)
+        let contentWidth = boardRect.width + paddingWorld * 2
+        let contentHeight = boardRect.height + paddingWorld * 2
+        let width: CGFloat
+        let height: CGFloat
+        if aspect >= contentWidth / contentHeight {
+            height = contentHeight; width = height * aspect
+        } else {
+            width = contentWidth; height = width / aspect
+        }
+        let center = CGPoint(x: boardRect.midX, y: boardRect.midY)
+        return CameraRect(x: Double(center.x - width / 2), y: Double(center.y - height / 2), width: Double(width), height: Double(height))
+    }
+
+    static func isFiniteAndPositive(_ camera: CameraRect) -> Bool {
+        camera.x.isFinite && camera.y.isFinite && camera.width.isFinite && camera.height.isFinite && camera.width > 0 && camera.height > 0
+    }
+
+    static func resolve(persisted: CameraRect, boardRect: CGRect, contentBounds: CGRect, viewport: CGSize) -> (camera: CameraRect, reason: CameraMutationReason?) {
+        let fallback = fitBoard(boardRect: boardRect, viewport: viewport)
+        guard isFiniteAndPositive(persisted) else { return (fallback, .boardInitialFit) }
+        // A viewport saved on another device can have a very different
+        // aspect ratio (for example, a landscape web viewport restored into
+        // the portrait iPad canvas). That camera is numerically valid but
+        // makes the board appear off-screen. Zooming preserves the aspect
+        // ratio, so this check does not interfere with an intentional zoom.
+        guard viewport.width > 0, viewport.height > 0,
+              boardRect.width > 0, boardRect.height > 0 else {
+            return (fallback, .boardInitialFit)
+        }
+        let persistedRect = persisted.cgRect
+        let viewportAspect = viewport.width / viewport.height
+        let persistedAspect = persistedRect.width / persistedRect.height
+        let aspectRatio = max(persistedAspect / viewportAspect, viewportAspect / persistedAspect)
+        let aspectMismatch = !aspectRatio.isFinite || aspectRatio > 1.75
+
+        // The board is the source of truth for the initial view. A historical
+        // viewport that no longer intersects it is treated as stale even if
+        // it happens to contain an off-board user stroke.
+        let missesBoard = !persistedRect.intersects(boardRect)
+
+        // Reject only genuinely absurd extents. A normal zoom may be much
+        // smaller than the board, while a wide canvas with legitimate
+        // off-board content can still be restored as long as it is not
+        // orders of magnitude larger than the persisted scene.
+        let sceneWidth = max(max(boardRect.width, contentBounds.width), 1)
+        let sceneHeight = max(max(boardRect.height, contentBounds.height), 1)
+        let absurdlyLarge = persistedRect.width > sceneWidth * 12 || persistedRect.height > sceneHeight * 12
+
+        if missesBoard || aspectMismatch || absurdlyLarge {
+            return (fallback, .boardInitialFit)
+        }
+        return (persisted, nil)
+    }
+}
+
 struct WorldScreenTransform: Equatable {
     let camera: CameraRect
     let viewport: CGSize
@@ -76,4 +149,8 @@ struct CameraController: Equatable {
         else { camera.height = camera.width / Double(newAspect) }
         camera.x = center.x - camera.width / 2; camera.y = center.y - camera.height / 2
     }
+}
+
+private extension CameraRect {
+    var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
 }
