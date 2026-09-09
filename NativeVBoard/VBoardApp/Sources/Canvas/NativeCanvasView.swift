@@ -242,6 +242,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if boardChanged {
             persistedCamera = camera
             cameraInitializedForBoardID = nil
+            lastAppliedCamera = nil
             setCamera(camera, reason: .restorePersistedViewport)
         }
         self.onStroke = onStroke
