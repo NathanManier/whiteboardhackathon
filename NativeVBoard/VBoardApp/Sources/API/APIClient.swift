@@ -148,9 +148,9 @@ final class APIClient: ObservableObject {
 
     func deleteBoard(id: String) async throws { var request = try request(path: "/api/boards/\(id)", method: "DELETE"); let (data, response) = try await data(for: request); try validate(response, data: data) }
 
-    func explain(boardID: String, action: String = "explain", selectedText: String = "") async throws -> StudyInteractionResponse {
+    func explain(boardID: String, action: String = "explain", selectedText: String = "", selectedObjectIDs: [String] = []) async throws -> StudyInteractionResponse {
         var request = try request(path: "/api/boards/\(boardID)/study/explain", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["action": action, "selected_text": selectedText])
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["action": action, "selected_text": selectedText, "selected_object_ids": selectedObjectIDs])
         let (data, response) = try await data(for: request); try validate(response, data: data)
         do { return try decoder.decode(StudyInteractionResponse.self, from: data) }
         catch { throw APIError.decoding("Could not decode the study response.") }
