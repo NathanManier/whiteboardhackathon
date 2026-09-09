@@ -166,7 +166,7 @@ struct EditorState: Codable, Sendable {
 
 struct SourceBoard: Codable, Sendable { let boardID: String; enum CodingKeys: String, CodingKey { case boardID = "board_id" } }
 struct EditorGroup: Codable, Sendable { let id: String?; let children: [String]? }
-struct ObjectTransform: Codable, Sendable { let x: Double; let y: Double; let scaleX: Double?; let scaleY: Double?; let deleted: Bool? }
+struct ObjectTransform: Codable, Equatable, Sendable { let x: Double; let y: Double; let scaleX: Double?; let scaleY: Double?; let deleted: Bool? }
 
 struct CanvasObject: Codable, Identifiable, Sendable {
     let id: String

@@ -7,6 +7,14 @@ struct WorldScreenTransform: Equatable {
     var scale: CGFloat { min(viewport.width / CGFloat(camera.width), viewport.height / CGFloat(camera.height)) }
     var contentSize: CGSize { CGSize(width: CGFloat(camera.width) * scale, height: CGFloat(camera.height) * scale) }
     var origin: CGPoint { CGPoint(x: (viewport.width - contentSize.width) / 2, y: (viewport.height - contentSize.height) / 2) }
+    /// Affine transform applied to world-space display layers. Keeping paths in
+    /// world coordinates lets pan/zoom use Core Animation composition rather
+    /// than rebuilding every path for each camera sample.
+    var affineTransform: CGAffineTransform {
+        CGAffineTransform(translationX: origin.x - CGFloat(camera.x) * scale,
+                          y: origin.y - CGFloat(camera.y) * scale)
+            .scaledBy(x: scale, y: scale)
+    }
 
     func screenPoint(for world: CGPoint) -> CGPoint {
         CGPoint(x: origin.x + (world.x - camera.x) * scale, y: origin.y + (world.y - camera.y) * scale)
@@ -22,6 +30,8 @@ struct CameraController: Equatable {
     private(set) var camera: CameraRect
 
     init(camera: CameraRect) { self.camera = camera }
+
+    mutating func setCamera(_ camera: CameraRect) { self.camera = camera }
 
     mutating func pan(screenTranslation: CGPoint, viewport: CGSize) {
         let transform = WorldScreenTransform(camera: camera, viewport: viewport)

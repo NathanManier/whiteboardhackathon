@@ -25,6 +25,25 @@ final class WorldScreenTransformTests: XCTestCase {
     }
 }
 
+final class SpatialIndexTests: XCTestCase {
+    func testViewportQueryHandlesNegativeCoordinatesAndExactIntersection() {
+        var index = SpatialIndex(cellSize: 100)
+        index.insert(id: "negative", bounds: CGRect(x: -180, y: -40, width: 30, height: 30))
+        index.insert(id: "visible", bounds: CGRect(x: 110, y: 110, width: 20, height: 20))
+        index.insert(id: "far", bounds: CGRect(x: 1000, y: 1000, width: 20, height: 20))
+        XCTAssertEqual(index.query(CGRect(x: -200, y: -50, width: 80, height: 80)), ["negative"])
+        XCTAssertEqual(index.query(CGRect(x: 100, y: 100, width: 50, height: 50)), ["visible"])
+        XCTAssertTrue(index.query(CGRect(x: 0, y: 0, width: 50, height: 50)).isEmpty)
+    }
+
+    func testLargeViewportDoesNotReturnObjectsOutsideBounds() {
+        var index = SpatialIndex(cellSize: 64)
+        for i in 0..<500 { index.insert(id: "p\(i)", bounds: CGRect(x: CGFloat(i * 100), y: 0, width: 10, height: 10)) }
+        let result = index.query(CGRect(x: 1000, y: -20, width: 100, height: 50))
+        XCTAssertEqual(result, ["p10"])
+    }
+}
+
 final class SVGDocumentTests: XCTestCase {
     func testParserPreservesCanonicalPathAndEvenOddHoles() throws {
         let d = "M 0 0 L 40 0 L 40 40 L 0 40 Z M 10 10 L 30 10 L 30 30 L 10 30 Z"
