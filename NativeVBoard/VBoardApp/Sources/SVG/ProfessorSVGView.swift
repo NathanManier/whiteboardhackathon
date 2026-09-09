@@ -77,6 +77,19 @@ final class ProfessorSVGView: UIView {
         entries[id]?.bounds ?? .null
     }
 
+    /// Applies a transient world-space translation to selected professor
+    /// paths. The immutable SVG path and its baked imported transform remain
+    /// untouched; the affine transform is cleared when the move commits or
+    /// is cancelled.
+    func previewTranslation(ids: Set<String>, delta: CGPoint) {
+        let transform = CGAffineTransform(translationX: delta.x, y: delta.y)
+        for id in ids { entries[id]?.layer.setAffineTransform(transform) }
+    }
+
+    func clearPreviewTranslation(ids: Set<String>) {
+        for id in ids { entries[id]?.layer.setAffineTransform(.identity) }
+    }
+
     private func rebuild(document: SVGDocument, importedTransforms: [String: ObjectTransform], composition: SceneComposition?) {
         self.document = document
         self.importedTransforms = importedTransforms

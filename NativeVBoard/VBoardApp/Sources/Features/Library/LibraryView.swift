@@ -47,7 +47,7 @@ struct LibraryView: View {
                 } else { ProgressView("Loading your library…") }
             }
             .navigationTitle("V-Board")
-            .toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { showImporter = true } label: { Label("New Whiteboard", systemImage: "photo.badge.plus") }; Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "books.vertical") } } label: { Label("Create", systemImage: "plus") }.buttonStyle(.borderedProminent) }; ToolbarItem(placement: .secondaryAction) { Button { load() } label: { Image(systemName: "arrow.clockwise") } } }
+            .toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { showImporter = true } label: { Label("Import Whiteboard", systemImage: "photo.badge.plus") }; Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "books.vertical") } } label: { Image(systemName: "plus") }.accessibilityLabel("Add to V-Board") }; ToolbarItem(placement: .secondaryAction) { Button { load() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh library") } }
             .sheet(isPresented: $showImporter) { ImportFlowView { board in launchBoard = board; showImporter = false; load() } }
             .sheet(isPresented: $showNewLecture) { NewLectureView { showNewLecture = false; load() } }
             .navigationDestination(item: $launchBoard) { BoardView(board: $0) }
@@ -67,7 +67,16 @@ struct LibraryView: View {
 
 private struct LibraryHero: View {
     let add: () -> Void
-    var body: some View { HStack(spacing: 20) { VStack(alignment: .leading, spacing: 8) { Text("Turn any whiteboard into a study canvas.").font(.system(size: 34, weight: .bold, design: .rounded)).fixedSize(horizontal: false, vertical: true); Text("Import a photo, preserve the professor’s ink as editable geometry, and study from the same board.").font(.title3).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true); Button(action: add) { Label("New Whiteboard", systemImage: "plus") }.buttonStyle(.borderedProminent).controlSize(.large).padding(.top, 8) }; Spacer(minLength: 10); Image(systemName: "square.and.pencil").font(.system(size: 82, weight: .light)).foregroundStyle(.tint).symbolRenderingMode(.hierarchical).accessibilityHidden(true) }.padding(28).background(.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 24, style: .continuous)) }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("V-Board").font(.title.weight(.semibold))
+            Text("Turn a physical whiteboard into editable ink you can study.").font(.title2).fixedSize(horizontal: false, vertical: true)
+            Text("Import a photo, keep the professor’s geometry intact, and annotate the same board.").foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Button(action: add) { Label("Import Whiteboard", systemImage: "photo.badge.plus") }.buttonStyle(.borderedProminent).controlSize(.large).padding(.top, 4)
+        }
+        .frame(maxWidth: 620, alignment: .leading)
+        .padding(.vertical, 12)
+    }
 }
 
 private struct EmptyLibraryView: View {
@@ -77,12 +86,12 @@ private struct EmptyLibraryView: View {
 
 private struct LectureCard: View {
     let folder: LectureFolder
-    var body: some View { VStack(alignment: .leading, spacing: 10) { Image(systemName: "books.vertical.fill").font(.title2).foregroundStyle(.tint); Text(folder.name).font(.headline); Text("\(folder.boardOrder.count) whiteboard\(folder.boardOrder.count == 1 ? "" : "s")").font(.subheadline).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading).padding(18).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous)) }
+    var body: some View { VStack(alignment: .leading, spacing: 8) { Label(folder.name, systemImage: "books.vertical").font(.headline); Text("\(folder.boardOrder.count) whiteboard\(folder.boardOrder.count == 1 ? "" : "s")").font(.subheadline).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 14).overlay(alignment: .bottom) { Rectangle().fill(.quaternary).frame(height: 1) } }
 }
 
 private struct BoardCard: View {
     let board: LibraryBoard
-    var body: some View { VStack(alignment: .leading, spacing: 10) { if let raw = board.thumbnailURL, let url = URL(string: raw, relativeTo: URL(string: "https://chsinteract.com")) { AsyncImage(url: url) { phase in switch phase { case .success(let image): image.resizable().scaledToFill(); default: Image(systemName: "photo").font(.largeTitle).foregroundStyle(.secondary) } }.frame(height: 130).clipped().clipShape(RoundedRectangle(cornerRadius: 12)) } else { RoundedRectangle(cornerRadius: 12).fill(.gray.opacity(0.14)).frame(height: 130).overlay { Image(systemName: board.status == "ready" ? "checkmark.circle" : "clock").font(.largeTitle).foregroundStyle(board.status == "ready" ? .green : .orange) } }; Text(board.name).font(.headline).lineLimit(2); Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized).font(.caption).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading).padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous)) }
+    var body: some View { VStack(alignment: .leading, spacing: 9) { if let raw = board.thumbnailURL, let url = URL(string: raw, relativeTo: URL(string: "https://chsinteract.com")) { AsyncImage(url: url) { phase in switch phase { case .success(let image): image.resizable().scaledToFill(); default: Image(systemName: "photo").font(.largeTitle).foregroundStyle(.secondary) } }.frame(height: 130).clipped().clipShape(RoundedRectangle(cornerRadius: 8)) } else { RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.45)).frame(height: 130).overlay { Image(systemName: board.status == "ready" ? "checkmark" : "clock").font(.title2).foregroundStyle(.secondary) } }; Text(board.name).font(.headline).lineLimit(2); Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized).font(.caption).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading) }
 }
 
 struct LectureView: View {

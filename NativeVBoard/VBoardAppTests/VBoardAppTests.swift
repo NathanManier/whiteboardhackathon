@@ -113,6 +113,37 @@ final class StrokeSerializationTests: XCTestCase {
         XCTAssertEqual(decoded, stroke)
         XCTAssertEqual(decoded.points[0].pressure ?? -1, 0.6, accuracy: 0.0001)
     }
+
+    func testSelectedUserObjectMovePreservesSourcePointsAndAddsWorldTranslation() {
+        let object = CanvasObject(id: "stroke-1", type: "stroke", color: "#183153", width: 4, opacity: 1,
+                                  points: [WorldPoint(x: -12, y: 8, pressure: 1)], translation: nil,
+                                  sourceMarkdown: nil, text: nil, x: nil, y: nil, height: nil, fontSize: nil)
+        let moved = object.translated(by: CGPoint(x: -30, y: 14))
+        XCTAssertEqual(moved.points, object.points)
+        XCTAssertEqual(moved.translation?.x, -30)
+        XCTAssertEqual(moved.translation?.y, 14)
+        XCTAssertEqual(moved.id, object.id)
+    }
+
+    func testImportedProfessorMoveUsesTransformWithoutChangingSourceGeometry() throws {
+        let svg = try SVGDocument.parse("<svg viewBox='0 0 100 100'><path id='prof-1' d='M 2 3 L 8 3 Z'/></svg>")
+        let originalPath = svg.paths[0].d
+        let transform = ObjectTransform(x: -40, y: 22, scaleX: 1, scaleY: 1, deleted: false)
+        let moved = ObjectTransform(x: transform.x - 15, y: transform.y + 9, scaleX: transform.scaleX, scaleY: transform.scaleY, deleted: transform.deleted)
+        XCTAssertEqual(svg.paths[0].d, originalPath)
+        XCTAssertEqual(moved.x ?? .nan, -55, accuracy: 0.000001)
+        XCTAssertEqual(moved.y ?? .nan, 31, accuracy: 0.000001)
+    }
+
+    func testMultiSelectionWorldDeltaPreservesRelativeSpacing() {
+        let first = CGPoint(x: -20, y: 10)
+        let second = CGPoint(x: 45, y: -30)
+        let delta = CGPoint(x: -70, y: 18)
+        let movedFirst = CGPoint(x: first.x + delta.x, y: first.y + delta.y)
+        let movedSecond = CGPoint(x: second.x + delta.x, y: second.y + delta.y)
+        XCTAssertEqual(movedSecond.x - movedFirst.x, second.x - first.x, accuracy: 0.000001)
+        XCTAssertEqual(movedSecond.y - movedFirst.y, second.y - first.y, accuracy: 0.000001)
+    }
 }
 
 final class ServerContractDecodingTests: XCTestCase {

@@ -99,23 +99,28 @@ private struct BoardEditorSurface: View {
             // never left with the previous tool, while the document/camera
             // remain owned by BoardDocumentStore and therefore survive the
             // handoff exactly once.
-            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { id, delta in store.moveObject(id: id, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
+            NativeCanvasView(boardID: board.id, document: document, camera: store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { ids, delta in store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
                 .id(activeTool)
                 .ignoresSafeArea(edges: .bottom)
-            HStack(spacing: 8) {
+            HStack(spacing: 14) {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) { ForEach(CanvasTool.allCases, id: \.self) { tool in ToolButton(title: tool.title, icon: tool.icon, selected: activeTool == tool) { activeTool = tool } } }
+                    HStack(spacing: 6) {
+                        ForEach(CanvasTool.allCases, id: \.self) { tool in
+                            ToolButton(title: tool.title, icon: tool.icon, selected: activeTool == tool) { activeTool = tool }
+                        }
+                    }
                 }
-                Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                Button { showStudy = true } label: { Label("Study", systemImage: "sparkles") }.buttonStyle(.borderedProminent)
-                Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle.fill").font(.title2) }.buttonStyle(.bordered)
-            }.padding(10).background(.regularMaterial, in: Capsule()).padding(.horizontal, 14).padding(.bottom, 12)
+                Divider().frame(height: 28)
+                Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1).frame(minWidth: 76, alignment: .leading)
+                Button { showStudy = true } label: { Label("Explain", systemImage: "text.magnifyingglass") }.buttonStyle(.borderedProminent).controlSize(.small)
+                Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis").font(.headline).frame(width: 32, height: 32) }.accessibilityLabel("Board actions")
+            }.padding(.horizontal, 14).padding(.vertical, 8).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous)).padding(.horizontal, 14).padding(.bottom, 12)
             // SwiftUI's command system is the reliable keyboard path when the
             // simulator captures the Mac keyboard; the canvas also exposes
             // the same commands through UIKeyCommand for device input.
             Button("") { store.undo(api: api) }.keyboardShortcut("z", modifiers: .command).frame(width: 0, height: 0).opacity(0.001)
             Button("") { store.redo(api: api) }.keyboardShortcut("z", modifiers: [.command, .shift]).frame(width: 0, height: 0).opacity(0.001)
-        }.navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItemGroup(placement: .navigationBarTrailing) { Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo); Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo); Button { showStudy = true } label: { Image(systemName: "sparkles") } } }
+        }.navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItemGroup(placement: .navigationBarTrailing) { Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo); Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo); Button { showStudy = true } label: { Image(systemName: "text.magnifyingglass") }.accessibilityLabel("Explain selection") } }
         .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
         .sheet(isPresented: $showStudy) { StudyActionsView(boardID: board.id, selectedObjectIDs: Array(selectedIDs)) { problems, interactionID in store.applyPracticeProblems(problems, interactionID: interactionID, api: api) } }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
@@ -153,7 +158,16 @@ private struct ToolButton: View {
     let icon: String
     let selected: Bool
     let action: () -> Void
-    var body: some View { Button(action: action) { VStack(spacing: 3) { Image(systemName: icon); Text(title).font(.caption2) }.frame(minWidth: 54, minHeight: 42) }.buttonStyle(.bordered).tint(selected ? .accentColor : .secondary) }
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon).font(.system(size: 17, weight: .medium)).frame(width: 36, height: 34)
+        }
+        .buttonStyle(.bordered)
+        .tint(selected ? .accentColor : .secondary)
+        .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .accessibilityLabel(title)
+        .help(title)
+    }
 }
 
 private struct StudyActionsView: View {
@@ -165,7 +179,7 @@ private struct StudyActionsView: View {
     @State private var loading = false
     @State private var result: StudyInteractionResponse?
     @State private var error: String?
-    var body: some View { NavigationStack { VStack(spacing: 18) { if loading { ProgressView("Thinking about this board…") } else if let result { Text(result.interaction?.title ?? (result.problems == nil ? "Study Notes" : "Practice Problems")).font(.title2.bold()); ScrollView { Text(result.interaction?.answer ?? result.problem ?? result.problems?.map(\.text).joined(separator: "\n\n") ?? "No study response was returned.").frame(maxWidth: 700, alignment: .leading).textSelection(.enabled) }; if let problems = result.problems, !problems.isEmpty { Label("Added to your canvas", systemImage: "rectangle.on.rectangle") .foregroundStyle(.secondary); Button("Add Again") { onPracticeProblems(problems, result.interaction?.id) }.buttonStyle(.bordered) }; HStack { Button("Ask Again") { explain() }.buttonStyle(.bordered); Button("Check My Work") { explain(action: "check_my_work") }.buttonStyle(.bordered) } } else { Image(systemName: "sparkles").font(.largeTitle).foregroundStyle(.tint); Text("Study this board").font(.title2.bold()); Text("Ask V-Board to explain the visible lecture material or create practice prompts.").multilineTextAlignment(.center).foregroundStyle(.secondary); Button("Explain") { explain() }.buttonStyle(.borderedProminent); Button("Practice Problems") { explain(action: "practice_problems") }.buttonStyle(.bordered); Button("Check My Work") { explain(action: "check_my_work") }.buttonStyle(.bordered) }; if let error { Text(error).foregroundStyle(.red) } }.padding(28).navigationTitle("Study").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } } } }
+    var body: some View { NavigationStack { VStack(spacing: 18) { if loading { ProgressView("Reading the selected board…") } else if let result { Text(result.interaction?.title ?? (result.problems == nil ? "Board explanation" : "Practice Problems")).font(.title2.bold()); ScrollView { Text(result.interaction?.answer ?? result.problem ?? result.problems?.map(\.text).joined(separator: "\n\n") ?? "No study response was returned.").frame(maxWidth: 700, alignment: .leading).textSelection(.enabled) }; if let problems = result.problems, !problems.isEmpty { Label("Added to this board", systemImage: "rectangle.on.rectangle") .foregroundStyle(.secondary); Button("Add Again") { onPracticeProblems(problems, result.interaction?.id) }.buttonStyle(.bordered) }; HStack { Button("Explain Again") { explain() }.buttonStyle(.bordered); Button("Check My Work") { explain(action: "check_my_work") }.buttonStyle(.bordered) } } else { Image(systemName: "text.magnifyingglass").font(.largeTitle).foregroundStyle(.tint); Text("Study the selected ink").font(.title2.bold()); Text("Explain a selected concept, create two practice problems, or check a handwritten solution.").multilineTextAlignment(.center).foregroundStyle(.secondary); Button("Explain") { explain() }.buttonStyle(.borderedProminent); Button("Practice Problems") { explain(action: "practice_problems") }.buttonStyle(.bordered); Button("Check My Work") { explain(action: "check_my_work") }.buttonStyle(.bordered) }; if let error { Text(error).foregroundStyle(.red) } }.padding(28).navigationTitle("Study").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } } } }
     private func explain(action: String = "explain") { loading = true; error = nil; Task { do { result = try await api.explain(boardID: boardID, action: action, selectedObjectIDs: selectedObjectIDs); if action == "practice_problems", let problems = result?.problems { onPracticeProblems(problems, result?.interaction?.id) }; loading = false } catch { loading = false; self.error = "AI is temporarily unavailable." } } }
 }
 

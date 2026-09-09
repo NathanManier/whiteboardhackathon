@@ -18,7 +18,7 @@ struct NativeCanvasView: UIViewRepresentable {
     var onStroke: (UserStroke) -> Void = { _ in }
     var tool: CanvasTool = .pen
     var onSelectionChanged: (Set<String>) -> Void = { _ in }
-    var onMove: (String, CGPoint) -> Void = { _, _ in }
+    var onMove: (Set<String>, CGPoint) -> Void = { _, _ in }
     var onDelete: (Set<String>) -> Void = { _ in }
     var onCameraChanged: (CameraRect) -> Void = { _ in }
     var onUndo: () -> Void = {}
@@ -54,14 +54,17 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var onStroke: (UserStroke) -> Void
     private var activeTool: CanvasTool
     private var onSelectionChanged: (Set<String>) -> Void
-    private var onMove: (String, CGPoint) -> Void
+    private var onMove: (Set<String>, CGPoint) -> Void
     private var onDelete: (Set<String>) -> Void
     private var onCameraChanged: (CameraRect) -> Void
     private var onUndo: () -> Void
     private var onRedo: () -> Void
     private var selectedIDs = Set<String>()
     private var editStart = CGPoint.zero
+    private var editStartScreen = CGPoint.zero
     private var lastEditPoint = CGPoint.zero
+    private var moveDelta = CGPoint.zero
+    private var moveActive = false
     private var lassoWorldPoints: [CGPoint] = []
     private let interactionLayer = CAShapeLayer()
     private var boardID: String
@@ -87,7 +90,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
          objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:],
          composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in },
          tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
-         onMove: @escaping (String, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
+         onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
         self.boardID = boardID; self.document = document; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition
         self.onStroke = onStroke
@@ -170,7 +173,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 objects: [CanvasObject], importedTransforms: [String: ObjectTransform],
                 composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in },
                 tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
-                onMove: @escaping (String, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
+                onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
         let documentChanged = self.document != document || self.importedTransforms != importedTransforms
         let objectsChanged = self.objects != objects
         self.boardID = boardID; self.document = document; self.objects = objects
@@ -386,7 +389,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             panStart = screen; panStartCamera = controller.camera
             interactionState = .panning; professor.beginNavigation(); debugInputOperation("PAN BEGIN"); debugPan("BEGIN", screen: screen); updateInputHUD(); return
         }
-        if activeTool != .pen && activeTool != .highlighter { beginEditing(at: point); return }
+        if activeTool != .pen && activeTool != .highlighter { beginEditing(at: point, screen: touch.location(in: self)); return }
         guard isDrawingTouch(touch) else { super.touchesBegan(touches, with: event); return }
         interactionState = .drawing; debugInputOperation("STROKE BEGIN"); updateInputHUD()
         activeID = UUID().uuidString; activePoints = samples(for: touch, event: event)
@@ -405,7 +408,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             controller.pan(screenTranslation: CGPoint(x: screen.x - panStart.x, y: screen.y - panStart.y), viewport: bounds.size)
             applyCamera(interacting: true); debugInputOperation("PAN UPDATE"); debugPan("UPDATE", screen: screen); return
         }
-        if activeTool != .pen && activeTool != .highlighter { continueEditing(at: worldPoint(touch.location(in: self), from: self)); return }
+        if activeTool != .pen && activeTool != .highlighter { continueEditing(at: worldPoint(touch.location(in: self), from: self), screen: touch.location(in: self)); return }
         guard isDrawingTouch(touch) else { return }
         activePoints.append(contentsOf: samples(for: touch, event: event)); updateActiveStroke(); debugInputOperation("STROKE APPEND")
     }
@@ -449,8 +452,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
     }
 
-    private func beginEditing(at point: CGPoint) {
-        editStart = point; lastEditPoint = point
+    private func beginEditing(at point: CGPoint, screen: CGPoint) {
+        editStart = point; editStartScreen = screen; lastEditPoint = point
+        moveDelta = .zero; moveActive = false
         if activeTool == .navigation {
             interactionState = .panning
             return
@@ -459,7 +463,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         } else if activeTool == .objectEraser {
             interactionState = .erasing; eraseIDs.removeAll(); eraseSegment(from: point, to: point); debugInputOperation("ERASER BEGIN")
         } else if activeTool == .select {
-            selectedIDs = hitTestIDs(at: point)
+            let hitIDs = hitTestIDs(at: point)
+            // Clicking inside an already-selected member preserves the full
+            // selection so a lasso-selected set moves as one group. Clicking
+            // an unrelated object intentionally replaces the selection.
+            if selectedIDs.isEmpty || hitIDs.isDisjoint(with: selectedIDs) {
+                selectedIDs = hitIDs
+            }
             interactionState = selectedIDs.isEmpty ? .idle : .selecting
             #if DEBUG
             print("[VBoard] SELECT HIT ids=\(Array(selectedIDs))")
@@ -469,17 +479,19 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
     }
 
-    private func continueEditing(at point: CGPoint) {
+    private func continueEditing(at point: CGPoint, screen: CGPoint) {
         switch activeTool {
         case .navigation:
             break
         case .lasso:
             lassoWorldPoints.append(point); updateInteractionPath(); debugInputOperation("LASSO UPDATE")
         case .select:
-            let delta = CGPoint(x: point.x - lastEditPoint.x, y: point.y - lastEditPoint.y)
-            if !selectedIDs.isEmpty, (delta.x != 0 || delta.y != 0) {
+            let screenDistance = hypot(screen.x - editStartScreen.x, screen.y - editStartScreen.y)
+            if !selectedIDs.isEmpty, screenDistance >= 4 {
+                moveActive = true
+                moveDelta = CGPoint(x: point.x - editStart.x, y: point.y - editStart.y)
                 interactionState = .movingSelection; debugInputOperation("MOVE UPDATE")
-                for id in selectedIDs { onMove(id, delta) }
+                previewMove(moveDelta)
             }
         case .objectEraser: eraseSegment(from: lastEditPoint, to: point); debugInputOperation("ERASER SEGMENT")
         case .pen, .highlighter: break
@@ -488,6 +500,20 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func finishEditing(at endpoint: CGPoint?) {
+        if activeTool == .select {
+            if let endpoint, !selectedIDs.isEmpty {
+                let delta = CGPoint(x: endpoint.x - editStart.x, y: endpoint.y - editStart.y)
+                if moveActive || hypot(delta.x, delta.y) > 0 {
+                    moveDelta = delta
+                    onMove(selectedIDs, delta)
+                    debugInputOperation("MOVE COMMIT")
+                }
+            }
+            clearMovePreview()
+            moveActive = false; moveDelta = .zero
+            interactionState = .idle; updateSelectionOverlay(); updateInputHUD()
+            return
+        }
         if activeTool == .lasso, let endpoint, lassoWorldPoints.count == 1 { lassoWorldPoints.append(endpoint) }
         if activeTool == .lasso, lassoWorldPoints.count >= 2 {
             // A simulator drag is delivered as a begin/end pair by the Mac
@@ -515,6 +541,19 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             debugInputOperation("LASSO FINALIZE")
         }
         lassoWorldPoints.removeAll(); interactionState = .idle; updateInteractionPath(); updateInputHUD()
+    }
+
+    private func previewMove(_ delta: CGPoint) {
+        for id in selectedIDs {
+            userObjectLayers[id]?.setAffineTransform(CGAffineTransform(translationX: delta.x, y: delta.y))
+        }
+        professor.previewTranslation(ids: selectedIDs, delta: delta)
+        updateSelectionOverlay()
+    }
+
+    private func clearMovePreview() {
+        for id in selectedIDs { userObjectLayers[id]?.setAffineTransform(.identity) }
+        professor.clearPreviewTranslation(ids: selectedIDs)
     }
 
     private func eraseSegment(from start: CGPoint, to end: CGPoint) {
@@ -563,6 +602,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         for id in selectedIDs { bounds = bounds.union(professor.bounds(for: id)) }
         guard !bounds.isNull else { return }
+        if moveActive { bounds = bounds.offsetBy(dx: moveDelta.x, dy: moveDelta.y) }
         interactionLayer.path = UIBezierPath(rect: bounds.insetBy(dx: -10, dy: -10)).cgPath; interactionLayer.isHidden = false
     }
 

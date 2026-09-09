@@ -121,17 +121,26 @@ final class BoardDocumentStore: ObservableObject {
     }
 
     func moveObject(id: String, by delta: CGPoint, api: APIClient) {
+        moveObjects(ids: Set([id]), by: delta, api: api)
+    }
+
+    /// Applies one world-space delta to all selected objects as one document
+    /// mutation, producing one undo entry and one outbox snapshot per drag.
+    func moveObjects(ids: Set<String>, by delta: CGPoint, api: APIClient) {
+        guard !ids.isEmpty, (delta.x != 0 || delta.y != 0) else { return }
         var next = editor
-        if let index = next.objects.firstIndex(where: { $0.id == id }) {
-            next.objects[index] = next.objects[index].translated(by: delta)
-        } else if let imported = next.importedTransforms[id] {
-            next.importedTransforms[id] = ObjectTransform(x: imported.x + delta.x, y: imported.y + delta.y,
-                                                          scaleX: imported.scaleX, scaleY: imported.scaleY,
-                                                          deleted: imported.deleted)
-        } else {
-            // A selected untransformed professor path is promoted to the live
-            // layer by adding its first translation without touching board.svg.
-            next.importedTransforms[id] = ObjectTransform(x: delta.x, y: delta.y, scaleX: 1, scaleY: 1, deleted: false)
+        for id in ids {
+            if let index = next.objects.firstIndex(where: { $0.id == id }) {
+                next.objects[index] = next.objects[index].translated(by: delta)
+            } else if let imported = next.importedTransforms[id] {
+                next.importedTransforms[id] = ObjectTransform(x: imported.x + delta.x, y: imported.y + delta.y,
+                                                              scaleX: imported.scaleX, scaleY: imported.scaleY,
+                                                              deleted: imported.deleted)
+            } else {
+                // A selected untransformed professor path is promoted to the
+                // live layer by adding its first translation without touching board.svg.
+                next.importedTransforms[id] = ObjectTransform(x: delta.x, y: delta.y, scaleX: 1, scaleY: 1, deleted: false)
+            }
         }
         apply(next, api: api)
     }
