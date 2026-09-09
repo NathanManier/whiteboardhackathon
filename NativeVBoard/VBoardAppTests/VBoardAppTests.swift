@@ -68,6 +68,42 @@ final class WorldScreenTransformTests: XCTestCase {
         XCTAssertEqual(camera.camera.width, 50, accuracy: 0.0001)
     }
 
+    func testPinchKeepsWorldPointUnderMovingMidpoint() {
+        let viewport = CGSize(width: 1_000, height: 600)
+        let start = CameraRect(x: -200, y: -100, width: 1_000, height: 600)
+        let startMidpoint = CGPoint(x: 420, y: 260)
+        let currentMidpoint = CGPoint(x: 560, y: 330)
+        let anchor = WorldScreenTransform(camera: start, viewport: viewport).worldPoint(for: startMidpoint)
+
+        var controller = CameraController(camera: start)
+        controller.pinch(startCamera: start,
+                         startMidpoint: startMidpoint,
+                         currentMidpoint: currentMidpoint,
+                         magnification: 1.75,
+                         viewport: viewport)
+
+        let transformed = WorldScreenTransform(camera: controller.camera, viewport: viewport)
+        let finalScreen = transformed.screenPoint(for: anchor)
+        XCTAssertEqual(finalScreen.x, currentMidpoint.x, accuracy: 0.0001)
+        XCTAssertEqual(finalScreen.y, currentMidpoint.y, accuracy: 0.0001)
+        XCTAssertLessThan(controller.camera.width, start.width)
+    }
+
+    func testCameraTransformMovesWorldPixelsWhenCameraPans() {
+        let viewport = CGSize(width: 800, height: 400)
+        let start = CameraRect(x: 0, y: 0, width: 800, height: 400)
+        let startTransform = WorldScreenTransform(camera: start, viewport: viewport)
+        var controller = CameraController(camera: start)
+        controller.pan(screenTranslation: CGPoint(x: 200, y: 75), viewport: viewport)
+        let endTransform = WorldScreenTransform(camera: controller.camera, viewport: viewport)
+        let worldPoint = CGPoint(x: 300, y: 150)
+        let startScreen = startTransform.screenPoint(for: worldPoint)
+        let endScreen = endTransform.screenPoint(for: worldPoint)
+        XCTAssertEqual(endScreen.x - startScreen.x, 200, accuracy: 0.0001)
+        XCTAssertEqual(endScreen.y - startScreen.y, 75, accuracy: 0.0001)
+        XCTAssertNotEqual(startTransform.affineTransform, endTransform.affineTransform)
+    }
+
     func testFitBoardCentersTheFullNonZeroViewBox() {
         let board = CGRect(x: 120, y: -40, width: 1_600, height: 800)
         let viewport = CGSize(width: 820, height: 1_106)

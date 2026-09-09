@@ -140,6 +140,39 @@ struct CameraController: Equatable {
         camera.x += anchor.x - newAnchor.x; camera.y += anchor.y - newAnchor.y
     }
 
+    /// Applies a complete pinch from immutable gesture-start state. Using the
+    /// total recognizer scale and the current midpoint avoids cumulative drift
+    /// and keeps the world point under the fingers anchored while the midpoint
+    /// translates. Pan and pinch therefore share one CameraRect mutation path.
+    mutating func pinch(startCamera: CameraRect,
+                        startMidpoint: CGPoint,
+                        currentMidpoint: CGPoint,
+                        magnification: CGFloat,
+                        viewport: CGSize) {
+        guard magnification.isFinite, magnification > 0,
+              viewport.width > 0, viewport.height > 0,
+              startCamera.width > 0, startCamera.height > 0 else { return }
+
+        let startTransform = WorldScreenTransform(camera: startCamera, viewport: viewport)
+        let anchoredWorld = startTransform.worldPoint(for: startMidpoint)
+        let startZoom = max(1.0 / startTransform.scale, .leastNonzeroMagnitude)
+        let targetZoom = min(max(startZoom / Double(magnification), Self.zoomRange.lowerBound), Self.zoomRange.upperBound)
+        let ratio = targetZoom / startZoom
+
+        var candidate = CameraRect(x: startCamera.x,
+                                   y: startCamera.y,
+                                   width: startCamera.width * ratio,
+                                   height: startCamera.height * ratio)
+        let candidateTransform = WorldScreenTransform(camera: candidate, viewport: viewport)
+        let scale = max(candidateTransform.scale, .leastNonzeroMagnitude)
+        // Solve the camera origin directly so the original world anchor stays
+        // under the moving midpoint. This includes translation and scale in a
+        // single atomic camera update.
+        candidate.x = anchoredWorld.x - Double((currentMidpoint.x - candidateTransform.origin.x) / scale)
+        candidate.y = anchoredWorld.y - Double((currentMidpoint.y - candidateTransform.origin.y) / scale)
+        camera = candidate
+    }
+
     mutating func resizeViewport(from old: CGSize, to new: CGSize) {
         guard old.width > 0, old.height > 0, new.width > 0, new.height > 0 else { return }
         let center = camera.center
@@ -149,8 +182,4 @@ struct CameraController: Equatable {
         else { camera.height = camera.width / Double(newAspect) }
         camera.x = center.x - camera.width / 2; camera.y = center.y - camera.height / 2
     }
-}
-
-private extension CameraRect {
-    var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
 }

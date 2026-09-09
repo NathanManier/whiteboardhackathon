@@ -14,6 +14,7 @@ struct CameraRect: Codable, Equatable, Sendable {
     }
 
     var center: CGPoint { CGPoint(x: x + width / 2, y: y + height / 2) }
+    var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
 }
 
 struct WorldPoint: Codable, Equatable, Sendable {

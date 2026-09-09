@@ -1,7 +1,8 @@
 import UIKit
 
 /// Demand-driven professor renderer. Paths are parsed once into world-space
-/// layers; camera movement only changes a GPU-composited container transform.
+/// layers. Camera movement is owned by InfiniteCanvasUIView's world
+/// container; this view only refines visibility after the camera has settled.
 final class ProfessorSVGView: UIView {
     private let contentLayer = CALayer()
     private var entries: [String: Entry] = [:]
@@ -24,7 +25,9 @@ final class ProfessorSVGView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
-        clipsToBounds = true
+        // World-space paths may legitimately extend outside this view's local
+        // bounds. The parent world container is the camera/clipping boundary.
+        clipsToBounds = false
         contentLayer.anchorPoint = .zero
         contentLayer.position = .zero
         layer.addSublayer(contentLayer)
@@ -45,8 +48,13 @@ final class ProfessorSVGView: UIView {
 
     func updateCamera(_ transform: WorldScreenTransform, interacting: Bool) {
         isInteracting = interacting
-        contentLayer.frame = bounds
-        contentLayer.setAffineTransform(transform.affineTransform)
+        // The world container applies `transform.affineTransform`. Keeping
+        // this layer untransformed is critical: applying camera math here as
+        // well would transform the professor layer twice and make input and
+        // visibility appear to disagree with the rendered pixels.
+        contentLayer.bounds = CGRect(origin: .zero, size: bounds.size)
+        contentLayer.position = .zero
+        contentLayer.setAffineTransform(.identity)
         if !interacting { refine(transform: transform) }
     }
 
@@ -152,12 +160,14 @@ final class ProfessorSVGView: UIView {
     private func refine(transform: WorldScreenTransform) {
         guard !entries.isEmpty else { return }
         let started = CACurrentMediaTime()
-        let visibleRect = transform.camera.cgRect.expanded(by: max(transform.camera.width, transform.camera.height) * 0.15)
+        let preloadMargin = max(transform.camera.width, transform.camera.height) * 0.15
+        let visibleRect = transform.camera.cgRect.expanded(by: preloadMargin)
         let candidates = index.query(visibleRect)
         let changed = visibleIDs.symmetricDifference(candidates)
         for id in changed { entries[id]?.layer.isHidden = !candidates.contains(id) }
         visibleIDs = candidates
         #if DEBUG
+        print("[VBoard] VECTOR VISIBILITY cameraRect=\(transform.camera.cgRect) preloadMargin=\(preloadMargin) queryRect=\(visibleRect) candidates=\(candidates.count) changed=\(changed.count) interacting=\(isInteracting)")
         var stats = RenderPerformance.shared.last
         stats.state = isInteracting ? "interacting" : "refining"
         stats.visibleObjects = visibleIDs.count
@@ -181,10 +191,6 @@ final class ProfessorSVGView: UIView {
         }
         #endif
     }
-}
-
-private extension CameraRect {
-    var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
 }
 
 private extension CGRect {
