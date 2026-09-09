@@ -58,9 +58,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         userLayer.anchorPoint = .zero
         userLayer.position = .zero
         layer.addSublayer(userLayer)
+        #if DEBUG
         professor.onStats = { [weak self] stats in
             DispatchQueue.main.async { self?.updatePerformanceOverlay(stats) }
         }
+        #endif
         addSubview(professor)
         let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
         pan.minimumNumberOfTouches = 1; pan.maximumNumberOfTouches = 2
