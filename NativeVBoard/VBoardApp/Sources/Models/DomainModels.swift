@@ -292,7 +292,7 @@ struct PracticeProblem: Codable, Identifiable, Sendable {
 
 struct EditorEnvelope: Codable, Sendable { let editor: EditorState }
 
-struct EditorState: Codable, Sendable {
+struct EditorState: Codable, Equatable, Sendable {
     var schemaVersion: Int
     var revision: Int
     var updatedAt: Double?
@@ -329,8 +329,8 @@ struct EditorState: Codable, Sendable {
     }
 }
 
-struct SourceBoard: Codable, Sendable { let boardID: String; enum CodingKeys: String, CodingKey { case boardID = "board_id" } }
-struct EditorGroup: Codable, Sendable { let id: String?; let children: [String]? }
+struct SourceBoard: Codable, Equatable, Sendable { let boardID: String; enum CodingKeys: String, CodingKey { case boardID = "board_id" } }
+struct EditorGroup: Codable, Equatable, Sendable { let id: String?; let children: [String]? }
 struct ObjectTransform: Codable, Equatable, Sendable { let x: Double; let y: Double; let scaleX: Double?; let scaleY: Double?; let deleted: Bool? }
 
 struct CanvasObject: Codable, Equatable, Identifiable, Sendable {

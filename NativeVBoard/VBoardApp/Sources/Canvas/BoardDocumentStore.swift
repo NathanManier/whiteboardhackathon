@@ -22,6 +22,194 @@ enum EditorPersistenceStatus: Equatable {
     }
 }
 
+struct EditorMergeResult: Equatable {
+    let editor: EditorState
+    let unresolvedObjectIDs: Set<String>
+
+    var isAutomatic: Bool { unresolvedObjectIDs.isEmpty }
+}
+
+/// Stable-ID three-way merge used only after the server proves that the
+/// client's acknowledged base revision is stale. Camera state is deliberately
+/// local-last-write-wins and can never create a blocking content conflict.
+enum EditorThreeWayMerger {
+    static func merge(base: EditorState,
+                      local: EditorState,
+                      server: EditorState) -> EditorMergeResult {
+        var unresolved = Set<String>()
+        let baseObjects = Dictionary(uniqueKeysWithValues: base.objects.map { ($0.id, $0) })
+        let localObjects = Dictionary(uniqueKeysWithValues: local.objects.map { ($0.id, $0) })
+        let serverObjects = Dictionary(uniqueKeysWithValues: server.objects.map { ($0.id, $0) })
+        let objectIDs = Set(baseObjects.keys).union(localObjects.keys).union(serverObjects.keys)
+        var mergedByID: [String: CanvasObject] = [:]
+
+        for id in objectIDs {
+            if let object = mergeObject(id: id,
+                                        base: baseObjects[id],
+                                        local: localObjects[id],
+                                        server: serverObjects[id],
+                                        unresolved: &unresolved) {
+                mergedByID[id] = object
+            }
+        }
+
+        // Server order remains stable for its existing objects; locally-added
+        // objects are appended in the order the user created them.
+        var ordered: [CanvasObject] = []
+        var emitted = Set<String>()
+        for object in server.objects + local.objects {
+            guard emitted.insert(object.id).inserted,
+                  let merged = mergedByID[object.id] else { continue }
+            ordered.append(merged)
+        }
+
+        let transformIDs = Set(base.importedTransforms.keys)
+            .union(local.importedTransforms.keys)
+            .union(server.importedTransforms.keys)
+        var transforms: [String: ObjectTransform] = [:]
+        for id in transformIDs {
+            let identity = ObjectTransform(x: 0, y: 0, scaleX: 1, scaleY: 1, deleted: false)
+            let baseValue = base.importedTransforms[id] ?? identity
+            let localValue = local.importedTransforms[id] ?? identity
+            let serverValue = server.importedTransforms[id] ?? identity
+            var fieldConflict = false
+            let merged = ObjectTransform(
+                x: resolve(baseValue.x, localValue.x, serverValue.x, conflict: &fieldConflict),
+                y: resolve(baseValue.y, localValue.y, serverValue.y, conflict: &fieldConflict),
+                scaleX: resolve(baseValue.scaleX, localValue.scaleX, serverValue.scaleX,
+                                conflict: &fieldConflict),
+                scaleY: resolve(baseValue.scaleY, localValue.scaleY, serverValue.scaleY,
+                                conflict: &fieldConflict),
+                deleted: resolve(baseValue.deleted, localValue.deleted, serverValue.deleted,
+                                 conflict: &fieldConflict)
+            )
+            if fieldConflict { unresolved.insert(id) }
+            if local.importedTransforms[id] != nil || server.importedTransforms[id] != nil {
+                transforms[id] = merged
+            }
+        }
+
+        let groups = mergeGroups(base: base.groups, local: local.groups, server: server.groups,
+                                 unresolved: &unresolved)
+        let sourceBoards = stableUnion(server.sourceBoards, local.sourceBoards, key: \SourceBoard.boardID)
+        let mergedBoardIDs = Array(Set(server.mergedBoardIDs).union(local.mergedBoardIDs)).sorted()
+        return EditorMergeResult(
+            editor: EditorState(
+                schemaVersion: max(base.schemaVersion, max(local.schemaVersion, server.schemaVersion)),
+                revision: server.revision,
+                updatedAt: server.updatedAt,
+                viewport: local.viewport,
+                objects: ordered,
+                groups: groups,
+                importedTransforms: transforms,
+                sourceBoards: sourceBoards,
+                mergedBoardIDs: mergedBoardIDs
+            ),
+            unresolvedObjectIDs: unresolved
+        )
+    }
+
+    private static func mergeObject(id: String,
+                                    base: CanvasObject?,
+                                    local: CanvasObject?,
+                                    server: CanvasObject?,
+                                    unresolved: inout Set<String>) -> CanvasObject? {
+        switch (base, local, server) {
+        case (nil, nil, nil):
+            return nil
+        case (nil, let local?, nil):
+            return local
+        case (nil, nil, let server?):
+            return server
+        case (nil, let local?, let server?):
+            guard local != server else { return local }
+            unresolved.insert(id)
+            return local
+        case (let base?, nil, let server?):
+            if server == base { return nil }
+            unresolved.insert(id)
+            return server
+        case (let base?, let local?, nil):
+            if local == base { return nil }
+            unresolved.insert(id)
+            return local
+        case (_, nil, nil):
+            return nil
+        case (let base?, let local?, let server?):
+            var conflict = false
+            let merged = CanvasObject(
+                id: id,
+                type: resolve(base.type, local.type, server.type, conflict: &conflict),
+                color: resolve(base.color, local.color, server.color, conflict: &conflict),
+                width: resolve(base.width, local.width, server.width, conflict: &conflict),
+                opacity: resolve(base.opacity, local.opacity, server.opacity, conflict: &conflict),
+                points: resolve(base.points, local.points, server.points, conflict: &conflict),
+                translation: resolve(base.translation, local.translation, server.translation,
+                                     conflict: &conflict),
+                sourceMarkdown: resolve(base.sourceMarkdown, local.sourceMarkdown,
+                                        server.sourceMarkdown, conflict: &conflict),
+                text: resolve(base.text, local.text, server.text, conflict: &conflict),
+                x: resolve(base.x, local.x, server.x, conflict: &conflict),
+                y: resolve(base.y, local.y, server.y, conflict: &conflict),
+                height: resolve(base.height, local.height, server.height, conflict: &conflict),
+                fontSize: resolve(base.fontSize, local.fontSize, server.fontSize, conflict: &conflict),
+                scaleX: resolve(base.scaleX, local.scaleX, server.scaleX, conflict: &conflict),
+                scaleY: resolve(base.scaleY, local.scaleY, server.scaleY, conflict: &conflict),
+                d: resolve(base.d, local.d, server.d, conflict: &conflict),
+                fill: resolve(base.fill, local.fill, server.fill, conflict: &conflict),
+                role: resolve(base.role, local.role, server.role, conflict: &conflict),
+                sourceStudyInteractionID: resolve(base.sourceStudyInteractionID,
+                                                  local.sourceStudyInteractionID,
+                                                  server.sourceStudyInteractionID,
+                                                  conflict: &conflict),
+                createdAt: resolve(base.createdAt, local.createdAt, server.createdAt,
+                                   conflict: &conflict),
+                unitLabel: resolve(base.unitLabel, local.unitLabel, server.unitLabel,
+                                   conflict: &conflict),
+                origin: resolve(base.origin, local.origin, server.origin, conflict: &conflict)
+            )
+            if conflict { unresolved.insert(id) }
+            return merged
+        }
+    }
+
+    private static func mergeGroups(base: [EditorGroup],
+                                    local: [EditorGroup],
+                                    server: [EditorGroup],
+                                    unresolved: inout Set<String>) -> [EditorGroup] {
+        func keyed(_ groups: [EditorGroup]) -> [String: EditorGroup] {
+            Dictionary(uniqueKeysWithValues: groups.enumerated().map {
+                ($0.element.id ?? "anonymous-\($0.offset)", $0.element)
+            })
+        }
+        let baseByID = keyed(base), localByID = keyed(local), serverByID = keyed(server)
+        let ids = Set(baseByID.keys).union(localByID.keys).union(serverByID.keys)
+        return ids.sorted().compactMap { id in
+            let baseValue = baseByID[id], localValue = localByID[id], serverValue = serverByID[id]
+            if localValue == serverValue { return localValue }
+            if localValue == baseValue { return serverValue }
+            if serverValue == baseValue { return localValue }
+            unresolved.insert("group:\(id)")
+            return localValue ?? serverValue
+        }
+    }
+
+    private static func resolve<T: Equatable>(_ base: T, _ local: T, _ server: T,
+                                              conflict: inout Bool) -> T {
+        if local == server { return local }
+        if local == base { return server }
+        if server == base { return local }
+        conflict = true
+        return local
+    }
+
+    private static func stableUnion<T>(_ first: [T], _ second: [T],
+                                       key: (T) -> String) -> [T] {
+        var seen = Set<String>()
+        return (first + second).filter { seen.insert(key($0)).inserted }
+    }
+}
+
 /// Server-authoritative editor state plus a recoverable local working copy.
 /// The outbox stores the complete latest document, so unknown future fields
 /// are not intentionally reconstructed or merged by the client.
@@ -34,8 +222,12 @@ final class BoardDocumentStore: ObservableObject {
     private(set) var canRedo = false
     private let boardID: String
     private var baseRevision: Int
+    private var baseEditor: EditorState
     private var hasRestored = false
     private var mutationGeneration = 0
+    private var saveSequence = 0
+    private var saveInFlight = false
+    private var saveWaiters: [CheckedContinuation<Void, Never>] = []
     private var undoStack: [EditorState] = []
     private var redoStack: [EditorState] = []
     private var saveTask: Task<Void, Never>?
@@ -44,13 +236,17 @@ final class BoardDocumentStore: ObservableObject {
         self.boardID = boardID
         self.editor = editor
         self.baseRevision = editor.revision
+        self.baseEditor = editor
     }
 
     deinit { saveTask?.cancel() }
 
     func replace(with editor: EditorState, status: EditorPersistenceStatus = .clean) {
         self.editor = editor
-        if status == .clean { baseRevision = editor.revision }
+        if status == .clean {
+            baseRevision = editor.revision
+            baseEditor = editor
+        }
         self.status = status
         undoStack.removeAll(); redoStack.removeAll(); canUndo = false; canRedo = false
     }
@@ -280,59 +476,138 @@ final class BoardDocumentStore: ObservableObject {
         guard !hasRestored else { return }
         hasRestored = true
         guard let envelope = readOutbox() else {
-            editor = server; status = .clean; return
+            editor = server; baseEditor = server; baseRevision = server.revision
+            status = .clean; return
         }
-        // A dirty snapshot is based on the server revision it was opened from.
-        // If the server has advanced independently, retain both and require a
-        // visible conflict decision rather than overwriting either version.
+        baseEditor = envelope.baseEditor ?? server
         if envelope.dirty, envelope.baseRevision == server.revision {
             editor = envelope.editor
             baseRevision = envelope.baseRevision
             status = .offlinePending
         } else if envelope.dirty, envelope.baseRevision != server.revision {
-            editor = envelope.editor
-            baseRevision = envelope.baseRevision
-            conflictServerEditor = server
-            status = .conflict
+            let merged = EditorThreeWayMerger.merge(base: envelope.baseEditor ?? server,
+                                                    local: envelope.editor,
+                                                    server: server)
+            editor = merged.editor
+            baseEditor = server
+            baseRevision = server.revision
+            conflictServerEditor = merged.isAutomatic ? nil : server
+            status = merged.isAutomatic ? .offlinePending : .conflict
+            persistOutbox()
         } else {
             removeOutbox()
-            editor = server; status = .clean
+            editor = server; baseEditor = server; baseRevision = server.revision
+            status = .clean
         }
     }
 
     func saveNow(api: APIClient) async {
         saveTask?.cancel()
         saveTask = nil
-        await performSave(api: api)
+        await withCheckedContinuation { continuation in
+            saveWaiters.append(continuation)
+            Task { @MainActor in await drainSaveQueue(api: api) }
+        }
     }
 
-    /// Saves the current editor snapshot without cancelling the debounce task
-    /// that called it. Cancelling that task also cancelled its URLSession PUT,
-    /// leaving otherwise healthy edits indefinitely in the local outbox.
-    private func performSave(api: APIClient) async {
-        guard status == .dirty || status == .offlinePending else { return }
+    /// Serializes all writes for this board. Main-actor reentrancy permits new
+    /// drawing mutations while URLSession is awaiting a response, but a
+    /// second PUT can never start until the first response has advanced the
+    /// acknowledged base revision.
+    private func drainSaveQueue(api: APIClient) async {
+        if saveInFlight { return }
+        saveInFlight = true
+        var automaticConflictRetries = 0
+        while status == .dirty || status == .offlinePending {
+            let result = await performSaveAttempt(
+                api: api,
+                permitsConflictRetry: automaticConflictRetries == 0
+            )
+            if result.consumedConflictRetry { automaticConflictRetries += 1 }
+            if !result.shouldContinue { break }
+        }
+        saveInFlight = false
+        let waiters = saveWaiters
+        saveWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    /// Returns true only when the queue should immediately send a newer,
+    /// rebased generation. Network failures stop the drain and retain outbox
+    /// data for the next explicit/debounced retry.
+    private func performSaveAttempt(
+        api: APIClient,
+        permitsConflictRetry: Bool
+    ) async -> (shouldContinue: Bool, consumedConflictRetry: Bool) {
+        guard status == .dirty || status == .offlinePending else {
+            return (false, false)
+        }
         status = .saving
         let candidate = editor
         let candidateGeneration = mutationGeneration
+        saveSequence += 1
+        let sequence = saveSequence
+        #if DEBUG
+        print("[VBoard] EDITOR SAVE BEGIN board=\(boardID) sequence=\(sequence) baseRevision=\(baseRevision) requestRevision=\(candidate.revision) generation=\(candidateGeneration) inFlight=1")
+        #endif
         do {
             let saved = try await api.save(editor: candidate, boardID: boardID)
+            baseEditor = saved
+            baseRevision = saved.revision
             // Do not replace newer local edits that happened while the request
             // was in flight. They remain dirty and will be sent next.
             if mutationGeneration == candidateGeneration {
-                editor = saved; baseRevision = saved.revision; status = .clean; removeOutbox()
+                editor = saved; status = .clean; removeOutbox()
+                #if DEBUG
+                print("[VBoard] EDITOR SAVE ACK board=\(boardID) sequence=\(sequence) serverRevision=\(saved.revision) generation=\(candidateGeneration) pending=false")
+                #endif
+                return (false, false)
             } else {
                 // The candidate reached the server even though newer local
                 // edits now exist. Keep those edits, but advance their
                 // revision precondition to the revision just accepted.
                 editor.revision = saved.revision
                 editor.updatedAt = saved.updatedAt
-                baseRevision = saved.revision
-                status = .dirty; persistOutbox(); scheduleSave(api: api)
+                status = .dirty; persistOutbox()
+                #if DEBUG
+                print("[VBoard] EDITOR SAVE ACK board=\(boardID) sequence=\(sequence) serverRevision=\(saved.revision) generation=\(candidateGeneration) pending=true newestGeneration=\(mutationGeneration)")
+                #endif
+                return (true, false)
             }
         } catch let error as APIError {
             switch error {
             case .conflict(let server):
-                conflictServerEditor = server; status = .conflict; persistOutbox()
+                let merged = EditorThreeWayMerger.merge(base: baseEditor,
+                                                        local: editor,
+                                                        server: server)
+                editor = merged.editor
+                baseEditor = server
+                baseRevision = server.revision
+                if merged.isAutomatic, permitsConflictRetry {
+                    conflictServerEditor = nil
+                    mutationGeneration += 1
+                    status = .dirty
+                    persistOutbox()
+                    #if DEBUG
+                    print("[VBoard] EDITOR SAVE AUTO-REBASE board=\(boardID) sequence=\(sequence) serverRevision=\(server.revision) retry=true")
+                    #endif
+                    return (true, true)
+                }
+                if merged.isAutomatic {
+                    // Another external writer won a second race. Preserve the
+                    // merged document locally and retry after the next
+                    // debounce rather than interrupting the user.
+                    conflictServerEditor = nil
+                    status = .offlinePending
+                    persistOutbox()
+                } else {
+                    conflictServerEditor = server
+                    status = .conflict
+                    persistOutbox()
+                }
+                #if DEBUG
+                print("[VBoard] EDITOR SAVE CONFLICT board=\(boardID) sequence=\(sequence) serverRevision=\(server.revision) unresolved=\(merged.unresolvedObjectIDs.sorted()) retry=false")
+                #endif
             case .transport, .server:
                 status = .offlinePending; persistOutbox()
             default:
@@ -341,6 +616,7 @@ final class BoardDocumentStore: ObservableObject {
         } catch {
             status = .offlinePending; persistOutbox()
         }
+        return (false, false)
     }
 
     func keepLocalChanges(api: APIClient) async {
@@ -354,13 +630,15 @@ final class BoardDocumentStore: ObservableObject {
                                  importedTransforms: editor.importedTransforms,
                                  sourceBoards: latest.sourceBoards, mergedBoardIDs: latest.mergedBoardIDs)
             baseRevision = latest.revision
+            baseEditor = latest
             conflictServerEditor = nil; status = .dirty; persistOutbox(); scheduleSave(api: api)
         } catch { status = .offlinePending; persistOutbox() }
     }
 
     func reloadServerVersion() {
         guard let server = conflictServerEditor else { return }
-        editor = server; conflictServerEditor = nil; status = .clean; removeOutbox()
+        editor = server; baseEditor = server; baseRevision = server.revision
+        conflictServerEditor = nil; status = .clean; removeOutbox()
     }
 
     func persistForBackgrounding() { if status != .clean { persistOutbox() } }
@@ -371,16 +649,22 @@ final class BoardDocumentStore: ObservableObject {
             try? await Task.sleep(nanoseconds: 700_000_000)
             guard !Task.isCancelled, let self else { return }
             self.saveTask = nil
-            await self.performSave(api: api)
+            await self.drainSaveQueue(api: api)
         }
     }
 
     private struct OutboxEnvelope: Codable {
         let boardID: String
         let baseRevision: Int
+        let baseEditor: EditorState?
         let dirty: Bool
         let editor: EditorState
-        enum CodingKeys: String, CodingKey { case boardID = "board_id", baseRevision = "base_revision", dirty, editor }
+        enum CodingKeys: String, CodingKey {
+            case boardID = "board_id"
+            case baseRevision = "base_revision"
+            case baseEditor = "base_editor"
+            case dirty, editor
+        }
     }
 
     private var outboxURL: URL {
@@ -391,7 +675,8 @@ final class BoardDocumentStore: ObservableObject {
     }
 
     private func persistOutbox() {
-        let envelope = OutboxEnvelope(boardID: boardID, baseRevision: baseRevision, dirty: true, editor: editor)
+        let envelope = OutboxEnvelope(boardID: boardID, baseRevision: baseRevision,
+                                      baseEditor: baseEditor, dirty: true, editor: editor)
         guard let data = try? JSONEncoder().encode(envelope) else { return }
         let temp = outboxURL.appendingPathExtension("tmp")
         do { try data.write(to: temp, options: .atomic); _ = try? FileManager.default.replaceItemAt(outboxURL, withItemAt: temp) }

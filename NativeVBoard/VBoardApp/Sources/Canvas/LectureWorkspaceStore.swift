@@ -29,6 +29,91 @@ struct WorkspaceFocusRequest: Equatable {
     let boardID: String
 }
 
+/// Lecture manifests contain placement metadata rather than board content.
+/// Non-overlapping board changes merge by stable board ID; camera and active
+/// focus are local-device preferences and therefore never require a modal.
+enum LectureWorkspaceThreeWayMerger {
+    static func merge(base: LectureWorkspace,
+                      local: LectureWorkspace,
+                      server: LectureWorkspace) -> LectureWorkspace {
+        let baseItems = Dictionary(uniqueKeysWithValues: base.items.map { ($0.boardID, $0) })
+        let localItems = Dictionary(uniqueKeysWithValues: local.items.map { ($0.boardID, $0) })
+        let serverItems = Dictionary(uniqueKeysWithValues: server.items.map { ($0.boardID, $0) })
+        let ids = Set(baseItems.keys).union(localItems.keys).union(serverItems.keys)
+        var mergedByID: [String: WorkspaceBoardItem] = [:]
+        for id in ids {
+            if let item = mergeItem(base: baseItems[id], local: localItems[id], server: serverItems[id]) {
+                mergedByID[id] = item
+            }
+        }
+
+        var ordered: [WorkspaceBoardItem] = []
+        var emitted = Set<String>()
+        for item in server.items + local.items {
+            guard emitted.insert(item.boardID).inserted,
+                  let merged = mergedByID[item.boardID] else { continue }
+            ordered.append(merged)
+        }
+        return LectureWorkspace(
+            schemaVersion: max(base.schemaVersion, max(local.schemaVersion, server.schemaVersion)),
+            revision: server.revision,
+            camera: local.camera,
+            items: ordered,
+            activeBoardID: local.activeBoardID ?? server.activeBoardID,
+            lastViewedAt: local.lastViewedAt ?? server.lastViewedAt
+        )
+    }
+
+    private static func mergeItem(base: WorkspaceBoardItem?,
+                                  local: WorkspaceBoardItem?,
+                                  server: WorkspaceBoardItem?) -> WorkspaceBoardItem? {
+        switch (base, local, server) {
+        case (nil, nil, nil): return nil
+        case (nil, let local?, nil): return local
+        case (nil, nil, let server?): return server
+        case (nil, let local?, _): return local
+        case (let base?, nil, let server?): return server == base ? nil : server
+        case (let base?, let local?, nil): return local == base ? nil : local
+        case (_, nil, nil): return nil
+        case (let base?, let local?, let server?):
+            return WorkspaceBoardItem(
+                id: server.id,
+                kind: server.kind,
+                boardID: server.boardID,
+                canvasX: resolve(base.canvasX, local.canvasX, server.canvasX),
+                canvasY: resolve(base.canvasY, local.canvasY, server.canvasY),
+                boardWidth: server.boardWidth,
+                boardHeight: server.boardHeight,
+                effectiveContentBounds: resolve(base.effectiveContentBounds,
+                                                local.effectiveContentBounds,
+                                                server.effectiveContentBounds),
+                createdAt: server.createdAt,
+                capturedAt: server.capturedAt,
+                detectedBoardDate: server.detectedBoardDate,
+                unitLabel: resolve(base.unitLabel, local.unitLabel, server.unitLabel),
+                unitNumber: resolve(base.unitNumber, local.unitNumber, server.unitNumber),
+                unitConfidence: resolve(base.unitConfidence,
+                                        local.unitConfidence,
+                                        server.unitConfidence),
+                unitSource: resolve(base.unitSource, local.unitSource, server.unitSource),
+                title: server.title,
+                thumbnailURL: server.thumbnailURL,
+                sourceKind: server.sourceKind,
+                pdfURL: server.pdfURL,
+                pdfPageNumber: server.pdfPageNumber,
+                zIndex: resolve(base.zIndex, local.zIndex, server.zIndex)
+            )
+        }
+    }
+
+    private static func resolve<T: Equatable>(_ base: T, _ local: T, _ server: T) -> T {
+        if local == server { return local }
+        if local == base { return server }
+        if server == base { return local }
+        return local
+    }
+}
+
 /// Owns only lecture placement/camera state and a bounded cache of separately
 /// persisted board stores. It never constructs a merged editor document.
 @MainActor
@@ -57,6 +142,10 @@ final class LectureWorkspaceStore: ObservableObject {
     private var saveTask: Task<Void, Never>?
     private var mutationGeneration = 0
     private var baseRevision = 0
+    private var baseWorkspace: LectureWorkspace?
+    private var saveSequence = 0
+    private var saveInFlight = false
+    private var saveWaiters: [CheckedContinuation<Void, Never>] = []
     private var undoHistory: [HistoryEntry] = []
     private var redoHistory: [HistoryEntry] = []
 
@@ -97,13 +186,25 @@ final class LectureWorkspaceStore: ObservableObject {
             if let local, local.baseRevision == serverWorkspace.revision {
                 workspace = local.workspace
                 baseRevision = local.baseRevision
+                baseWorkspace = local.baseWorkspace ?? serverWorkspace
                 status = .offlinePending
+                scheduleSave(api: api)
+            } else if let local {
+                workspace = LectureWorkspaceThreeWayMerger.merge(
+                    base: local.baseWorkspace ?? serverWorkspace,
+                    local: local.workspace,
+                    server: serverWorkspace
+                )
+                baseRevision = serverWorkspace.revision
+                baseWorkspace = serverWorkspace
+                status = .dirty
+                persistOutbox()
                 scheduleSave(api: api)
             } else {
                 workspace = serverWorkspace
                 baseRevision = serverWorkspace.revision
+                baseWorkspace = serverWorkspace
                 status = .clean
-                if local != nil { removeOutbox() }
             }
             if let focusBoardID, workspace?.items.contains(where: { $0.boardID == focusBoardID }) == true {
                 setActiveBoard(focusBoardID, api: api, requestFocus: true)
@@ -127,6 +228,7 @@ final class LectureWorkspaceStore: ObservableObject {
             workspace = refreshed
             lecture = refreshedLecture
             baseRevision = refreshed.revision
+            baseWorkspace = refreshed
             status = .clean
             removeOutbox()
             setActiveBoard(boardID, api: api, requestFocus: true)
@@ -404,43 +506,91 @@ final class LectureWorkspaceStore: ObservableObject {
     func saveNow(api: APIClient) async {
         saveTask?.cancel()
         saveTask = nil
-        await performSave(api: api)
+        await withCheckedContinuation { continuation in
+            saveWaiters.append(continuation)
+            Task { @MainActor in await drainSaveQueue(api: api) }
+        }
     }
 
-    /// Performs one authoritative workspace save without touching the
-    /// debounce task that invoked it. Calling `saveNow` from inside
-    /// `saveTask` used to cancel the current task, which in turn cancelled the
-    /// URLSession request before its PUT reached the server.
-    private func performSave(api: APIClient) async {
+    private func drainSaveQueue(api: APIClient) async {
+        if saveInFlight { return }
+        saveInFlight = true
+        var automaticConflictRetries = 0
+        while status == .dirty || status == .offlinePending {
+            let result = await performSaveAttempt(
+                api: api,
+                permitsConflictRetry: automaticConflictRetries == 0
+            )
+            if result.consumedConflictRetry { automaticConflictRetries += 1 }
+            if !result.shouldContinue { break }
+        }
+        saveInFlight = false
+        let waiters = saveWaiters
+        saveWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func performSaveAttempt(
+        api: APIClient,
+        permitsConflictRetry: Bool
+    ) async -> (shouldContinue: Bool, consumedConflictRetry: Bool) {
         guard let candidate = workspace,
-              status == .dirty || status == .offlinePending else { return }
+              status == .dirty || status == .offlinePending else {
+            return (false, false)
+        }
         let generation = mutationGeneration
         status = .saving
+        saveSequence += 1
+        let sequence = saveSequence
+        #if DEBUG
+        print("[VBoard] WORKSPACE SAVE BEGIN folder=\(folderID) sequence=\(sequence) baseRevision=\(baseRevision) requestRevision=\(candidate.revision) generation=\(generation) inFlight=1")
+        #endif
         do {
             let saved = try await api.saveLectureWorkspace(candidate, folderID: folderID)
+            baseWorkspace = saved
+            baseRevision = saved.revision
             if mutationGeneration == generation {
                 workspace = saved
-                baseRevision = saved.revision
                 status = .clean
                 removeOutbox()
+                #if DEBUG
+                print("[VBoard] WORKSPACE SAVE ACK folder=\(folderID) sequence=\(sequence) serverRevision=\(saved.revision) pending=false")
+                #endif
+                return (false, false)
             } else {
                 // A camera/placement mutation happened while this request was
                 // in flight. Its content remains local, but its next PUT must
                 // be based on the revision the server has just accepted.
                 workspace?.revision = saved.revision
-                baseRevision = saved.revision
                 status = .dirty
                 persistOutbox()
-                scheduleSave(api: api)
+                #if DEBUG
+                print("[VBoard] WORKSPACE SAVE ACK folder=\(folderID) sequence=\(sequence) serverRevision=\(saved.revision) pending=true newestGeneration=\(mutationGeneration)")
+                #endif
+                return (true, false)
             }
         } catch APIError.workspaceConflict(let serverWorkspace) {
-            conflictServerWorkspace = serverWorkspace
-            status = .conflict
+            let merged = LectureWorkspaceThreeWayMerger.merge(
+                base: baseWorkspace ?? candidate,
+                local: workspace ?? candidate,
+                server: serverWorkspace
+            )
+            workspace = merged
+            baseWorkspace = serverWorkspace
+            baseRevision = serverWorkspace.revision
+            conflictServerWorkspace = nil
+            mutationGeneration += 1
+            status = permitsConflictRetry ? .dirty : .offlinePending
             persistOutbox()
+            #if DEBUG
+            print("[VBoard] WORKSPACE SAVE AUTO-REBASE folder=\(folderID) sequence=\(sequence) serverRevision=\(serverWorkspace.revision) retry=\(permitsConflictRetry)")
+            #endif
+            return (permitsConflictRetry, permitsConflictRetry)
         } catch {
             status = .offlinePending
             persistOutbox()
         }
+        return (false, false)
     }
 
     func keepLocalChanges(api: APIClient) {
@@ -448,6 +598,7 @@ final class LectureWorkspaceStore: ObservableObject {
         local.revision = server.revision
         workspace = local
         baseRevision = server.revision
+        baseWorkspace = server
         conflictServerWorkspace = nil
         mutationGeneration += 1
         status = .dirty
@@ -459,6 +610,7 @@ final class LectureWorkspaceStore: ObservableObject {
         guard let server = conflictServerWorkspace else { return }
         workspace = server
         baseRevision = server.revision
+        baseWorkspace = server
         conflictServerWorkspace = nil
         selectedKeys.removeAll()
         status = .clean
@@ -614,18 +766,20 @@ final class LectureWorkspaceStore: ObservableObject {
             try? await Task.sleep(nanoseconds: 750_000_000)
             guard !Task.isCancelled, let self else { return }
             self.saveTask = nil
-            await self.performSave(api: api)
+            await self.drainSaveQueue(api: api)
         }
     }
 
     private struct OutboxEnvelope: Codable {
         let folderID: String
         let baseRevision: Int
+        let baseWorkspace: LectureWorkspace?
         let workspace: LectureWorkspace
 
         enum CodingKeys: String, CodingKey {
             case folderID = "folder_id"
             case baseRevision = "base_revision"
+            case baseWorkspace = "base_workspace"
             case workspace
         }
     }
@@ -639,7 +793,10 @@ final class LectureWorkspaceStore: ObservableObject {
 
     private func persistOutbox() {
         guard let workspace,
-              let data = try? JSONEncoder().encode(OutboxEnvelope(folderID: folderID, baseRevision: baseRevision, workspace: workspace)) else { return }
+              let data = try? JSONEncoder().encode(OutboxEnvelope(folderID: folderID,
+                                                                   baseRevision: baseRevision,
+                                                                   baseWorkspace: baseWorkspace,
+                                                                   workspace: workspace)) else { return }
         try? data.write(to: outboxURL, options: .atomic)
     }
 
