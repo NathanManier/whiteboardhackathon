@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -11,7 +12,57 @@ from typing import Any, Callable
 BOARD_ID_LEN = 32
 FOLDER_ID_LEN = 16
 BOARD_GAP = 96.0
-MAX_SOURCE_BOARDS = 24
+# Lecture manifests are intentionally bounded, but large enough for a full
+# term.  Keep this configurable so deployments can lower the budget without
+# changing persistence semantics.
+MAX_SOURCE_BOARDS = max(1, min(int(os.environ.get("MAX_BOARDS_PER_LECTURE", "100")), 250))
+
+
+_EXPLICIT_UNIT_RE = re.compile(
+    r"(?:^|\b)unit\s+(?P<value>\d{1,3}|[ivxlcdm]{1,8})(?:\b|$)",
+    flags=re.IGNORECASE,
+)
+
+
+def normalize_explicit_unit_text(value: object) -> tuple[str, int] | None:
+    """Return an explicit course-unit marker without inferring from topic.
+
+    Phrases such as "unit vector" and "Chapter 2" deliberately do not match.
+    Roman numerals are accepted only after the literal word ``Unit``.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _EXPLICIT_UNIT_RE.search(value)
+    if not match:
+        return None
+    raw = match.group("value")
+    if raw.isdigit():
+        number = int(raw)
+    else:
+        roman = raw.upper()
+        values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+        number = 0
+        previous = 0
+        for character in reversed(roman):
+            current = values[character]
+            number += -current if current < previous else current
+            previous = max(previous, current)
+        # Reject malformed roman strings by round-tripping the supported
+        # course-sized range through a canonical representation.
+        def roman_for(candidate: int) -> str:
+            result = ""
+            for amount, token in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+                                  (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+                                  (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+                while candidate >= amount:
+                    result += token
+                    candidate -= amount
+            return result
+        if number < 1 or number > 999 or roman_for(number) != roman:
+            return None
+    if number < 1 or number > 999:
+        return None
+    return f"Unit {number}", number
 
 
 def imported_id_prefix(board_id: str, host_id: str | None) -> str:

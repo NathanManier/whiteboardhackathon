@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app as board_app
-from lecture import place_source_board, validate_source_boards
+from lecture import MAX_SOURCE_BOARDS, normalize_explicit_unit_text, place_source_board, validate_source_boards
 
 
 class LectureWorkspaceTests(unittest.TestCase):
@@ -55,6 +55,97 @@ class LectureWorkspaceTests(unittest.TestCase):
         x3, y3 = place_source_board([first, second], width=640, height=480)
         self.assertGreater(x3, x + 700)
         self.assertEqual(y3, 0)
+
+    def test_workspace_is_lazily_created_without_merging_board_documents(self):
+        folder = self.client.post("/api/folders", json={"name": "Shared Lecture"}).get_json()["folder"]
+        first_id, second_id = "1" * 32, "2" * 32
+        self._ready_board(first_id, "Board One", folder["id"], 800, 600)
+        self._ready_board(second_id, "Board Two", folder["id"], 700, 500)
+        library = board_app.read_library()
+        library["boards"].update({
+            first_id: {"name": "Board One", "folder_id": folder["id"], "created_at": 1},
+            second_id: {"name": "Board Two", "folder_id": folder["id"], "created_at": 2},
+        })
+        board_app.write_library(library)
+
+        response = self.client.get(f"/api/folders/{folder['id']}/workspace")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        workspace = response.get_json()["workspace"]
+        self.assertEqual(workspace["revision"], 0)
+        self.assertEqual([item["board_id"] for item in workspace["items"]], [first_id, second_id])
+        self.assertGreater(workspace["items"][1]["canvas_x"], workspace["items"][0]["board_width"])
+        self.assertEqual(workspace["items"][0]["unit_label"], "No Unit")
+        self.assertEqual(workspace["active_board_id"], first_id)
+        self.assertFalse((board_app.BOARDS_DIR / first_id / "editor.json").exists())
+        self.assertFalse((board_app.BOARDS_DIR / second_id / "editor.json").exists())
+
+    def test_workspace_revision_conflict_and_manual_placement_round_trip(self):
+        folder = self.client.post("/api/folders", json={"name": "Placement"}).get_json()["folder"]
+        board_id = "3" * 32
+        self._ready_board(board_id, "Movable", folder["id"])
+        library = board_app.read_library()
+        library["boards"][board_id] = {"name": "Movable", "folder_id": folder["id"], "created_at": 1}
+        board_app.write_library(library)
+        workspace = self.client.get(f"/api/folders/{folder['id']}/workspace").get_json()["workspace"]
+        workspace["camera"] = {"x": -900, "y": 320, "width": 1400, "height": 900}
+        workspace["items"][0].update({
+            "canvas_x": 4200,
+            "canvas_y": -350,
+            "effective_content_bounds": {"x": 4200, "y": -350, "width": 900, "height": 650},
+            "unit_label": "Unit 3",
+            "unit_number": 3,
+            "unit_source": "manual",
+        })
+        saved_response = self.client.put(
+            f"/api/folders/{folder['id']}/workspace", json={"workspace": workspace}
+        )
+        self.assertEqual(saved_response.status_code, 200, saved_response.get_data(as_text=True))
+        saved = saved_response.get_json()["workspace"]
+        self.assertEqual(saved["revision"], 1)
+        self.assertEqual(saved["camera"]["x"], -900)
+        self.assertEqual(saved["items"][0]["canvas_x"], 4200)
+        self.assertEqual(saved["items"][0]["unit_source"], "manual")
+
+        stale = self.client.put(
+            f"/api/folders/{folder['id']}/workspace", json={"workspace": workspace}
+        )
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.get_json()["workspace"]["revision"], 1)
+
+    def test_new_lecture_board_reconciles_to_right_of_effective_content(self):
+        folder = self.client.post("/api/folders", json={"name": "Chronology"}).get_json()["folder"]
+        first_id, second_id = "4" * 32, "5" * 32
+        self._ready_board(first_id, "First", folder["id"], 800, 600)
+        library = board_app.read_library()
+        library["boards"][first_id] = {"name": "First", "folder_id": folder["id"], "created_at": 1}
+        board_app.write_library(library)
+        workspace = self.client.get(f"/api/folders/{folder['id']}/workspace").get_json()["workspace"]
+        workspace["items"][0]["effective_content_bounds"] = {
+            "x": 0, "y": 0, "width": 1600, "height": 700,
+        }
+        workspace = self.client.put(
+            f"/api/folders/{folder['id']}/workspace", json={"workspace": workspace}
+        ).get_json()["workspace"]
+
+        self._ready_board(second_id, "Second", folder["id"], 700, 500)
+        library = board_app.read_library()
+        library["boards"][second_id] = {"name": "Second", "folder_id": folder["id"], "created_at": 2}
+        board_app.write_library(library)
+        reconciled = self.client.get(f"/api/folders/{folder['id']}/workspace").get_json()["workspace"]
+        self.assertEqual(len(reconciled["items"]), 2)
+        self.assertGreaterEqual(reconciled["items"][1]["canvas_x"], 1600 + 96)
+        self.assertEqual(reconciled["revision"], workspace["revision"] + 1)
+
+    def test_explicit_unit_normalization_is_conservative(self):
+        self.assertEqual(normalize_explicit_unit_text("Unit 1 — Limits"), ("Unit 1", 1))
+        self.assertEqual(normalize_explicit_unit_text("UNIT 2"), ("Unit 2", 2))
+        self.assertEqual(normalize_explicit_unit_text("Unit III"), ("Unit 3", 3))
+        self.assertEqual(normalize_explicit_unit_text("unit 10"), ("Unit 10", 10))
+        self.assertIsNone(normalize_explicit_unit_text("Chapter 2"))
+        self.assertIsNone(normalize_explicit_unit_text("Find the unit vector"))
+
+    def test_configured_lecture_limit_supports_a_hundred_boards(self):
+        self.assertGreaterEqual(MAX_SOURCE_BOARDS, 100)
 
     def test_folder_lists_three_boards_as_independent_scenes(self):
         folder = self.client.post("/api/folders", json={"name": "Physics — Cross Products"}).get_json()["folder"]

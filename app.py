@@ -43,6 +43,8 @@ except ImportError:  # pragma: no cover - production and supported dev platforms
     fcntl = None
 
 from lecture import (
+    BOARD_GAP,
+    MAX_SOURCE_BOARDS,
     default_source_board,
     folder_board_ids,
     folder_by_id,
@@ -51,6 +53,7 @@ from lecture import (
     normalize_folder,
     public_lecture_context,
     public_study_guide,
+    normalize_explicit_unit_text,
     sync_folder_board_order,
     validate_source_boards,
 )
@@ -103,6 +106,8 @@ BOARDS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 _BOARD_THREAD_LOCKS: dict[str, threading.RLock] = {}
 _BOARD_THREAD_LOCKS_GUARD = threading.Lock()
+_WORKSPACE_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_WORKSPACE_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 def load_dotenv() -> None:
@@ -177,6 +182,36 @@ def locked_board_operation(handler):
     def wrapped(board_id: str, *args, **kwargs):
         with board_operation_lock(board_id):
             return handler(board_id, *args, **kwargs)
+
+    return wrapped
+
+
+@contextmanager
+def workspace_operation_lock(folder_id: str):
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    key = str((BOARDS_DIR / ".workspaces" / folder_id).resolve(strict=False))
+    with _WORKSPACE_THREAD_LOCKS_GUARD:
+        thread_lock = _WORKSPACE_THREAD_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        lock_dir = BOARDS_DIR / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"workspace-{folder_id}.lock"
+        with lock_path.open("a+b") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def locked_workspace_operation(handler):
+    @wraps(handler)
+    def wrapped(folder_id: str, *args, **kwargs):
+        with workspace_operation_lock(folder_id):
+            return handler(folder_id, *args, **kwargs)
 
     return wrapped
 
@@ -342,6 +377,271 @@ def read_library() -> dict[str, Any]:
 
 def write_library(value: dict[str, Any]) -> None:
     atomic_json(library_path(), value, create_parent=True)
+
+
+def lecture_workspace_path(folder_id: str) -> Path:
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    return BOARDS_DIR / ".workspaces" / f"{folder_id}.json"
+
+
+def _workspace_number(value: Any, label: str, *, minimum: float | None = None) -> float:
+    return finite_number(
+        value,
+        label,
+        minimum=minimum,
+        maximum=MAX_WORLD_COORDINATE,
+    )
+
+
+def _workspace_rect(value: Any, label: str, *, positive_size: bool = True) -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object.")
+    minimum = 0.0001 if positive_size else None
+    return {
+        "x": _workspace_number(value.get("x"), f"{label}.x"),
+        "y": _workspace_number(value.get("y"), f"{label}.y"),
+        "width": _workspace_number(value.get("width"), f"{label}.width", minimum=minimum),
+        "height": _workspace_number(value.get("height"), f"{label}.height", minimum=minimum),
+    }
+
+
+def _workspace_board_item(
+    board_id: str,
+    metadata: dict[str, Any],
+    catalog: dict[str, Any],
+    *,
+    x: float,
+    y: float,
+    z_index: int,
+) -> dict[str, Any]:
+    dimensions = metadata.get("dimensions") if isinstance(metadata.get("dimensions"), dict) else {}
+    source = metadata.get("source") if isinstance(metadata.get("source"), dict) else {}
+    width = max(1.0, float(dimensions.get("width") or source.get("width") or 1))
+    height = max(1.0, float(dimensions.get("height") or source.get("height") or 1))
+    assets = metadata.get("assets") if isinstance(metadata.get("assets"), dict) else {}
+    thumbnail = assets.get("thumbnail")
+    if not isinstance(thumbnail, str) or thumbnail not in asset_paths(metadata):
+        thumbnail = assets.get("master")
+    thumbnail_url = (
+        url_for("board_file", board_id=board_id, asset=thumbnail)
+        if isinstance(thumbnail, str) and thumbnail in asset_paths(metadata)
+        else None
+    )
+    stored_unit = metadata.get("unit_metadata") if isinstance(metadata.get("unit_metadata"), dict) else {}
+    explicit = normalize_explicit_unit_text(stored_unit.get("unit_label"))
+    unit_label = str(stored_unit.get("unit_label") or (explicit[0] if explicit else "No Unit"))[:40]
+    unit_number = stored_unit.get("unit_number")
+    if unit_number is None and explicit:
+        unit_number = explicit[1]
+    created_at = catalog.get("created_at") or metadata.get("created_at") or time.time()
+    captured_at = metadata.get("captured_at") or source.get("captured_at")
+    bounds = {"x": x, "y": y, "width": width, "height": height}
+    return {
+        "id": f"board:{board_id}",
+        "kind": "board",
+        "board_id": board_id,
+        "canvas_x": round(float(x), 4),
+        "canvas_y": round(float(y), 4),
+        "board_width": round(width, 4),
+        "board_height": round(height, 4),
+        "effective_content_bounds": bounds,
+        "created_at": float(created_at),
+        "captured_at": float(captured_at) if isinstance(captured_at, (int, float)) else None,
+        "detected_board_date": metadata.get("detected_board_date"),
+        "unit_label": unit_label,
+        "unit_number": int(unit_number) if isinstance(unit_number, (int, float)) else None,
+        "unit_confidence": float(stored_unit.get("unit_confidence") or 0),
+        "unit_source": str(stored_unit.get("unit_source") or "none"),
+        "title": str(catalog.get("name") or metadata.get("name") or f"Whiteboard {z_index + 1}")[:80],
+        "thumbnail_url": thumbnail_url,
+        "z_index": z_index,
+    }
+
+
+def _new_lecture_workspace(library: dict[str, Any], folder_id: str) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    rightmost = 0.0
+    for order, board_id in enumerate(folder_board_ids(library, folder_id)):
+        board_dir = BOARDS_DIR / board_id
+        if not board_dir.is_dir():
+            continue
+        try:
+            metadata = read_metadata(board_dir)
+        except Exception:
+            continue
+        catalog = library.get("boards", {}).get(board_id)
+        catalog = catalog if isinstance(catalog, dict) else {}
+        dimensions = metadata.get("dimensions") if isinstance(metadata.get("dimensions"), dict) else {}
+        source = metadata.get("source") if isinstance(metadata.get("source"), dict) else {}
+        width = max(1.0, float(dimensions.get("width") or source.get("width") or 1))
+        x = 0.0 if not items else rightmost + BOARD_GAP
+        item = _workspace_board_item(board_id, metadata, catalog, x=x, y=0, z_index=order)
+        items.append(item)
+        rightmost = item["effective_content_bounds"]["x"] + item["effective_content_bounds"]["width"]
+    if items:
+        first = items[0]
+        padding = max(64.0, first["board_width"] * 0.08)
+        camera = {
+            "x": first["canvas_x"] - padding,
+            "y": first["canvas_y"] - padding - 52.0,
+            "width": first["board_width"] + padding * 2,
+            "height": first["board_height"] + padding * 2 + 52.0,
+        }
+        active_board_id = first["board_id"]
+    else:
+        camera = {"x": -500.0, "y": -350.0, "width": 1000.0, "height": 700.0}
+        active_board_id = None
+    return {
+        "schema_version": 1,
+        "revision": 0,
+        "camera": camera,
+        "items": items,
+        "active_board_id": active_board_id,
+        "last_viewed_at": time.time(),
+    }
+
+
+def _reconcile_lecture_workspace(
+    workspace: dict[str, Any], library: dict[str, Any], folder_id: str
+) -> tuple[dict[str, Any], bool]:
+    member_ids = folder_board_ids(library, folder_id)
+    members = set(member_ids)
+    existing = {
+        item.get("board_id"): item
+        for item in workspace.get("items", [])
+        if isinstance(item, dict) and item.get("kind") == "board" and item.get("board_id") in members
+    }
+    items = [existing[board_id] for board_id in member_ids if board_id in existing]
+    changed = len(items) != len(workspace.get("items", []))
+    rightmost = max(
+        (
+            float(item.get("effective_content_bounds", {}).get("x", item.get("canvas_x", 0)))
+            + float(item.get("effective_content_bounds", {}).get("width", item.get("board_width", 1)))
+            for item in items
+        ),
+        default=0.0,
+    )
+    for board_id in member_ids:
+        if board_id in existing:
+            continue
+        board_dir = BOARDS_DIR / board_id
+        if not board_dir.is_dir():
+            continue
+        metadata = read_metadata(board_dir)
+        catalog = library.get("boards", {}).get(board_id)
+        catalog = catalog if isinstance(catalog, dict) else {}
+        x = 0.0 if not items else rightmost + BOARD_GAP
+        item = _workspace_board_item(board_id, metadata, catalog, x=x, y=0, z_index=len(items))
+        items.append(item)
+        rightmost = item["effective_content_bounds"]["x"] + item["effective_content_bounds"]["width"]
+        changed = True
+    workspace["items"] = items
+    if workspace.get("active_board_id") not in members:
+        workspace["active_board_id"] = member_ids[0] if member_ids else None
+        changed = True
+    return workspace, changed
+
+
+def read_lecture_workspace(library: dict[str, Any], folder_id: str) -> dict[str, Any]:
+    path = lecture_workspace_path(folder_id)
+    created = False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("invalid workspace")
+    except FileNotFoundError:
+        value = _new_lecture_workspace(library, folder_id)
+        created = True
+    except (OSError, json.JSONDecodeError, ValueError):
+        abort(500, description="Lecture workspace is unavailable.")
+    value, reconciled = _reconcile_lecture_workspace(value, library, folder_id)
+    if reconciled and not created:
+        # Membership changed outside the manifest (import/delete). Treat that
+        # as a real workspace revision so an older client cannot overwrite the
+        # newly reconciled board list with stale placement data.
+        value["revision"] = int(value.get("revision") or 0) + 1
+    if created or reconciled:
+        atomic_json(path, value, create_parent=True)
+    return value
+
+
+def validate_lecture_workspace(
+    payload: Any, *, current: dict[str, Any], member_ids: list[str]
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("A JSON request body is required.")
+    camera = _workspace_rect(payload.get("camera"), "camera")
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list) or len(raw_items) > MAX_SOURCE_BOARDS:
+        raise ValueError(f"items must contain at most {MAX_SOURCE_BOARDS} boards.")
+    allowed = set(member_ids)
+    current_by_id = {
+        item.get("board_id"): item
+        for item in current.get("items", [])
+        if isinstance(item, dict) and isinstance(item.get("board_id"), str)
+    }
+    clean_items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_items):
+        if not isinstance(raw, dict) or raw.get("kind") != "board":
+            raise ValueError(f"items[{index}] must be a board workspace item.")
+        board_id = raw.get("board_id")
+        if board_id not in allowed:
+            raise ValueError(f"items[{index}] references a board outside this lecture.")
+        if board_id in seen:
+            raise ValueError(f"items[{index}] repeats board_id {board_id}.")
+        seen.add(board_id)
+        canonical = current_by_id.get(board_id)
+        if not canonical:
+            raise ValueError(f"items[{index}] references an unavailable board.")
+        x = _workspace_number(raw.get("canvas_x"), f"items[{index}].canvas_x")
+        y = _workspace_number(raw.get("canvas_y"), f"items[{index}].canvas_y")
+        effective = _workspace_rect(
+            raw.get("effective_content_bounds")
+            or {"x": x, "y": y, "width": canonical["board_width"], "height": canonical["board_height"]},
+            f"items[{index}].effective_content_bounds",
+        )
+        unit_label = str(raw.get("unit_label") or "No Unit").strip()[:40] or "No Unit"
+        unit_source = str(raw.get("unit_source") or "none")
+        if unit_source not in {"explicit_ai", "explicit_text", "manual", "none"}:
+            raise ValueError(f"items[{index}].unit_source is invalid.")
+        unit_number = raw.get("unit_number")
+        if unit_number is not None:
+            unit_number = int(_workspace_number(unit_number, f"items[{index}].unit_number", minimum=1))
+        unit_confidence = _workspace_number(
+            raw.get("unit_confidence", 0),
+            f"items[{index}].unit_confidence",
+            minimum=0,
+        )
+        if unit_confidence > 1:
+            raise ValueError(f"items[{index}].unit_confidence must not exceed 1.")
+        item = dict(canonical)
+        item.update({
+            "canvas_x": x,
+            "canvas_y": y,
+            "effective_content_bounds": effective,
+            "unit_label": unit_label,
+            "unit_number": unit_number,
+            "unit_confidence": unit_confidence,
+            "unit_source": unit_source,
+            "z_index": int(raw.get("z_index", index)),
+        })
+        clean_items.append(item)
+    missing = allowed - seen
+    if missing:
+        raise ValueError("The workspace must include every board in the lecture.")
+    active_board_id = payload.get("active_board_id")
+    if active_board_id is not None and active_board_id not in allowed:
+        raise ValueError("active_board_id must belong to this lecture.")
+    return {
+        "schema_version": max(1, int(payload.get("schema_version") or current.get("schema_version") or 1)),
+        "revision": int(current.get("revision") or 0) + 1,
+        "camera": camera,
+        "items": clean_items,
+        "active_board_id": active_board_id,
+        "last_viewed_at": time.time(),
+    }
 
 
 def folder_ids(library: dict[str, Any]) -> set[str]:
@@ -2595,6 +2895,7 @@ def delete_folder(folder_id: str) -> Response | tuple[Response, int]:
         if not isinstance(folder, dict) or folder.get("id") != folder_id
     ]
     write_library(library)
+    lecture_workspace_path(folder_id).unlink(missing_ok=True)
     return jsonify(status="deleted", id=folder_id, deleted_boards=len(board_ids))
 
 
@@ -2630,6 +2931,57 @@ def get_lecture(folder_id: str) -> Response | tuple[Response, int]:
         study_guide=guide,
         study_guide_stale=bool(guide and guide.get("stale")),
     )
+
+
+@app.get("/api/folders/<folder_id>/workspace")
+@locked_workspace_operation
+def get_folder_workspace(folder_id: str) -> Response | tuple[Response, int]:
+    library = read_library()
+    if folder_by_id(library, folder_id) is None:
+        abort(404)
+    workspace = read_lecture_workspace(library, folder_id)
+    LOGGER.info(
+        "LECTURE WORKSPACE LOAD folder=%s revision=%s boards=%d active=%s",
+        folder_id,
+        workspace.get("revision"),
+        len(workspace.get("items") or []),
+        workspace.get("active_board_id"),
+    )
+    return jsonify(workspace=workspace)
+
+
+@app.put("/api/folders/<folder_id>/workspace")
+@locked_workspace_operation
+def put_folder_workspace(folder_id: str) -> Response | tuple[Response, int]:
+    library = read_library()
+    if folder_by_id(library, folder_id) is None:
+        abort(404)
+    current = read_lecture_workspace(library, folder_id)
+    payload = request.get_json(silent=True)
+    raw = payload.get("workspace") if isinstance(payload, dict) and isinstance(payload.get("workspace"), dict) else payload
+    try:
+        client_revision = int(raw.get("revision")) if isinstance(raw, dict) else -1
+        if client_revision != int(current.get("revision") or 0):
+            return jsonify(
+                error="This lecture workspace changed elsewhere.",
+                workspace=current,
+            ), 409
+        clean = validate_lecture_workspace(
+            raw,
+            current=current,
+            member_ids=folder_board_ids(library, folder_id),
+        )
+    except (TypeError, ValueError) as exc:
+        return jsonify(error=str(exc)), 400
+    atomic_json(lecture_workspace_path(folder_id), clean, create_parent=True)
+    LOGGER.info(
+        "LECTURE WORKSPACE SAVE folder=%s revision=%s boards=%d active=%s",
+        folder_id,
+        clean["revision"],
+        len(clean["items"]),
+        clean.get("active_board_id"),
+    )
+    return jsonify(workspace=clean)
 
 
 @app.post("/api/folders/<folder_id>/analyze")
