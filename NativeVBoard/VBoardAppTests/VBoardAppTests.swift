@@ -1,5 +1,19 @@
 import XCTest
+@preconcurrency import WebKit
 @testable import VBoardApp
+
+@MainActor
+private final class WebViewNavigationWaiter: NSObject, WKNavigationDelegate {
+    let finished: XCTestExpectation
+
+    init(finished: XCTestExpectation) {
+        self.finished = finished
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        finished.fulfill()
+    }
+}
 
 final class WorldScreenTransformTests: XCTestCase {
     func testCanvasCoordinateMapperConvertsFromOffsetSourceView() {
@@ -248,6 +262,27 @@ final class ServerContractDecodingTests: XCTestCase {
         XCTAssertTrue(html.contains("connect-src 'none'"))
         XCTAssertFalse(html.contains(source))
         XCTAssertTrue(html.contains(Data(source.utf8).base64EncodedString()))
+    }
+
+    @MainActor
+    func testBundledStudyRendererExecutesMathAndChemistryWithoutNetwork() async throws {
+        let completed = expectation(description: "local study renderer loaded")
+        let delegate = WebViewNavigationWaiter(finished: completed)
+        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 700, height: 500))
+        webView.navigationDelegate = delegate
+        let source = #"## Energy\n\nUse $E=\frac{1}{2}mv^2$ and $\ce{H2O}$."#
+        webView.loadHTMLString(StudyContentDocument.html(source: source),
+                               baseURL: Bundle.main.resourceURL)
+        await fulfillment(of: [completed], timeout: 4)
+        let count = try await webView.evaluateJavaScript(
+            "document.querySelectorAll('.katex').length"
+        ) as? NSNumber
+        let visibleText = try await webView.evaluateJavaScript(
+            "document.getElementById('content').innerText"
+        ) as? String
+        XCTAssertGreaterThanOrEqual(count?.intValue ?? 0, 2)
+        XCTAssertFalse(visibleText?.contains("$\\frac") == true)
+        XCTAssertFalse(visibleText?.contains("$\\ce") == true)
     }
 
     func testStudyFollowUpDecodesPracticeProblemsFromCanonicalServerShape() throws {
