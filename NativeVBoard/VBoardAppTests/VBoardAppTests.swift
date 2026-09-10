@@ -187,6 +187,40 @@ final class SelectionResizeTests: XCTestCase {
         XCTAssertEqual(store.editor.objects.first(where: { $0.id == "note-1" })?.sourceMarkdown,
                        "Keep source")
     }
+
+    func testStandaloneSelectionResizeRoutesStableIDsToTheirCanonicalOwners() {
+        let stroke = CanvasObject(
+            id: "stroke-1", type: "stroke", color: "#183153", width: 4, opacity: 1,
+            points: [WorldPoint(x: 10, y: 10, pressure: 1)], translation: nil,
+            sourceMarkdown: nil, text: nil, x: nil, y: nil, height: nil, fontSize: nil
+        )
+        let editor = EditorState(
+            schemaVersion: 4, revision: 7, updatedAt: nil,
+            viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+            objects: [stroke], groups: [],
+            importedTransforms: [
+                "professor-path-1": ObjectTransform(
+                    x: 20, y: 30, scaleX: 1, scaleY: 1, deleted: false
+                )
+            ],
+            sourceBoards: [], mergedBoardIDs: []
+        )
+        let api = APIClient(baseURL: URL(string: "https://resize.invalid")!)
+        let store = BoardDocumentStore(
+            boardID: "standalone-routing-\(UUID().uuidString)", editor: editor
+        )
+
+        store.scaleObjects(ids: ["stroke-1", "professor-path-1"],
+                           around: CGPoint(x: 0, y: 0), by: 1.5, api: api)
+
+        XCTAssertEqual(store.editor.objects.first?.scaleX, 1.5)
+        XCTAssertEqual(store.editor.objects.first?.scaleY, 1.5)
+        XCTAssertEqual(store.editor.importedTransforms["professor-path-1"]?.scaleX, 1.5)
+        XCTAssertEqual(store.editor.importedTransforms["professor-path-1"]?.scaleY, 1.5)
+        XCTAssertEqual(Set(store.editor.objects.map(\.id)), ["stroke-1"])
+        XCTAssertEqual(Set(store.editor.importedTransforms.keys), ["professor-path-1"])
+        XCTAssertTrue(store.canUndo)
+    }
 }
 
 final class ThreeWayMergeTests: XCTestCase {

@@ -15,7 +15,7 @@ struct CanvasStrokeStyle: Equatable, Sendable {
 }
 
 private enum InputSource: String { case pencil, touch, indirectPointer, mouse, trackpad }
-private enum InteractionState: String { case idle = "IDLE", drawing = "DRAWING", panning = "PANNING", pinching = "PINCHING", lassoing = "LASSOING", erasing = "ERASING", selecting = "SELECTING", movingSelection = "MOVING_SELECTION" }
+private enum InteractionState: String { case idle = "IDLE", drawing = "DRAWING", panning = "PANNING", pinching = "PINCHING", lassoing = "LASSOING", erasing = "ERASING", selecting = "SELECTING", movingSelection = "MOVING_SELECTION", resizingSelection = "RESIZING_SELECTION" }
 
 struct NativeCanvasView: UIViewRepresentable {
     let boardID: String
@@ -35,6 +35,7 @@ struct NativeCanvasView: UIViewRepresentable {
     var onSelectionChanged: (Set<String>) -> Void = { _ in }
     var onSelectionRegionChanged: (CGRect?) -> Void = { _ in }
     var onMove: (Set<String>, CGPoint) -> Void = { _, _ in }
+    var onResize: (Set<String>, CGPoint, CGFloat) -> Void = { _, _, _ in }
     var onDelete: (Set<String>) -> Void = { _ in }
     var onCameraChanged: (CameraRect) -> Void = { _ in }
     var onUndo: () -> Void = {}
@@ -47,7 +48,7 @@ struct NativeCanvasView: UIViewRepresentable {
                              penStyle: penStyle, markerStyle: markerStyle,
                              showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                              onStroke: onStroke, tool: tool,
-                             onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
+                             onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
     }
 
     func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) {
@@ -57,7 +58,7 @@ struct NativeCanvasView: UIViewRepresentable {
                       penStyle: penStyle, markerStyle: markerStyle,
                       showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                       onStroke: onStroke, tool: tool,
-                      onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
+                      onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
     }
 }
 
@@ -89,6 +90,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var onSelectionChanged: (Set<String>) -> Void
     private var onSelectionRegionChanged: (CGRect?) -> Void
     private var onMove: (Set<String>, CGPoint) -> Void
+    private var onResize: (Set<String>, CGPoint, CGFloat) -> Void
     private var onDelete: (Set<String>) -> Void
     private var onCameraChanged: (CameraRect) -> Void
     private var onUndo: () -> Void
@@ -99,6 +101,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var lastEditPoint = CGPoint.zero
     private var moveDelta = CGPoint.zero
     private var moveActive = false
+    private var resizeSession: SelectionResizeSession?
+    private var resizePreviewBounds: CGRect?
+    private var resizePreviewPositions: [String: CGPoint] = [:]
     private var lassoWorldPoints: [CGPoint] = []
     private let interactionLayer = CAShapeLayer()
     private var boardID: String
@@ -142,7 +147,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
          onStroke: @escaping (UserStroke) -> Void = { _ in },
          tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
          onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
-         onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
+         onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in },
+         onResize: @escaping (Set<String>, CGPoint, CGFloat) -> Void = { _, _, _ in },
+         onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
         self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
@@ -151,7 +158,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.onStroke = onStroke
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
-        self.onMove = onMove; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
+        self.onMove = onMove; self.onResize = onResize; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
         controller = CameraController(camera: camera)
         persistedCamera = camera
         super.init(frame: .zero)
@@ -343,7 +350,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 onStroke: @escaping (UserStroke) -> Void = { _ in },
                 tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
                 onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
-                onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
+                onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in },
+                onResize: @escaping (Set<String>, CGPoint, CGFloat) -> Void = { _, _, _ in },
+                onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
         let boardChanged = self.boardID != boardID
         let documentChanged = self.document != document || self.importedTransforms != importedTransforms
         let pdfChanged = self.pdfData != pdfData
@@ -374,7 +383,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
-        self.onMove = onMove; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
+        self.onMove = onMove; self.onResize = onResize; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
         // Hand and simulator Space-pan own the root touch stream directly.
         // This keeps one camera owner for indirect-pointer drags; physical
         // devices retain the recognizer path below.
@@ -830,11 +839,26 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     private func beginEditing(at point: CGPoint, screen: CGPoint) {
         editStart = point; editStartScreen = screen; lastEditPoint = point
-        moveDelta = .zero; moveActive = false
+        moveDelta = .zero; moveActive = false; resizeSession = nil; resizePreviewBounds = nil
         if activeTool == .navigation {
             interactionState = .panning
             return
+        } else if (activeTool == .lasso || activeTool == .select),
+                  let bounds = selectionWorldBounds(),
+                  let handle = resizeHandle(at: point, bounds: bounds) {
+            let session = SelectionResizeSession(keys: [], startBounds: bounds,
+                                                 handle: handle, startPointer: point)
+            resizeSession = session
+            resizePreviewBounds = bounds
+            interactionState = .resizingSelection
+            return
         } else if activeTool == .lasso {
+            if let bounds = selectionWorldBounds(),
+               bounds.insetBy(dx: -10 / max(worldTransform.scale, 0.001),
+                              dy: -10 / max(worldTransform.scale, 0.001)).contains(point) {
+                interactionState = .movingSelection
+                return
+            }
             interactionState = .lassoing; lassoWorldPoints = [point]; debugInputOperation("LASSO BEGIN"); updateInteractionPath()
         } else if activeTool == .objectEraser {
             interactionState = .erasing; eraseIDs.removeAll(); eraseSegment(from: point, to: point); debugInputOperation("ERASER BEGIN")
@@ -856,6 +880,22 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func continueEditing(at point: CGPoint, screen: CGPoint) {
+        if interactionState == .movingSelection {
+            moveActive = true
+            moveDelta = CGPoint(x: point.x - editStart.x, y: point.y - editStart.y)
+            previewMove(moveDelta)
+            debugInputOperation("MOVE UPDATE")
+            lastEditPoint = point
+            return
+        }
+        if interactionState == .resizingSelection, let session = resizeSession {
+            let scale = SelectionResizeGeometry.scale(session: session, currentPointer: point)
+            resizePreviewBounds = SelectionResizeGeometry.bounds(session: session, scale: scale)
+            previewResize(anchor: session.anchor, scale: scale)
+            updateSelectionOverlay()
+            lastEditPoint = point
+            return
+        }
         switch activeTool {
         case .navigation:
             break
@@ -876,7 +916,20 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func finishEditing(at endpoint: CGPoint?) {
-        if activeTool == .select {
+        if interactionState == .resizingSelection, let session = resizeSession {
+            let scale = endpoint.map {
+                SelectionResizeGeometry.scale(session: session, currentPointer: $0)
+            } ?? 1
+            clearResizePreview()
+            if endpoint != nil, abs(scale - 1) > 0.001 {
+                onResize(selectedIDs, session.anchor, scale)
+                debugInputOperation("RESIZE COMMIT")
+            }
+            resizeSession = nil; resizePreviewBounds = nil
+            interactionState = .idle; updateSelectionOverlay(); updateInputHUD()
+            return
+        }
+        if activeTool == .select || interactionState == .movingSelection {
             if let endpoint, !selectedIDs.isEmpty {
                 let delta = CGPoint(x: endpoint.x - editStart.x, y: endpoint.y - editStart.y)
                 if moveActive || hypot(delta.x, delta.y) > 0 {
@@ -890,8 +943,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             interactionState = .idle; updateSelectionOverlay(); updateInputHUD()
             return
         }
-        if activeTool == .lasso, let endpoint, lassoWorldPoints.count == 1 { lassoWorldPoints.append(endpoint) }
-        if activeTool == .lasso, lassoWorldPoints.count >= 2 {
+        if interactionState == .lassoing, let endpoint, lassoWorldPoints.count == 1 { lassoWorldPoints.append(endpoint) }
+        if interactionState == .lassoing, lassoWorldPoints.count >= 2 {
             // A simulator drag is delivered as a begin/end pair by the Mac
             // automation layer. Treat that two-point gesture as the natural
             // rectangular lasso fallback; Pencil and touch still provide a
@@ -937,6 +990,35 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         professor.clearPreviewTranslation(ids: selectedIDs)
     }
 
+    private func previewResize(anchor: CGPoint, scale: CGFloat) {
+        professor.previewScale(ids: selectedIDs, anchor: anchor, scale: scale)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for id in selectedIDs {
+            guard let layer = userObjectLayers[id] else { continue }
+            let original = resizePreviewPositions[id] ?? layer.position
+            resizePreviewPositions[id] = original
+            layer.setAffineTransform(CGAffineTransform(scaleX: scale, y: scale))
+            layer.position = CGPoint(x: anchor.x + (original.x - anchor.x) * scale,
+                                     y: anchor.y + (original.y - anchor.y) * scale)
+        }
+        CATransaction.commit()
+    }
+
+    private func clearResizePreview() {
+        professor.clearPreviewScale(ids: selectedIDs)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for id in selectedIDs {
+            guard let layer = userObjectLayers[id] else { continue }
+            layer.setAffineTransform(.identity)
+            if let original = resizePreviewPositions.removeValue(forKey: id) {
+                layer.position = original
+            }
+        }
+        CATransaction.commit()
+    }
+
     private func eraseSegment(from start: CGPoint, to end: CGPoint) {
         let segmentBounds = CGRect(x: min(start.x, end.x), y: min(start.y, end.y), width: abs(end.x - start.x), height: abs(end.y - start.y)).insetBy(dx: -14, dy: -14)
         var hit = Set(objects.compactMap { object -> String? in
@@ -962,21 +1044,47 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func updateInteractionPath() {
-        guard !lassoWorldPoints.isEmpty else { interactionLayer.isHidden = true; return }
+        guard !lassoWorldPoints.isEmpty else { updateSelectionOverlay(); return }
         let path = UIBezierPath(); for (index, point) in lassoWorldPoints.enumerated() { if index == 0 { path.move(to: point) } else { path.addLine(to: point) } }
         interactionLayer.path = path.cgPath; interactionLayer.isHidden = false
     }
 
     private func updateSelectionOverlay() {
         guard !selectedIDs.isEmpty else { interactionLayer.isHidden = lassoWorldPoints.isEmpty; return }
+        guard var bounds = resizePreviewBounds ?? selectionWorldBounds() else { return }
+        if moveActive { bounds = bounds.offsetBy(dx: moveDelta.x, dy: moveDelta.y) }
+        let inverseScale = 1 / max(worldTransform.scale, 0.001)
+        let path = UIBezierPath(rect: bounds.insetBy(dx: -10 * inverseScale,
+                                                     dy: -10 * inverseScale))
+        let handleRadius = 6 * inverseScale
+        for handle in SelectionResizeHandle.allCases {
+            let point = handle.point(in: bounds)
+            path.append(UIBezierPath(ovalIn: CGRect(x: point.x - handleRadius,
+                                                    y: point.y - handleRadius,
+                                                    width: handleRadius * 2,
+                                                    height: handleRadius * 2)))
+        }
+        interactionLayer.lineWidth = 2 * inverseScale
+        interactionLayer.lineDashPattern = [NSNumber(value: 8 * inverseScale),
+                                            NSNumber(value: 5 * inverseScale)]
+        interactionLayer.path = path.cgPath; interactionLayer.isHidden = false
+    }
+
+    private func selectionWorldBounds() -> CGRect? {
         var bounds = CGRect.null
         for object in objects where selectedIDs.contains(object.id) {
             bounds = bounds.union(BoardHitTestPolicy.bounds(of: object))
         }
         for id in selectedIDs { bounds = bounds.union(professor.bounds(for: id)) }
-        guard !bounds.isNull else { return }
-        if moveActive { bounds = bounds.offsetBy(dx: moveDelta.x, dy: moveDelta.y) }
-        interactionLayer.path = UIBezierPath(rect: bounds.insetBy(dx: -10, dy: -10)).cgPath; interactionLayer.isHidden = false
+        return bounds.isNull ? nil : bounds
+    }
+
+    private func resizeHandle(at point: CGPoint, bounds: CGRect) -> SelectionResizeHandle? {
+        let tolerance = 16 / max(worldTransform.scale, 0.001)
+        return SelectionResizeHandle.allCases.first {
+            let handlePoint = $0.point(in: bounds)
+            return hypot(point.x - handlePoint.x, point.y - handlePoint.y) <= tolerance
+        }
     }
 
     private func polygonContains(_ point: CGPoint, polygon: [CGPoint]) -> Bool {

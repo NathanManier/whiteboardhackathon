@@ -445,6 +445,14 @@ final class BoardDocumentStore: ObservableObject {
         apply(next, api: api)
     }
 
+    func scaleObjects(ids: Set<String>, around anchor: CGPoint, by factor: CGFloat,
+                      api: APIClient) {
+        let editorIDs = Set(editor.objects.lazy.filter { ids.contains($0.id) }.map(\.id))
+        scaleObjects(editorObjectIDs: editorIDs,
+                     professorPathIDs: ids.subtracting(editorIDs),
+                     around: anchor, by: factor, api: api)
+    }
+
     func deleteObjects(ids: Set<String>, api: APIClient) {
         let editorIDs = Set(editor.objects.lazy.filter { ids.contains($0.id) }.map(\.id))
         deleteObjects(editorObjectIDs: editorIDs,
