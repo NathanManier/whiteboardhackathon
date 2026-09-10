@@ -3,3 +3,5 @@ opencv-python-headless>=4.9,<5
 numpy>=1.26,<3
 Pillow>=10,<13
 CairoSVG>=2.7,<3
+SQLAlchemy>=2.0,<3
+PyJWT[crypto]>=2.9,<3

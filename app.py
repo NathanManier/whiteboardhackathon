@@ -27,6 +27,7 @@ from flask import (
     Flask,
     Response,
     abort,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -36,6 +37,9 @@ from flask import (
 )
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
+
+from vboard_auth import AppleCredential, AppleTokenVerifier, AuthDatabase, AuthUser
+from vboard_auth.apple import AppleVerificationError
 
 try:
     import fcntl
@@ -131,6 +135,123 @@ def load_dotenv() -> None:
 
 
 load_dotenv()
+
+DATABASE_URL = str(os.environ.get("DATABASE_URL") or "").strip()
+AUTH_DB = AuthDatabase(DATABASE_URL) if DATABASE_URL else AuthDatabase.local(BASE_DIR)
+APPLE_VERIFIER: AppleTokenVerifier | None = None
+
+
+def _auth_test_bypass_enabled() -> bool:
+    return bool(app.config.get("TESTING")) and bool(app.config.get("AUTH_TEST_BYPASS", True))
+
+
+def _bearer_token() -> str | None:
+    header = str(request.headers.get("Authorization") or "")
+    scheme, separator, token = header.partition(" ")
+    if separator and scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    return None
+
+
+def authenticated_user() -> AuthUser | None:
+    cached = getattr(g, "vboard_user", None)
+    if cached is not None:
+        return cached
+    if _auth_test_bypass_enabled():
+        user = AuthUser(
+            id=str(request.headers.get("X-VBoard-Test-User") or "test-owner"),
+            display_name="V-Board Test User",
+            email=None,
+            is_test_user=True,
+        )
+        g.vboard_user = user
+        return user
+    token = _bearer_token()
+    user = AUTH_DB.authenticate_access_token(token) if token else None
+    if user is not None:
+        g.vboard_user = user
+    return user
+
+
+def require_authenticated(handler):
+    @wraps(handler)
+    def wrapped(*args, **kwargs):
+        if authenticated_user() is None:
+            response = jsonify(error="Authentication is required.", code="authentication_required")
+            response.headers["WWW-Authenticate"] = "Bearer"
+            return response, 401
+        return handler(*args, **kwargs)
+
+    return wrapped
+
+
+def current_user() -> AuthUser:
+    user = authenticated_user()
+    if user is None:
+        abort(401)
+    return user
+
+
+def require_board_owner(board_id: str) -> None:
+    user = current_user()
+    if user.is_test_user:
+        return
+    if not AUTH_DB.user_owns_board(user.id, board_id):
+        abort(404)
+
+
+def require_lecture_owner(folder_id: str) -> None:
+    user = current_user()
+    if user.is_test_user:
+        return
+    if not AUTH_DB.user_owns_lecture(user.id, folder_id):
+        abort(404)
+
+
+def claim_board_for_current_user(
+    board_id: str,
+    *,
+    folder_id: str | None,
+    title: str | None,
+    source_kind: str = "physical_whiteboard",
+) -> None:
+    user = current_user()
+    if user.is_test_user:
+        return
+    AUTH_DB.own_board(
+        user.id,
+        board_id,
+        lecture_id=folder_id,
+        title=title,
+        source_kind=source_kind,
+    )
+
+
+def claim_lecture_for_current_user(folder_id: str, *, title: str | None) -> None:
+    user = current_user()
+    if not user.is_test_user:
+        AUTH_DB.own_lecture(user.id, folder_id, title=title)
+
+
+def owned_library(value: dict[str, Any]) -> dict[str, Any]:
+    user = current_user()
+    if user.is_test_user:
+        return value
+    lecture_ids = AUTH_DB.owned_lecture_ids(user.id)
+    board_ids = AUTH_DB.owned_board_ids(user.id)
+    return {
+        "schema_version": value.get("schema_version", 1),
+        "folders": [
+            folder
+            for folder in value.get("folders", [])
+            if isinstance(folder, dict) and folder.get("id") in lecture_ids
+        ],
+        "boards": {
+            board_id: entry
+            for board_id, entry in value.get("boards", {}).items()
+            if board_id in board_ids
+        },
+    }
 
 
 def board_directory(board_id: str, *, create: bool = False) -> Path:
@@ -2432,13 +2553,154 @@ def upload_success(
     return redirect(next_url)
 
 
+def apple_verifier() -> AppleTokenVerifier:
+    global APPLE_VERIFIER
+    if APPLE_VERIFIER is None:
+        APPLE_VERIFIER = AppleTokenVerifier.from_environment()
+    return APPLE_VERIFIER
+
+
+def _optional_clean_name(value: Any) -> str | None:
+    if value in {None, ""}:
+        return None
+    return validate_display_name(value, "Display name")
+
+
+@app.post("/api/auth/apple")
+def authenticate_with_apple() -> Response | tuple[Response, int]:
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    try:
+        given = str(payload.get("givenName") or "").strip()
+        family = str(payload.get("familyName") or "").strip()
+        display_name = _optional_clean_name(" ".join(part for part in (given, family) if part))
+        credential = AppleCredential(
+            identity_token=str(payload.get("identityToken") or ""),
+            authorization_code=str(payload.get("authorizationCode") or ""),
+            nonce=str(payload.get("nonce") or ""),
+            claimed_user=str(payload.get("user") or "").strip() or None,
+            display_name=display_name,
+            email=str(payload.get("email") or "").strip() or None,
+        )
+        identity = apple_verifier().verify(credential)
+        user = AUTH_DB.upsert_apple_user(
+            apple_subject=identity.subject,
+            display_name=display_name,
+            email=identity.email if identity.email_verified else None,
+            apple_refresh_token=identity.refresh_token,
+        )
+        tokens = AUTH_DB.create_session(
+            user.id,
+            device_label=str(payload.get("deviceName") or "")[:160] or None,
+        )
+    except (AppleVerificationError, ValueError, PermissionError) as exc:
+        LOGGER.info("AUTH APPLE FAILED category=%s", type(exc).__name__)
+        return jsonify(error=str(exc), code="apple_authentication_failed"), 401
+    LOGGER.info("AUTH APPLE SUCCEEDED user=%s", user.id)
+    return jsonify(user=user.public_json(), session=tokens.json())
+
+
+@app.post("/api/auth/refresh")
+def refresh_authentication() -> Response | tuple[Response, int]:
+    payload = request.get_json(silent=True)
+    token = str(payload.get("refreshToken") or "").strip() if isinstance(payload, dict) else ""
+    if not token:
+        return jsonify(error="A refresh credential is required."), 401
+    refreshed = AUTH_DB.rotate_refresh_token(token)
+    if refreshed is None:
+        return jsonify(error="The session has expired.", code="session_expired"), 401
+    user, tokens = refreshed
+    return jsonify(user=user.public_json(), session=tokens.json())
+
+
+@app.get("/api/auth/me")
+@require_authenticated
+def auth_me() -> Response:
+    return jsonify(user=current_user().public_json())
+
+
+@app.post("/api/auth/logout")
+@require_authenticated
+def logout() -> Response:
+    user = current_user()
+    if not user.is_test_user:
+        AUTH_DB.revoke_session(access_token=_bearer_token())
+    return jsonify(status="signed_out")
+
+
+@app.post("/api/auth/debug")
+def debug_authentication() -> Response | tuple[Response, int]:
+    enabled = _auth_test_bypass_enabled() or (
+        os.environ.get("FLASK_DEBUG") == "1"
+        and os.environ.get("AUTH_DEBUG_BYPASS") == "1"
+    )
+    if not enabled:
+        abort(404)
+    payload = request.get_json(silent=True)
+    subject = str(payload.get("testUser") or "simulator") if isinstance(payload, dict) else "simulator"
+    user = AUTH_DB.create_test_user(subject[:80])
+    tokens = AUTH_DB.create_session(user.id, device_label="DEBUG simulator")
+    return jsonify(user=user.public_json(), session=tokens.json(), debug=True)
+
+
+@app.delete("/api/account")
+@require_authenticated
+def delete_account() -> Response | tuple[Response, int]:
+    user = current_user()
+    if user.is_test_user:
+        return jsonify(error="Test-bypass accounts cannot be deleted through this route."), 409
+    board_ids, lecture_ids = AUTH_DB.account_resource_ids(user.id)
+    apple_refresh_token = AUTH_DB.delete_account(user.id)
+    if apple_refresh_token:
+        try:
+            apple_verifier().revoke(apple_refresh_token)
+        except (AppleVerificationError, ValueError):
+            # Account deletion must still complete if Apple's revocation service is
+            # temporarily unavailable. The category is safe to log; the token is not.
+            LOGGER.exception("ACCOUNT APPLE REVOCATION FAILED user=%s", user.id)
+    library = read_library()
+    for board_id in board_ids:
+        board_dir = BOARDS_DIR / board_id
+        if board_dir.is_dir() and not board_dir.is_symlink():
+            shutil.rmtree(board_dir)
+        library.get("boards", {}).pop(board_id, None)
+    library["folders"] = [
+        folder
+        for folder in library.get("folders", [])
+        if not isinstance(folder, dict) or folder.get("id") not in lecture_ids
+    ]
+    write_library(library)
+    for lecture_id in lecture_ids:
+        lecture_workspace_path(lecture_id).unlink(missing_ok=True)
+        (BOARDS_DIR / ".workspaces" / f"{lecture_id}.study.json").unlink(missing_ok=True)
+    LOGGER.info(
+        "ACCOUNT DELETED user=%s boards=%d lectures=%d",
+        user.id,
+        len(board_ids),
+        len(lecture_ids),
+    )
+    return jsonify(status="deleted")
+
+
 @app.get("/")
 def index() -> str:
     return render_template("index.html")
 
 
+@app.get("/privacy")
+def privacy() -> str:
+    return render_template("privacy.html")
+
+
+@app.get("/terms")
+def terms() -> str:
+    return render_template("terms.html")
+
+
 @app.post("/upload/")
 @app.post("/upload")
+@require_authenticated
 def upload() -> Response | tuple[str, int]:
     upload_started = time.perf_counter()
     LOGGER.info(
@@ -2498,6 +2760,8 @@ def upload() -> Response | tuple[str, int]:
         workspace_board_id = None
     if requested_folder is not None and requested_folder not in folder_ids(library):
         return upload_failure("The selected lecture no longer exists.", 404)
+    if requested_folder is not None:
+        require_lecture_owner(requested_folder)
     if workspace_board_id:
         workspace_entry = library["boards"].get(workspace_board_id)
         if not isinstance(workspace_entry, dict):
@@ -2577,6 +2841,11 @@ def upload() -> Response | tuple[str, int]:
             mark_study_guide_stale(folder)
             folder["lecture_context"] = None
     write_library(library)
+    claim_board_for_current_user(
+        board_id,
+        folder_id=requested_folder,
+        title=board_name,
+    )
 
     started = time.perf_counter()
     LOGGER.info(
@@ -2644,7 +2913,9 @@ def upload() -> Response | tuple[str, int]:
 
 
 @app.get("/board/<board_id>")
+@require_authenticated
 def board(board_id: str) -> str | Response:
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     accepts = request.accept_mimetypes
@@ -2657,7 +2928,9 @@ def board(board_id: str) -> str | Response:
 
 @app.post("/board/<board_id>/corners")
 @locked_board_operation
+@require_authenticated
 def set_corners(board_id: str) -> Response | tuple[str, int]:
+    require_board_owner(board_id)
     request_started = time.perf_counter()
     LOGGER.info("BOARD CORNERS RECEIVED board=%s", board_id)
     board_dir = require_board_id(board_id)
@@ -2719,7 +2992,9 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
 
 @app.post("/board/<board_id>/save")
 @locked_board_operation
+@require_authenticated
 def save_board(board_id: str) -> Response | tuple[Response, int]:
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     payload = request.get_json(silent=True)
@@ -2744,7 +3019,9 @@ def save_board(board_id: str) -> Response | tuple[Response, int]:
 
 @app.route("/api/boards/<board_id>/editor", methods=["GET", "PUT", "POST"])
 @locked_board_operation
+@require_authenticated
 def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     current = read_editor_state(board_dir, metadata, persist_isolation=True)
@@ -2788,10 +3065,12 @@ def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
 
 
 @app.get("/api/library")
+@require_authenticated
 def get_library() -> Response:
-    library = read_library()
+    library = owned_library(read_library())
     known_folders = folder_ids(library)
     board_entries = library["boards"]
+    discover_unindexed_boards = current_user().is_test_user
     boards = []
     for board_dir in sorted(BOARDS_DIR.iterdir()):
         if not board_dir.is_dir() or not BOARD_ID_RE.fullmatch(board_dir.name):
@@ -2803,6 +3082,8 @@ def get_library() -> Response:
         if not isinstance(metadata, dict):
             continue
         board_id = board_dir.name
+        if not discover_unindexed_boards and board_id not in board_entries:
+            continue
         catalog = board_entries.get(board_id)
         if not isinstance(catalog, dict):
             catalog = {}
@@ -2881,6 +3162,7 @@ def get_library() -> Response:
 
 
 @app.post("/api/folders")
+@require_authenticated
 def create_folder() -> Response | tuple[Response, int]:
     payload = request.get_json(silent=True)
     try:
@@ -2901,13 +3183,16 @@ def create_folder() -> Response | tuple[Response, int]:
     })
     library["folders"].append(folder)
     write_library(library)
+    claim_lecture_for_current_user(folder["id"], title=folder["name"])
     return jsonify(folder=folder), 201
 
 
 @app.patch("/api/folders/<folder_id>")
+@require_authenticated
 def rename_folder(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
+    require_lecture_owner(folder_id)
     payload = request.get_json(silent=True)
     try:
         name = validate_display_name(payload.get("name") if isinstance(payload, dict) else None)
@@ -2938,9 +3223,11 @@ def rename_folder(folder_id: str) -> Response | tuple[Response, int]:
 
 
 @app.delete("/api/folders/<folder_id>")
+@require_authenticated
 def delete_folder(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
+    require_lecture_owner(folder_id)
     library = read_library()
     if folder_id not in folder_ids(library):
         abort(404)
@@ -2971,13 +3258,18 @@ def delete_folder(folder_id: str) -> Response | tuple[Response, int]:
     ]
     write_library(library)
     lecture_workspace_path(folder_id).unlink(missing_ok=True)
+    user = current_user()
+    if not user.is_test_user:
+        AUTH_DB.delete_lecture_record(user.id, folder_id)
     return jsonify(status="deleted", id=folder_id, deleted_boards=len(board_ids))
 
 
 @app.get("/api/folders/<folder_id>/lecture")
+@require_authenticated
 def get_lecture(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
+    require_lecture_owner(folder_id)
     library = read_library()
     folder = folder_by_id(library, folder_id)
     if folder is None:
@@ -3010,7 +3302,9 @@ def get_lecture(folder_id: str) -> Response | tuple[Response, int]:
 
 @app.get("/api/folders/<folder_id>/workspace")
 @locked_workspace_operation
+@require_authenticated
 def get_folder_workspace(folder_id: str) -> Response | tuple[Response, int]:
+    require_lecture_owner(folder_id)
     library = read_library()
     if folder_by_id(library, folder_id) is None:
         abort(404)
@@ -3027,7 +3321,9 @@ def get_folder_workspace(folder_id: str) -> Response | tuple[Response, int]:
 
 @app.put("/api/folders/<folder_id>/workspace")
 @locked_workspace_operation
+@require_authenticated
 def put_folder_workspace(folder_id: str) -> Response | tuple[Response, int]:
+    require_lecture_owner(folder_id)
     library = read_library()
     if folder_by_id(library, folder_id) is None:
         abort(404)
@@ -3060,9 +3356,11 @@ def put_folder_workspace(folder_id: str) -> Response | tuple[Response, int]:
 
 
 @app.post("/api/folders/<folder_id>/analyze")
+@require_authenticated
 def analyze_lecture_route(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
+    require_lecture_owner(folder_id)
     from study.ai import StudyAIError
     from study.service import ensure_lecture_ai_context
 
@@ -3090,9 +3388,11 @@ def analyze_lecture_route(folder_id: str) -> Response | tuple[Response, int]:
 
 
 @app.post("/api/folders/<folder_id>/study-guide")
+@require_authenticated
 def generate_study_guide_route(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
+    require_lecture_owner(folder_id)
     from study.ai import StudyAIError
     from study.service import generate_lecture_study_guide
 
@@ -3114,7 +3414,9 @@ def generate_study_guide_route(folder_id: str) -> Response | tuple[Response, int
 
 @app.post("/api/boards/<board_id>/lecture/ensure-folder")
 @locked_board_operation
+@require_authenticated
 def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int]:
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     library = read_library()
@@ -3159,6 +3461,7 @@ def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int
         "board_order": [board_id],
     })
     library["folders"].append(folder)
+    claim_lecture_for_current_user(folder["id"], title=folder["name"])
     catalog["folder_id"] = folder["id"]
     metadata["folder_id"] = folder["id"]
     update_metadata(board_dir, metadata)
@@ -3169,7 +3472,9 @@ def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int
 
 @app.patch("/api/boards/<board_id>")
 @locked_board_operation
+@require_authenticated
 def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
@@ -3195,6 +3500,7 @@ def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
             elif not isinstance(selected, str) or selected not in folder_ids(library):
                 raise ValueError("The selected folder does not exist.")
             else:
+                require_lecture_owner(selected)
                 entry["folder_id"] = selected
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
@@ -3216,12 +3522,19 @@ def update_board_entry(board_id: str) -> Response | tuple[Response, int]:
     metadata["name"] = entry["name"]
     metadata["folder_id"] = entry.get("folder_id")
     update_metadata(board_dir, metadata)
+    claim_board_for_current_user(
+        board_id,
+        folder_id=entry.get("folder_id"),
+        title=entry.get("name"),
+    )
     return jsonify(board={"id": board_id, **entry})
 
 
 @app.delete("/api/boards/<board_id>")
 @locked_board_operation
+@require_authenticated
 def delete_board(board_id: str) -> Response:
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     library = read_library()
     entry = library["boards"].get(board_id)
@@ -3235,12 +3548,17 @@ def delete_board(board_id: str) -> Response:
         if folder:
             folder["lecture_context"] = None
     write_library(library)
+    user = current_user()
+    if not user.is_test_user:
+        AUTH_DB.delete_board_record(user.id, board_id)
     return jsonify(status="deleted", id=board_id)
 
 
 @app.get("/api/boards/<board_id>/study")
 @locked_board_operation
+@require_authenticated
 def list_study_interactions(board_id: str) -> Response:
+    require_board_owner(board_id)
     from study.storage import public_interaction, read_study_state, write_study_state
 
     board_dir = require_board_id(board_id)
@@ -3256,11 +3574,13 @@ def list_study_interactions(board_id: str) -> Response:
 
 
 @app.post("/api/boards/<board_id>/study/analyze")
+@require_authenticated
 def analyze_board_context_route(board_id: str) -> Response | tuple[Response, int]:
     from study.ai import StudyAIError
     from study.service import ensure_board_ai_context
     from study.storage import public_board_context
 
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     library = read_library()
@@ -3290,9 +3610,11 @@ def analyze_board_context_route(board_id: str) -> Response | tuple[Response, int
 
 
 @app.post("/api/folders/<folder_id>/study/explain-selection")
+@require_authenticated
 def explain_lecture_selection_route(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
+    require_lecture_owner(folder_id)
     from study.ai import StudyAIError
     from study.service import explain_lecture_selection
 
@@ -3321,10 +3643,12 @@ def explain_lecture_selection_route(folder_id: str) -> Response | tuple[Response
 
 
 @app.post("/api/boards/<board_id>/study/explain")
+@require_authenticated
 def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
     from study.ai import StudyAIError
     from study.service import explain_board
 
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     payload = request.get_json(silent=True)
@@ -3362,10 +3686,12 @@ def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
 
 
 @app.post("/api/boards/<board_id>/study/<interaction_id>/followup")
+@require_authenticated
 def follow_up_route(board_id: str, interaction_id: str) -> Response | tuple[Response, int]:
     from study.ai import StudyAIError
     from study.service import follow_up_board
 
+    require_board_owner(board_id)
     route_started = time.perf_counter()
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
@@ -3472,9 +3798,11 @@ def follow_up_route(board_id: str, interaction_id: str) -> Response | tuple[Resp
 
 
 @app.get("/board/<board_id>/asset/<asset_name>")
+@require_authenticated
 def board_asset(board_id: str, asset_name: str) -> Response:
     if asset_name not in ASSET_NAMES:
         abort(404)
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     filename = metadata.get("assets", {}).get(asset_name)
@@ -3489,7 +3817,9 @@ def board_asset(board_id: str, asset_name: str) -> Response:
 
 
 @app.get("/boards/<board_id>/<path:asset>")
+@require_authenticated
 def board_file(board_id: str, asset: str) -> Response:
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     candidate = Path(asset)
     if (
@@ -3514,7 +3844,9 @@ def board_file(board_id: str, asset: str) -> Response:
 
 
 @app.get("/board/<board_id>/svg")
+@require_authenticated
 def board_svg(board_id: str) -> Response:
+    require_board_owner(board_id)
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     svg = combined_svg(metadata, board_dir)
