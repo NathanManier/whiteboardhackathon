@@ -71,6 +71,9 @@ struct BoardView: View {
             let message: String
             switch error {
             case .transport: message = "Network unavailable. Check your connection and try again."
+            case .authenticationExpired: message = "Your session expired. Sign in again."
+            case .forbidden: message = "You don’t have permission to open this board."
+            case .notFound: message = "This board is no longer available."
             case .server(let status, _, _): message = "Couldn’t load board data (HTTP \(status))."
             case .decoding: message = "Couldn’t decode board data returned by the server."
             case .invalidBaseURL: message = "Couldn’t load board data because the server URL is invalid."

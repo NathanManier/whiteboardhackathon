@@ -35,6 +35,11 @@ struct LoginView: View {
                 }
                 .frame(maxWidth: 420)
             }
+            if auth.state == .sessionExpired {
+                Text("Your session expired. Sign in again.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
             #if DEBUG
             if ProcessInfo.processInfo.environment["VBOARD_SHOW_DEBUG_LOGIN"] == "1" {
                 Button("Use Simulator Test Account") {

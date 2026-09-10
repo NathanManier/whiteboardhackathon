@@ -14,7 +14,7 @@ struct VBoardApp: App {
                         .task { await auth.resolveLaunchSession() }
                 case .signedIn(let user):
                     LibraryView(account: user)
-                case .signedOut, .authenticating, .failed:
+                case .signedOut, .authenticating, .sessionExpired, .failed:
                     LoginView()
                 }
             }

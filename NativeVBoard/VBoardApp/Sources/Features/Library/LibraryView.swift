@@ -39,7 +39,7 @@ struct LibraryView: View {
                         }.padding(.horizontal, 24).padding(.vertical, 18).frame(maxWidth: 1200, alignment: .leading)
                     }
                 } else if let error {
-                    ContentUnavailableView("Couldn’t load your library", systemImage: "wifi.exclamationmark", description: Text(error)).overlay(alignment: .bottom) { Button("Retry") { load() }.buttonStyle(.borderedProminent).padding(.bottom, 32) }
+                    ContentUnavailableView("Couldn’t load your library", systemImage: "exclamationmark.triangle", description: Text(error)).overlay(alignment: .bottom) { Button("Retry") { load() }.buttonStyle(.borderedProminent).padding(.bottom, 32) }
                 } else { ProgressView("Loading your library…") }
             }
             .navigationTitle("V-Board")
@@ -180,7 +180,30 @@ struct LibraryView: View {
             do {
                 let result = try await api.library(); library = result; error = nil
                 if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-VBoardOpenID"), index + 1 < ProcessInfo.processInfo.arguments.count { launchBoard = result.boards.first(where: { $0.id == ProcessInfo.processInfo.arguments[index + 1] }) }
-            } catch { self.error = "Check your connection and try again." }
+            } catch let apiError as APIError {
+                switch apiError {
+                case .authenticationExpired:
+                    self.error = "Your session expired. Sign in again."
+                case .transport:
+                    self.error = "Couldn’t connect to V-Board."
+                case .forbidden:
+                    self.error = "You don’t have permission to open this library."
+                case .notFound:
+                    self.error = "Your library is unavailable."
+                case .server(let status, _, _):
+                    self.error = status >= 500
+                        ? "V-Board is temporarily unavailable. Try again."
+                        : "Your library couldn’t be loaded."
+                case .decoding:
+                    self.error = "V-Board returned an unexpected library response."
+                case .invalidBaseURL:
+                    self.error = "V-Board isn’t configured correctly."
+                case .conflict, .workspaceConflict:
+                    self.error = "Your library changed elsewhere. Try again."
+                }
+            } catch {
+                self.error = "Your library couldn’t be loaded."
+            }
         }
     }
 

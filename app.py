@@ -187,12 +187,22 @@ def _auth_test_bypass_enabled() -> bool:
     return bool(app.config.get("TESTING")) and bool(app.config.get("AUTH_TEST_BYPASS", True))
 
 
-def _bearer_token() -> str | None:
+def _bearer_token_with_rejection() -> tuple[str | None, str | None]:
+    """Parse bearer authentication while retaining a secret-free rejection reason."""
     header = str(request.headers.get("Authorization") or "")
+    if not header:
+        return None, "missing_authorization_header"
     scheme, separator, token = header.partition(" ")
-    if separator and scheme.lower() == "bearer" and token.strip():
-        return token.strip()
-    return None
+    if scheme.lower() != "bearer":
+        return None, "invalid_authorization_scheme"
+    if not separator or not token.strip():
+        return None, "empty_bearer_token"
+    return token.strip(), None
+
+
+def _bearer_token() -> str | None:
+    token, _rejection = _bearer_token_with_rejection()
+    return token
 
 
 def authenticated_user() -> AuthUser | None:
@@ -208,10 +218,12 @@ def authenticated_user() -> AuthUser | None:
         )
         g.vboard_user = user
         return user
-    token = _bearer_token()
+    token, rejection = _bearer_token_with_rejection()
     user = AUTH_DB.authenticate_access_token(token) if token else None
     if user is not None:
         g.vboard_user = user
+    else:
+        g.vboard_auth_rejection_reason = rejection or AUTH_DB.access_token_rejection_reason(token or "")
     return user
 
 
@@ -219,6 +231,10 @@ def require_authenticated(handler):
     @wraps(handler)
     def wrapped(*args, **kwargs):
         if authenticated_user() is None:
+            reason = getattr(g, "vboard_auth_rejection_reason", "unknown_access_token")
+            # Keep this at warning so managed WSGI hosts that install their own
+            # WARNING-level logging handler still emit the secret-free reason.
+            LOGGER.warning("AUTH REJECTED reason=%s path=%s", reason, request.path)
             response = jsonify(error="Authentication is required.", code="authentication_required")
             response.headers["WWW-Authenticate"] = "Bearer"
             return response, 401

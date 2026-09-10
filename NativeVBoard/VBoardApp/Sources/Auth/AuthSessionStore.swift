@@ -16,6 +16,14 @@ struct AuthCredentials: Codable, Equatable, Sendable {
     var accessExpiresAt: Double
     var refreshExpiresAt: Double
     var appleUserIdentifier: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken
+        case refreshToken
+        case accessExpiresAt
+        case refreshExpiresAt
+        case appleUserIdentifier
+    }
 }
 
 struct AuthEnvelope: Codable, Sendable {
@@ -42,6 +50,7 @@ enum AuthState: Equatable {
     case signedOut
     case authenticating
     case signedIn(AccountUser)
+    case sessionExpired
     case failed(String)
 }
 
@@ -150,12 +159,17 @@ final class AuthSessionStore: ObservableObject {
             if let credentials { try? self.keychain.save(credentials) }
             else { self.keychain.clear() }
         }
+        api.onAuthenticationExpired = { [weak self] in
+            guard let self else { return }
+            LocalAccountNamespace.clear()
+            self.state = .sessionExpired
+        }
     }
 
     func resolveLaunchSession() async {
         guard let credentials = keychain.load(), credentials.refreshExpiresAt > Date().timeIntervalSince1970 else {
             keychain.clear()
-            api.install(credentials: nil)
+            api.install(credentials: nil, reason: .logout)
             state = .signedOut
             return
         }
@@ -166,14 +180,18 @@ final class AuthSessionStore: ObservableObject {
                 return
             }
         }
-        api.install(credentials: credentials)
+        api.install(credentials: credentials, reason: .restore)
         do {
             state = .signedIn(try await api.currentAccount())
             if case .signedIn(let user) = state { LocalAccountNamespace.activate(user.id) }
-        } catch {
-            api.install(credentials: nil)
+        } catch APIError.authenticationExpired {
             keychain.clear()
-            state = .signedOut
+            LocalAccountNamespace.clear()
+            state = .sessionExpired
+        } catch {
+            // A transport outage does not invalidate a refresh credential. Keep
+            // the Keychain session so the user can retry after connectivity returns.
+            state = .failed("Couldn’t connect to V-Board.")
         }
     }
 
@@ -217,7 +235,7 @@ final class AuthSessionStore: ObservableObject {
             var envelope = try await api.authenticateWithApple(payload)
             envelope.session.appleUserIdentifier = credential.user
             try keychain.save(envelope.session)
-            api.install(credentials: envelope.session)
+            api.install(credentials: envelope.session, reason: .appleLogin)
             LocalAccountNamespace.activate(envelope.user.id)
             state = .signedIn(envelope.user)
             rawNonce = nil
@@ -235,7 +253,7 @@ final class AuthSessionStore: ObservableObject {
         do {
             let envelope = try await api.debugAuthentication(testUser: name)
             try keychain.save(envelope.session)
-            api.install(credentials: envelope.session)
+            api.install(credentials: envelope.session, reason: .debugLogin)
             LocalAccountNamespace.activate(envelope.user.id)
             state = .signedIn(envelope.user)
         } catch {
@@ -246,7 +264,7 @@ final class AuthSessionStore: ObservableObject {
 
     func signOut(revokeServerSession: Bool = true) async {
         if revokeServerSession { try? await api.logout() }
-        api.install(credentials: nil)
+        api.install(credentials: nil, reason: .logout)
         keychain.clear()
         LocalAccountNamespace.clear()
         state = .signedOut
@@ -254,7 +272,7 @@ final class AuthSessionStore: ObservableObject {
 
     func deleteAccount() async throws {
         try await api.deleteAccount()
-        api.install(credentials: nil)
+        api.install(credentials: nil, reason: .logout)
         keychain.clear()
         LocalAccountNamespace.clear()
         state = .signedOut

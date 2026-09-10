@@ -293,6 +293,149 @@ final class SourceAssetCacheTests: XCTestCase {
     }
 }
 
+@MainActor
+final class AuthenticationPipelineTests: XCTestCase {
+    override func tearDown() {
+        WorkspaceURLProtocolStub.handler = nil
+        super.tearDown()
+    }
+
+    func testUnauthorizedRequestRefreshesOnceAndRebuildsWithNewBearer() async throws {
+        var libraryRequests = 0
+        var refreshRequests = 0
+        var observedHeaders: [String?] = []
+        var logs: [String] = []
+        let expiry = Date().timeIntervalSince1970 + 3_600
+        WorkspaceURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/api/library":
+                libraryRequests += 1
+                observedHeaders.append(request.value(forHTTPHeaderField: "Authorization"))
+                let status = libraryRequests == 1 ? 401 : 200
+                let body = status == 200
+                    ? Data(#"{"schema_version":1,"folders":[],"boards":[]}"#.utf8)
+                    : Data(#"{"code":"authentication_required","error":"Authentication is required."}"#.utf8)
+                return (Self.response(for: request, status: status), body)
+            case "/api/auth/refresh":
+                refreshRequests += 1
+                XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+                let json = """
+                {"user":{"id":"user-a","displayName":"Nate","email":null},"session":{"accessToken":"access-B","refreshToken":"refresh-R2","accessExpiresAt":\(expiry),"refreshExpiresAt":\(expiry)}}
+                """
+                return (Self.response(for: request, status: 200), Data(json.utf8))
+            default:
+                XCTFail("Unexpected request path \(request.url?.path ?? "nil")")
+                return (Self.response(for: request, status: 500), Data())
+            }
+        }
+        let api = makeAPI(logs: { logs.append($0) })
+        api.install(credentials: credentials(access: "access-A", refresh: "refresh-R1",
+                                             expiry: expiry), reason: .appleLogin)
+
+        let library = try await api.library()
+
+        XCTAssertEqual(library.schemaVersion, 1)
+        XCTAssertEqual(libraryRequests, 2)
+        XCTAssertEqual(refreshRequests, 1)
+        XCTAssertEqual(observedHeaders, ["Bearer access-A", "Bearer access-B"])
+        XCTAssertEqual(api.accessTokenGeneration, 2)
+        XCTAssertTrue(logs.contains { $0.contains("path=/api/library") && $0.contains("accessTokenGeneration=1") && $0.contains("isRetry=false") })
+        XCTAssertTrue(logs.contains { $0.contains("path=/api/library") && $0.contains("accessTokenGeneration=2") && $0.contains("isRetry=true") })
+        XCTAssertFalse(logs.joined().contains("access-A"))
+        XCTAssertFalse(logs.joined().contains("access-B"))
+        XCTAssertFalse(logs.joined().contains("refresh-R1"))
+        XCTAssertFalse(logs.joined().contains("refresh-R2"))
+    }
+
+    func testInstalledLoginSessionIsUsedByFirstLibraryRequest() async throws {
+        let expiry = Date().timeIntervalSince1970 + 3_600
+        var firstLibraryHeader: String?
+        WorkspaceURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.url?.path, "/api/library")
+            firstLibraryHeader = request.value(forHTTPHeaderField: "Authorization")
+            return (Self.response(for: request, status: 200),
+                    Data(#"{"schema_version":1,"folders":[],"boards":[]}"#.utf8))
+        }
+        let api = makeAPI()
+
+        api.install(credentials: credentials(access: "login-access", refresh: "login-refresh",
+                                             expiry: expiry), reason: .appleLogin)
+        _ = try await api.library()
+
+        XCTAssertEqual(firstLibraryHeader, "Bearer login-access")
+    }
+
+    func testSecondUnauthorizedResponseExpiresSessionWithoutAnotherRefresh() async throws {
+        let expiry = Date().timeIntervalSince1970 + 3_600
+        var protectedRequests = 0
+        var refreshRequests = 0
+        var expirationCallbacks = 0
+        WorkspaceURLProtocolStub.handler = { request in
+            if request.url?.path == "/api/auth/refresh" {
+                refreshRequests += 1
+                let json = """
+                {"user":{"id":"user-a","displayName":null,"email":null},"session":{"accessToken":"access-B","refreshToken":"refresh-R2","accessExpiresAt":\(expiry),"refreshExpiresAt":\(expiry)}}
+                """
+                return (Self.response(for: request, status: 200), Data(json.utf8))
+            }
+            protectedRequests += 1
+            return (Self.response(for: request, status: 401),
+                    Data(#"{"code":"authentication_required","error":"Authentication is required."}"#.utf8))
+        }
+        let api = makeAPI()
+        api.onAuthenticationExpired = { expirationCallbacks += 1 }
+        api.install(credentials: credentials(access: "access-A", refresh: "refresh-R1",
+                                             expiry: expiry), reason: .restore)
+
+        do {
+            _ = try await api.library()
+            XCTFail("Expected the rebuilt request to remain unauthorized")
+        } catch APIError.authenticationExpired {
+            // Expected.
+        }
+
+        XCTAssertEqual(protectedRequests, 2)
+        XCTAssertEqual(refreshRequests, 1)
+        XCTAssertEqual(expirationCallbacks, 1)
+        XCTAssertFalse(api.hasInstalledCredentials)
+    }
+
+    func testKeychainRefreshAtomicallyReplacesTheStoredCredentialPair() throws {
+        let keychain = AuthKeychain(service: "com.vboard.ipad.tests.\(UUID().uuidString)")
+        defer { keychain.clear() }
+        let expiry = Date().timeIntervalSince1970 + 3_600
+        let original = credentials(access: "access-A", refresh: "refresh-R1", expiry: expiry)
+        let rotated = credentials(access: "access-B", refresh: "refresh-R2", expiry: expiry + 60)
+
+        try keychain.save(original)
+        XCTAssertEqual(keychain.load(), original)
+        try keychain.save(rotated)
+
+        XCTAssertEqual(keychain.load(), rotated)
+        XCTAssertNotEqual(keychain.load()?.accessToken, original.accessToken)
+        XCTAssertNotEqual(keychain.load()?.refreshToken, original.refreshToken)
+    }
+
+    private func makeAPI(logs: ((String) -> Void)? = nil) -> APIClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        return APIClient(baseURL: URL(string: "https://auth.test")!,
+                         session: URLSession(configuration: configuration),
+                         diagnostics: logs)
+    }
+
+    private func credentials(access: String, refresh: String, expiry: Double) -> AuthCredentials {
+        AuthCredentials(accessToken: access, refreshToken: refresh,
+                        accessExpiresAt: expiry, refreshExpiresAt: expiry,
+                        appleUserIdentifier: nil)
+    }
+
+    private static func response(for request: URLRequest, status: Int) -> HTTPURLResponse {
+        HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": "application/json"])!
+    }
+}
+
 private final class WorkspaceURLProtocolStub: URLProtocol, @unchecked Sendable {
     static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 

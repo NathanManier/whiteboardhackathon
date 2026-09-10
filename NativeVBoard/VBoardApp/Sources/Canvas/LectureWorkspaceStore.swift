@@ -85,7 +85,7 @@ final class LectureWorkspaceStore: ObservableObject {
             let serverWorkspace: LectureWorkspace
             do {
                 serverWorkspace = try await api.lectureWorkspace(id: folderID)
-            } catch APIError.server(let status, _, _) where status == 404 {
+            } catch APIError.notFound {
                 serverWorkspace = LectureWorkspace.legacy(lecture: lecture)
                 #if DEBUG
                 print("[VBoard] WORKSPACE ENDPOINT UNAVAILABLE folder=\(folderID) using=isolated-local-manifest")
@@ -121,7 +121,7 @@ final class LectureWorkspaceStore: ObservableObject {
             let refreshed: LectureWorkspace
             do {
                 refreshed = try await api.lectureWorkspace(id: folderID)
-            } catch APIError.server(let status, _, _) where status == 404 {
+            } catch APIError.notFound {
                 refreshed = mergeLegacyRefresh(LectureWorkspace.legacy(lecture: refreshedLecture))
             }
             workspace = refreshed

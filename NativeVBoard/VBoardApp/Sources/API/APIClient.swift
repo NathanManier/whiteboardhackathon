@@ -4,6 +4,9 @@ import CryptoKit
 enum APIError: LocalizedError {
     case invalidBaseURL
     case transport(String)
+    case authenticationExpired
+    case forbidden
+    case notFound
     case server(status: Int, message: String, retryable: Bool)
     case conflict(EditorState)
     case workspaceConflict(LectureWorkspace)
@@ -13,11 +16,23 @@ enum APIError: LocalizedError {
         switch self {
         case .invalidBaseURL: return "The V-Board server URL is invalid."
         case .transport(let detail), .decoding(let detail): return detail
+        case .authenticationExpired: return "Your session expired. Sign in again."
+        case .forbidden: return "You don’t have permission to access this content."
+        case .notFound: return "The requested V-Board content is no longer available."
         case .server(_, let message, _): return message
         case .conflict: return "This board changed elsewhere. Reload before saving."
         case .workspaceConflict: return "This lecture layout changed elsewhere. Reload before saving."
         }
     }
+}
+
+enum AuthSessionUpdateReason: String, Sendable {
+    case restore
+    case appleLogin
+    case debugLogin
+    case refresh
+    case logout
+    case sessionExpired
 }
 
 @MainActor
@@ -31,9 +46,11 @@ final class APIClient: ObservableObject {
     private let sourceAssetCache: SourceAssetCache
     private var credentials: AuthCredentials?
     private var refreshTask: Task<AuthCredentials?, Error>?
+    private(set) var accessTokenGeneration = 0
     private var sourceAssetTasks: [String: Task<Data, Error>] = [:]
-    @Published private(set) var authorizationHeader: String?
+    private(set) var hasInstalledCredentials = false
     var onCredentialsChanged: ((AuthCredentials?) -> Void)?
+    var onAuthenticationExpired: (() -> Void)?
 
     init(baseURL: URL? = nil, session: URLSession = .shared,
          diagnostics: ((String) -> Void)? = nil,
@@ -51,25 +68,29 @@ final class APIClient: ObservableObject {
         self.sourceAssetCache = sourceAssetCache
     }
 
-    func install(credentials: AuthCredentials?) {
+    func install(credentials: AuthCredentials?, reason: AuthSessionUpdateReason = .restore) {
         self.credentials = credentials
-        authorizationHeader = credentials.map { "Bearer \($0.accessToken)" }
+        hasInstalledCredentials = !(credentials?.accessToken.isEmpty ?? true)
+        accessTokenGeneration += 1
         onCredentialsChanged?(credentials)
+        debugLog("AUTH SESSION UPDATED reason=\(reason.rawValue) hasAccessToken=\(!(credentials?.accessToken.isEmpty ?? true)) hasRefreshToken=\(!(credentials?.refreshToken.isEmpty ?? true)) generation=\(accessTokenGeneration)")
     }
 
     func authenticateWithApple(_ payload: AppleSignInPayload) async throws -> AuthEnvelope {
-        var request = try request(path: "/api/auth/apple", method: "POST", authenticated: false)
+        var request = try request(path: "/api/auth/apple", method: "POST")
         request.httpBody = try encoder.encode(payload)
-        let (data, response) = try await data(for: request, refreshOnUnauthorized: false)
+        let (data, response) = try await data(for: request, authenticated: false,
+                                                  refreshOnUnauthorized: false)
         try validate(response, data: data)
         return try decoder.decode(AuthEnvelope.self, from: data)
     }
 
     #if DEBUG
     func debugAuthentication(testUser: String) async throws -> AuthEnvelope {
-        var request = try request(path: "/api/auth/debug", method: "POST", authenticated: false)
+        var request = try request(path: "/api/auth/debug", method: "POST")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["testUser": testUser])
-        let (data, response) = try await data(for: request, refreshOnUnauthorized: false)
+        let (data, response) = try await data(for: request, authenticated: false,
+                                                  refreshOnUnauthorized: false)
         try validate(response, data: data)
         return try decoder.decode(AuthEnvelope.self, from: data)
     }
@@ -84,14 +105,14 @@ final class APIClient: ObservableObject {
         let request = try request(path: "/api/auth/logout", method: "POST")
         let (data, response) = try await data(for: request, refreshOnUnauthorized: false)
         try validate(response, data: data)
-        install(credentials: nil)
+        install(credentials: nil, reason: .logout)
     }
 
     func deleteAccount() async throws {
         let request = try request(path: "/api/account", method: "DELETE")
         let (data, response) = try await data(for: request, refreshOnUnauthorized: false)
         try validate(response, data: data)
-        install(credentials: nil)
+        install(credentials: nil, reason: .logout)
     }
 
     func library() async throws -> LibraryResponse { try await get("/api/library") }
@@ -381,36 +402,93 @@ final class APIClient: ObservableObject {
         }
     }
 
-    private func request(path: String, method: String = "GET", accept: String = "application/json", authenticated: Bool = true) throws -> URLRequest {
+    private func request(path: String, method: String = "GET", accept: String = "application/json") throws -> URLRequest {
         guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else { throw APIError.invalidBaseURL }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue(accept, forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if authenticated, let token = credentials?.accessToken {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
         request.timeoutInterval = 30
         return request
     }
 
-    private func data(for request: URLRequest, refreshOnUnauthorized: Bool = true) async throws -> (Data, URLResponse) {
+    private func data(for request: URLRequest,
+                      authenticated: Bool = true,
+                      refreshOnUnauthorized: Bool = true) async throws -> (Data, URLResponse) {
         do {
-            let first = try await session.data(for: request)
+            // A URLRequest is only a metadata template. Authentication is applied
+            // immediately before transmission so a request created before a login
+            // or concurrent refresh can never retain a stale bearer credential.
+            let firstRequest = try rebuiltRequest(from: request, authenticated: authenticated,
+                                                  isRetry: false)
+            let firstGeneration = accessTokenGeneration
+            let first = try await session.data(for: firstRequest)
+            logAuthResponse(for: firstRequest, response: first.1)
             guard refreshOnUnauthorized,
+                  authenticated,
                   (first.1 as? HTTPURLResponse)?.statusCode == 401,
-                  request.url?.path != "/api/auth/refresh",
-                  let refreshed = try await refreshSession() else {
+                  !isNonRefreshingAuthPath(request.url?.path) else {
                 return first
             }
-            var retry = request
-            retry.setValue("Bearer \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
-            return try await session.data(for: retry)
+            if accessTokenGeneration == firstGeneration {
+                guard try await refreshSession() != nil else { return first }
+            } else {
+                debugLog("AUTH REFRESH REUSED path=\(request.url?.path ?? "<missing>") requestGeneration=\(firstGeneration) currentGeneration=\(accessTokenGeneration)")
+            }
+            // Rebuild from the original metadata rather than resending or copying
+            // the first URLRequest. This reads the newly rotated access token and
+            // makes the generation change observable in DEBUG diagnostics.
+            let retryRequest = try rebuiltRequest(from: request, authenticated: true,
+                                                  isRetry: true)
+            let retryGeneration = accessTokenGeneration
+            let retry = try await session.data(for: retryRequest)
+            logAuthResponse(for: retryRequest, response: retry.1)
+            if (retry.1 as? HTTPURLResponse)?.statusCode == 401,
+               accessTokenGeneration == retryGeneration {
+                invalidateAuthentication()
+            }
+            return retry
         } catch let error as APIError {
             throw error
         } catch {
             throw APIError.transport("Could not reach V-Board: \(error.localizedDescription)")
         }
+    }
+
+    private func rebuiltRequest(from template: URLRequest,
+                                authenticated: Bool,
+                                isRetry: Bool) throws -> URLRequest {
+        guard let url = template.url else { throw APIError.invalidBaseURL }
+        var rebuilt = URLRequest(url: url,
+                                 cachePolicy: template.cachePolicy,
+                                 timeoutInterval: template.timeoutInterval)
+        rebuilt.httpMethod = template.httpMethod
+        rebuilt.httpBody = template.httpBody
+        for (field, value) in template.allHTTPHeaderFields ?? [:]
+        where field.caseInsensitiveCompare("Authorization") != .orderedSame {
+            rebuilt.setValue(value, forHTTPHeaderField: field)
+        }
+        let token = authenticated ? credentials?.accessToken : nil
+        if let token, !token.isEmpty {
+            rebuilt.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        debugLog("AUTH REQUEST method=\(rebuilt.httpMethod ?? "GET") path=\(url.path) authorizationHeaderPresent=\(rebuilt.value(forHTTPHeaderField: "Authorization") != nil) accessTokenAvailable=\(!(token?.isEmpty ?? true)) accessTokenGeneration=\(accessTokenGeneration) isRetry=\(isRetry)")
+        return rebuilt
+    }
+
+    private func isNonRefreshingAuthPath(_ path: String?) -> Bool {
+        path == "/api/auth/apple" || path == "/api/auth/refresh"
+    }
+
+    private func logAuthResponse(for request: URLRequest, response: URLResponse) {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        debugLog("AUTH RESPONSE path=\(request.url?.path ?? "<missing>") status=\(status)")
+    }
+
+    private func invalidateAuthentication() {
+        guard credentials != nil else { return }
+        install(credentials: nil, reason: .sessionExpired)
+        onAuthenticationExpired?()
     }
 
     private func refreshSession() async throws -> AuthCredentials? {
@@ -427,19 +505,28 @@ final class APIClient: ObservableObject {
     private func performRefreshSession() async throws -> AuthCredentials? {
         guard let current = credentials,
               current.refreshExpiresAt > Date().timeIntervalSince1970 else {
-            install(credentials: nil)
+            invalidateAuthentication()
             return nil
         }
-        var refreshRequest = try request(path: "/api/auth/refresh", method: "POST", authenticated: false)
+        let startingGeneration = accessTokenGeneration
+        var refreshRequest = try request(path: "/api/auth/refresh", method: "POST")
         refreshRequest.httpBody = try encoder.encode(["refreshToken": current.refreshToken])
-        let (data, response) = try await session.data(for: refreshRequest)
+        let outgoing = try rebuiltRequest(from: refreshRequest, authenticated: false,
+                                          isRetry: false)
+        let (data, response) = try await session.data(for: outgoing)
+        logAuthResponse(for: outgoing, response: response)
+        guard accessTokenGeneration == startingGeneration else {
+            return credentials
+        }
         guard (response as? HTTPURLResponse)?.statusCode == 200,
-              var envelope = try? decoder.decode(AuthEnvelope.self, from: data) else {
-            install(credentials: nil)
+              var envelope = try? decoder.decode(AuthEnvelope.self, from: data),
+              !envelope.session.accessToken.isEmpty,
+              !envelope.session.refreshToken.isEmpty else {
+            invalidateAuthentication()
             return nil
         }
         envelope.session.appleUserIdentifier = current.appleUserIdentifier
-        install(credentials: envelope.session)
+        install(credentials: envelope.session, reason: .refresh)
         return envelope.session
     }
 
@@ -447,6 +534,9 @@ final class APIClient: ObservableObject {
         guard let http = response as? HTTPURLResponse else { throw APIError.transport("The server returned an invalid response.") }
         guard (200..<300).contains(http.statusCode) else {
             let message = (try? decoder.decode(ServerError.self, from: data).error) ?? "Server request failed (HTTP \(http.statusCode))."
+            if http.statusCode == 401 { throw APIError.authenticationExpired }
+            if http.statusCode == 403 { throw APIError.forbidden }
+            if http.statusCode == 404 { throw APIError.notFound }
             throw APIError.server(status: http.statusCode, message: message, retryable: http.statusCode >= 500)
         }
     }

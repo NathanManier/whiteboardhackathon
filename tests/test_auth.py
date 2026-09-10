@@ -194,6 +194,42 @@ class AccountAndOwnershipTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/auth/logout", headers=self.headers(rotated)).status_code, 200)
         self.assertEqual(self.client.get("/api/auth/me", headers=self.headers(rotated)).status_code, 401)
 
+    def test_database_created_and_rotated_access_tokens_authenticate(self):
+        user = board_app.AUTH_DB.upsert_apple_user(
+            apple_subject="database-session-user", display_name="Database User", email=None
+        )
+        original = board_app.AUTH_DB.create_session(user.id)
+        authenticated = board_app.AUTH_DB.authenticate_access_token(original.access_token)
+        self.assertIsNotNone(authenticated)
+        self.assertEqual(authenticated.id, user.id)
+
+        refreshed = board_app.AUTH_DB.rotate_refresh_token(original.refresh_token)
+        self.assertIsNotNone(refreshed)
+        refreshed_user, rotated = refreshed
+        self.assertEqual(refreshed_user.id, user.id)
+        self.assertIsNone(board_app.AUTH_DB.authenticate_access_token(original.access_token))
+        self.assertEqual(
+            board_app.AUTH_DB.authenticate_access_token(rotated.access_token).id,
+            user.id,
+        )
+
+    def test_auth_rejection_logs_safe_specific_reason_without_token(self):
+        cases = [
+            ({}, "missing_authorization_header"),
+            ({"Authorization": "Token invalid"}, "invalid_authorization_scheme"),
+            ({"Authorization": "Bearer "}, "empty_bearer_token"),
+            ({"Authorization": "Bearer private-unknown-token"}, "unknown_access_token"),
+        ]
+        for headers, expected_reason in cases:
+            with self.subTest(expected_reason=expected_reason), self.assertLogs(
+                board_app.LOGGER.name, level="INFO"
+            ) as captured:
+                response = self.client.get("/api/auth/me", headers=headers)
+            self.assertEqual(response.status_code, 401)
+            rendered = "\n".join(captured.output)
+            self.assertIn(f"AUTH REJECTED reason={expected_reason} path=/api/auth/me", rendered)
+            self.assertNotIn("private-unknown-token", rendered)
+
     def test_expired_server_session_is_rejected(self):
         expired_db = AuthDatabase(
             f"sqlite:///{self.root / 'expired.sqlite3'}", access_ttl=-1, refresh_ttl=60

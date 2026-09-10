@@ -323,6 +323,28 @@ class AuthDatabase:
             session.last_used_at = now
             return self._user(user)
 
+    def access_token_rejection_reason(self, token: str) -> str:
+        """Return a log-safe reason for an already-rejected opaque access token."""
+        if not token:
+            return "empty_bearer_token"
+        now = _now()
+        with self.sessions() as db:
+            session = db.scalar(
+                select(SessionRecord).where(SessionRecord.access_token_hash == _digest(token))
+            )
+            if session is None:
+                return "unknown_access_token"
+            if session.revoked_at is not None:
+                return "revoked_session"
+            if session.access_expires_at <= now:
+                return "expired_access_token"
+            user = db.get(UserRecord, session.user_id)
+            if user is None or user.deleted_at is not None:
+                return "revoked_session"
+            # Authentication should have succeeded for a live session. Keep the
+            # fallback deterministic while avoiding any session/token details.
+            return "unknown_access_token"
+
     def rotate_refresh_token(self, token: str) -> tuple[AuthUser, SessionTokens] | None:
         now = _now()
         access = secrets.token_urlsafe(48)
