@@ -238,6 +238,18 @@ final class StrokeSerializationTests: XCTestCase {
 }
 
 final class ServerContractDecodingTests: XCTestCase {
+    func testStudyContentDocumentUsesBundledSanitizedRendererWithoutEmbeddingRawSource() {
+        let source = #"## Reaction\n$\frac{1}{2}$ and $\ce{H2O}$ </script>"#
+        let html = StudyContentDocument.html(source: source)
+        XCTAssertTrue(html.contains("katex/katex.min.js"))
+        XCTAssertTrue(html.contains("katex/mhchem.min.js"))
+        XCTAssertTrue(html.contains("dompurify/purify.min.js"))
+        XCTAssertTrue(html.contains("study-render.js"))
+        XCTAssertTrue(html.contains("connect-src 'none'"))
+        XCTAssertFalse(html.contains(source))
+        XCTAssertTrue(html.contains(Data(source.utf8).base64EncodedString()))
+    }
+
     func testStudyFollowUpDecodesPracticeProblemsFromCanonicalServerShape() throws {
         let response = try JSONDecoder().decode(StudyInteractionResponse.self, from: Data(#"""
         {
@@ -279,6 +291,23 @@ final class ServerContractDecodingTests: XCTestCase {
         XCTAssertEqual(decoded.createdAt, 1_789_000_000)
         XCTAssertEqual(decoded.unitLabel, "Unit 3")
         XCTAssertEqual(decoded.origin, "study")
+    }
+
+    func testLectureNoteResizePreservesCanonicalSourceAndOwnershipMetadata() {
+        let note = CanvasObject(
+            id: "note-1", type: "text", color: "#183153", width: 520, opacity: 1,
+            points: nil, translation: nil, sourceMarkdown: "Keep $x^2$ exactly.",
+            text: "Keep $x^2$ exactly.", x: 900, y: -40, height: 260, fontSize: 28,
+            createdAt: 1_789_000_000, unitLabel: "Unit 3", origin: "study"
+        )
+        let resized = note.resized(to: CGSize(width: 680, height: 340))
+        XCTAssertEqual(resized.width, 680)
+        XCTAssertEqual(resized.height, 340)
+        XCTAssertEqual(resized.sourceMarkdown, note.sourceMarkdown)
+        XCTAssertEqual(resized.unitLabel, note.unitLabel)
+        XCTAssertEqual(resized.origin, note.origin)
+        XCTAssertEqual(resized.x, note.x)
+        XCTAssertEqual(resized.y, note.y)
     }
 
     func testEditorEnvelopeAndOmittedCollectionsUseServerDefaults() throws {

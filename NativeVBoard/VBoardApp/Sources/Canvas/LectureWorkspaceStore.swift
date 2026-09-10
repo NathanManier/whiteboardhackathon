@@ -255,6 +255,13 @@ final class LectureWorkspaceStore: ObservableObject {
         }
     }
 
+    func resizeTextObject(_ key: SelectionKey, to localSize: CGSize, api: APIClient) {
+        guard key.kind == .editorObject, let store = boardStores[key.boardID] else { return }
+        recordBoardUndo([key.boardID])
+        store.resizeTextObject(id: key.objectID, to: localSize, api: api)
+        refreshSceneSnapshot(key.boardID, api: api)
+    }
+
     func deleteSelection(_ keys: Set<SelectionKey>, api: APIClient) {
         let grouped = Dictionary(grouping: keys, by: \.boardID)
         let affected = grouped.keys.filter { boardStores[$0] != nil }.sorted()

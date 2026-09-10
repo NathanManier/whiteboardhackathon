@@ -55,6 +55,71 @@ class StudyApiTests(unittest.TestCase):
         self.assertIn("board.svg", board["thumbnail_url"])
         self.assertNotIn("master.png", board["thumbnail_url"] or "")
 
+    def test_lecture_study_guide_uses_all_isolated_board_notes_with_bounded_context_refresh(self):
+        folder = self.client.post("/api/folders", json={"name": "Large Lecture"}).get_json()["folder"]
+        second_id = "c" * 32
+        second_dir = board_app.BOARDS_DIR / second_id
+        second_dir.mkdir()
+        second_meta = {**self.metadata, "id": second_id, "name": "Physics Lecture — Sep 7", "created_at": 2}
+        board_app.atomic_json(second_dir / "board.json", second_meta)
+        (second_dir / "board.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600">'
+            '<path id="second-path" d="M 1 1 L 2 2 Z"/></svg>',
+            encoding="utf-8",
+        )
+
+        first_meta = {**self.metadata, "folder_id": folder["id"]}
+        second_meta = {**second_meta, "folder_id": folder["id"]}
+        board_app.atomic_json(self.board_dir / "board.json", first_meta)
+        board_app.atomic_json(second_dir / "board.json", second_meta)
+        library = board_app.read_library()
+        library["boards"].update({
+            self.board_id: {"name": first_meta["name"], "folder_id": folder["id"], "created_at": 1},
+            second_id: {"name": second_meta["name"], "folder_id": folder["id"], "created_at": 2},
+        })
+        next(item for item in library["folders"] if item["id"] == folder["id"])["board_order"] = [
+            self.board_id, second_id,
+        ]
+        board_app.write_library(library)
+
+        for index, (board_id, board_dir, metadata) in enumerate([
+            (self.board_id, self.board_dir, first_meta),
+            (second_id, second_dir, second_meta),
+        ], start=1):
+            editor = board_app.default_editor_state(metadata)
+            editor["objects"].append({
+                "id": f"problem-{index}", "type": "text", "role": "ai_practice_problem",
+                "text": f"Problem from board {index}", "x": 0, "y": 0, "width": 200, "height": 100,
+                "unit_label": f"Unit {index}",
+            })
+            board_app.atomic_json(board_dir / "editor.json", editor)
+            board_app.atomic_json(board_dir / "study.json", {
+                "schema_version": 2,
+                "board_ai_context": None,
+                "interactions": [{
+                    "id": str(index) * 16, "board_id": board_id,
+                    "source_board_id": board_id, "question": f"Question {index}",
+                    "answer": f"Answer {index}",
+                }],
+            })
+
+        captured = {}
+
+        def generated(**kwargs):
+            captured.update(kwargs)
+            return {"title": "Lecture Study Guide", "content": "# Guide", "sources": []}
+
+        with patch("study.service.ensure_lecture_ai_context", return_value={"summary": "Lecture"}) as context, patch(
+            "study.service.generate_study_guide", side_effect=generated
+        ), patch("study.service.encode_master_overview", return_value=None):
+            response = self.client.post(f"/api/folders/{folder['id']}/study-guide", json={})
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertEqual(context.call_args.kwargs["max_missing_board_contexts"], 3)
+        self.assertEqual([item["board_id"] for item in captured["board_summaries"]], [self.board_id, second_id])
+        self.assertEqual({item["board_id"] for item in captured["study_notes"]}, {self.board_id, second_id})
+        self.assertEqual({item["board_id"] for item in captured["practice_problems"]}, {self.board_id, second_id})
+
     def test_explain_without_selection_is_rejected(self):
         response = self.client.post(
             f"/api/boards/{self.board_id}/study/explain",

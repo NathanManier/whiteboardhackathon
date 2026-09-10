@@ -22,6 +22,12 @@
 		A015 /* LectureWorkspaceStore.swift */ = {isa = PBXBuildFile; fileRef = A115; };
 		A016 /* LectureCanvasView.swift */ = {isa = PBXBuildFile; fileRef = A116; };
 		A017 /* LectureWorkspaceView.swift */ = {isa = PBXBuildFile; fileRef = A117; };
+		A018 /* StudyContentRenderer.swift */ = {isa = PBXBuildFile; fileRef = A118; };
+		A019 /* katex */ = {isa = PBXBuildFile; fileRef = A119; };
+		A020 /* markdown-it */ = {isa = PBXBuildFile; fileRef = A120; };
+		A021 /* markdown-it-texmath */ = {isa = PBXBuildFile; fileRef = A121; };
+		A022 /* dompurify */ = {isa = PBXBuildFile; fileRef = A122; };
+		A023 /* study-render.js */ = {isa = PBXBuildFile; fileRef = A123; };
 		A010 /* Tests */ = {isa = PBXBuildFile; fileRef = A110; };
 /* End PBXBuildFile section */
 /* Begin PBXFileReference section */
@@ -41,14 +47,21 @@
 		A115 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/LectureWorkspaceStore.swift; sourceTree = "<group>"; };
 		A116 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/LectureCanvasView.swift; sourceTree = "<group>"; };
 		A117 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Features/Library/LectureWorkspaceView.swift; sourceTree = "<group>"; };
+		A118 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Study/StudyContentRenderer.swift; sourceTree = "<group>"; };
+		A119 = {isa = PBXFileReference; lastKnownFileType = folder; name = katex; path = ../static/vendor/katex; sourceTree = "<group>"; };
+		A120 = {isa = PBXFileReference; lastKnownFileType = folder; name = "markdown-it"; path = ../static/vendor/markdown-it; sourceTree = "<group>"; };
+		A121 = {isa = PBXFileReference; lastKnownFileType = folder; name = "markdown-it-texmath"; path = ../static/vendor/markdown-it-texmath; sourceTree = "<group>"; };
+		A122 = {isa = PBXFileReference; lastKnownFileType = folder; name = dompurify; path = ../static/vendor/dompurify; sourceTree = "<group>"; };
+		A123 = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = "study-render.js"; path = ../static/study-render.js; sourceTree = "<group>"; };
 		A110 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VBoardAppTests.swift; sourceTree = "<group>"; };
 		B001 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 /* Begin PBXGroup section */
-		C001 = {isa = PBXGroup; children = (C002, C003, B001, B002); sourceTree = "<group>"; };
-		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113); };
+		C001 = {isa = PBXGroup; children = (C002, C003, C004, B001, B002); sourceTree = "<group>"; };
+		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113, A118); };
 		C003 = {isa = PBXGroup; path = VBoardAppTests; sourceTree = "<group>"; children = (A110); };
+		C004 = {isa = PBXGroup; name = "Study Renderer Resources"; sourceTree = "<group>"; children = (A119, A120, A121, A122, A123); };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
 		D001 = {isa = PBXNativeTarget; buildConfigurationList = E001; buildPhases = (F001, F002, F003); buildRules = (); dependencies = (); name = VBoardApp; productName = VBoardApp; productReference = B001; productType = "com.apple.product-type.application"; };
@@ -58,11 +71,11 @@
 		P001 = {isa = PBXProject; attributes = { LastUpgradeCheck = 1620; TargetAttributes = { D001 = { CreatedOnToolsVersion = 16.2; }; D002 = { CreatedOnToolsVersion = 16.2; TestTargetID = D001; }; }; }; buildConfigurationList = E003; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = C001; productRefGroup = C001; projectDirPath = ""; projectRoot = ""; targets = (D001, D002); };
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
-		F002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		F002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A019, A020, A021, A022, A023); runOnlyForDeploymentPostprocessing = 0; };
 		F005 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013); runOnlyForDeploymentPostprocessing = 0; };
+		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013, A018); runOnlyForDeploymentPostprocessing = 0; };
 		F004 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A010); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXFrameworksBuildPhase section */

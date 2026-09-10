@@ -165,6 +165,14 @@ final class BoardDocumentStore: ObservableObject {
         apply(next, api: api)
     }
 
+    func resizeTextObject(id: String, to size: CGSize, api: APIClient) {
+        guard size.width >= 120, size.height >= 80,
+              let index = editor.objects.firstIndex(where: { $0.id == id && $0.type == "text" }) else { return }
+        var next = editor
+        next.objects[index] = next.objects[index].resized(to: size)
+        apply(next, api: api)
+    }
+
     func deleteObjects(ids: Set<String>, api: APIClient) {
         guard !ids.isEmpty else { return }
         var next = editor

@@ -4,6 +4,38 @@ This is the native iPadOS client for the existing V-Board Flask service. The
 server remains the source of truth for board processing, professor SVG
 geometry, editor persistence, and study APIs.
 
+## Shared lecture workspace
+
+A lecture opens as one persistent infinite canvas containing independently
+owned whiteboards. The lecture workspace persists only camera, placement,
+dates, unit labels, ordering, and effective bounds. Every board continues to
+load and save its own immutable `board.svg`, `editor.json`, and `study.json`;
+the native client never creates a merged lecture editor document.
+
+Nested coordinate conversion is explicit: screen coordinates map through the
+lecture camera into lecture-world coordinates, then through a board placement
+into that board's local coordinates. This is used by drawing, lasso, hit
+testing, object movement, erasing, and grouped AI selections.
+
+Only three nearby or active boards are promoted to full native vector scenes
+by default. Other visible boards use their thumbnails, and scene loads are
+cancelled when they become stale. The manifest accepts up to 100 boards by
+default without embedding SVG or editor payloads.
+
+The additive workspace routes are:
+
+- `GET /api/folders/<folder_id>/workspace`
+- `PUT /api/folders/<folder_id>/workspace`
+
+The server revision is authoritative and stale writes return HTTP 409. A
+locally retained manifest is used as a recoverable outbox while offline. The
+deployed server must include these routes for cross-device layout sync; older
+servers receive the native client's isolated local-manifest fallback.
+
+Study answers and guides use the repository's bundled KaTeX, mhchem,
+markdown-it, and DOMPurify resources in an isolated native web view. There is
+no CDN dependency, and canonical Markdown/LaTeX remains unchanged in storage.
+
 Open `VBoardApp.xcodeproj` in Xcode and run on an iPad simulator or device.
 The production default is `https://chsinteract.com`. To use a local Flask
 server during development, set `VBoardAPIBaseURL` in the Run scheme to a

@@ -8,6 +8,7 @@ private enum LectureInteraction {
     case lassoing
     case erasing(boardID: String?, erased: Set<SelectionKey>)
     case movingSelection(startWorld: CGPoint)
+    case resizingText(key: SelectionKey, startWorld: CGPoint, startBounds: CGRect)
     case movingBoard(boardID: String, startWorld: CGPoint)
 }
 
@@ -24,6 +25,7 @@ struct LectureCanvasView: UIViewRepresentable {
     var onSelectionChanged: (Set<SelectionKey>) -> Void
     var onStroke: (UserStroke, String) -> Void
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
+    var onResizeTextObject: (SelectionKey, CGSize) -> Void
     var onDelete: (Set<SelectionKey>) -> Void
     var onMoveBoard: (String, CGPoint) -> Void
     var onUndo: () -> Void
@@ -53,6 +55,7 @@ struct LectureCanvasView: UIViewRepresentable {
                                onSelectionChanged: onSelectionChanged,
                                onStroke: onStroke,
                                onMoveSelection: onMoveSelection,
+                               onResizeTextObject: onResizeTextObject,
                                onDelete: onDelete,
                                onMoveBoard: onMoveBoard,
                                onUndo: onUndo,
@@ -67,6 +70,7 @@ struct LectureCanvasCallbacks {
     var onSelectionChanged: (Set<SelectionKey>) -> Void
     var onStroke: (UserStroke, String) -> Void
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
+    var onResizeTextObject: (SelectionKey, CGSize) -> Void
     var onDelete: (Set<SelectionKey>) -> Void
     var onMoveBoard: (String, CGPoint) -> Void
     var onUndo: () -> Void
@@ -92,6 +96,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var liveStrokePoints: [StrokePoint] = []
     private var liveStrokeBoardID: String?
     private var movePreviewDelta = CGPoint.zero
+    private var resizePreviewBounds: CGRect?
     private var lastEraseWorld: CGPoint?
     private var lastFocusRequestID: UUID?
     private var isSpacePressed = false
@@ -224,6 +229,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         case .lassoing: return "LASSOING"
         case .erasing: return "ERASING"
         case .movingSelection: return "MOVING_SELECTION"
+        case .resizingText: return "RESIZING_TEXT"
         case .movingBoard: return "MOVING_BOARD"
         }
     }
@@ -427,6 +433,15 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             boardViews.values.forEach { $0.beginNavigation() }
             return
         }
+        if activeTool == .select,
+           let resize = resizableTextSelection(),
+           resizeHandleContains(world, bounds: resize.bounds) {
+            resizePreviewBounds = resize.bounds
+            interaction = .resizingText(key: resize.key, startWorld: world,
+                                        startBounds: resize.bounds)
+            callbacks.onActiveBoardChanged(resize.key.boardID)
+            return
+        }
         if activeTool == .lasso,
            let bounds = selectionWorldBounds(),
            bounds.insetBy(dx: -10, dy: -10).contains(world) {
@@ -516,6 +531,12 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         case .movingSelection(let startWorld):
             movePreviewDelta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
             previewSelectionMove(movePreviewDelta)
+        case .resizingText(let key, let startWorld, let startBounds):
+            let size = CGSize(width: max(120, startBounds.width + world.x - startWorld.x),
+                              height: max(80, startBounds.height + world.y - startWorld.y))
+            resizePreviewBounds = CGRect(origin: startBounds.origin, size: size)
+            boardViews[key.boardID]?.previewResize(key: key, size: size)
+            updateSelectionOverlay()
         case .movingBoard(let boardID, let startWorld):
             let delta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
             if let item = workspace.items.first(where: { $0.boardID == boardID }) {
@@ -578,6 +599,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             let delta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
             clearSelectionMovePreview()
             if delta != .zero { callbacks.onMoveSelection(selectedKeys, delta) }
+        case .resizingText(let key, let startWorld, let startBounds):
+            let size = CGSize(width: max(120, startBounds.width + world.x - startWorld.x),
+                              height: max(80, startBounds.height + world.y - startWorld.y))
+            boardViews[key.boardID]?.clearResizePreview(key: key)
+            callbacks.onResizeTextObject(key, size)
         case .movingBoard(let boardID, let startWorld):
             let delta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
             if delta != .zero { callbacks.onMoveBoard(boardID, delta) }
@@ -585,6 +611,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         interaction = .idle
         movePreviewDelta = .zero
+        resizePreviewBounds = nil
         updateSelectionOverlay()
     }
 
@@ -596,6 +623,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if case .drawing(let boardID, _) = interaction { boardViews[boardID]?.clearLiveStroke() }
         if case .panning = interaction { boardViews.values.forEach { $0.endNavigation() } }
         if case .movingSelection = interaction { clearSelectionMovePreview() }
+        if case .resizingText(let key, _, _) = interaction {
+            boardViews[key.boardID]?.clearResizePreview(key: key)
+        }
         if case .movingBoard(let boardID, _) = interaction,
            let item = workspace.items.first(where: { $0.boardID == boardID }) {
             boardViews[boardID]?.frame = item.frame
@@ -604,6 +634,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         liveStrokePoints.removeAll()
         liveStrokeBoardID = nil
         lastEraseWorld = nil
+        resizePreviewBounds = nil
         interaction = .idle
         updateSelectionOverlay()
     }
@@ -698,14 +729,37 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     private func updateSelectionOverlay() {
         if !lassoPoints.isEmpty { updateInteractionOverlay(); return }
-        guard var union = selectionWorldBounds() else {
+        guard var union = resizePreviewBounds ?? selectionWorldBounds() else {
             interactionLayer.isHidden = true
             interactionLayer.path = nil
             return
         }
         if case .movingSelection = interaction { union = union.offsetBy(dx: movePreviewDelta.x, dy: movePreviewDelta.y) }
-        interactionLayer.path = UIBezierPath(rect: union.insetBy(dx: -10, dy: -10)).cgPath
+        let path = UIBezierPath(rect: union.insetBy(dx: -10, dy: -10))
+        if resizableTextSelection() != nil {
+            let radius = max(5, 11 / max(worldTransform.scale, 0.001))
+            path.append(UIBezierPath(ovalIn: CGRect(x: union.maxX - radius,
+                                                    y: union.maxY - radius,
+                                                    width: radius * 2,
+                                                    height: radius * 2)))
+        }
+        interactionLayer.path = path.cgPath
         interactionLayer.isHidden = false
+    }
+
+    private func resizableTextSelection() -> (key: SelectionKey, bounds: CGRect)? {
+        guard selectedKeys.count == 1, let key = selectedKeys.first,
+              key.kind == .editorObject,
+              let item = workspace.items.first(where: { $0.boardID == key.boardID }),
+              let boardView = boardViews[key.boardID],
+              boardView.isResizableTextObject(id: key.objectID),
+              let local = boardView.selectionBounds(keys: Set([key])) else { return nil }
+        return (key, LectureCoordinateTransform.boardLocalToLectureWorld(local, board: item))
+    }
+
+    private func resizeHandleContains(_ world: CGPoint, bounds: CGRect) -> Bool {
+        let tolerance = max(8, 20 / max(worldTransform.scale, 0.001))
+        return hypot(world.x - bounds.maxX, world.y - bounds.maxY) <= tolerance
     }
 
     private func selectionWorldBounds() -> CGRect? {
@@ -961,6 +1015,31 @@ private final class LectureBoardRenderView: UIView {
     func clearMovePreview(keys: Set<SelectionKey>) {
         professor.clearPreviewTranslation(ids: Set(keys.filter { $0.kind == .professorPath }.map(\.objectID)))
         for key in keys where key.kind == .editorObject { objectLayers[key.objectID]?.setAffineTransform(.identity) }
+    }
+
+    func isResizableTextObject(id: String) -> Bool {
+        scene?.editor.objects.contains(where: { $0.id == id && $0.type == "text" }) == true
+    }
+
+    func previewResize(key: SelectionKey, size: CGSize) {
+        guard key.kind == .editorObject,
+              let object = scene?.editor.objects.first(where: { $0.id == key.objectID }),
+              let layer = objectLayers[key.objectID] else { return }
+        var frame = objectBounds(object)
+        frame.size = size
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.frame = frame
+        CATransaction.commit()
+    }
+
+    func clearResizePreview(key: SelectionKey) {
+        guard let object = scene?.editor.objects.first(where: { $0.id == key.objectID }),
+              let layer = objectLayers[key.objectID] else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.frame = objectBounds(object)
+        CATransaction.commit()
     }
 
     func showLiveStroke(points: [StrokePoint], color: String, width: Double) {

@@ -121,6 +121,7 @@ struct LectureWorkspaceView: View {
                 onSelectionChanged: { store.setSelection($0) },
                 onStroke: { stroke, boardID in store.applyStroke(stroke, boardID: boardID, api: api) },
                 onMoveSelection: { keys, delta in store.moveSelection(keys, by: delta, api: api) },
+                onResizeTextObject: { key, size in store.resizeTextObject(key, to: size, api: api) },
                 onDelete: { store.deleteSelection($0, api: api) },
                 onMoveBoard: { boardID, delta in store.moveBoard(boardID: boardID, by: delta, api: api) },
                 onUndo: { store.undo(api: api) },
@@ -243,9 +244,8 @@ private struct LectureSelectionStudyView: View {
                 } else if let interaction = result?.interaction {
                     Text(interaction.title ?? "Across this lecture").font(.title2.bold())
                     ScrollView {
-                        Text(interaction.answer ?? "No explanation was returned.")
-                            .frame(maxWidth: 700, alignment: .leading)
-                            .textSelection(.enabled)
+                        StudyContentView(source: interaction.answer ?? "No explanation was returned.",
+                                         maximumWidth: 700)
                     }
                 } else {
                     Image(systemName: "rectangle.3.group.bubble.left")

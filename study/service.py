@@ -1381,6 +1381,7 @@ def ensure_lecture_ai_context(
     atomic_json: AtomicJson,
     write_library: Callable[[dict[str, Any]], None],
     force: bool = False,
+    max_missing_board_contexts: int | None = None,
 ) -> dict[str, Any] | None:
     folder = folder_by_id(library, folder_id)
     if folder is None:
@@ -1393,6 +1394,7 @@ def ensure_lecture_ai_context(
 
     summaries = []
     images: dict[str, str] = {}
+    generated_contexts = 0
     for index, member_id in enumerate(member_ids, start=1):
         member_dir = BOARDS_DIR / member_id
         if not member_dir.is_dir():
@@ -1403,7 +1405,10 @@ def ensure_lecture_ai_context(
             continue
         study = read_study_state(member_dir)
         board_context = compact_board_context(study.get("board_ai_context"))
-        if board_context is None:
+        if board_context is None and (
+            max_missing_board_contexts is None
+            or generated_contexts < max(0, max_missing_board_contexts)
+        ):
             try:
                 board_context = compact_board_context(
                     ensure_board_ai_context(
@@ -1415,6 +1420,8 @@ def ensure_lecture_ai_context(
                         atomic_json=atomic_json,
                     )
                 )
+                if board_context is not None:
+                    generated_contexts += 1
             except StudyAIError:
                 board_context = None
         summaries.append(
@@ -1466,8 +1473,12 @@ def generate_lecture_study_guide(
         library=library,
         atomic_json=atomic_json,
         write_library=write_library,
+        # A newly imported 100-board lecture must not synchronously launch 100
+        # visual-analysis requests just to open a guide. Existing per-board
+        # summaries are reused; a small bounded batch fills legacy gaps.
+        max_missing_board_contexts=3,
     )
-    from app import BOARDS_DIR, read_editor_state, read_metadata
+    from app import BOARDS_DIR, read_editor_state, read_lecture_workspace, read_metadata
 
     member_ids = folder_board_ids(library, folder_id)
     summaries = []
@@ -1475,6 +1486,15 @@ def generate_lecture_study_guide(
     problems = []
     host_id = folder.get("workspace_board_id") or (member_ids[0] if member_ids else None)
     images: dict[str, str] = {}
+    try:
+        workspace = read_lecture_workspace(library, folder_id)
+    except Exception:
+        workspace = {"items": []}
+    workspace_items = {
+        str(item.get("board_id")): item
+        for item in (workspace.get("items") or [])
+        if isinstance(item, dict) and item.get("board_id")
+    }
     for index, member_id in enumerate(member_ids, start=1):
         member_dir = BOARDS_DIR / member_id
         if not member_dir.is_dir():
@@ -1484,40 +1504,60 @@ def generate_lecture_study_guide(
         except Exception:
             continue
         study = read_study_state(member_dir)
+        workspace_item = workspace_items.get(member_id) or {}
+        catalog = library.get("boards", {}).get(member_id)
+        catalog = catalog if isinstance(catalog, dict) else {}
         summaries.append(
             {
                 "board_id": member_id,
                 "board_order": index,
                 "label": f"Whiteboard {index}",
+                "title": str(
+                    catalog.get("name") or member_meta.get("name") or f"Whiteboard {index}"
+                ),
+                "date": workspace_item.get("detected_board_date"),
+                "created_at": (
+                    workspace_item.get("created_at")
+                    or catalog.get("created_at")
+                    or member_meta.get("created_at")
+                ),
+                "unit_label": workspace_item.get("unit_label") or "No Unit",
                 "context": compact_board_context(study.get("board_ai_context")),
             }
         )
+        for item in study.get("interactions") or []:
+            if not isinstance(item, dict):
+                continue
+            notes.append(
+                {
+                    "question": item.get("question"),
+                    "answer": str(item.get("answer") or "")[:1_500],
+                    "board_id": item.get("source_board_id") or member_id,
+                    "board_order": index,
+                    "unit_label": workspace_item.get("unit_label") or "No Unit",
+                }
+            )
+        try:
+            editor = read_editor_state(member_dir, member_meta)
+        except Exception:
+            editor = {}
+        for obj in editor.get("objects") or []:
+            if not isinstance(obj, dict) or obj.get("type") != "text":
+                continue
+            if obj.get("role") not in {"ai_practice_problem", "practice_problem"}:
+                continue
+            problems.append(
+                {
+                    "text": str(obj.get("text") or "")[:800],
+                    "origin": "ai_generated_practice",
+                    "board_id": member_id,
+                    "board_order": index,
+                    "unit_label": (
+                        obj.get("unit_label") or workspace_item.get("unit_label") or "No Unit"
+                    ),
+                }
+            )
         if member_id == host_id:
-            for item in study.get("interactions") or []:
-                if not isinstance(item, dict):
-                    continue
-                notes.append(
-                    {
-                        "question": item.get("question"),
-                        "answer": str(item.get("answer") or "")[:1_500],
-                        "board_id": item.get("source_board_id") or member_id,
-                    }
-                )
-            try:
-                editor = read_editor_state(member_dir, member_meta)
-            except Exception:
-                editor = {}
-            for obj in editor.get("objects") or []:
-                if not isinstance(obj, dict) or obj.get("type") != "text":
-                    continue
-                if obj.get("role") not in {"ai_practice_problem", "practice_problem"}:
-                    continue
-                problems.append(
-                    {
-                        "text": str(obj.get("text") or "")[:800],
-                        "origin": "ai_generated_practice",
-                    }
-                )
             path = master_path(member_dir, member_meta)
             image = encode_master_overview(path) if path else None
             if image:

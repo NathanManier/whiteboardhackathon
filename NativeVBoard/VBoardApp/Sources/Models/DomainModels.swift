@@ -337,6 +337,16 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                            sourceStudyInteractionID: sourceStudyInteractionID,
                            createdAt: createdAt, unitLabel: unitLabel, origin: origin)
     }
+
+    func resized(to size: CGSize) -> CanvasObject {
+        CanvasObject(id: id, type: type, color: color,
+                     width: Double(size.width), opacity: opacity,
+                     points: points, translation: translation,
+                     sourceMarkdown: sourceMarkdown, text: text, x: x, y: y,
+                     height: Double(size.height), fontSize: fontSize, role: role,
+                     sourceStudyInteractionID: sourceStudyInteractionID,
+                     createdAt: createdAt, unitLabel: unitLabel, origin: origin)
+    }
 }
 
 /// Canonical Pencil data. This deliberately mirrors the server's stroke

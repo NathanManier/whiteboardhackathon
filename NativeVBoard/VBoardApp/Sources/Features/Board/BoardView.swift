@@ -190,12 +190,10 @@ struct StudyActionsView: View {
                         .font(.title2.bold())
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
-                            Text(displayAnswer(result))
-                                .frame(maxWidth: 700, alignment: .leading)
-                                .textSelection(.enabled)
+                            StudyContentView(source: displayAnswer(result), maximumWidth: 700)
                             if let problems = result.problems, !problems.isEmpty {
                                 ForEach(Array(problems.prefix(2))) { problem in
-                                    Text(problem.text)
+                                    StudyContentView(source: problem.text, maximumWidth: 660)
                                         .padding(14)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))

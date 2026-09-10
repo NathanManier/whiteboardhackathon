@@ -170,7 +170,7 @@ struct StudyGuideView: View {
     @State private var error: String?
     var body: some View {
         NavigationStack {
-            Group { if let current { ScrollView { Text(current.content ?? "No guide content yet.").frame(maxWidth: 760, alignment: .leading).padding(24) } } else if loading { ProgressView("Preparing your study guide…") } else { ContentUnavailableView("No study guide yet", systemImage: "text.book.closed", description: Text("Generate a concise guide from this lecture’s whiteboards.")) } }
+            Group { if let current { ScrollView { StudyContentView(source: current.content ?? "No guide content yet.").padding(24) } } else if loading { ProgressView("Preparing your study guide…") } else { ContentUnavailableView("No study guide yet", systemImage: "text.book.closed", description: Text("Generate a concise guide from this lecture’s whiteboards.")) } }
                 .navigationTitle("Study Guide")
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }; ToolbarItem(placement: .primaryAction) { Button(guide == nil ? "Generate" : "Regenerate") { generate() }.disabled(loading) } }
         }.onAppear { current = guide }
