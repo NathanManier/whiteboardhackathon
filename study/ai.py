@@ -10,6 +10,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from .routing import AIModelPolicy, current_ai_request
+from .telemetry import USAGE_RECORDER
+
 LOGGER = logging.getLogger("study.ai")
 
 PRIORITY_RULES = """
@@ -1310,15 +1313,54 @@ def call_study_model(
     timeout: float = 90,
     request_id: str | None = None,
     metrics: dict[str, float | int | str] | None = None,
+    model_role: str | None = None,
 ) -> dict[str, str]:
     total_started = time.perf_counter()
+    active_request = current_ai_request()
+    route = active_request.route if active_request else None
+    policy = AIModelPolicy()
+    role = model_role or policy.role(route)
+    model = policy.model(route, role)
+    thinking_level = thinking_level or policy.thinking_level(route, role)
+    image_count = sum(
+        1
+        for key, value in images.items()
+        if key != "lecture_boards" and isinstance(value, str) and value
+    ) + sum(
+        1
+        for item in (images.get("lecture_boards") or [])
+        if isinstance(item, dict) and item.get("image")
+    )
+    telemetry_recorded = False
+
+    def record_usage(success: bool, *, body: dict[str, Any] | None = None, error: str | None = None) -> None:
+        nonlocal telemetry_recorded
+        if telemetry_recorded or active_request is None:
+            return
+        telemetry_recorded = True
+        usage = body.get("usageMetadata") if isinstance(body, dict) else None
+        model_latency = metrics.get("gemini_ms") if isinstance(metrics, dict) else None
+        USAGE_RECORDER.record(
+            context=active_request.context,
+            route=active_request.route,
+            model_role=role,
+            actual_model=model,
+            thinking_level=thinking_level,
+            image_count=image_count,
+            latency_ms=(time.perf_counter() - total_started) * 1000,
+            model_latency_ms=float(model_latency) if isinstance(model_latency, (int, float)) else None,
+            usage=usage if isinstance(usage, dict) else None,
+            success=success,
+            error_category=error,
+        )
+
     api_key = gemini_api_key()
     if not api_key:
+        record_usage(False, error="not_configured")
         raise StudyAIError(
             "Study explanations aren't configured on this server. Your board is still saved.",
             status=503,
         )
-    model = gemini_model()
     prompt_started = time.perf_counter()
     payload = json.dumps(
         {
@@ -1390,6 +1432,7 @@ def call_study_model(
         except Exception:
             detail = ""
         LOGGER.error("Gemini HTTP %s model=%s body=%s", exc.code, model, detail)
+        record_usage(False, error=f"provider_http_{exc.code}")
         status = 429 if exc.code == 429 else 503
         raise StudyAIError(
             "Couldn't explain this right now. Your board is still saved.",
@@ -1397,11 +1440,13 @@ def call_study_model(
         ) from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         LOGGER.error("Gemini request failed model=%s error=%s", model, exc)
+        record_usage(False, error=type(exc).__name__)
         raise StudyAIError(
             "Couldn't explain this right now. Your board is still saved.",
             status=503,
         ) from exc
     if not isinstance(body, dict):
+        record_usage(False, error="invalid_provider_response")
         raise StudyAIError(
             "Couldn't explain this right now. Your board is still saved.",
             status=503,
@@ -1409,14 +1454,20 @@ def call_study_model(
     try:
         raw = _extract_gemini_text(body)
     except StudyAIError:
+        record_usage(False, body=body, error="provider_response_rejected")
         raise
     except (KeyError, IndexError, TypeError) as exc:
+        record_usage(False, body=body, error="provider_response_invalid")
         raise StudyAIError(
             "Couldn't explain this right now. Your board is still saved.",
             status=503,
         ) from exc
     parse_started = time.perf_counter()
-    parsed = (parser or _parse_model_json)(str(raw or ""))
+    try:
+        parsed = (parser or _parse_model_json)(str(raw or ""))
+    except Exception:
+        record_usage(False, body=body, error="response_parse_failed")
+        raise
     parse_ms = (time.perf_counter() - parse_started) * 1000
     if metrics is not None:
         metrics["response_parsing_ms"] = round(parse_ms, 2)
@@ -1427,6 +1478,7 @@ def call_study_model(
             request_id,
             parse_ms,
         )
+    record_usage(True, body=body)
     return parsed
 
 
@@ -1447,6 +1499,7 @@ def analyze_board(
         user_text="\n".join(lines),
         images={"selected": master_image},
         parser=_parse_board_context,
+        model_role="fast",
     )
     return result
 
@@ -1486,6 +1539,7 @@ def analyze_lecture(
         # Lecture analysis returns summary/key_topics JSON, not explanation
         # JSON with an "answer" field. Preserve the raw JSON for its parser.
         parser=lambda raw: {"answer": raw},
+        model_role="fast",
     )
     value = _load_json_object(result.get("answer") or "")
     if not value:

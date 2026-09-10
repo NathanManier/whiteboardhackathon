@@ -204,6 +204,23 @@ def compact_board_context(value: Any) -> dict[str, Any] | None:
     return public_board_context(stored) if stored else None
 
 
+def board_ai_source_revision(board_dir: Path, metadata: dict[str, Any]) -> str:
+    assets = metadata.get("assets") if isinstance(metadata.get("assets"), dict) else {}
+    names = [assets.get("svg"), assets.get("master")]
+    evidence = []
+    for name in names:
+        if not isinstance(name, str) or Path(name).name != name:
+            continue
+        try:
+            stat = (board_dir / name).stat()
+            evidence.append((name, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            evidence.append((name, 0, 0))
+    return hashlib.sha256(
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def ensure_board_ai_context(
     *,
     board_id: str,
@@ -219,7 +236,9 @@ def ensure_board_ai_context(
     with _context_lock(board_id):
         state = read_study_state(board_dir)
         existing = stored_board_context(state.get("board_ai_context"))
-        if existing and not force:
+        source_revision = board_ai_source_revision(board_dir, metadata)
+        existing_revision = existing.get("source_board_revision") if existing else None
+        if existing and not force and (not existing_revision or existing_revision == source_revision):
             _update_explicit_unit_metadata(board_dir, metadata, existing, update_metadata)
             return existing
         path = master_path(board_dir, metadata)
@@ -233,7 +252,13 @@ def ensure_board_ai_context(
             folder_name=folder_name,
             master_image=image,
         )
-        context = stored_board_context({**result, "analyzed_at": time.time()})
+        context = stored_board_context({
+            **result,
+            "schema_version": 1,
+            "source_board_revision": source_revision,
+            "analysis_version": "board-context-v1",
+            "analyzed_at": time.time(),
+        })
         if context is None:
             return existing
         state["board_ai_context"] = context

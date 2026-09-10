@@ -37,6 +37,11 @@ def stored_board_context(value: Any) -> dict[str, Any] | None:
     ):
         return None
     return {
+        "schema_version": int(value.get("schema_version") or value.get("schemaVersion") or 1),
+        "source_board_revision": str(
+            value.get("source_board_revision") or value.get("sourceBoardRevision") or ""
+        ) or None,
+        "analysis_version": str(value.get("analysis_version") or value.get("analysisVersion") or "board-context-v1"),
         "analyzed_at": public["analyzedAt"],
         "subject": public["subject"],
         "summary": public["summary"],
@@ -45,6 +50,9 @@ def stored_board_context(value: Any) -> dict[str, Any] | None:
         "important_observations": public["importantObservations"],
         "explicit_unit_text": public["explicitUnitText"],
         "unit_confidence": public["unitConfidence"],
+        "recognized_text": public["recognizedText"],
+        "concepts": public["concepts"],
+        "equations": public["equations"],
     }
 
 
@@ -58,6 +66,9 @@ def public_board_context(value: Any) -> dict[str, Any] | None:
     if not isinstance(observations, list):
         observations = []
     return {
+        "schemaVersion": int(value.get("schema_version") or value.get("schemaVersion") or 1),
+        "sourceBoardRevision": value.get("source_board_revision") or value.get("sourceBoardRevision"),
+        "analysisVersion": str(value.get("analysis_version") or value.get("analysisVersion") or "board-context-v1"),
         "analyzedAt": value.get("analyzed_at") or value.get("analyzedAt"),
         "subject": str(value.get("subject") or "")[:200],
         "summary": str(value.get("summary") or "")[:4_000],
@@ -71,6 +82,17 @@ def public_board_context(value: Any) -> dict[str, Any] | None:
         "unitConfidence": _bounded_confidence(
             value.get("unit_confidence", value.get("unitConfidence"))
         ),
+        "recognizedText": str(value.get("recognized_text") or value.get("recognizedText") or "")[:8_000],
+        "concepts": [
+            str(item)[:160]
+            for item in (value.get("concepts") if isinstance(value.get("concepts"), list) else topics)[:40]
+            if item
+        ],
+        "equations": [
+            str(item)[:400]
+            for item in (value.get("equations") if isinstance(value.get("equations"), list) else [])[:40]
+            if item
+        ],
     }
 
 

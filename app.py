@@ -40,6 +40,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from vboard_auth import AppleCredential, AppleTokenVerifier, AuthDatabase, AuthUser
 from vboard_auth.apple import AppleVerificationError
+from study.routing import AIRequestContext, routed_request
 
 try:
     import fcntl
@@ -252,6 +253,49 @@ def owned_library(value: dict[str, Any]) -> dict[str, Any]:
             if board_id in board_ids
         },
     }
+
+
+def ai_context(
+    *,
+    action: str,
+    question: str,
+    request_id: str | None = None,
+    board_id: str | None = None,
+    folder_id: str | None = None,
+    selected_ids: Any = None,
+    selected_board_count: int = 1,
+    has_selected_visual: bool = False,
+    conversation_depth: int = 0,
+) -> AIRequestContext:
+    selected_count = len(selected_ids) if isinstance(selected_ids, list) else 0
+    return AIRequestContext(
+        user_id=current_user().id,
+        lecture_id=folder_id,
+        active_board_id=board_id,
+        action=action,
+        question=question,
+        request_id=request_id,
+        selected_object_count=selected_count,
+        selected_board_count=max(1, selected_board_count),
+        has_selected_visual=has_selected_visual or selected_count > 0,
+        conversation_depth=max(0, conversation_depth),
+    )
+
+
+@contextmanager
+def routed_study(context: AIRequestContext):
+    with routed_request(context) as route:
+        LOGGER.info(
+            "AI ROUTE request=%s user=%s action=%s scope=%s difficulty=%s boards=%d objects=%d",
+            context.request_id or "none",
+            context.user_id,
+            context.action,
+            route.scope.value,
+            route.difficulty.value,
+            context.selected_board_count,
+            context.selected_object_count,
+        )
+        yield route
 
 
 def board_directory(board_id: str, *, create: bool = False) -> Path:
@@ -3373,13 +3417,21 @@ def analyze_lecture_route(folder_id: str) -> Response | tuple[Response, int]:
     if isinstance(payload, dict):
         force = bool(payload.get("force"))
     try:
-        context = ensure_lecture_ai_context(
+        route_context = ai_context(
+            action="lecture_analysis",
+            question="Analyze this lecture",
+            request_id=(str(payload.get("requestId") or "") or None) if isinstance(payload, dict) else None,
             folder_id=folder_id,
-            library=library,
-            atomic_json=atomic_json,
-            write_library=write_library,
-            force=force,
+            selected_board_count=len(folder_board_ids(library, folder_id)),
         )
+        with routed_study(route_context):
+            context = ensure_lecture_ai_context(
+                folder_id=folder_id,
+                library=library,
+                atomic_json=atomic_json,
+                write_library=write_library,
+                force=force,
+            )
     except StudyAIError as exc:
         if exc.status == 503:
             return jsonify(status="unavailable", context=None)
@@ -3401,12 +3453,19 @@ def generate_study_guide_route(folder_id: str) -> Response | tuple[Response, int
     if folder is None:
         abort(404)
     try:
-        guide = generate_lecture_study_guide(
+        route_context = ai_context(
+            action="study_guide",
+            question="Create a study guide for this lecture",
             folder_id=folder_id,
-            library=library,
-            atomic_json=atomic_json,
-            write_library=write_library,
+            selected_board_count=len(folder_board_ids(library, folder_id)),
         )
+        with routed_study(route_context):
+            guide = generate_lecture_study_guide(
+                folder_id=folder_id,
+                library=library,
+                atomic_json=atomic_json,
+                write_library=write_library,
+            )
     except StudyAIError as exc:
         return jsonify(error=str(exc)), exc.status
     return jsonify(study_guide=public_study_guide(guide), study_guide_stale=False)
@@ -3586,21 +3645,31 @@ def analyze_board_context_route(board_id: str) -> Response | tuple[Response, int
     library = read_library()
     catalog = library["boards"].get(board_id)
     folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
+    payload = request.get_json(silent=True)
+    payload = payload if isinstance(payload, dict) else {}
     try:
-        context = ensure_board_ai_context(
+        route_context = ai_context(
+            action="board_analysis",
+            question="Analyze this board",
+            request_id=str(payload.get("requestId") or "") or None,
             board_id=board_id,
-            board_dir=board_dir,
-            metadata=metadata,
-            board_title=str(
-                (catalog.get("name") if isinstance(catalog, dict) else None)
-                or metadata.get("name")
-                or "Untitled board"
-            ),
-            folder_name=folder_name_for(library, folder_id if isinstance(folder_id, str) else None),
             folder_id=folder_id if isinstance(folder_id, str) else None,
-            atomic_json=atomic_json,
-            update_metadata=update_metadata,
         )
+        with routed_study(route_context):
+            context = ensure_board_ai_context(
+                board_id=board_id,
+                board_dir=board_dir,
+                metadata=metadata,
+                board_title=str(
+                    (catalog.get("name") if isinstance(catalog, dict) else None)
+                    or metadata.get("name")
+                    or "Untitled board"
+                ),
+                folder_name=folder_name_for(library, folder_id if isinstance(folder_id, str) else None),
+                folder_id=folder_id if isinstance(folder_id, str) else None,
+                atomic_json=atomic_json,
+                update_metadata=update_metadata,
+            )
     except StudyAIError as exc:
         if exc.status == 503:
             return jsonify(status="unavailable", context=None)
@@ -3625,13 +3694,34 @@ def explain_lecture_selection_route(folder_id: str) -> Response | tuple[Response
     if folder_by_id(library, folder_id) is None:
         abort(404)
     try:
-        interaction = explain_lecture_selection(
+        requested_boards = payload.get("boards") if isinstance(payload.get("boards"), list) else []
+        selected_ids = [
+            object_id
+            for board_payload in requested_boards
+            if isinstance(board_payload, dict)
+            for object_id in (
+                board_payload.get("selected_ids")
+                or board_payload.get("selectedObjectIds")
+                or []
+            )
+        ]
+        route_context = ai_context(
+            action="explain_across_boards",
+            question=str(payload.get("question") or "Explain across these boards"),
+            request_id=str(payload.get("requestId") or "") or None,
             folder_id=folder_id,
-            library=library,
-            payload=payload,
-            combined_svg=combined_svg,
-            atomic_json=atomic_json,
+            selected_ids=selected_ids,
+            selected_board_count=len(requested_boards),
+            has_selected_visual=True,
         )
+        with routed_study(route_context):
+            interaction = explain_lecture_selection(
+                folder_id=folder_id,
+                library=library,
+                payload=payload,
+                combined_svg=combined_svg,
+                atomic_json=atomic_json,
+            )
     except StudyAIError as exc:
         return jsonify(error=str(exc)), exc.status
     return jsonify(
@@ -3658,23 +3748,37 @@ def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
     catalog = library["boards"].get(board_id)
     folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
     try:
-        interaction = explain_board(
+        selected_ids = payload.get("selectedObjectIds") or payload.get("selected_object_ids") or []
+        action = str(payload.get("action") or payload.get("kind") or "explain")
+        route_context = ai_context(
+            action=action,
+            question=str(payload.get("question") or action.replace("_", " ")),
+            request_id=str(payload.get("requestId") or payload.get("studyInteractionId") or "") or None,
             board_id=board_id,
-            board_dir=board_dir,
-            metadata=metadata,
-            editor=read_editor_state(board_dir, metadata),
-            payload=payload,
-            board_title=str(
-                (catalog.get("name") if isinstance(catalog, dict) else None)
-                or metadata.get("name")
-                or "Untitled board"
-            ),
-            folder_name=folder_name_for(library, folder_id if isinstance(folder_id, str) else None),
             folder_id=folder_id if isinstance(folder_id, str) else None,
-            library=library,
-            combined_svg=combined_svg,
-            atomic_json=atomic_json,
+            selected_ids=selected_ids,
+            has_selected_visual=bool(
+                selected_ids or payload.get("selectionBBox") or payload.get("selection_bbox")
+            ),
         )
+        with routed_study(route_context):
+            interaction = explain_board(
+                board_id=board_id,
+                board_dir=board_dir,
+                metadata=metadata,
+                editor=read_editor_state(board_dir, metadata),
+                payload=payload,
+                board_title=str(
+                    (catalog.get("name") if isinstance(catalog, dict) else None)
+                    or metadata.get("name")
+                    or "Untitled board"
+                ),
+                folder_name=folder_name_for(library, folder_id if isinstance(folder_id, str) else None),
+                folder_id=folder_id if isinstance(folder_id, str) else None,
+                library=library,
+                combined_svg=combined_svg,
+                atomic_json=atomic_json,
+            )
     except StudyAIError as exc:
         return jsonify(error=str(exc)), exc.status
     return jsonify(
@@ -3720,20 +3824,30 @@ def follow_up_route(board_id: str, interaction_id: str) -> Response | tuple[Resp
                 (time.perf_counter() - context_started) * 1000,
                 2,
             )
-        interaction = follow_up_board(
+        route_context = ai_context(
+            action=action or "followup",
+            question=str(payload.get("question") or action or "Follow up"),
+            request_id=request_id,
             board_id=board_id,
-            board_dir=board_dir,
-            metadata=metadata,
-            editor=editor,
-            interaction_id=interaction_id,
-            payload=payload,
             folder_id=folder_id if isinstance(folder_id, str) else None,
-            library=library,
-            combined_svg=combined_svg,
-            atomic_json=atomic_json,
-            timings=timings if practice else None,
-            request_started=route_started,
+            conversation_depth=1,
+            has_selected_visual=True,
         )
+        with routed_study(route_context):
+            interaction = follow_up_board(
+                board_id=board_id,
+                board_dir=board_dir,
+                metadata=metadata,
+                editor=editor,
+                interaction_id=interaction_id,
+                payload=payload,
+                folder_id=folder_id if isinstance(folder_id, str) else None,
+                library=library,
+                combined_svg=combined_svg,
+                atomic_json=atomic_json,
+                timings=timings if practice else None,
+                request_started=route_started,
+            )
     except StudyAIError as exc:
         if practice and exc.status >= 500:
             LOGGER.exception(
