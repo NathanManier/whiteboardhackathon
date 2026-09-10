@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, create_engine, delete, event, select
+from sqlalchemy import Double, Float, ForeignKey, Index, Integer, String, Text, create_engine, delete, event, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -57,11 +57,14 @@ class SessionRecord(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     access_token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     refresh_token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-    access_expires_at: Mapped[float] = mapped_column(Float, nullable=False)
-    refresh_expires_at: Mapped[float] = mapped_column(Float, nullable=False)
-    created_at: Mapped[float] = mapped_column(Float, nullable=False)
-    last_used_at: Mapped[float] = mapped_column(Float, nullable=False)
-    revoked_at: Mapped[float | None] = mapped_column(Float)
+    # Access tokens are intentionally short-lived. MySQL FLOAT is only
+    # single-precision and can round present-day Unix timestamps by thousands
+    # of seconds, which made newly issued 15-minute tokens immediately expire.
+    access_expires_at: Mapped[float] = mapped_column(Double, nullable=False)
+    refresh_expires_at: Mapped[float] = mapped_column(Double, nullable=False)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
+    last_used_at: Mapped[float] = mapped_column(Double, nullable=False)
+    revoked_at: Mapped[float | None] = mapped_column(Double)
     device_label: Mapped[str | None] = mapped_column(String(160))
 
     __table_args__ = (
@@ -189,12 +192,36 @@ class AuthDatabase:
         except (TypeError, ValueError) as exc:
             raise AuthConfigurationError("APPLE_TOKEN_ENCRYPTION_KEY is invalid.") from exc
         Base.metadata.create_all(self.engine)
+        self._ensure_session_timestamp_precision()
 
     @staticmethod
     def _enable_sqlite_foreign_keys(connection, _record) -> None:
         cursor = connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
+
+    def _ensure_session_timestamp_precision(self) -> None:
+        """Upgrade existing MySQL session timestamps without touching tokens."""
+        if self.engine.dialect.name not in {"mysql", "mariadb"}:
+            return
+        timestamp_columns = {
+            "access_expires_at": False,
+            "refresh_expires_at": False,
+            "created_at": False,
+            "last_used_at": False,
+            "revoked_at": True,
+        }
+        columns = {column["name"]: column for column in inspect(self.engine).get_columns("sessions")}
+        changes = []
+        for name, nullable in timestamp_columns.items():
+            column = columns.get(name)
+            if column is None or str(column["type"]).upper().startswith("DOUBLE"):
+                continue
+            nullability = "NULL" if nullable else "NOT NULL"
+            changes.append(f"MODIFY COLUMN {name} DOUBLE {nullability}")
+        if changes:
+            with self.engine.begin() as connection:
+                connection.exec_driver_sql("ALTER TABLE sessions " + ", ".join(changes))
 
     @classmethod
     def local(cls, base_dir: Path) -> "AuthDatabase":

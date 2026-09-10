@@ -12,10 +12,11 @@ import jwt
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.asymmetric import rsa
 from pypdf import PdfWriter
+from sqlalchemy.dialects import mysql
 
 import app as board_app
 from vboard_auth.apple import APPLE_ISSUER, AppleCredential, AppleIdentity, AppleTokenVerifier, AppleVerificationError
-from vboard_auth.models import AuthDatabase
+from vboard_auth.models import AuthDatabase, SessionRecord
 
 
 class _SigningKey:
@@ -212,6 +213,13 @@ class AccountAndOwnershipTests(unittest.TestCase):
             board_app.AUTH_DB.authenticate_access_token(rotated.access_token).id,
             user.id,
         )
+
+    def test_session_expiry_columns_use_mysql_double_precision(self):
+        for column_name in (
+            "access_expires_at", "refresh_expires_at", "created_at", "last_used_at", "revoked_at"
+        ):
+            column = SessionRecord.__table__.columns[column_name]
+            self.assertEqual(column.type.compile(dialect=mysql.dialect()), "DOUBLE")
 
     def test_auth_rejection_logs_safe_specific_reason_without_token(self):
         cases = [
