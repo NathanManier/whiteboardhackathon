@@ -100,7 +100,8 @@ final class BoardDocumentStore: ObservableObject {
         scheduleSave(api: api)
     }
 
-    func applyPracticeProblems(_ problems: [PracticeProblem], interactionID: String? = nil, api: APIClient) {
+    func applyPracticeProblems(_ problems: [PracticeProblem], interactionID: String? = nil,
+                               unitLabel: String? = nil, api: APIClient) {
         let existing = Set(editor.objects.filter { $0.role == "ai_practice_problem" }.map(\.id))
         let fresh = problems.filter { !existing.contains($0.id) }.prefix(2)
         guard !fresh.isEmpty else { return }
@@ -115,8 +116,27 @@ final class BoardDocumentStore: ObservableObject {
                                              x: originX + Double(offset) * editor.viewport.width * 0.40,
                                              y: originY, height: editor.viewport.height * 0.28,
                                              fontSize: 28, role: "ai_practice_problem",
-                                             sourceStudyInteractionID: interactionID))
+                                             sourceStudyInteractionID: interactionID,
+                                             createdAt: Date().timeIntervalSince1970,
+                                             unitLabel: unitLabel,
+                                             origin: "ai_practice"))
         }
+        apply(next, api: api)
+    }
+
+    func addNote(markdown: String, at point: CGPoint, unitLabel: String?, api: APIClient) {
+        let source = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else { return }
+        var next = editor
+        next.objects.append(CanvasObject(
+            id: "note-" + UUID().uuidString.lowercased(), type: "text",
+            color: "#183153", width: 520, opacity: 1,
+            points: nil, translation: nil, sourceMarkdown: source, text: source,
+            x: point.x, y: point.y, height: 260, fontSize: 28,
+            role: nil, sourceStudyInteractionID: nil,
+            createdAt: Date().timeIntervalSince1970,
+            unitLabel: unitLabel, origin: "study"
+        ))
         apply(next, api: api)
     }
 

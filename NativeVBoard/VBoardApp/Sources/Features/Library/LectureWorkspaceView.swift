@@ -11,6 +11,7 @@ struct LectureWorkspaceView: View {
     @State private var showNavigator = false
     @State private var showGuide = false
     @State private var showStudy = false
+    @State private var showNote = false
     @State private var showDelete = false
 
     init(folder: LectureFolder, focusBoardID: String? = nil) {
@@ -48,6 +49,8 @@ struct LectureWorkspaceView: View {
                 Menu {
                     Button { showImporter = true } label: { Label("Add Whiteboard", systemImage: "photo.badge.plus") }
                     Button { showGuide = true } label: { Label("Study Guide", systemImage: "text.book.closed") }
+                    Button { showNote = true } label: { Label("Add Note", systemImage: "note.text.badge.plus") }
+                        .disabled(store.activeBoardStore == nil)
                     Button(role: .destructive) { showDelete = true } label: { Label("Delete Lecture", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
@@ -63,6 +66,12 @@ struct LectureWorkspaceView: View {
         }
         .sheet(isPresented: $showGuide) {
             StudyGuideView(folderID: folder.id, guide: store.lecture?.studyGuide)
+        }
+        .sheet(isPresented: $showNote) {
+            LectureNoteSheet(unitLabel: activeUnitLabel) { markdown in
+                store.addNote(markdown, api: api)
+                showNote = false
+            }
         }
         .sheet(isPresented: $showStudy) {
             if selectedBoardIDs.count > 1 {
@@ -170,9 +179,49 @@ struct LectureWorkspaceView: View {
             .mapValues { keys in Array(Set(keys.map(\.objectID))).sorted() }
     }
 
+    private var activeUnitLabel: String {
+        store.workspace?.items.first(where: { $0.boardID == store.activeBoardID })?.unitLabel ?? "No Unit"
+    }
+
     private var studyObjectIDs: [String] {
         guard let boardID = studyBoardID else { return [] }
         return store.selectedKeys.filter { $0.boardID == boardID }.map(\.objectID)
+    }
+}
+
+private struct LectureNoteSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let unitLabel: String
+    let onAdd: (String) -> Void
+    @State private var markdown = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("This note will stay with the active whiteboard and inherit \(unitLabel).")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                TextEditor(text: $markdown)
+                    .font(.body)
+                    .padding(8)
+                    .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(alignment: .topLeading) {
+                        if markdown.isEmpty {
+                            Text("Write a study note…")
+                                .foregroundStyle(.tertiary).padding(.horizontal, 14).padding(.vertical, 16)
+                                .allowsHitTesting(false)
+                        }
+                    }
+            }
+            .padding(20)
+            .navigationTitle("New Note")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Add to Canvas") { onAdd(markdown) }
+                        .disabled(markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
     }
 }
 

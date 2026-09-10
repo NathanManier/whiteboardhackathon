@@ -230,6 +230,32 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertIsNone(normalize_explicit_unit_text("Chapter 2"))
         self.assertIsNone(normalize_explicit_unit_text("Find the unit vector"))
 
+    def test_board_owned_note_preserves_date_unit_and_source_markdown(self):
+        board_id = "9" * 32
+        self._ready_board(board_id, "Notes")
+        response = self.client.put(
+            f"/api/boards/{board_id}/editor",
+            json={
+                "schema_version": 4, "revision": 0,
+                "viewport": {"x": 0, "y": 0, "width": 800, "height": 600},
+                "objects": [{
+                    "id": "note-native-1", "type": "text", "color": "#183153",
+                    "text": "Keep $x^2$ exactly.", "source_markdown": "Keep $x^2$ exactly.",
+                    "x": 900, "y": -40, "width": 520, "height": 260, "font_size": 28,
+                    "translation": {"x": 0, "y": 0}, "board_id": board_id,
+                    "created_at": 1789000000, "unit_label": "Unit 3", "origin": "study",
+                }],
+                "groups": [], "imported_transforms": {}, "source_boards": [],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        note = response.get_json()["editor"]["objects"][0]
+        self.assertEqual(note["source_markdown"], "Keep $x^2$ exactly.")
+        self.assertEqual(note["created_at"], 1789000000)
+        self.assertEqual(note["unit_label"], "Unit 3")
+        self.assertEqual(note["origin"], "study")
+        self.assertEqual(note["board_id"], board_id)
+
     def test_configured_lecture_limit_supports_a_hundred_boards(self):
         self.assertGreaterEqual(MAX_SOURCE_BOARDS, 100)
 

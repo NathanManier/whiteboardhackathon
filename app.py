@@ -1213,6 +1213,9 @@ def attach_object_source_fields(clean: dict[str, Any], item: dict[str, Any]) -> 
     folder_id = item.get("folder_id") or item.get("folderId")
     if isinstance(folder_id, str) and FOLDER_ID_RE.fullmatch(folder_id):
         clean["folder_id"] = folder_id
+    unit_label = item.get("unit_label") or item.get("unitLabel")
+    if isinstance(unit_label, str) and unit_label.strip():
+        clean["unit_label"] = unit_label.strip()[:40]
 
 
 def clean_merged_board_ids(value: Any) -> list[str]:

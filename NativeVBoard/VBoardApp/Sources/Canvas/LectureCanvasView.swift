@@ -998,6 +998,8 @@ private final class LectureBoardRenderView: UIView {
                 textLayer.string = text
                 textLayer.fontSize = object.fontSize ?? 28
                 textLayer.foregroundColor = UIColor(svgHex: object.color ?? "#183153").cgColor
+                textLayer.isWrapped = true
+                textLayer.alignmentMode = .left
                 textLayer.contentsScale = window?.screen.scale ?? UIScreen.main.scale
                 textLayer.frame = objectBounds(object)
                 layer = textLayer

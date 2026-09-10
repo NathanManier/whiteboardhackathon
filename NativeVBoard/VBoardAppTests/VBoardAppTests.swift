@@ -266,6 +266,21 @@ final class ServerContractDecodingTests: XCTestCase {
         XCTAssertEqual(response.problems?.map(\.id), ["p1", "p2"])
     }
 
+    func testLectureNoteMetadataRoundTripsWithCanonicalMarkdown() throws {
+        let note = CanvasObject(
+            id: "note-1", type: "text", color: "#183153", width: 520, opacity: 1,
+            points: nil, translation: nil,
+            sourceMarkdown: "Keep $x^2$ exactly.", text: "Keep $x^2$ exactly.",
+            x: 900, y: -40, height: 260, fontSize: 28,
+            createdAt: 1_789_000_000, unitLabel: "Unit 3", origin: "study"
+        )
+        let decoded = try JSONDecoder().decode(CanvasObject.self, from: JSONEncoder().encode(note))
+        XCTAssertEqual(decoded.sourceMarkdown, "Keep $x^2$ exactly.")
+        XCTAssertEqual(decoded.createdAt, 1_789_000_000)
+        XCTAssertEqual(decoded.unitLabel, "Unit 3")
+        XCTAssertEqual(decoded.origin, "study")
+    }
+
     func testEditorEnvelopeAndOmittedCollectionsUseServerDefaults() throws {
         let json = """
         {"editor":{"schema_version":4,"revision":7,"viewport":{"x":-20,"y":-10,"width":800,"height":600},"objects":[],"imported_transforms":null,"source_boards":null,"merged_board_ids":null}}

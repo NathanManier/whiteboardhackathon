@@ -301,23 +301,31 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
     let fontSize: Double?
     let role: String?
     let sourceStudyInteractionID: String?
+    let createdAt: Double?
+    let unitLabel: String?
+    let origin: String?
 
     enum CodingKeys: String, CodingKey {
         case id, type, color, width, opacity, points, translation
         case sourceMarkdown = "source_markdown", text, x, y, height
         case fontSize = "font_size", role
         case sourceStudyInteractionID = "source_study_interaction_id"
+        case createdAt = "created_at"
+        case unitLabel = "unit_label"
+        case origin
     }
 
     init(id: String, type: String, color: String?, width: Double?, opacity: Double?,
          points: [WorldPoint]?, translation: WorldPoint?, sourceMarkdown: String?,
          text: String?, x: Double?, y: Double?, height: Double?, fontSize: Double?,
-         role: String? = nil, sourceStudyInteractionID: String? = nil) {
+         role: String? = nil, sourceStudyInteractionID: String? = nil,
+         createdAt: Double? = nil, unitLabel: String? = nil, origin: String? = nil) {
         self.id = id; self.type = type; self.color = color; self.width = width
         self.opacity = opacity; self.points = points; self.translation = translation
         self.sourceMarkdown = sourceMarkdown; self.text = text; self.x = x; self.y = y
         self.height = height; self.fontSize = fontSize; self.role = role
         self.sourceStudyInteractionID = sourceStudyInteractionID
+        self.createdAt = createdAt; self.unitLabel = unitLabel; self.origin = origin
     }
 
     func translated(by delta: CGPoint) -> CanvasObject {
@@ -326,7 +334,8 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                            opacity: opacity, points: points, translation: WorldPoint(x: existing.x + delta.x, y: existing.y + delta.y, pressure: nil),
                            sourceMarkdown: sourceMarkdown, text: text, x: x, y: y,
                            height: height, fontSize: fontSize, role: role,
-                           sourceStudyInteractionID: sourceStudyInteractionID)
+                           sourceStudyInteractionID: sourceStudyInteractionID,
+                           createdAt: createdAt, unitLabel: unitLabel, origin: origin)
     }
 }
 

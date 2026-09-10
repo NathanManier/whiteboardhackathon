@@ -272,9 +272,22 @@ final class LectureWorkspaceStore: ObservableObject {
                                boardID: String, api: APIClient) {
         guard let store = boardStores[boardID] else { return }
         let before = store.editor.objects.count
-        store.applyPracticeProblems(problems, interactionID: interactionID, api: api)
+        let unitLabel = workspace?.items.first(where: { $0.boardID == boardID })?.unitLabel
+        store.applyPracticeProblems(problems, interactionID: interactionID,
+                                    unitLabel: unitLabel, api: api)
         guard store.editor.objects.count != before else { return }
         recordBoardUndo([boardID])
+        refreshSceneSnapshot(boardID, api: api)
+    }
+
+    func addNote(_ markdown: String, api: APIClient) {
+        guard let boardID = activeBoardID,
+              let store = boardStores[boardID],
+              let item = workspace?.items.first(where: { $0.boardID == boardID }) else { return }
+        recordBoardUndo([boardID])
+        store.addNote(markdown: markdown,
+                      at: CGPoint(x: item.boardWidth + 72, y: 72),
+                      unitLabel: item.unitLabel, api: api)
         refreshSceneSnapshot(boardID, api: api)
     }
 
