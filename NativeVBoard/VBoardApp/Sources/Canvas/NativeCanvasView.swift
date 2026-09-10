@@ -232,7 +232,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         worldContainer.bounds = CGRect(origin: .zero, size: bounds.size)
         worldContainer.layer.position = .zero
         professor.frame = worldContainer.bounds
-        pdfSource.frame = document.viewBox
+        pdfSource.bounds = CGRect(origin: .zero, size: document.viewBox.size)
+        pdfSource.layer.position = document.viewBox.origin
         userLayer.bounds = worldContainer.bounds
         userLayer.position = .zero
         paperLayer.bounds = worldContainer.bounds

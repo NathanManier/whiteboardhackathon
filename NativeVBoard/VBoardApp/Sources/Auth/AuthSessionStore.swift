@@ -141,7 +141,8 @@ final class AuthSessionStore: ObservableObject {
     let api: APIClient
     private let keychain: AuthKeychain
 
-    init(api: APIClient = .shared, keychain: AuthKeychain = AuthKeychain()) {
+    init(api: APIClient? = nil, keychain: AuthKeychain = AuthKeychain()) {
+        let api = api ?? APIClient.shared
         self.api = api
         self.keychain = keychain
         api.onCredentialsChanged = { [weak self] credentials in

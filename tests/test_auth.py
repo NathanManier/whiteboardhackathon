@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import tempfile
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
+from pypdf import PdfWriter
 
 import app as board_app
 from vboard_auth.apple import APPLE_ISSUER, AppleCredential, AppleIdentity, AppleTokenVerifier, AppleVerificationError
@@ -218,6 +220,39 @@ class AccountAndOwnershipTests(unittest.TestCase):
             f"/api/folders/{folder_b}/workspace",
         ]:
             self.assertEqual(self.client.get(path, headers=headers_a).status_code, 404, path)
+
+    def test_lecture_names_and_pdf_import_targets_are_tenant_scoped(self):
+        account_a = self.login("apple-a")
+        account_b = self.login("apple-b")
+        headers_a = self.headers(account_a["session"])
+        headers_b = self.headers(account_b["session"])
+
+        lecture_a = self.client.post(
+            "/api/folders", json={"name": "Calculus"}, headers=headers_a
+        )
+        lecture_b = self.client.post(
+            "/api/folders", json={"name": "Calculus"}, headers=headers_b
+        )
+        self.assertEqual(lecture_a.status_code, 201, lecture_a.get_data(as_text=True))
+        self.assertEqual(lecture_b.status_code, 201, lecture_b.get_data(as_text=True))
+        lecture_a_id = lecture_a.get_json()["folder"]["id"]
+
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        output = io.BytesIO()
+        writer.write(output)
+        response = self.client.post(
+            "/api/import/pdf",
+            data={
+                "pdf": (io.BytesIO(output.getvalue()), "Private Notes.pdf", "application/pdf"),
+                "source_kind": "freeform_pdf",
+                "folder_id": lecture_a_id,
+            },
+            content_type="multipart/form-data",
+            headers={**headers_b, "Accept": "application/json"},
+        )
+        self.assertEqual(response.status_code, 404, response.get_data(as_text=True))
+        self.assertEqual(board_app.read_library()["boards"], {})
 
     def test_account_deletion_revokes_session_and_removes_owned_assets(self):
         account = self.login("disposable")

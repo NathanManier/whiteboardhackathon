@@ -16,6 +16,11 @@ final class PDFPageRenderView: UIView {
         isOpaque = true
         backgroundColor = .white
         isUserInteractionEnabled = false
+        // Imported professor transforms use the board's top-left world origin.
+        // Keep the PDF backing layer on that same origin so scaling does not
+        // drift around UIView's default center anchor point.
+        layer.anchorPoint = .zero
+        layer.position = .zero
         if let tiled = layer as? CATiledLayer {
             tiled.tileSize = CGSize(width: 768, height: 768)
             tiled.levelsOfDetail = 4
@@ -71,12 +76,12 @@ enum PDFBoardSource {
     static func apply(transform: ObjectTransform?, to view: UIView) {
         guard let transform, transform.deleted != true else {
             view.isHidden = transform?.deleted == true
-            view.transform = .identity
+            view.layer.setAffineTransform(.identity)
             return
         }
         view.isHidden = false
-        view.transform = CGAffineTransform.identity
+        view.layer.setAffineTransform(CGAffineTransform.identity
             .translatedBy(x: CGFloat(transform.x), y: CGFloat(transform.y))
-            .scaledBy(x: CGFloat(transform.scaleX ?? 1), y: CGFloat(transform.scaleY ?? 1))
+            .scaledBy(x: CGFloat(transform.scaleX ?? 1), y: CGFloat(transform.scaleY ?? 1)))
     }
 }

@@ -952,7 +952,8 @@ private final class LectureBoardRenderView: UIView {
         paperLayer.frame = bounds
         paperLayer.path = UIBezierPath(rect: bounds).cgPath
         thumbnail.frame = bounds
-        pdfSource.frame = bounds
+        pdfSource.bounds = CGRect(origin: .zero, size: bounds.size)
+        pdfSource.layer.position = .zero
         professor.frame = bounds
         userLayer.bounds = bounds
         userLayer.position = .zero

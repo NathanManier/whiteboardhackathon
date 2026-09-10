@@ -2839,6 +2839,7 @@ def upload() -> Response | tuple[str, int]:
     if requested_folder is not None:
         require_lecture_owner(requested_folder)
     if workspace_board_id:
+        require_board_owner(workspace_board_id)
         workspace_entry = library["boards"].get(workspace_board_id)
         if not isinstance(workspace_entry, dict):
             return upload_failure("The lecture workspace could not be found.", 404)
@@ -2849,6 +2850,7 @@ def upload() -> Response | tuple[str, int]:
             return upload_failure("The lecture workspace does not match the selected lecture.", 400)
         if not requested_folder:
             requested_folder = workspace_folder
+            require_lecture_owner(requested_folder)
         board_directory(workspace_board_id)
     requested_name = (request.form.get("name") or "").strip()
     try:
@@ -2857,13 +2859,13 @@ def upload() -> Response | tuple[str, int]:
         elif requested_folder:
             next_order = len(folder_board_ids(library, requested_folder)) + 1
             board_name = unique_board_name(
-                library,
+                owned_library(library),
                 f"Whiteboard {next_order}",
                 requested_folder,
             )
         else:
             board_name = unique_board_name(
-                library,
+                owned_library(library),
                 default_board_title(folder_name_for(library, requested_folder)),
                 requested_folder,
             )
@@ -3045,7 +3047,7 @@ def import_pdf() -> Response | tuple[Response, int]:
         for page in pages:
             board_id = secrets.token_hex(16)
             page_label = base_name if len(pages) == 1 else f"{base_name} — Page {page.index + 1}"
-            board_name = unique_board_name(library, page_label, requested_folder)
+            board_name = unique_board_name(owned_library(library), page_label, requested_folder)
             board_dir = board_directory(board_id, create=True)
             created_board_ids.append(board_id)
             atomic_bytes(board_dir / "source.pdf", page.page_pdf)
@@ -3438,9 +3440,10 @@ def create_folder() -> Response | tuple[Response, int]:
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     library = read_library()
+    visible_library = owned_library(library)
     if any(
         isinstance(folder, dict) and str(folder.get("name", "")).casefold() == name.casefold()
-        for folder in library["folders"]
+        for folder in visible_library["folders"]
     ):
         return jsonify(error="A folder with that name already exists."), 409
     folder = normalize_folder({
@@ -3477,11 +3480,12 @@ def rename_folder(folder_id: str) -> Response | tuple[Response, int]:
     )
     if target is None:
         abort(404)
+    visible_library = owned_library(library)
     if any(
         isinstance(folder, dict)
         and folder.get("id") != folder_id
         and str(folder.get("name", "")).casefold() == name.casefold()
-        for folder in library["folders"]
+        for folder in visible_library["folders"]
     ):
         return jsonify(error="A folder with that name already exists."), 409
     target["name"] = name
@@ -3727,12 +3731,12 @@ def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int
         name = default_board_title()
     existing = {
         str(folder.get("name", "")).casefold()
-        for folder in library["folders"]
+        for folder in owned_library(library)["folders"]
         if isinstance(folder, dict)
     }
     if name.casefold() in existing:
         try:
-            name = validate_display_name(unique_folder_name(library, name))
+            name = validate_display_name(unique_folder_name(owned_library(library), name))
         except ValueError:
             name = f"Lecture {secrets.token_hex(2)}"
     folder = normalize_folder({

@@ -28,6 +28,7 @@ final class APIClient: ObservableObject {
     private let baseURL: URL
     private let diagnostics: ((String) -> Void)?
     private var credentials: AuthCredentials?
+    private var refreshTask: Task<AuthCredentials?, Error>?
     @Published private(set) var authorizationHeader: String?
     var onCredentialsChanged: ((AuthCredentials?) -> Void)?
 
@@ -366,6 +367,17 @@ final class APIClient: ObservableObject {
     }
 
     private func refreshSession() async throws -> AuthCredentials? {
+        if let refreshTask { return try await refreshTask.value }
+        let task: Task<AuthCredentials?, Error> = Task { @MainActor [weak self] in
+            guard let self else { return nil }
+            return try await self.performRefreshSession()
+        }
+        refreshTask = task
+        defer { refreshTask = nil }
+        return try await task.value
+    }
+
+    private func performRefreshSession() async throws -> AuthCredentials? {
         guard let current = credentials,
               current.refreshExpiresAt > Date().timeIntervalSince1970 else {
             install(credentials: nil)
