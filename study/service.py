@@ -239,6 +239,8 @@ def ensure_board_ai_context(
         source_revision = board_ai_source_revision(board_dir, metadata)
         existing_revision = existing.get("source_board_revision") if existing else None
         if existing and not force and (not existing_revision or existing_revision == source_revision):
+            from study.routing import mark_ai_cache_hit
+            mark_ai_cache_hit(sidecar=True)
             _update_explicit_unit_metadata(board_dir, metadata, existing, update_metadata)
             return existing
         path = master_path(board_dir, metadata)
@@ -1188,6 +1190,9 @@ def follow_up_board(
     key = visual_cache_key(board_dir, metadata, editor)
     views = cached_interaction_views(board_dir, interaction, key) if practice else None
     cache_hit = views is not None
+    if cache_hit:
+        from study.routing import mark_ai_cache_hit
+        mark_ai_cache_hit(visual=True)
     if timings is not None:
         timings["context_gathering_ms"] = round((time.perf_counter() - context_started) * 1000, 2)
         timings["visual_cache_hit"] = "true" if cache_hit else "false"

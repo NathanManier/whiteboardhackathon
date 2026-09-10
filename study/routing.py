@@ -287,11 +287,13 @@ class AIModelPolicy:
         }[route.difficulty]
 
 
-@dataclass(frozen=True)
+@dataclass
 class ActiveAIRequest:
     context: AIRequestContext
     route: AIRoute
     started_at: float
+    cache_hit: bool = False
+    sidecar_hit: bool = False
 
 
 _ACTIVE: contextvars.ContextVar[ActiveAIRequest | None] = contextvars.ContextVar(
@@ -303,6 +305,14 @@ def current_ai_request() -> ActiveAIRequest | None:
     return _ACTIVE.get()
 
 
+def mark_ai_cache_hit(*, visual: bool = False, sidecar: bool = False) -> None:
+    active = current_ai_request()
+    if active is None:
+        return
+    active.cache_hit = active.cache_hit or visual
+    active.sidecar_hit = active.sidecar_hit or sidecar
+
+
 @contextmanager
 def override_active_route(route: AIRoute) -> Iterator[AIRoute]:
     """Temporarily preserve request identity while making one bounded retry."""
@@ -310,7 +320,13 @@ def override_active_route(route: AIRoute) -> Iterator[AIRoute]:
     if active is None:
         yield route
         return
-    token = _ACTIVE.set(ActiveAIRequest(active.context, route, active.started_at))
+    token = _ACTIVE.set(ActiveAIRequest(
+        active.context,
+        route,
+        active.started_at,
+        cache_hit=active.cache_hit,
+        sidecar_hit=active.sidecar_hit,
+    ))
     try:
         yield route
     finally:

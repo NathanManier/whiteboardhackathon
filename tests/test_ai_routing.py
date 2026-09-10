@@ -13,6 +13,9 @@ from study.routing import (
     ReasoningDifficulty,
     _bounded_classifier_route,
     classify_request,
+    current_ai_request,
+    mark_ai_cache_hit,
+    routed_request,
 )
 from study.telemetry import AIUsageEstimator, AIUsageRecorder
 
@@ -103,6 +106,15 @@ class AIRouterTests(unittest.TestCase):
         })
         self.assertEqual(cost, 2.425)
         self.assertIsNone(AIUsageEstimator({}).estimate_usd("model", {}))
+
+    def test_active_request_accumulates_real_cache_and_sidecar_hits(self):
+        with routed_request(context("Explain this", has_selected_visual=True)):
+            mark_ai_cache_hit(visual=True)
+            mark_ai_cache_hit(sidecar=True)
+            active = current_ai_request()
+            self.assertIsNotNone(active)
+            self.assertTrue(active.cache_hit)
+            self.assertTrue(active.sidecar_hit)
 
     def test_ambiguous_classifier_cannot_downgrade_rules_minimums(self):
         request = context("Can you help with this?", selected_board_count=2, has_selected_visual=True)

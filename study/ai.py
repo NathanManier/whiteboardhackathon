@@ -1398,6 +1398,8 @@ def call_study_model(
             error_category=error,
             image_dimensions=image_dimensions,
             retrieval_latency_ms=float(retrieval_latency),
+            cache_hit=active_request.cache_hit,
+            sidecar_hit=active_request.sidecar_hit,
         )
 
     api_key = gemini_api_key()
