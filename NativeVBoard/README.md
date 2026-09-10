@@ -4,6 +4,20 @@ This is the native iPadOS client for the existing V-Board Flask service. The
 server remains the source of truth for board processing, professor SVG
 geometry, editor persistence, and study APIs.
 
+The app now launches through native Sign in with Apple, restores its V-Board
+session from Keychain, and exposes Sign Out and Delete Account in account
+settings. Board, lecture, workspace, study, SVG, and asset routes require both
+authentication and resource ownership. Production provisioning and controlled
+legacy ownership migration are documented in `PRODUCTION_SETUP.md`.
+
+PDFs exported from Freeform or selected in Files are imported as source-
+preserving PDF-backed boards. Multi-page PDFs create ordered, isolated board
+containers in the selected lecture. PDFKit renders the locked source at high
+detail while ordinary V-Board strokes, selections, transforms, erasures, and
+AI region requests remain canonical editor operations. A native Share
+Extension transfers one selected image or PDF through the shared App Group and
+the main app completes the authenticated import.
+
 ## Shared lecture workspace
 
 A lecture opens as one persistent infinite canvas containing independently

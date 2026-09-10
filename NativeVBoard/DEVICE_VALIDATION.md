@@ -19,6 +19,11 @@
 | Cross-board lasso | Board spatial query plus board-local 65% containment | Verified with hosted professor content | Re-test |
 | Text/practice resize | Bottom-right handle mutates board-owned text object | XCTest and manual move/resize/reopen pass | Re-test |
 | Local math/chemistry | Bundled KaTeX, mhchem, markdown-it, DOMPurify | XCTest/JavaScript pass and manual rich Study/Explain rendering pass | Re-test |
+| Sign in with Apple | Native authorization UI, nonce, server verification, Keychain session | Mock verifier and server contract tests pass; real Apple authorization requires configured signing | Required |
+| Account isolation/deletion | SQL ownership, authenticated assets, session revocation, destructive account flow | Flask integration tests pass with two users | Re-test with production account |
+| Files PDF import | Source-preserving multipage import and PDFKit board source | Backend and native contract tests pass; end-to-end signed App Group flow pending | Re-test |
+| Freeform Share Extension | One-image/PDF handoff through App Group | Builds for simulator; system share handoff requires signed group entitlement validation | Required |
+| PDF-region study | Board-local lasso crop over stable PDF source ID | Native request and server rendering tests pass | Re-test with configured AI provider |
 
 Before TestFlight, run the Pencil and camera rows on a physical iPad and
 record the OS/device combination. Basic import, upload, corner confirmation,
@@ -106,9 +111,13 @@ measurements, not physical-device energy or frame-rate claims.
 ## Release validation
 
 The unsigned device archive and Release simulator build both succeeded with
-Xcode 16.2. The archived app uses only `https://chsinteract.com`, contains no
-localhost App Transport Security exception, supports all four iPad interface
-orientations, contains the compiled AppIcon assets, and targets iPadOS 17 or
-newer. A Release launch on the iPad Pro 13-inch (M4), iOS 18.2 simulator loaded
-the production library without the DEBUG input/performance HUD. Signing and
-App Store Connect upload remain intentionally outside this validation.
+Xcode 16.2. The compiled Release app uses only `https://chsinteract.com`,
+contains no localhost App Transport Security exception, excludes the native
+DEBUG identity path, supports all four iPad interface orientations, contains
+the compiled AppIcon assets, and targets iPadOS 17 or newer. The server also
+returns 404 for its debug-auth route unless both Flask debug mode and the
+explicit debug bypass setting are active. A production account launch cannot
+be called validated until this server revision, Apple configuration, database,
+and legacy ownership migration are deployed. Signing, App Group entitlement
+verification, real Apple authorization, and App Store Connect upload remain
+outside this local validation.

@@ -26,7 +26,7 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-Open `http://127.0.0.1:5000`. Set `FLASK_DEBUG=1` before starting for Flask debug mode. Uploads default to a 16 MB limit; set `MAX_UPLOAD_BYTES` to change it.
+Open `http://127.0.0.1:5000`. Set `FLASK_DEBUG=1` before starting for Flask debug mode. Uploads default to a 16 MB limit; set `MAX_UPLOAD_BYTES` to change it. Product APIs now require a V-Board bearer session created from a server-verified Sign in with Apple credential. A DEBUG identity is available only when both Flask debug mode and `AUTH_DEBUG_BYPASS=1` are explicitly enabled.
 
 ### Study assistant
 
@@ -96,9 +96,14 @@ Existing 32-character board directories are discovered even when they are absent
 
 SVG export composes imported professor vectors and student strokes with their transforms. It does not embed the Enhanced Master raster or study notes.
 
-## MVP limitations
+## Current boundaries
 
 - Folders are one level deep.
 - Study explanations do not rewrite board geometry.
-- There is no authentication, cloud sync, or collaboration.
+- Accounts use Sign in with Apple; collaboration and live multi-user editing are not implemented.
+- The legacy browser UI still needs its own Sign in with Apple presentation. Protected APIs intentionally do not fall back to anonymous access.
 - Autosave is local-server persistence after completed interactions, not every Pencil point.
+
+See `NativeVBoard/PRODUCTION_SETUP.md` for Apple Developer configuration,
+hosted database/deployment steps, controlled legacy ownership migration, and
+share-extension validation.
