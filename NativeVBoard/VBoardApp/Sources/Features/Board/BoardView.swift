@@ -118,7 +118,7 @@ private struct BoardEditorSurface: View {
     @AppStorage("vboard.study.panelWidth") private var studyPanelWidth = 360.0
     @AppStorage("vboard.study.panelCollapsed") private var studyPanelCollapsed = false
     @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
-    @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.subtleGrid.rawValue
+    @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.dots.rawValue
     @AppStorage("vboard.pen.color") private var penColor = CanvasStrokeStyle.pen.colorHex
     @AppStorage("vboard.pen.width") private var penWidth = CanvasStrokeStyle.pen.width
     @AppStorage("vboard.marker.color") private var markerColor = CanvasStrokeStyle.marker.colorHex
@@ -186,7 +186,7 @@ private struct BoardEditorSurface: View {
             // Keep one UIKit input surface alive for the board. Tool changes
             // update that surface in place so recognizers, responder focus,
             // and the live camera cannot be reset by SwiftUI identity churn.
-            NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), showsPaper: pdfData != nil || physicalBoardShowsPaper, backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .subtleGrid, penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1), markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
+            NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), showsPaper: pdfData != nil || physicalBoardShowsPaper, backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots, penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1), markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
                 .ignoresSafeArea(edges: .bottom)
             WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
                                  penColor: $penColor, penWidth: $penWidth,
@@ -266,6 +266,19 @@ private struct BoardEditorSurface: View {
 }
 
 struct StudyActionsView: View {
+    private enum LoadingStage {
+        case preparingSelection
+        case requestingExplanation
+        case requestingPractice
+
+        var label: String {
+            switch self {
+            case .preparingSelection: return "Reading selection…"
+            case .requestingExplanation: return "Analyzing this board…"
+            case .requestingPractice: return "Creating practice problems…"
+            }
+        }
+    }
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
     let selection: BoardStudySelection
@@ -275,6 +288,7 @@ struct StudyActionsView: View {
     let onPracticeProblems: ([PracticeProblem], String?) -> Void
     @StateObject private var submissionGate = StudySubmissionGate()
     @State private var loading = false
+    @State private var loadingStage: LoadingStage = .preparingSelection
     @State private var result: StudyInteractionResponse?
     @State private var error: String?
     @State private var followUpQuestion = ""
@@ -306,7 +320,14 @@ struct StudyActionsView: View {
     private var studyBody: some View {
         VStack(spacing: compact ? 12 : 18) {
                 if loading {
-                    ProgressView("Reading the selected board…")
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text(loadingStage.label)
+                            .font(.subheadline.weight(.medium))
+                        Text("Your selection stays visible while V-Board works.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 } else if let result {
                     Text(result.interaction?.title ?? (result.problems == nil ? "Board explanation" : "Practice Problems"))
                         .font(.title2.bold())
@@ -372,6 +393,7 @@ struct StudyActionsView: View {
             return
         }
         loading = true
+        loadingStage = .preparingSelection
         error = nil
         Task {
             defer {
@@ -379,12 +401,21 @@ struct StudyActionsView: View {
                 loading = false
             }
             do {
+                #if DEBUG
+                let preparationStarted = Date().timeIntervalSinceReferenceDate
+                #endif
                 await prepareSelection()
+                #if DEBUG
+                print("[VBoard] AI TIMELINE request=\(request.requestId) stage=selectionPrepared milliseconds=\((Date().timeIntervalSinceReferenceDate - preparationStarted) * 1_000)")
+                #endif
+                loadingStage = .requestingExplanation
                 let initial = try await api.explain(request: request)
                 if let followUpAction {
                     guard let interactionID = initial.interaction?.id else {
                         throw APIError.decoding("The explanation did not include an interaction ID.")
                     }
+                    loadingStage = followUpAction == "practice_problems"
+                        ? .requestingPractice : .requestingExplanation
                     let response = try await api.followUp(
                         boardID: selection.boardID,
                         interactionID: interactionID,
@@ -403,7 +434,9 @@ struct StudyActionsView: View {
     private func followUp(action: String = "followup") {
         guard let interactionID = result?.interaction?.id else { return }
         let question = followUpQuestion
-        loading = true; error = nil
+        loading = true
+        loadingStage = action == "practice_problems" ? .requestingPractice : .requestingExplanation
+        error = nil
         Task {
             do {
                 let response = try await api.followUp(boardID: selection.boardID,

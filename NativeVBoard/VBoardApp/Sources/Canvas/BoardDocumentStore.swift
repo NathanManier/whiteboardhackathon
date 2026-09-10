@@ -200,6 +200,55 @@ final class BoardDocumentStore: ObservableObject {
         apply(next, api: api)
     }
 
+    /// Commits one non-cumulative resize transaction for every selected item
+    /// in this isolated board document. Professor paths retain their source
+    /// SVG and editor objects retain their source points/path/markdown.
+    func scaleObjects(editorObjectIDs: Set<String>,
+                      professorPathIDs: Set<String>,
+                      around anchor: CGPoint,
+                      by factor: CGFloat,
+                      api: APIClient) {
+        guard !editorObjectIDs.isEmpty || !professorPathIDs.isEmpty,
+              factor.isFinite, factor > 0, abs(factor - 1) > 0.001 else { return }
+
+        // Clamp once for the complete selection. Clamping every object after
+        // applying the requested factor would distort a mixed selection when
+        // one item is already near the supported transform limits.
+        var existingScales: [Double] = []
+        existingScales.reserveCapacity(editorObjectIDs.count * 2 + professorPathIDs.count * 2)
+        for object in editor.objects where editorObjectIDs.contains(object.id) && object.type != "text" {
+            existingScales.append(object.scaleX ?? 1)
+            existingScales.append(object.scaleY ?? 1)
+        }
+        for id in professorPathIDs {
+            let transform = editor.importedTransforms[id]
+            existingScales.append(transform?.scaleX ?? 1)
+            existingScales.append(transform?.scaleY ?? 1)
+        }
+        let lowerBound = existingScales.map { 0.01 / max($0, 0.000_001) }.max() ?? 0.01
+        let upperBound = existingScales.map { 100 / max($0, 0.000_001) }.min() ?? 100
+        let boundedFactor = min(upperBound, max(lowerBound, Double(factor)))
+        guard abs(boundedFactor - 1) > 0.001 else { return }
+
+        var next = editor
+        for id in editorObjectIDs {
+            guard let index = next.objects.firstIndex(where: { $0.id == id }) else { continue }
+            next.objects[index] = next.objects[index].scaled(around: anchor, by: CGFloat(boundedFactor))
+        }
+        for id in professorPathIDs {
+            let existing = next.importedTransforms[id]
+                ?? ObjectTransform(x: 0, y: 0, scaleX: 1, scaleY: 1, deleted: false)
+            next.importedTransforms[id] = ObjectTransform(
+                x: Double(anchor.x) + boundedFactor * (existing.x - Double(anchor.x)),
+                y: Double(anchor.y) + boundedFactor * (existing.y - Double(anchor.y)),
+                scaleX: (existing.scaleX ?? 1) * boundedFactor,
+                scaleY: (existing.scaleY ?? 1) * boundedFactor,
+                deleted: existing.deleted
+            )
+        }
+        apply(next, api: api)
+    }
+
     func deleteObjects(ids: Set<String>, api: APIClient) {
         let editorIDs = Set(editor.objects.lazy.filter { ids.contains($0.id) }.map(\.id))
         deleteObjects(editorObjectIDs: editorIDs,

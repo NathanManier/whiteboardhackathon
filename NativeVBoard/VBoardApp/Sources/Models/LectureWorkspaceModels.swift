@@ -177,6 +177,32 @@ struct SelectionKey: Codable, Hashable, Sendable {
     let boardID: String
     let objectID: String
     let kind: WorkspaceSelectionKind
+    let objectType: String?
+
+    init(boardID: String, objectID: String, kind: WorkspaceSelectionKind,
+         objectType: String? = nil) {
+        self.boardID = boardID
+        self.objectID = objectID
+        self.kind = kind
+        self.objectType = objectType
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case boardID = "board_id"
+        case objectID = "object_id"
+        case kind
+        case objectType = "object_type"
+    }
+
+    static func == (lhs: SelectionKey, rhs: SelectionKey) -> Bool {
+        lhs.boardID == rhs.boardID && lhs.objectID == rhs.objectID && lhs.kind == rhs.kind
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(boardID)
+        hasher.combine(objectID)
+        hasher.combine(kind)
+    }
 }
 
 /// Defines deterministic layer ownership for point selection. Editor objects
@@ -199,13 +225,23 @@ enum BoardHitTestPolicy {
                           width: max(object.width ?? 400, 0),
                           height: max(object.height ?? 100, 0))
         }
+        if object.type == "path", let definition = object.d,
+           let parsed = try? SVGPathParser.cachedPath(from: definition) {
+            var transform = CGAffineTransform.identity
+                .translatedBy(x: CGFloat(translation.x), y: CGFloat(translation.y))
+                .scaledBy(x: CGFloat(object.scaleX ?? 1), y: CGFloat(object.scaleY ?? 1))
+            return (parsed.copy(using: &transform) ?? parsed).boundingBoxOfPath
+        }
         guard let first = object.points?.first else { return .null }
+        let scaleX = object.scaleX ?? 1
+        let scaleY = object.scaleY ?? 1
         return (object.points ?? []).dropFirst().reduce(
-            CGRect(x: first.x + translation.x, y: first.y + translation.y,
+            CGRect(x: first.x * scaleX + translation.x,
+                   y: first.y * scaleY + translation.y,
                    width: 0, height: 0)
         ) { partial, point in
-            partial.union(CGRect(x: point.x + translation.x,
-                                 y: point.y + translation.y,
+            partial.union(CGRect(x: point.x * scaleX + translation.x,
+                                 y: point.y * scaleY + translation.y,
                                  width: 0, height: 0))
         }
     }

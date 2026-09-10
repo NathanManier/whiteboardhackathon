@@ -3,6 +3,169 @@ import XCTest
 import UIKit
 @testable import VBoardApp
 
+final class WorkspaceAppearanceTests: XCTestCase {
+    func testAdaptiveDotSpacingUsesStableCleanIntervalsNearTargetScreenDensity() {
+        for scale: CGFloat in [0.04, 0.1, 0.25, 0.75, 1, 2, 4] {
+            let world = WorkspaceDotFieldPolicy.worldSpacing(forScale: scale)
+            XCTAssertTrue(WorkspaceDotFieldPolicy.worldIntervals.contains(world))
+            let screen = world * scale
+            XCTAssertGreaterThanOrEqual(screen, 39)
+            XCTAssertLessThanOrEqual(screen, 125)
+        }
+    }
+
+    func testDotFieldFadesAndThenHidesAtExtremeCloseZoom() {
+        XCTAssertEqual(WorkspaceDotFieldPolicy.opacity(forScale: 1), 0.14, accuracy: 0.0001)
+        XCTAssertLessThan(WorkspaceDotFieldPolicy.opacity(forScale: 8), 0.14)
+        XCTAssertEqual(WorkspaceDotFieldPolicy.opacity(forScale: 12), 0)
+    }
+
+    func testShippingBackgroundChoicesExcludeGraphPaper() {
+        XCTAssertEqual(Set(WorkspaceBackgroundStyle.allCases), Set([.dots, .blank]))
+    }
+
+    func testPencilPressureCurveIsGentleMonotonicAndSmoothed() {
+        let low = PencilPressureResponse.curved(0.1)
+        let middle = PencilPressureResponse.curved(0.5)
+        let high = PencilPressureResponse.curved(0.9)
+        XCTAssertLessThan(low, middle)
+        XCTAssertLessThan(middle, high)
+        XCTAssertGreaterThan(PencilPressureResponse.widthMultiplier(for: 0), 0.6)
+        XCTAssertLessThan(PencilPressureResponse.widthMultiplier(for: 1), 1.25)
+        let smoothed = PencilPressureResponse.smoothed(previous: 0.2, sample: 1)
+        XCTAssertGreaterThan(smoothed, 0.2)
+        XCTAssertLessThan(smoothed, 1)
+    }
+
+    #if DEBUG
+    func testDebugAuthenticationIsNeverEligibleOnProduction() {
+        XCTAssertFalse(DebugAPIEnvironment.production.allowsTestUser)
+        XCTAssertTrue(DebugAPIEnvironment.localDevelopment.allowsTestUser)
+        XCTAssertTrue(DebugAPIEnvironment.staging.allowsTestUser)
+        XCTAssertEqual(DebugAPIEnvironment.production.baseURL.absoluteString,
+                       "https://chsinteract.com")
+    }
+    #endif
+}
+
+@MainActor
+final class SelectionResizeTests: XCTestCase {
+    func testEveryCornerUsesFixedOppositeAnchorAndUniformScale() {
+        let bounds = CGRect(x: -40, y: 20, width: 200, height: 100)
+        for handle in SelectionResizeHandle.allCases {
+            let start = handle.point(in: bounds)
+            let anchor = handle.oppositePoint(in: bounds)
+            let target = CGPoint(x: anchor.x + (start.x - anchor.x) * 1.5,
+                                 y: anchor.y + (start.y - anchor.y) * 1.5)
+            let session = SelectionResizeSession(keys: [], startBounds: bounds,
+                                                 handle: handle, startPointer: start)
+            let scale = SelectionResizeGeometry.scale(session: session, currentPointer: target)
+            let resized = SelectionResizeGeometry.bounds(session: session, scale: scale)
+            XCTAssertEqual(scale, 1.5, accuracy: 0.0001)
+            XCTAssertEqual(resized.width / resized.height,
+                           bounds.width / bounds.height, accuracy: 0.0001)
+            XCTAssertTrue(abs(resized.minX - anchor.x) < 0.001 || abs(resized.maxX - anchor.x) < 0.001)
+            XCTAssertTrue(abs(resized.minY - anchor.y) < 0.001 || abs(resized.maxY - anchor.y) < 0.001)
+        }
+    }
+
+    func testCanonicalStrokeScalePreservesPointsAndComposesTransform() throws {
+        let source = CanvasObject(
+            id: "stroke-1", type: "stroke", color: "#183153", width: 4, opacity: 1,
+            points: [WorldPoint(x: 10, y: 20, pressure: 0.5),
+                     WorldPoint(x: 30, y: 50, pressure: 1)],
+            translation: WorldPoint(x: 5, y: -10, pressure: nil),
+            sourceMarkdown: nil, text: nil, x: nil, y: nil, height: nil, fontSize: nil,
+            scaleX: 2, scaleY: 2
+        )
+        let resized = source.scaled(around: CGPoint(x: 100, y: -50), by: 1.5)
+        XCTAssertEqual(resized.points, source.points)
+        XCTAssertEqual(resized.scaleX, 3)
+        XCTAssertEqual(resized.scaleY, 3)
+        XCTAssertEqual(resized.translation?.x, -42.5)
+        XCTAssertEqual(resized.translation?.y, 10)
+
+        let encoded = try JSONEncoder().encode(resized)
+        let decoded = try JSONDecoder().decode(CanvasObject.self, from: encoded)
+        XCTAssertEqual(decoded, resized)
+    }
+
+    func testMixedSelectionScaleIsOneUndoableCanonicalMutation() {
+        let stroke = CanvasObject(
+            id: "stroke-1", type: "stroke", color: "#183153", width: 4, opacity: 1,
+            points: [WorldPoint(x: 10, y: 10, pressure: 1),
+                     WorldPoint(x: 30, y: 20, pressure: 1)],
+            translation: WorldPoint(x: 0, y: 0, pressure: nil),
+            sourceMarkdown: nil, text: nil, x: nil, y: nil, height: nil, fontSize: nil
+        )
+        let text = CanvasObject(
+            id: "note-1", type: "text", color: "#183153", width: 200, opacity: 1,
+            points: nil, translation: WorldPoint(x: 0, y: 0, pressure: nil),
+            sourceMarkdown: "# Exact source", text: "# Exact source",
+            x: 100, y: 50, height: 80, fontSize: 24
+        )
+        let editor = EditorState(schemaVersion: 4, revision: 3, updatedAt: nil,
+                                 viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+                                 objects: [stroke, text], groups: [], importedTransforms: [:],
+                                 sourceBoards: [], mergedBoardIDs: [])
+        let api = APIClient(baseURL: URL(string: "https://resize.invalid")!)
+        let store = BoardDocumentStore(boardID: "resize-\(UUID().uuidString)", editor: editor)
+        store.scaleObjects(editorObjectIDs: ["stroke-1", "note-1"],
+                           professorPathIDs: ["professor-1"],
+                           around: CGPoint(x: 0, y: 0), by: 2, api: api)
+
+        XCTAssertEqual(store.editor.objects.first(where: { $0.id == "stroke-1" })?.scaleX, 2)
+        let resizedText = store.editor.objects.first(where: { $0.id == "note-1" })
+        XCTAssertEqual(resizedText?.width, 400)
+        XCTAssertEqual(resizedText?.height, 160)
+        XCTAssertEqual(resizedText?.sourceMarkdown, "# Exact source")
+        XCTAssertEqual(store.editor.importedTransforms["professor-1"]?.scaleX, 2)
+        XCTAssertTrue(store.canUndo)
+
+        store.undo(api: api)
+        XCTAssertEqual(store.editor.objects, editor.objects)
+        XCTAssertEqual(store.editor.importedTransforms, editor.importedTransforms)
+        XCTAssertEqual(store.editor.revision, editor.revision)
+        XCTAssertFalse(store.canUndo)
+        XCTAssertTrue(store.canRedo)
+    }
+
+    func testMixedSelectionUsesOneBoundedFactorInsteadOfDistortingMembers() {
+        let stroke = CanvasObject(
+            id: "stroke-1", type: "stroke", color: "#183153", width: 4, opacity: 1,
+            points: [WorldPoint(x: 10, y: 10, pressure: 1)], translation: nil,
+            sourceMarkdown: nil, text: nil, x: nil, y: nil, height: nil, fontSize: nil
+        )
+        let note = CanvasObject(
+            id: "note-1", type: "text", color: "#183153", width: 200, opacity: 1,
+            points: nil, translation: nil, sourceMarkdown: "Keep source", text: "Keep source",
+            x: 20, y: 30, height: 80, fontSize: 24
+        )
+        let editor = EditorState(
+            schemaVersion: 4, revision: 1, updatedAt: nil,
+            viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+            objects: [stroke, note], groups: [],
+            importedTransforms: [
+                "professor-1": ObjectTransform(x: 40, y: 50, scaleX: 80, scaleY: 80, deleted: false)
+            ],
+            sourceBoards: [], mergedBoardIDs: []
+        )
+        let api = APIClient(baseURL: URL(string: "https://resize.invalid")!)
+        let store = BoardDocumentStore(boardID: "bounded-\(UUID().uuidString)", editor: editor)
+
+        store.scaleObjects(editorObjectIDs: ["stroke-1", "note-1"],
+                           professorPathIDs: ["professor-1"],
+                           around: CGPoint(x: 0, y: 0), by: 2, api: api)
+
+        XCTAssertEqual(store.editor.importedTransforms["professor-1"]?.scaleX, 100)
+        XCTAssertEqual(store.editor.objects.first(where: { $0.id == "stroke-1" })?.scaleX, 1.25)
+        XCTAssertEqual(store.editor.objects.first(where: { $0.id == "note-1" })?.width, 250)
+        XCTAssertEqual(store.editor.objects.first(where: { $0.id == "note-1" })?.height, 100)
+        XCTAssertEqual(store.editor.objects.first(where: { $0.id == "note-1" })?.sourceMarkdown,
+                       "Keep source")
+    }
+}
+
 @MainActor
 private final class WebViewNavigationWaiter: NSObject, WKNavigationDelegate {
     let finished: XCTestExpectation

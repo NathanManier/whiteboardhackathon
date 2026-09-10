@@ -22,7 +22,9 @@ struct LectureWorkspaceView: View {
     @State private var actionError: String?
     @State private var selectionScreenBounds: CGRect?
     @State private var studyInitialAction: String?
-    @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.subtleGrid.rawValue
+    @State private var previousPencilTool: CanvasTool = .pen
+    @State private var pencilQuickPalettePoint: CGPoint?
+    @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.dots.rawValue
     @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
     @AppStorage("vboard.study.panelWidth") private var studyPanelWidth = 360.0
     @AppStorage("vboard.study.panelCollapsed") private var studyPanelCollapsed = false
@@ -144,6 +146,11 @@ struct LectureWorkspaceView: View {
         .onChange(of: store.status) { _, status in
             if status == .conflict { showConflict = true }
         }
+        .onChange(of: activeTool) { oldValue, newValue in
+            if newValue != .objectEraser && oldValue != newValue {
+                previousPencilTool = newValue
+            }
+        }
         .task { await store.load(api: api, focusBoardID: initialFocusBoardID) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             store.persistForBackgrounding()
@@ -195,7 +202,7 @@ struct LectureWorkspaceView: View {
                     scenes: store.scenes,
                     selectedKeys: store.selectedKeys,
                     tool: activeTool,
-                    backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .subtleGrid,
+                    backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots,
                     physicalBoardShowsPaper: physicalBoardShowsPaper,
                     penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),
                     markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity),
@@ -215,11 +222,15 @@ struct LectureWorkspaceView: View {
                     },
                     onStroke: { stroke, boardID in store.applyStroke(stroke, boardID: boardID, api: api) },
                     onMoveSelection: { keys, delta in store.moveSelection(keys, by: delta, api: api) },
-                    onResizeTextObject: { key, size in store.resizeTextObject(key, to: size, api: api) },
+                    onResizeSelection: { keys, anchor, scale in
+                        store.resizeSelection(keys, around: anchor, by: scale, api: api)
+                    },
                     onDelete: { store.deleteSelection($0, api: api) },
                     onMoveBoard: { boardID, delta in store.moveBoard(boardID: boardID, by: delta, api: api) },
                     onUndo: { store.undo(api: api) },
-                    onRedo: { store.redo(api: api) }
+                    onRedo: { store.redo(api: api) },
+                    onPencilDoubleTap: { togglePencilEraser() },
+                    onPencilSqueeze: { point in showPencilQuickPalette(at: point) }
                 )
                 .ignoresSafeArea(edges: .bottom)
 
@@ -245,6 +256,16 @@ struct LectureWorkspaceView: View {
                     EmptyWorkspaceAction(addWhiteboard: { showImporter = true })
                 }
 
+                if let point = pencilQuickPalettePoint {
+                    PencilQuickPalette(activeTool: activeTool) { tool in
+                        activeTool = tool
+                        pencilQuickPalettePoint = nil
+                    }
+                    .position(x: min(max(point.x, 150), proxy.size.width - 150),
+                              y: min(max(point.y - 58, 42), proxy.size.height - 88))
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                }
+
                 Button("") { store.undo(api: api) }
                     .keyboardShortcut("z", modifiers: .command)
                     .frame(width: 0, height: 0).opacity(0.001)
@@ -252,6 +273,24 @@ struct LectureWorkspaceView: View {
                     .keyboardShortcut("z", modifiers: [.command, .shift])
                     .frame(width: 0, height: 0).opacity(0.001)
             }
+        }
+    }
+
+    private func togglePencilEraser() {
+        if activeTool == .objectEraser {
+            activeTool = previousPencilTool == .objectEraser ? .pen : previousPencilTool
+        } else {
+            previousPencilTool = activeTool
+            activeTool = .objectEraser
+        }
+    }
+
+    private func showPencilQuickPalette(at point: CGPoint) {
+        withAnimation(.easeOut(duration: 0.16)) { pencilQuickPalettePoint = point }
+        Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.16)) { pencilQuickPalettePoint = nil }
         }
     }
 
@@ -753,6 +792,41 @@ private struct WorkspaceToolButton: View {
         case .select: return "cursorarrow"
         case .lasso: return "lasso"
         case .objectEraser: return "eraser"
+        }
+    }
+}
+
+private struct PencilQuickPalette: View {
+    let activeTool: CanvasTool
+    let select: (CanvasTool) -> Void
+    private let tools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(tools, id: \.rawValue) { tool in
+                Button { select(tool) } label: {
+                    Image(systemName: icon(for: tool))
+                        .frame(width: 38, height: 34)
+                        .background(activeTool == tool ? Color.accentColor.opacity(0.18) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(tool.rawValue.capitalized)
+            }
+        }
+        .padding(7)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 12).stroke(.separator.opacity(0.45), lineWidth: 0.5) }
+        .shadow(color: .black.opacity(0.16), radius: 14, y: 5)
+    }
+
+    private func icon(for tool: CanvasTool) -> String {
+        switch tool {
+        case .pen: return "pencil.tip"
+        case .highlighter: return "highlighter"
+        case .objectEraser: return "eraser"
+        case .lasso: return "lasso"
+        default: return "cursorarrow"
         }
     }
 }

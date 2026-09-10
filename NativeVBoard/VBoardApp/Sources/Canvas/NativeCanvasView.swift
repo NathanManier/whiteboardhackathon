@@ -26,7 +26,7 @@ struct NativeCanvasView: UIViewRepresentable {
     let importedTransforms: [String: ObjectTransform]
     let composition: SceneComposition
     var showsPaper = true
-    var backgroundStyle = WorkspaceBackgroundStyle.subtleGrid
+    var backgroundStyle = WorkspaceBackgroundStyle.dots
     var penStyle = CanvasStrokeStyle.pen
     var markerStyle = CanvasStrokeStyle.marker
     var onStroke: (UserStroke) -> Void = { _ in }
@@ -77,6 +77,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var activeStrokeLayer: CAShapeLayer?
     private(set) var userStrokes: [UserStroke] = []
     private var activePoints: [StrokePoint] = []
+    private var predictedPoints: [StrokePoint] = []
+    private var lastPencilPressure: CGFloat?
     private var activeID: String?
     private var onStroke: (UserStroke) -> Void
     private var activeTool: CanvasTool
@@ -128,7 +130,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     init(boardID: String, document: SVGDocument, pdfData: Data? = nil, camera: CameraRect,
          objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:],
          composition: SceneComposition, showsPaper: Bool = true,
-         backgroundStyle: WorkspaceBackgroundStyle = .subtleGrid,
+         backgroundStyle: WorkspaceBackgroundStyle = .dots,
          penStyle: CanvasStrokeStyle = .pen, markerStyle: CanvasStrokeStyle = .marker,
          onStroke: @escaping (UserStroke) -> Void = { _ in },
          tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
@@ -166,11 +168,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
         paperLayer.anchorPoint = .zero
         paperLayer.position = .zero
-        paperLayer.fillColor = showsPaper
-            ? UIColor(red: 0.985, green: 0.982, blue: 0.965, alpha: 1).cgColor
-            : UIColor.clear.cgColor
-        paperLayer.strokeColor = UIColor.separator.withAlphaComponent(0.35).cgColor
-        paperLayer.lineWidth = 2
+        paperLayer.fillColor = boardSurfaceColor(showsPaper: showsPaper).cgColor
+        paperLayer.strokeColor = boardBoundaryColor().cgColor
+        paperLayer.lineWidth = 1.25
         paperLayer.name = "VBoardPaper"
         pdfSource.layer.name = "VBoardPDFSource"
         professor.layer.name = "VBoardProfessorSource"
@@ -298,7 +298,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     func update(boardID: String, document: SVGDocument, pdfData: Data? = nil, camera: CameraRect,
                 objects: [CanvasObject], importedTransforms: [String: ObjectTransform],
                 composition: SceneComposition, showsPaper: Bool = true,
-                backgroundStyle: WorkspaceBackgroundStyle = .subtleGrid,
+                backgroundStyle: WorkspaceBackgroundStyle = .dots,
                 penStyle: CanvasStrokeStyle = .pen, markerStyle: CanvasStrokeStyle = .marker,
                 onStroke: @escaping (UserStroke) -> Void = { _ in },
                 tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
@@ -312,9 +312,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
         self.backgroundStyle = backgroundStyle
-        paperLayer.fillColor = showsPaper
-            ? UIColor(red: 0.985, green: 0.982, blue: 0.965, alpha: 1).cgColor
-            : UIColor.clear.cgColor
+        paperLayer.fillColor = boardSurfaceColor(showsPaper: showsPaper).cgColor
+        paperLayer.strokeColor = boardBoundaryColor().cgColor
         updateWorkspaceBackground()
         if boardChanged {
             persistedCamera = camera
@@ -405,40 +404,47 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         gridLayer.isHidden = backgroundStyle == .blank
         guard backgroundStyle != .blank else { gridLayer.path = nil; return }
         let transform = worldTransform
-        let candidates: [CGFloat] = [8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096]
-        let worldSpacing = candidates.first(where: { $0 * transform.scale >= 34 }) ?? 4_096
+        let worldSpacing = WorkspaceDotFieldPolicy.worldSpacing(forScale: transform.scale)
         let spacing = max(worldSpacing * transform.scale, 1)
         let origin = transform.screenPoint(for: .zero)
         let firstX = origin.x.truncatingRemainder(dividingBy: spacing)
         let firstY = origin.y.truncatingRemainder(dividingBy: spacing)
         let path = UIBezierPath()
-        if backgroundStyle == .dots {
-            let radius: CGFloat = traitCollection.userInterfaceStyle == .dark ? 0.9 : 0.75
-            var x = firstX - spacing
-            while x <= bounds.maxX + spacing {
-                var y = firstY - spacing
-                while y <= bounds.maxY + spacing {
-                    path.append(UIBezierPath(ovalIn: CGRect(x: x - radius, y: y - radius,
-                                                            width: radius * 2, height: radius * 2)))
-                    y += spacing
-                }
-                x += spacing
-            }
-            gridLayer.fillColor = workspaceGridColor(alpha: 0.16).cgColor
-            gridLayer.strokeColor = UIColor.clear.cgColor
-        } else {
-            var x = firstX - spacing
-            while x <= bounds.maxX + spacing {
-                path.move(to: CGPoint(x: x, y: bounds.minY)); path.addLine(to: CGPoint(x: x, y: bounds.maxY)); x += spacing
-            }
+        let radius: CGFloat = traitCollection.userInterfaceStyle == .dark ? 0.8 : 0.7
+        var x = firstX - spacing
+        while x <= bounds.maxX + spacing {
             var y = firstY - spacing
             while y <= bounds.maxY + spacing {
-                path.move(to: CGPoint(x: bounds.minX, y: y)); path.addLine(to: CGPoint(x: bounds.maxX, y: y)); y += spacing
+                path.append(UIBezierPath(ovalIn: CGRect(x: x - radius, y: y - radius,
+                                                        width: radius * 2, height: radius * 2)))
+                y += spacing
             }
-            gridLayer.fillColor = UIColor.clear.cgColor
-            gridLayer.strokeColor = workspaceGridColor(alpha: 0.10).cgColor
+            x += spacing
         }
+        gridLayer.fillColor = workspaceGridColor(alpha: WorkspaceDotFieldPolicy.opacity(forScale: transform.scale)).cgColor
+        gridLayer.strokeColor = UIColor.clear.cgColor
         gridLayer.path = path.cgPath
+    }
+
+    private func boardSurfaceColor(showsPaper: Bool) -> UIColor {
+        UIColor { traits in
+            if traits.userInterfaceStyle == .dark {
+                return showsPaper
+                    ? UIColor(red: 0.105, green: 0.11, blue: 0.12, alpha: 1)
+                    : UIColor(red: 0.09, green: 0.095, blue: 0.105, alpha: 1)
+            }
+            return showsPaper
+                ? UIColor(red: 0.982, green: 0.982, blue: 0.975, alpha: 1)
+                : UIColor(red: 0.972, green: 0.974, blue: 0.973, alpha: 1)
+        }
+    }
+
+    private func boardBoundaryColor() -> UIColor {
+        UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor.white.withAlphaComponent(0.30)
+                : UIColor(red: 0.25, green: 0.29, blue: 0.32, alpha: 0.42)
+        }
     }
 
     private func workspaceGridColor(alpha: CGFloat) -> UIColor {
@@ -451,15 +457,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         guard bounds.width > 0, bounds.height > 0, cameraInitializedForBoardID != boardID else { return }
         var contentBounds = document.viewBox
         for object in objects {
-            if let x = object.x, let y = object.y {
-                contentBounds = contentBounds.union(CGRect(x: x, y: y, width: object.width ?? 400, height: object.height ?? 100))
-            } else if object.points?.isEmpty == false {
-                let points = object.points!.map { CGPoint(x: $0.x + (object.translation?.x ?? 0), y: $0.y + (object.translation?.y ?? 0)) }
-                if let firstPoint = points.first {
-                    let objectBounds = points.dropFirst().reduce(CGRect(x: firstPoint.x, y: firstPoint.y, width: 0, height: 0)) { $0.union(CGRect(x: $1.x, y: $1.y, width: 0, height: 0)) }
-                    contentBounds = contentBounds.union(objectBounds)
-                }
-            }
+            contentBounds = contentBounds.union(BoardHitTestPolicy.bounds(of: object))
         }
         let resolution = CameraResolver.resolve(persisted: persistedCamera, boardRect: document.viewBox, contentBounds: contentBounds, viewport: bounds.size)
         let cameraWasCorrected = resolution.camera != controller.camera
@@ -679,7 +677,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if interactionState == .panning { professor.endNavigation(worldTransform) }
         interactionState = .idle; panStart = .zero
         activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
-        activePoints.removeAll(); activeID = nil
+        activePoints.removeAll(); predictedPoints.removeAll(); lastPencilPressure = nil; activeID = nil
         lassoWorldPoints.removeAll(); updateInteractionPath(); updateInputHUD()
     }
 
@@ -719,6 +717,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if activeTool != .pen && activeTool != .highlighter { beginEditing(at: point, screen: screen); return }
         guard isDrawingTouch(touch) else { super.touchesBegan(touches, with: event); return }
         interactionState = .drawing; debugInputOperation("STROKE BEGIN"); updateInputHUD()
+        lastPencilPressure = nil
+        predictedPoints.removeAll(keepingCapacity: true)
         activeID = UUID().uuidString; activePoints = samples(for: touch, event: event)
         let layer = CAShapeLayer(); layer.fillColor = UIColor.clear.cgColor
         layer.strokeColor = strokeColor.cgColor; layer.lineWidth = strokeWidth
@@ -737,7 +737,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         if activeTool != .pen && activeTool != .highlighter { continueEditing(at: worldPoint(touch.location(in: self), from: self), screen: touch.location(in: self)); return }
         guard isDrawingTouch(touch) else { return }
-        activePoints.append(contentsOf: samples(for: touch, event: event)); updateActiveStroke(); debugInputOperation("STROKE APPEND")
+        activePoints.append(contentsOf: samples(for: touch, event: event))
+        predictedPoints = predictedSamples(for: touch, event: event)
+        updateActiveStroke(); debugInputOperation("STROKE APPEND")
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -765,7 +767,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             debugInputOperation("STROKE FINALIZE")
         }
         activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
-        activePoints.removeAll(); activeID = nil; interactionState = .idle; updateInputHUD()
+        activePoints.removeAll(); predictedPoints.removeAll(); lastPencilPressure = nil
+        activeID = nil; interactionState = .idle; updateInputHUD()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -775,7 +778,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if activeTool != .pen && activeTool != .highlighter { finishEditing(at: nil); return }
         if touches.contains(where: { isDrawingTouch($0) }) {
             activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
-            activePoints.removeAll(); activeID = nil
+            activePoints.removeAll(); predictedPoints.removeAll(); lastPencilPressure = nil; activeID = nil
         }
     }
 
@@ -854,7 +857,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             } else { polygon = lassoWorldPoints }
             let bounds = polygon.reduce(into: CGRect.null) { result, point in result = result.union(CGRect(x: point.x, y: point.y, width: 0, height: 0)) }
             let selected = Set(objects.filter { object in
-                let points = object.points?.map { CGPoint(x: $0.x + (object.translation?.x ?? 0), y: $0.y + (object.translation?.y ?? 0)) } ?? []
+                let points = selectionSamples(for: object)
                 guard !points.isEmpty, points.contains(where: { bounds.contains($0) }) else { return false }
                 let inside = points.filter { polygonContains($0, polygon: polygon) }.count
                 return Double(inside) / Double(points.count) >= 0.65
@@ -891,10 +894,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private func eraseSegment(from start: CGPoint, to end: CGPoint) {
         let segmentBounds = CGRect(x: min(start.x, end.x), y: min(start.y, end.y), width: abs(end.x - start.x), height: abs(end.y - start.y)).insetBy(dx: -14, dy: -14)
         var hit = Set(objects.compactMap { object -> String? in
-            let points = object.points?.map { CGPoint(x: $0.x + (object.translation?.x ?? 0), y: $0.y + (object.translation?.y ?? 0)) } ?? []
-            if let x = object.x, let y = object.y { return segmentBounds.intersects(CGRect(x: x, y: y, width: object.width ?? 400, height: object.height ?? 100)) ? object.id : nil }
-            guard let first = points.first else { return nil }
-            let objectBounds = points.dropFirst().reduce(CGRect(x: first.x, y: first.y, width: 0, height: 0)) { $0.union(CGRect(x: $1.x, y: $1.y, width: 0, height: 0)) }.insetBy(dx: -12, dy: -12)
+            let objectBounds = BoardHitTestPolicy.bounds(of: object).insetBy(dx: -12, dy: -12)
             return segmentBounds.intersects(objectBounds) ? object.id : nil
         })
         hit.formUnion(professor.ids(intersecting: segmentBounds))
@@ -908,10 +908,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     private func hitTestIDs(at point: CGPoint) -> Set<String> {
         var result = Set(objects.compactMap { object in
-            let points = object.points?.map { CGPoint(x: $0.x + (object.translation?.x ?? 0), y: $0.y + (object.translation?.y ?? 0)) } ?? []
-            if object.type == "text", let x = object.x, let y = object.y { return CGRect(x: x, y: y, width: object.width ?? 400, height: object.height ?? 100).contains(point) ? object.id : nil }
-            guard let first = points.first else { return nil }
-            let bounds = points.dropFirst().reduce(CGRect(x: first.x, y: first.y, width: 0, height: 0)) { $0.union(CGRect(x: $1.x, y: $1.y, width: 0, height: 0)) }.insetBy(dx: -12, dy: -12)
+            let bounds = BoardHitTestPolicy.bounds(of: object).insetBy(dx: -12, dy: -12)
             return bounds.contains(point) ? object.id : nil
         })
         if let professorID = professor.hitTest(point) { result.insert(professorID) }
@@ -928,9 +925,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         guard !selectedIDs.isEmpty else { interactionLayer.isHidden = lassoWorldPoints.isEmpty; return }
         var bounds = CGRect.null
         for object in objects where selectedIDs.contains(object.id) {
-            let points = object.points?.map { CGPoint(x: $0.x + (object.translation?.x ?? 0), y: $0.y + (object.translation?.y ?? 0)) } ?? []
-            if let first = points.first { bounds = bounds.union(points.dropFirst().reduce(CGRect(x: first.x, y: first.y, width: 0, height: 0)) { $0.union(CGRect(x: $1.x, y: $1.y, width: 0, height: 0)) }) }
-            if let x = object.x, let y = object.y { bounds = bounds.union(CGRect(x: x, y: y, width: object.width ?? 400, height: object.height ?? 100)) }
+            bounds = bounds.union(BoardHitTestPolicy.bounds(of: object))
         }
         for id in selectedIDs { bounds = bounds.union(professor.bounds(for: id)) }
         guard !bounds.isNull else { return }
@@ -951,27 +946,60 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         return inside
     }
 
+    private func selectionSamples(for object: CanvasObject) -> [CGPoint] {
+        if let points = object.points, !points.isEmpty {
+            let translation = object.translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
+            let scaleX = object.scaleX ?? 1
+            let scaleY = object.scaleY ?? 1
+            let stride = max(1, points.count / 40)
+            return points.enumerated().compactMap { index, point in
+                guard index % stride == 0 || index == points.count - 1 else { return nil }
+                return CGPoint(x: point.x * scaleX + translation.x,
+                               y: point.y * scaleY + translation.y)
+            }
+        }
+        let bounds = BoardHitTestPolicy.bounds(of: object)
+        guard !bounds.isNull else { return [] }
+        return [CGPoint(x: bounds.minX, y: bounds.minY), CGPoint(x: bounds.maxX, y: bounds.minY),
+                CGPoint(x: bounds.maxX, y: bounds.maxY), CGPoint(x: bounds.minX, y: bounds.maxY),
+                CGPoint(x: bounds.midX, y: bounds.midY)]
+    }
+
     private func samples(for touch: UITouch, event: UIEvent?) -> [StrokePoint] {
         let source = event?.coalescedTouches(for: touch) ?? [touch]
         return source.map { item in
-            let point = worldPoint(item.location(in: item.view ?? self), from: item.view ?? self)
-            #if targetEnvironment(simulator)
-            let pressure = item.type == .indirectPointer ? 1.0 : Double(item.force / max(item.maximumPossibleForce, 1))
-            #else
-            let pressure = Double(item.force / max(item.maximumPossibleForce, 1))
-            #endif
-            return StrokePoint(x: point.x, y: point.y, pressure: pressure)
+            sample(for: item, updatesPressure: true)
         }
+    }
+
+    private func predictedSamples(for touch: UITouch, event: UIEvent?) -> [StrokePoint] {
+        (event?.predictedTouches(for: touch) ?? []).map { sample(for: $0, updatesPressure: false) }
+    }
+
+    private func sample(for touch: UITouch, updatesPressure: Bool) -> StrokePoint {
+        let point = worldPoint(touch.location(in: touch.view ?? self), from: touch.view ?? self)
+        #if targetEnvironment(simulator)
+        let pressure: CGFloat = 1
+        #else
+        let normalized = touch.force / max(touch.maximumPossibleForce, 1)
+        let pressure = updatesPressure
+            ? PencilPressureResponse.smoothed(previous: lastPencilPressure, sample: normalized)
+            : PencilPressureResponse.curved(normalized)
+        if updatesPressure { lastPencilPressure = pressure }
+        #endif
+        return StrokePoint(x: point.x, y: point.y, pressure: Double(pressure))
     }
 
     private func updateActiveStroke() {
         guard let layer = activeStrokeLayer else { return }
         let path = UIBezierPath()
-        for (index, point) in activePoints.enumerated() {
+        for (index, point) in (activePoints + predictedPoints).enumerated() {
             let world = CGPoint(x: point.x, y: point.y)
             if index == 0 { path.move(to: world) } else { path.addLine(to: world) }
         }
-        layer.path = path.cgPath; layer.frame = bounds
+        layer.path = path.cgPath
+        layer.lineWidth = strokeWidth * PencilPressureResponse.widthMultiplier(for: lastPencilPressure ?? 1)
+        layer.frame = bounds
         if layer.superlayer == nil { userLayer.addSublayer(layer) }
     }
 
@@ -1001,15 +1029,31 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             )
             applyProvenance(object.id, to: layer); return layer
         }
-        let layer = CAShapeLayer(); let path = UIBezierPath()
+        let layer = CAShapeLayer()
+        if object.type == "path", let definition = object.d,
+           let parsed = try? SVGPathParser.cachedPath(from: definition) {
+            var transform = CGAffineTransform.identity
+                .translatedBy(x: CGFloat(object.translation?.x ?? 0),
+                              y: CGFloat(object.translation?.y ?? 0))
+                .scaledBy(x: CGFloat(object.scaleX ?? 1), y: CGFloat(object.scaleY ?? 1))
+            layer.path = parsed.copy(using: &transform)
+            layer.fillColor = UIColor(svgHex: object.fill ?? object.color ?? "#183153")
+                .withAlphaComponent(CGFloat(object.opacity ?? 1)).cgColor
+            layer.fillRule = .evenOdd
+            applyProvenance(object.id, to: layer)
+            return layer
+        }
+        let path = UIBezierPath()
         let tx = object.translation?.x ?? 0; let ty = object.translation?.y ?? 0
+        let scaleX = object.scaleX ?? 1; let scaleY = object.scaleY ?? 1
         for (index, point) in (object.points ?? []).enumerated() {
-            let world = CGPoint(x: point.x + tx, y: point.y + ty)
+            let world = CGPoint(x: point.x * scaleX + tx, y: point.y * scaleY + ty)
             if index == 0 { path.move(to: world) } else { path.addLine(to: world) }
         }
         layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor
         layer.strokeColor = UIColor(svgHex: object.color ?? "#183153").withAlphaComponent(CGFloat(object.opacity ?? 1)).cgColor
-        layer.lineWidth = object.width ?? 4; layer.lineCap = .round; layer.lineJoin = .round
+        layer.lineWidth = (object.width ?? 4) * sqrt(abs(scaleX * scaleY))
+        layer.lineCap = .round; layer.lineJoin = .round
         applyProvenance(object.id, to: layer); return layer
     }
 

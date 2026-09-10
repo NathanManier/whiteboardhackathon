@@ -348,6 +348,13 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
     let y: Double?
     let height: Double?
     let fontSize: Double?
+    /// Canonical non-destructive object scale used by the web editor and
+    /// server export pipeline for strokes and editable vector paths.
+    let scaleX: Double?
+    let scaleY: Double?
+    /// Editable vector objects keep their original source path verbatim.
+    let d: String?
+    let fill: String?
     let role: String?
     let sourceStudyInteractionID: String?
     let createdAt: Double?
@@ -357,7 +364,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, type, color, width, opacity, points, translation
         case sourceMarkdown = "source_markdown", text, x, y, height
-        case fontSize = "font_size", role
+        case fontSize = "font_size", scaleX, scaleY, d, fill, role
         case sourceStudyInteractionID = "source_study_interaction_id"
         case createdAt = "created_at"
         case unitLabel = "unit_label"
@@ -367,12 +374,14 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
     init(id: String, type: String, color: String?, width: Double?, opacity: Double?,
          points: [WorldPoint]?, translation: WorldPoint?, sourceMarkdown: String?,
          text: String?, x: Double?, y: Double?, height: Double?, fontSize: Double?,
+         scaleX: Double? = nil, scaleY: Double? = nil, d: String? = nil, fill: String? = nil,
          role: String? = nil, sourceStudyInteractionID: String? = nil,
          createdAt: Double? = nil, unitLabel: String? = nil, origin: String? = nil) {
         self.id = id; self.type = type; self.color = color; self.width = width
         self.opacity = opacity; self.points = points; self.translation = translation
         self.sourceMarkdown = sourceMarkdown; self.text = text; self.x = x; self.y = y
-        self.height = height; self.fontSize = fontSize; self.role = role
+        self.height = height; self.fontSize = fontSize; self.scaleX = scaleX; self.scaleY = scaleY
+        self.d = d; self.fill = fill; self.role = role
         self.sourceStudyInteractionID = sourceStudyInteractionID
         self.createdAt = createdAt; self.unitLabel = unitLabel; self.origin = origin
     }
@@ -382,7 +391,8 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         return CanvasObject(id: id, type: type, color: color, width: width,
                            opacity: opacity, points: points, translation: WorldPoint(x: existing.x + delta.x, y: existing.y + delta.y, pressure: nil),
                            sourceMarkdown: sourceMarkdown, text: text, x: x, y: y,
-                           height: height, fontSize: fontSize, role: role,
+                           height: height, fontSize: fontSize,
+                           scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
                            sourceStudyInteractionID: sourceStudyInteractionID,
                            createdAt: createdAt, unitLabel: unitLabel, origin: origin)
     }
@@ -392,9 +402,54 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                      width: Double(size.width), opacity: opacity,
                      points: points, translation: translation,
                      sourceMarkdown: sourceMarkdown, text: text, x: x, y: y,
-                     height: Double(size.height), fontSize: fontSize, role: role,
+                     height: Double(size.height), fontSize: fontSize,
+                     scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
                      sourceStudyInteractionID: sourceStudyInteractionID,
                      createdAt: createdAt, unitLabel: unitLabel, origin: origin)
+    }
+
+    /// Scales the displayed object uniformly around a board-local anchor.
+    /// Strokes and paths retain their source geometry and compose the new
+    /// scale with their canonical translation. Text remains editable and
+    /// reflows into a resized frame instead of becoming flattened artwork.
+    func scaled(around anchor: CGPoint, by factor: CGFloat) -> CanvasObject {
+        let safeFactor = Double(max(0.01, min(factor, 100)))
+        let existingTranslation = translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
+        let nextTranslation = WorldPoint(
+            x: Double(anchor.x) + safeFactor * (existingTranslation.x - Double(anchor.x)),
+            y: Double(anchor.y) + safeFactor * (existingTranslation.y - Double(anchor.y)),
+            pressure: nil
+        )
+
+        if type == "text", let x, let y {
+            let displayedX = x + existingTranslation.x
+            let displayedY = y + existingTranslation.y
+            let nextDisplayedX = Double(anchor.x) + safeFactor * (displayedX - Double(anchor.x))
+            let nextDisplayedY = Double(anchor.y) + safeFactor * (displayedY - Double(anchor.y))
+            return CanvasObject(
+                id: id, type: type, color: color,
+                width: max(4, (width ?? 400) * safeFactor), opacity: opacity,
+                points: points,
+                translation: WorldPoint(x: nextDisplayedX - x, y: nextDisplayedY - y, pressure: nil),
+                sourceMarkdown: sourceMarkdown, text: text, x: x, y: y,
+                height: max(4, (height ?? 100) * safeFactor), fontSize: fontSize,
+                scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
+                sourceStudyInteractionID: sourceStudyInteractionID,
+                createdAt: createdAt, unitLabel: unitLabel, origin: origin
+            )
+        }
+
+        return CanvasObject(
+            id: id, type: type, color: color, width: width, opacity: opacity,
+            points: points, translation: nextTranslation,
+            sourceMarkdown: sourceMarkdown, text: text, x: x, y: y,
+            height: height, fontSize: fontSize,
+            scaleX: (scaleX ?? 1) * safeFactor,
+            scaleY: (scaleY ?? 1) * safeFactor,
+            d: d, fill: fill, role: role,
+            sourceStudyInteractionID: sourceStudyInteractionID,
+            createdAt: createdAt, unitLabel: unitLabel, origin: origin
+        )
     }
 }
 

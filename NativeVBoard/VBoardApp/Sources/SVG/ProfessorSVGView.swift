@@ -12,6 +12,10 @@ final class ProfessorSVGView: UIView {
     private var importedTransforms: [String: ObjectTransform] = [:]
     private var composition: SceneComposition?
     private var isInteracting = false
+    private var currentTransform: WorldScreenTransform?
+    private var rebuildTask: Task<Void, Never>?
+    private var rebuildGeneration = UUID()
+    var onProgress: ((Double) -> Void)?
 
     #if DEBUG
     var onStats: ((RenderStats) -> Void)?
@@ -36,11 +40,15 @@ final class ProfessorSVGView: UIView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    deinit { rebuildTask?.cancel() }
+
     func display(_ document: SVGDocument, transform: WorldScreenTransform,
                  importedTransforms: [String: ObjectTransform] = [:],
                  composition: SceneComposition? = nil) {
         if self.document != document || self.importedTransforms != importedTransforms {
-            rebuild(document: document, importedTransforms: importedTransforms, composition: composition)
+            beginProgressiveRebuild(document: document,
+                                    importedTransforms: importedTransforms,
+                                    composition: composition)
         } else {
             self.composition = composition
         }
@@ -49,6 +57,7 @@ final class ProfessorSVGView: UIView {
 
     func updateCamera(_ transform: WorldScreenTransform, interacting: Bool) {
         isInteracting = interacting
+        currentTransform = transform
         // The world container applies `transform.affineTransform`. Keeping
         // this layer untransformed is critical: applying camera math here as
         // well would transform the professor layer twice and make input and
@@ -135,7 +144,29 @@ final class ProfessorSVGView: UIView {
         for id in ids { entries[id]?.layer.setAffineTransform(.identity) }
     }
 
-    private func rebuild(document: SVGDocument, importedTransforms: [String: ObjectTransform], composition: SceneComposition?) {
+    /// Applies a transient selection resize while preserving the immutable
+    /// professor path. The committed representation remains an imported
+    /// transform in editor.json.
+    func previewScale(ids: Set<String>, anchor: CGPoint, scale: CGFloat) {
+        let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale,
+                                          tx: anchor.x * (1 - scale),
+                                          ty: anchor.y * (1 - scale))
+        for id in ids { entries[id]?.layer.setAffineTransform(transform) }
+    }
+
+    func clearPreviewScale(ids: Set<String>) {
+        for id in ids { entries[id]?.layer.setAffineTransform(.identity) }
+    }
+
+    /// Parses canonical paths away from the frame-critical interaction path
+    /// and installs them in bounded batches. A board thumbnail remains visible
+    /// while this progresses, then fades as exact contours become available.
+    private func beginProgressiveRebuild(document: SVGDocument,
+                                         importedTransforms: [String: ObjectTransform],
+                                         composition: SceneComposition?) {
+        rebuildTask?.cancel()
+        rebuildGeneration = UUID()
+        let generation = rebuildGeneration
         self.document = document
         self.importedTransforms = importedTransforms
         self.composition = composition
@@ -143,69 +174,89 @@ final class ProfessorSVGView: UIView {
         index = SpatialIndex(cellSize: max(document.viewBox.width, document.viewBox.height) / 32)
         visibleIDs.removeAll(keepingCapacity: true)
         contentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        onProgress?(0)
+
+        let paths = SceneComposition.canonicalProfessorPaths(document.paths).filter {
+            guard let id = $0.id else { return false }
+            return importedTransforms[id]?.deleted != true
+        }
+        guard !paths.isEmpty else {
+            onProgress?(1)
+            return
+        }
 
         #if DEBUG
-        let start = CACurrentMediaTime()
-        var cacheHits = 0
-        var cacheMisses = 0
-        let provenanceBySourceID = Dictionary(uniqueKeysWithValues: (composition?.nodes ?? [])
-            .filter { $0.sourceKind == .professorSVG || $0.sourceKind == .importedTransform }
-            .map { ($0.sourceID, $0) })
+        let started = CACurrentMediaTime()
         #endif
-        let displayScale = window?.screen.scale ?? UIScreen.main.scale
-        var shapeLayers: [CAShapeLayer] = []
-        shapeLayers.reserveCapacity(document.paths.count)
-        for item in SceneComposition.canonicalProfessorPaths(document.paths) {
-            guard let id = item.id, importedTransforms[id]?.deleted != true else { continue }
-            do {
-                var worldTransform = CGAffineTransform.identity
-                if let imported = importedTransforms[id] {
-                    worldTransform = worldTransform
+        rebuildTask = Task { [weak self] in
+            let batchSize = 128
+            var completed = 0
+            while completed < paths.count, !Task.isCancelled {
+                let end = min(completed + batchSize, paths.count)
+                let definitions = paths[completed..<end].map(\.d)
+                let transforms = paths[completed..<end].map { item -> CGAffineTransform in
+                    guard let id = item.id, let imported = importedTransforms[id] else { return .identity }
+                    return CGAffineTransform.identity
                         .translatedBy(x: CGFloat(imported.x), y: CGFloat(imported.y))
-                        .scaledBy(x: CGFloat(imported.scaleX ?? 1), y: CGFloat(imported.scaleY ?? 1))
+                        .scaledBy(x: CGFloat(imported.scaleX ?? 1),
+                                  y: CGFloat(imported.scaleY ?? 1))
                 }
-                let parsed = try SVGPathParser.cachedPath(from: item.d, hits: {
+                let parsed: [CGPath?] = await Task.detached(priority: .userInitiated) {
+                    zip(definitions, transforms).map { definition, transform in
+                        guard let source = try? SVGPathParser.cachedPath(from: definition) else { return nil }
+                        var transform = transform
+                        return source.copy(using: &transform)
+                    }
+                }.value
+                guard let self, !Task.isCancelled,
+                      self.rebuildGeneration == generation else { return }
+
+                let displayScale = self.window?.screen.scale ?? UIScreen.main.scale
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                for (offset, path) in parsed.enumerated() {
+                    guard let path else { continue }
+                    let item = paths[completed + offset]
+                    guard let id = item.id else { continue }
+                    let shape = CAShapeLayer()
+                    shape.path = path
+                    shape.fillColor = item.fill.cgColor
+                    shape.fillRule = item.fillRule
+                    shape.contentsScale = displayScale
+                    shape.isHidden = true
                     #if DEBUG
-                    cacheHits += 1
+                    let node = composition?.nodes.first(where: {
+                        ($0.sourceKind == .professorSVG || $0.sourceKind == .importedTransform)
+                            && $0.sourceID == id
+                    })
+                    self.applyProvenance(node, to: shape)
                     #endif
-                }, misses: {
-                    #if DEBUG
-                    cacheMisses += 1
-                    #endif
-                })
-                let path = parsed.copy(using: &worldTransform) ?? CGPath(rect: .zero, transform: nil)
-                let shape = CAShapeLayer()
-                shape.path = path
-                shape.fillColor = item.fill.cgColor
-                shape.fillRule = item.fillRule
-                shape.contentsScale = displayScale
-                shape.isHidden = true
-                #if DEBUG
-                applyProvenance(provenanceBySourceID[id], to: shape)
-                #endif
-                shapeLayers.append(shape)
-                entries[id] = Entry(bounds: path.boundingBoxOfPath, layer: shape,
-                                    isRegionSurface: item.dataInk == "pdf-source")
-                index.insert(id: id, bounds: path.boundingBoxOfPath)
-            } catch {
-                #if DEBUG
-                print("[VBoard] SVG path skipped id=\(id) error=\(error)")
-                #endif
+                    let bounds = path.boundingBoxOfPath
+                    self.entries[id] = Entry(bounds: bounds, layer: shape,
+                                             isRegionSurface: item.dataInk == "pdf-source")
+                    self.index.insert(id: id, bounds: bounds)
+                    self.contentLayer.addSublayer(shape)
+                }
+                CATransaction.commit()
+                completed = end
+                if let transform = self.currentTransform, !self.isInteracting {
+                    self.refine(transform: transform)
+                }
+                self.onProgress?(Double(completed) / Double(paths.count))
+                await Task.yield()
             }
+            guard let self, self.rebuildGeneration == generation else { return }
+            #if DEBUG
+            var stats = RenderPerformance.shared.last
+            stats.indexedObjects = self.entries.count
+            stats.newPathsCreated = self.entries.count
+            stats.frameMilliseconds = (CACurrentMediaTime() - started) * 1_000
+            RenderPerformance.shared.record(stats)
+            self.onStats?(stats)
+            print("[VBoard] VECTOR PROGRESS exactReady paths=\(self.entries.count) milliseconds=\(stats.frameMilliseconds)")
+            #endif
+            self.rebuildTask = nil
         }
-        // Commit the layer tree once. Repeated `addSublayer` calls make Core
-        // Animation perform thousands of incremental tree mutations on dense
-        // boards even though none of the layers can be visible until rebuild
-        // is complete.
-        contentLayer.sublayers = shapeLayers
-        #if DEBUG
-        var stats = RenderStats(state: "idle", indexedObjects: entries.count,
-                                newPathsCreated: entries.count, cacheHits: cacheHits,
-                                cacheMisses: cacheMisses)
-        stats.frameMilliseconds = (CACurrentMediaTime() - start) * 1000
-        RenderPerformance.shared.record(stats)
-        onStats?(stats)
-        #endif
     }
 
     private func refine(transform: WorldScreenTransform) {

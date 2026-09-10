@@ -289,6 +289,29 @@ final class LectureWorkspaceStore: ObservableObject {
         refreshSceneSnapshot(key.boardID, api: api)
     }
 
+    /// Resizes a mixed or cross-board selection as one workspace history
+    /// gesture while keeping each board's editor.json isolated.
+    func resizeSelection(_ keys: Set<SelectionKey>,
+                         around lectureAnchor: CGPoint,
+                         by factor: CGFloat,
+                         api: APIClient) {
+        let grouped = Dictionary(grouping: keys, by: \.boardID)
+        let affected = grouped.keys.filter { boardStores[$0] != nil }.sorted()
+        guard !affected.isEmpty, factor.isFinite, factor > 0 else { return }
+        recordBoardUndo(affected)
+        for (boardID, boardKeys) in grouped {
+            guard let store = boardStores[boardID],
+                  let item = workspace?.items.first(where: { $0.boardID == boardID }) else { continue }
+            let localAnchor = LectureCoordinateTransform.lectureWorldToBoardLocal(lectureAnchor, board: item)
+            store.scaleObjects(
+                editorObjectIDs: Set(boardKeys.filter { $0.kind == .editorObject }.map(\.objectID)),
+                professorPathIDs: Set(boardKeys.filter { $0.kind == .professorPath }.map(\.objectID)),
+                around: localAnchor, by: factor, api: api
+            )
+            refreshSceneSnapshot(boardID, api: api)
+        }
+    }
+
     func deleteSelection(_ keys: Set<SelectionKey>, api: APIClient) {
         let grouped = Dictionary(grouping: keys, by: \.boardID)
         let affected = grouped.keys.filter { boardStores[$0] != nil }.sorted()
@@ -446,14 +469,23 @@ final class LectureWorkspaceStore: ObservableObject {
         let token = UUID()
         sceneLoadTokens[boardID] = token
         sceneLoadTasks[boardID] = Task { [weak self] in
+            let loadStarted = Date().timeIntervalSinceReferenceDate
             do {
                 async let editorRequest = api.editor(id: boardID)
                 async let svgRequest = api.professorSVG(id: boardID)
                 let (editor, source) = try await (editorRequest, svgRequest)
+                #if DEBUG
+                let downloadFinished = Date().timeIntervalSinceReferenceDate
+                print("[VBoard] VECTOR TIMELINE board=\(boardID) stage=download editorObjects=\(editor.objects.count) svgBytes=\(source.utf8.count) milliseconds=\((downloadFinished - loadStarted) * 1_000)")
+                #endif
                 let board = self?.boards.first(where: { $0.id == boardID })
                 let sourceKind = board?.sourceKind ?? .physicalWhiteboard
+                let parseStarted = Date().timeIntervalSinceReferenceDate
                 let parsedDocument = try SVGDocument.parse(source)
                 let document = PDFBoardSource.selectableDocument(parsedDocument, sourceKind: sourceKind)
+                #if DEBUG
+                print("[VBoard] VECTOR TIMELINE board=\(boardID) stage=manifestParse paths=\(document.paths.count) milliseconds=\((Date().timeIntervalSinceReferenceDate - parseStarted) * 1_000)")
+                #endif
                 let pdfData: Data?
                 if sourceKind.isPDF, let path = board?.pdfURL {
                     pdfData = try await api.cachedBoardAsset(
@@ -464,15 +496,6 @@ final class LectureWorkspaceStore: ObservableObject {
                 } else {
                     pdfData = nil
                 }
-                let definitions = document.paths.map(\.d)
-                let warmup = Task.detached(priority: .userInitiated) {
-                    await SVGPathParser.prewarm(definitions)
-                }
-                await withTaskCancellationHandler(operation: {
-                    await warmup.value
-                }, onCancel: {
-                    warmup.cancel()
-                })
                 guard let self, !Task.isCancelled,
                       self.sceneLoadTokens[boardID] == token,
                       self.desiredFullDetail.contains(boardID) else { return }
@@ -492,6 +515,9 @@ final class LectureWorkspaceStore: ObservableObject {
                 self.sceneLoadTasks.removeValue(forKey: boardID)
                 self.sceneLoadTokens.removeValue(forKey: boardID)
                 self.evictScenesIfNeeded()
+                #if DEBUG
+                print("[VBoard] VECTOR TIMELINE board=\(boardID) stage=sceneInstalled previewRetained=true milliseconds=\((Date().timeIntervalSinceReferenceDate - loadStarted) * 1_000)")
+                #endif
             } catch {
                 guard let self, self.sceneLoadTokens[boardID] == token else { return }
                 self.sceneLoadTasks.removeValue(forKey: boardID)
