@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 import jwt
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.asymmetric import rsa
 from pypdf import PdfWriter
 
@@ -117,7 +118,10 @@ class AccountAndOwnershipTests(unittest.TestCase):
         self.original_rate_limits = dict(board_app.RATE_LIMIT_POLICIES)
         board_app.BOARDS_DIR = self.root / "boards"
         board_app.BOARDS_DIR.mkdir()
-        board_app.AUTH_DB = AuthDatabase(f"sqlite:///{self.root / 'accounts.sqlite3'}")
+        board_app.AUTH_DB = AuthDatabase(
+            f"sqlite:///{self.root / 'accounts.sqlite3'}",
+            token_encryption_key=Fernet.generate_key(),
+        )
         board_app.APPLE_VERIFIER = _FakeAppleVerifier()
         board_app.app.config.update(TESTING=True, AUTH_TEST_BYPASS=False)
         self.client = board_app.app.test_client()
@@ -168,6 +172,12 @@ class AccountAndOwnershipTests(unittest.TestCase):
         second = self.login("apple-a")
         self.assertEqual(first["user"]["id"], second["user"]["id"])
         self.assertEqual(second["user"]["displayName"], "Nate")
+
+    def test_apple_revocation_credential_is_encrypted_at_rest(self):
+        self.login("apple-encrypted")
+        database_bytes = (self.root / "accounts.sqlite3").read_bytes()
+        self.assertNotIn(b"apple-refresh", database_bytes)
+        self.assertIn(b"fernet:v1:", database_bytes)
 
     def test_session_refresh_rotation_and_logout(self):
         login = self.login("apple-a")

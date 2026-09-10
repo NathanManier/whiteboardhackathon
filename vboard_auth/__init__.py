@@ -1,13 +1,14 @@
 """V-Board account, session, and resource-ownership boundary."""
 
 from .apple import AppleCredential, AppleIdentity, AppleTokenVerifier
-from .models import AuthDatabase, AuthUser, SessionTokens
+from .models import AuthConfigurationError, AuthDatabase, AuthUser, SessionTokens
 
 __all__ = [
     "AppleCredential",
     "AppleIdentity",
     "AppleTokenVerifier",
     "AuthDatabase",
+    "AuthConfigurationError",
     "AuthUser",
     "SessionTokens",
 ]

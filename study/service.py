@@ -745,16 +745,35 @@ def explain_lecture_selection(
     with the existing trusted renderer. Only the selected evidence is composed
     into one Gemini request; no board editor state or SVG identity is flattened.
     """
+    from app import BOARDS_DIR, read_editor_state, read_metadata
+
     folder = folder_by_id(library, folder_id)
     if folder is None:
         raise StudyAIError("That lecture could not be found.", status=404)
+    study_path = BOARDS_DIR / ".workspaces" / f"{folder_id}.study.json"
+    study_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        state = json.loads(study_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        state = {"schema_version": 1, "interactions": []}
+    interactions = state.get("interactions") if isinstance(state, dict) else []
+    interactions = interactions if isinstance(interactions, list) else []
+    client_request_id = requested_interaction_id(payload.get("requestId"))
+    if client_request_id:
+        existing = next(
+            (
+                item for item in interactions
+                if isinstance(item, dict) and item.get("id") == client_request_id
+            ),
+            None,
+        )
+        if existing is not None:
+            return public_interaction(existing)
     requested = payload.get("boards")
     if not isinstance(requested, list) or not 2 <= len(requested) <= 8:
         raise StudyAIError("Select content from two to eight whiteboards.", status=400)
     members = folder_board_ids(library, folder_id)
     member_set = set(members)
-    from app import BOARDS_DIR, read_editor_state, read_metadata
-
     materials: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in requested:
@@ -852,7 +871,7 @@ def explain_lecture_selection(
         action="explain_across_boards",
         images=images,
     )
-    interaction_id = requested_interaction_id(payload.get("requestId")) or secrets.token_hex(8)
+    interaction_id = client_request_id or secrets.token_hex(8)
     interaction = {
         "id": interaction_id,
         "board_id": materials[0]["board_id"],
@@ -869,14 +888,6 @@ def explain_lecture_selection(
         "follow_ups": [],
         "action": "explain_across_boards",
     }
-    study_path = BOARDS_DIR / ".workspaces" / f"{folder_id}.study.json"
-    study_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        state = json.loads(study_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        state = {"schema_version": 1, "interactions": []}
-    interactions = state.get("interactions") if isinstance(state, dict) else []
-    interactions = interactions if isinstance(interactions, list) else []
     state = {"schema_version": 1, "interactions": [interaction, *interactions][:MAX_INTERACTIONS]}
     atomic_json(study_path, state)
     return public_interaction(interaction)
@@ -907,6 +918,20 @@ def explain_board(
     bbox = validate_bbox(payload.get("selectionBBox") or payload.get("selection_bbox"))
     if not selected_ids and bbox is None:
         raise StudyAIError("Select something on the board first.", status=400)
+    state = read_study_state(board_dir)
+    client_interaction_id = requested_interaction_id(
+        payload.get("studyInteractionId") or payload.get("requestId")
+    )
+    if client_interaction_id:
+        existing = next(
+            (
+                item for item in state["interactions"]
+                if isinstance(item, dict) and item.get("id") == client_interaction_id
+            ),
+            None,
+        )
+        if existing is not None:
+            return public_interaction(existing)
     default_questions = {
         "explain": "Explain this",
         "explain_across_boards": "How does this relate to the previous board?",
@@ -943,7 +968,6 @@ def explain_board(
     except StudyAIError:
         board_context = stored_board_context(read_study_state(board_dir).get("board_ai_context"))
     master_overview = encode_master_overview(master_path(board_dir, metadata) or board_dir / "master.png")
-    state = read_study_state(board_dir)
     selection_context = build_selection_context(
         editor,
         selected_ids,
@@ -1049,9 +1073,7 @@ def explain_board(
         for item in state["interactions"]
         if isinstance(item, dict) and item.get("id")
     }
-    interaction_id = requested_interaction_id(
-        payload.get("studyInteractionId") or payload.get("requestId")
-    )
+    interaction_id = client_interaction_id
     if interaction_id is None or interaction_id in existing_ids:
         interaction_id = secrets.token_hex(8)
     interaction = new_interaction(
@@ -1103,7 +1125,8 @@ def follow_up_board(
     request_started: float | None = None,
 ) -> dict[str, Any]:
     total_started = request_started or time.perf_counter()
-    request_id = requested_interaction_id(payload.get("requestId")) or interaction_id
+    client_request_id = requested_interaction_id(payload.get("requestId"))
+    request_id = client_request_id or interaction_id
     practice = normalize_study_action(payload.get("action") or payload.get("kind")) == "practice_problems"
     if practice:
         _practice_log(request_id, "backend_service_received", (time.perf_counter() - total_started) * 1000)
@@ -1131,6 +1154,22 @@ def follow_up_board(
     if not isinstance(follow_ups, list):
         follow_ups = []
         interaction["follow_ups"] = follow_ups
+    if client_request_id:
+        existing_follow_up = next(
+            (
+                item for item in follow_ups
+                if isinstance(item, dict) and item.get("request_id") == client_request_id
+            ),
+            None,
+        )
+        if existing_follow_up is not None:
+            interaction["active_follow_up_id"] = existing_follow_up.get("id")
+            public = public_interaction(interaction)
+            if existing_follow_up.get("kind") == "practice_problems":
+                public["problem"] = existing_follow_up.get("problem")
+                public["problems"] = existing_follow_up.get("problems") or []
+                public["type"] = "practice_problems"
+            return public
     if len(follow_ups) >= MAX_FOLLOW_UPS:
         raise StudyAIError("This explanation has too many follow-ups.", status=400)
     selected_ids = [
@@ -1249,6 +1288,8 @@ def follow_up_board(
         "answer": result["answer"],
         "created_at": time.time(),
     }
+    if client_request_id:
+        follow_entry["request_id"] = client_request_id
     if result.get("problem") or result.get("problems") or action == "practice_problems":
         follow_entry["problem"] = str(result.get("problem") or result["answer"])
         follow_entry["kind"] = "practice_problems"

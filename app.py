@@ -39,7 +39,7 @@ from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from pdf_import import PDFImportError, import_pdf_pages
-from vboard_auth import AppleCredential, AppleTokenVerifier, AuthDatabase, AuthUser
+from vboard_auth import AuthConfigurationError, AppleCredential, AppleTokenVerifier, AuthDatabase, AuthUser
 from vboard_auth.apple import AppleVerificationError
 from study.routing import AIRequestContext, routed_request
 
@@ -237,6 +237,8 @@ def current_user() -> AuthUser:
 def enforce_rate_limit(action: str, *, unauthenticated_hint: str | None = None) -> Response | None:
     limit, window_seconds = RATE_LIMIT_POLICIES[action]
     user = authenticated_user()
+    if user is not None and user.is_test_user and _auth_test_bypass_enabled():
+        return None
     if user is not None:
         subjects = [f"user:{user.id}"]
         safe_user_id = user.id
@@ -2753,6 +2755,9 @@ def authenticate_with_apple() -> Response | tuple[Response, int]:
             user.id,
             device_label=str(payload.get("deviceName") or "")[:160] or None,
         )
+    except AuthConfigurationError as exc:
+        LOGGER.error("AUTH APPLE FAILED category=server_configuration")
+        return jsonify(error=str(exc), code="authentication_unavailable"), 503
     except (AppleVerificationError, ValueError, PermissionError) as exc:
         LOGGER.info("AUTH APPLE FAILED category=%s", type(exc).__name__)
         return jsonify(error=str(exc), code="apple_authentication_failed"), 401
@@ -2814,7 +2819,7 @@ def delete_account() -> Response | tuple[Response, int]:
     if apple_refresh_token:
         try:
             apple_verifier().revoke(apple_refresh_token)
-        except (AppleVerificationError, ValueError):
+        except (AppleVerificationError, AuthConfigurationError, ValueError):
             # Account deletion must still complete if Apple's revocation service is
             # temporarily unavailable. The category is safe to log; the token is not.
             LOGGER.exception("ACCOUNT APPLE REVOCATION FAILED user=%s", user.id)
@@ -4003,6 +4008,7 @@ def analyze_board_context_route(board_id: str) -> Response | tuple[Response, int
 
 
 @app.post("/api/folders/<folder_id>/study/explain-selection")
+@locked_workspace_operation
 @require_authenticated
 def explain_lecture_selection_route(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
@@ -4059,6 +4065,7 @@ def explain_lecture_selection_route(folder_id: str) -> Response | tuple[Response
 
 
 @app.post("/api/boards/<board_id>/study/explain")
+@locked_board_operation
 @require_authenticated
 def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
     from study.ai import StudyAIError
@@ -4118,6 +4125,7 @@ def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
 
 
 @app.post("/api/boards/<board_id>/study/<interaction_id>/followup")
+@locked_board_operation
 @require_authenticated
 def follow_up_route(board_id: str, interaction_id: str) -> Response | tuple[Response, int]:
     from study.ai import StudyAIError

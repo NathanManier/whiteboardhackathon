@@ -4,10 +4,11 @@ import contextvars
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Iterator
 
@@ -53,6 +54,7 @@ class AIRoute:
     confidence: float
     source: str = "rules"
     escalation_depth: int = 0
+    router_latency_ms: float = 0.0
 
     def escalate_scope(self) -> "AIRoute":
         next_scope = {
@@ -69,6 +71,7 @@ class AIRoute:
             confidence=self.confidence,
             source="escalation",
             escalation_depth=self.escalation_depth + 1,
+            router_latency_ms=self.router_latency_ms,
         )
 
     def escalate_difficulty(self) -> "AIRoute":
@@ -85,6 +88,7 @@ class AIRoute:
             confidence=self.confidence,
             source="escalation",
             escalation_depth=self.escalation_depth + 1,
+            router_latency_ms=self.router_latency_ms,
         )
 
     def escalate_context_once(self, *, has_lecture: bool) -> "AIRoute":
@@ -100,6 +104,7 @@ class AIRoute:
             confidence=self.confidence,
             source="insufficient_context_retry",
             escalation_depth=self.escalation_depth + 1,
+            router_latency_ms=self.router_latency_ms,
         )
 
 
@@ -233,10 +238,13 @@ def resolve_route(
     context: AIRequestContext,
     classifier: Callable[[AIRequestContext, AIRoute], AIRoute] | None = None,
 ) -> AIRoute:
+    started = time.perf_counter()
     base = classify_request(context)
     if base.confidence >= 0.8:
-        return base
-    return (classifier or cheap_model_classifier)(context, base)
+        route = base
+    else:
+        route = (classifier or cheap_model_classifier)(context, base)
+    return replace(route, router_latency_ms=round((time.perf_counter() - started) * 1000, 2))
 
 
 class AIModelPolicy:
@@ -283,6 +291,7 @@ class AIModelPolicy:
 class ActiveAIRequest:
     context: AIRequestContext
     route: AIRoute
+    started_at: float
 
 
 _ACTIVE: contextvars.ContextVar[ActiveAIRequest | None] = contextvars.ContextVar(
@@ -301,7 +310,7 @@ def override_active_route(route: AIRoute) -> Iterator[AIRoute]:
     if active is None:
         yield route
         return
-    token = _ACTIVE.set(ActiveAIRequest(active.context, route))
+    token = _ACTIVE.set(ActiveAIRequest(active.context, route, active.started_at))
     try:
         yield route
     finally:
@@ -310,8 +319,9 @@ def override_active_route(route: AIRoute) -> Iterator[AIRoute]:
 
 @contextmanager
 def routed_request(context: AIRequestContext) -> Iterator[AIRoute]:
+    started_at = time.perf_counter()
     route = resolve_route(context)
-    token = _ACTIVE.set(ActiveAIRequest(context, route))
+    token = _ACTIVE.set(ActiveAIRequest(context, route, started_at))
     try:
         yield route
     finally:

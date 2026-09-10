@@ -16,7 +16,10 @@ access and intentionally cannot be filled with invented credentials.
    deployment secret store, never in this repository.
 5. Set the deployment values listed in `.env.example`: `APPLE_CLIENT_ID`,
    `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_PRIVATE_KEY_PATH`,
-   `APPLE_REQUIRE_CODE_EXCHANGE=1`, `DATABASE_URL`, and `SECRET_KEY`.
+   `APPLE_REQUIRE_CODE_EXCHANGE=1`, `APPLE_TOKEN_ENCRYPTION_KEY`,
+   `DATABASE_URL`, and `SECRET_KEY`. Generate the token-encryption value once
+   with `Fernet.generate_key()` and retain it in the deployment secret store;
+   rotating or losing it prevents revocation of already stored Apple tokens.
 6. Build with signing enabled and validate first authorization, returning
    authorization, revoked credentials, logout, and Delete Account on a real
    Apple ID/device.
@@ -52,6 +55,14 @@ ThisDeviceOnly Keychain accessibility class.
    and Study Guide until per-account rate-limit and AI telemetry records are
    visible. Telemetry must contain identifiers and usage measurements, not raw
    board images, PDF bytes, prompts, or credentials.
+
+If `AI_MODEL_PRICING_JSON` is configured with provider rates, telemetry also
+records an estimated per-request cost. Generate scope/difficulty averages and
+100/500/1,500/3,000-action projections with:
+
+```sh
+.venv/bin/python scripts/report_ai_usage.py
+```
 
 The browser UI does not yet include a Sign in with Apple screen. Its protected
 resource APIs are deliberately no longer writable without a V-Board bearer

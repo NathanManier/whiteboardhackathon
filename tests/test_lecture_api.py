@@ -198,15 +198,20 @@ class LectureWorkspaceTests(unittest.TestCase):
                 "confidence": "high",
             },
         ) as explain:
+            request = {
+                "requestId": "eeeeeeeeeeeeeeee",
+                "question": "How do these connect?",
+                "boards": [
+                    {"board_id": first_id, "selected_ids": [f"ink-{first_id[:8]}"]},
+                    {"board_id": second_id, "selected_ids": [f"ink-{second_id[:8]}"]},
+                ],
+            }
             response = self.client.post(
                 f"/api/folders/{folder['id']}/study/explain-selection",
-                json={
-                    "question": "How do these connect?",
-                    "boards": [
-                        {"board_id": first_id, "selected_ids": [f"ink-{first_id[:8]}"]},
-                        {"board_id": second_id, "selected_ids": [f"ink-{second_id[:8]}"]},
-                    ],
-                },
+                json=request,
+            )
+            duplicate = self.client.post(
+                f"/api/folders/{folder['id']}/study/explain-selection", json=request,
             )
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         payload = response.get_json()
@@ -216,11 +221,15 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertEqual([item["board_id"] for item in grouped], [first_id, second_id])
         self.assertEqual(grouped[0]["selected_object_ids"], [f"ink-{first_id[:8]}"])
         self.assertEqual(grouped[1]["selected_object_ids"], [f"ink-{second_id[:8]}"])
+        self.assertEqual(duplicate.status_code, 200, duplicate.get_data(as_text=True))
+        self.assertEqual(duplicate.get_json()["interaction"], payload["interaction"])
+        self.assertEqual(explain.call_count, 1)
         persisted = json.loads(
             (board_app.BOARDS_DIR / ".workspaces" / f"{folder['id']}.study.json")
             .read_text(encoding="utf-8")
         )
         self.assertEqual(persisted["interactions"][0]["source_board_ids"], [first_id, second_id])
+        self.assertEqual(len(persisted["interactions"]), 1)
 
     def test_new_lecture_board_reconciles_to_right_of_effective_content(self):
         folder = self.client.post("/api/folders", json={"name": "Chronology"}).get_json()["folder"]

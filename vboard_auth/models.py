@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 import time
 import uuid
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, create_engine, delete, event, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
@@ -21,6 +23,10 @@ def _now() -> float:
 
 def _digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class AuthConfigurationError(RuntimeError):
+    pass
 
 
 class Base(DeclarativeBase):
@@ -160,7 +166,14 @@ class RateLimitDecision:
 class AuthDatabase:
     """SQL-backed account boundary; board binary assets remain outside SQL."""
 
-    def __init__(self, database_url: str, *, access_ttl: int = 900, refresh_ttl: int = 60 * 60 * 24 * 90):
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        access_ttl: int = 900,
+        refresh_ttl: int = 60 * 60 * 24 * 90,
+        token_encryption_key: str | bytes | None = None,
+    ):
         connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
         self.engine = create_engine(database_url, future=True, pool_pre_ping=True, connect_args=connect_args)
         if database_url.startswith("sqlite"):
@@ -168,6 +181,13 @@ class AuthDatabase:
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         self.access_ttl = access_ttl
         self.refresh_ttl = refresh_ttl
+        configured_key = token_encryption_key or os.environ.get("APPLE_TOKEN_ENCRYPTION_KEY")
+        try:
+            self._token_cipher = Fernet(
+                configured_key.encode("ascii") if isinstance(configured_key, str) else configured_key
+            ) if configured_key else None
+        except (TypeError, ValueError) as exc:
+            raise AuthConfigurationError("APPLE_TOKEN_ENCRYPTION_KEY is invalid.") from exc
         Base.metadata.create_all(self.engine)
 
     @staticmethod
@@ -180,7 +200,48 @@ class AuthDatabase:
     def local(cls, base_dir: Path) -> "AuthDatabase":
         instance = base_dir / "instance"
         instance.mkdir(parents=True, exist_ok=True)
-        return cls(f"sqlite:///{instance / 'vboard.sqlite3'}")
+        configured = os.environ.get("APPLE_TOKEN_ENCRYPTION_KEY")
+        key_path = instance / "apple-token.key"
+        if configured:
+            key = configured.encode("ascii")
+        else:
+            try:
+                key = key_path.read_bytes().strip()
+            except FileNotFoundError:
+                key = Fernet.generate_key()
+                try:
+                    with key_path.open("xb") as stream:
+                        stream.write(key)
+                    key_path.chmod(0o600)
+                except FileExistsError:
+                    key = key_path.read_bytes().strip()
+        return cls(f"sqlite:///{instance / 'vboard.sqlite3'}", token_encryption_key=key)
+
+    def _encrypt_apple_token(self, token: str | None) -> str | None:
+        if not token:
+            return None
+        if self._token_cipher is None:
+            raise AuthConfigurationError(
+                "Apple token encryption is not configured on this server."
+            )
+        encrypted = self._token_cipher.encrypt(token.encode("utf-8")).decode("ascii")
+        return f"fernet:v1:{encrypted}"
+
+    def _decrypt_apple_token(self, token: str | None) -> str | None:
+        if not token:
+            return None
+        if not token.startswith("fernet:v1:"):
+            # Compatibility for an existing pre-encryption row. It is cleared
+            # on deletion and replaced with ciphertext on the next Apple login.
+            return token
+        if self._token_cipher is None:
+            raise AuthConfigurationError(
+                "Apple token encryption is not configured on this server."
+            )
+        try:
+            return self._token_cipher.decrypt(token.removeprefix("fernet:v1:").encode("ascii")).decode("utf-8")
+        except (InvalidToken, UnicodeDecodeError) as exc:
+            raise AuthConfigurationError("The stored Apple revocation credential cannot be decrypted.") from exc
 
     @staticmethod
     def _user(record: UserRecord, *, include_subject: bool = False) -> AuthUser:
@@ -200,6 +261,7 @@ class AuthDatabase:
         apple_refresh_token: str | None = None,
     ) -> AuthUser:
         now = _now()
+        encrypted_refresh_token = self._encrypt_apple_token(apple_refresh_token)
         with self.sessions.begin() as db:
             record = db.scalar(select(UserRecord).where(UserRecord.apple_subject == apple_subject))
             if record is None:
@@ -208,7 +270,7 @@ class AuthDatabase:
                     apple_subject=apple_subject,
                     display_name=display_name,
                     email=email,
-                    apple_refresh_token=apple_refresh_token,
+                    apple_refresh_token=encrypted_refresh_token,
                     created_at=now,
                     updated_at=now,
                 )
@@ -220,8 +282,8 @@ class AuthDatabase:
                     record.display_name = display_name
                 if email:
                     record.email = email
-                if apple_refresh_token:
-                    record.apple_refresh_token = apple_refresh_token
+                if encrypted_refresh_token:
+                    record.apple_refresh_token = encrypted_refresh_token
                 record.updated_at = now
             db.flush()
             return self._user(record, include_subject=True)
@@ -436,7 +498,7 @@ class AuthDatabase:
             record = db.get(UserRecord, user_id)
             if record is None:
                 return None
-            refresh = record.apple_refresh_token
+            refresh = self._decrypt_apple_token(record.apple_refresh_token)
             record.apple_refresh_token = None
             record.deleted_at = _now()
             for session in record.sessions:

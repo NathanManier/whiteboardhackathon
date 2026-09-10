@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
 import os
@@ -9,6 +11,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+
+from PIL import Image
 
 from .routing import AIModelPolicy, current_ai_request
 from .telemetry import USAGE_RECORDER
@@ -464,6 +468,35 @@ def _append_labeled_image(parts: list[dict[str, Any]], label: str, data_url: str
         return
     parts.append(_text_part(label))
     parts.append(image)
+
+
+def _telemetry_image_dimensions(images: dict[str, Any]) -> list[dict[str, int | str]]:
+    candidates: list[tuple[str, str]] = [
+        (role, str(images.get(role) or ""))
+        for role in ("selected", "context", "overview")
+        if images.get(role)
+    ]
+    extras = images.get("lecture_boards")
+    if isinstance(extras, list):
+        candidates.extend(
+            ("lecture_context", str(item.get("image") or ""))
+            for item in extras[:4]
+            if isinstance(item, dict) and item.get("image")
+        )
+    dimensions: list[dict[str, int | str]] = []
+    for role, value in candidates:
+        match = _DATA_URL_RE.match(value)
+        if not match or len(match.group(2)) > 64 * 1024 * 1024:
+            continue
+        try:
+            raw = base64.b64decode(match.group(2), validate=True)
+            with Image.open(io.BytesIO(raw)) as image:
+                width, height = image.size
+            if width > 0 and height > 0:
+                dimensions.append({"role": role, "width": int(width), "height": int(height)})
+        except (OSError, ValueError):
+            continue
+    return dimensions
 
 
 def _user_content(
@@ -1331,6 +1364,8 @@ def call_study_model(
         for item in (images.get("lecture_boards") or [])
         if isinstance(item, dict) and item.get("image")
     )
+    image_dimensions = _telemetry_image_dimensions(images)
+    model_call_ms: float | None = None
     telemetry_recorded = False
 
     def record_usage(success: bool, *, body: dict[str, Any] | None = None, error: str | None = None) -> None:
@@ -1339,7 +1374,16 @@ def call_study_model(
             return
         telemetry_recorded = True
         usage = body.get("usageMetadata") if isinstance(body, dict) else None
-        model_latency = metrics.get("gemini_ms") if isinstance(metrics, dict) else None
+        model_latency = metrics.get("gemini_ms") if isinstance(metrics, dict) else model_call_ms
+        retrieval_latency = (
+            metrics.get("context_gathering_ms") if isinstance(metrics, dict) else None
+        )
+        if not isinstance(retrieval_latency, (int, float)):
+            retrieval_latency = max(
+                0.0,
+                (total_started - active_request.started_at) * 1000
+                - active_request.route.router_latency_ms,
+            )
         USAGE_RECORDER.record(
             context=active_request.context,
             route=active_request.route,
@@ -1352,6 +1396,8 @@ def call_study_model(
             usage=usage if isinstance(usage, dict) else None,
             success=success,
             error_category=error,
+            image_dimensions=image_dimensions,
+            retrieval_latency_ms=float(retrieval_latency),
         )
 
     api_key = gemini_api_key()
@@ -1412,6 +1458,7 @@ def call_study_model(
                 )
             raw_body = response.read()
         gemini_ms = (time.perf_counter() - gemini_started) * 1000
+        model_call_ms = gemini_ms
         decode_started = time.perf_counter()
         body = json.loads(raw_body.decode("utf-8"))
         response_decode_ms = (time.perf_counter() - decode_started) * 1000
@@ -1426,12 +1473,10 @@ def call_study_model(
                 len(raw_body),
             )
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", "replace")[:2_000]
-        except Exception:
-            detail = ""
-        LOGGER.error("Gemini HTTP %s model=%s body=%s", exc.code, model, detail)
+        # The provider body may echo private prompt or image metadata. Record
+        # only the operational category and configured model identifier.
+        LOGGER.error("Gemini HTTP status=%s model=%s", exc.code, model)
+        exc.close()
         record_usage(False, error=f"provider_http_{exc.code}")
         status = 429 if exc.code == 429 else 503
         raise StudyAIError(

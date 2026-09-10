@@ -14,7 +14,7 @@ from study.routing import (
     _bounded_classifier_route,
     classify_request,
 )
-from study.telemetry import AIUsageRecorder
+from study.telemetry import AIUsageEstimator, AIUsageRecorder
 
 
 def context(question: str, **kwargs) -> AIRequestContext:
@@ -90,6 +90,20 @@ class AIRouterTests(unittest.TestCase):
         self.assertEqual(policy.model(normal), "normal")
         self.assertEqual(policy.model(hard), "reasoning")
 
+    def test_usage_estimator_is_configuration_driven_and_cache_aware(self):
+        estimator = AIUsageEstimator({
+            "AI_MODEL_PRICING_JSON": json.dumps({
+                "model": {"input": 2.0, "cached_input": 0.5, "output": 8.0}
+            })
+        })
+        cost = estimator.estimate_usd("model", {
+            "promptTokenCount": 1_000_000,
+            "cachedContentTokenCount": 250_000,
+            "candidatesTokenCount": 100_000,
+        })
+        self.assertEqual(cost, 2.425)
+        self.assertIsNone(AIUsageEstimator({}).estimate_usd("model", {}))
+
     def test_ambiguous_classifier_cannot_downgrade_rules_minimums(self):
         request = context("Can you help with this?", selected_board_count=2, has_selected_visual=True)
         base = classify_request(request)
@@ -121,6 +135,8 @@ class AIRouterTests(unittest.TestCase):
                 model_latency_ms=40,
                 usage={"promptTokenCount": 100, "candidatesTokenCount": 20},
                 success=True,
+                image_dimensions=[{"role": "selected", "width": 320, "height": 240}],
+                retrieval_latency_ms=3.25,
             )
             raw = path.read_text(encoding="utf-8")
             value = json.loads(raw)
@@ -128,6 +144,9 @@ class AIRouterTests(unittest.TestCase):
             self.assertNotIn("private handwritten equation", raw)
             self.assertEqual(value["scope"], "local")
             self.assertEqual(value["input_tokens"], 100)
+            self.assertEqual(value["image_dimensions"][0]["width"], 320)
+            self.assertEqual(value["retrieval_latency_ms"], 3.25)
+            self.assertIn("router_latency_ms", value)
 
 
 if __name__ == "__main__":

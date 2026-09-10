@@ -209,6 +209,34 @@ class StudyApiTests(unittest.TestCase):
         self.assertAlmostEqual(payload["interaction"]["anchorOffsetNx"], 1.1)
         self.assertAlmostEqual(payload["interaction"]["anchorOffsetNy"], 0.0)
 
+    def test_duplicate_explain_request_id_returns_saved_result_without_second_model_call(self):
+        views = {
+            "selected": "data:image/png;base64,aaa",
+            "context": "data:image/jpeg;base64,bbb",
+            "overview": "data:image/jpeg;base64,ccc",
+            "selection_bbox": {"x": 10, "y": 12, "width": 80, "height": 60},
+            "objects": [{"id": "black-abc123def456", "color": "#111111", "bbox": None}],
+        }
+        request = {
+            "selectedObjectIds": ["black-abc123def456"],
+            "selectionBBox": {"x": 10, "y": 12, "width": 80, "height": 60},
+            "requestId": "dddddddddddddddd",
+            "question": "Explain this",
+        }
+        with patch("study.service.render_views", return_value=views) as render, patch(
+            "study.service.explain_selection",
+            return_value={"title": "Once", "answer": "One answer.", "confidence": "high"},
+        ) as explain:
+            first = self.client.post(f"/api/boards/{self.board_id}/study/explain", json=request)
+            second = self.client.post(f"/api/boards/{self.board_id}/study/explain", json=request)
+        self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
+        self.assertEqual(second.status_code, 200, second.get_data(as_text=True))
+        self.assertEqual(first.get_json()["interaction"], second.get_json()["interaction"])
+        self.assertEqual(explain.call_count, 1)
+        self.assertEqual(render.call_count, 1)
+        saved = json.loads((self.board_dir / "study.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(saved["interactions"]), 1)
+
     def test_practice_problem_returns_problem_payload(self):
         views = {
             "selected": "data:image/png;base64,aaa",
@@ -233,7 +261,7 @@ class StudyApiTests(unittest.TestCase):
                 ],
                 "type": "practice_problems",
             },
-        ):
+        ) as follow_model:
             created = self.client.post(
                 f"/api/boards/{self.board_id}/study/explain",
                 json={
@@ -243,6 +271,10 @@ class StudyApiTests(unittest.TestCase):
             )
             interaction_id = created.get_json()["interaction"]["id"]
             follow = self.client.post(
+                f"/api/boards/{self.board_id}/study/{interaction_id}/followup",
+                json={"action": "practice_problems", "requestId": "bbbbbbbbbbbbbbbb"},
+            )
+            duplicate = self.client.post(
                 f"/api/boards/{self.board_id}/study/{interaction_id}/followup",
                 json={"action": "practice_problems", "requestId": "bbbbbbbbbbbbbbbb"},
             )
@@ -264,6 +296,9 @@ class StudyApiTests(unittest.TestCase):
         self.assertNotIn("Solution", payload["problem"])
         self.assertEqual(payload["studyInteractionId"], interaction_id)
         self.assertEqual(payload["interaction"]["followUps"][-1]["kind"], "practice_problems")
+        self.assertEqual(duplicate.status_code, 200, duplicate.get_data(as_text=True))
+        self.assertEqual(duplicate.get_json()["problems"], payload["problems"])
+        self.assertEqual(follow_model.call_count, 1)
 
     def test_go_deeper_appends_follow_up_on_same_interaction(self):
         views = {
