@@ -57,6 +57,8 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
     let url: String?
     let createdAt: Double?
     let updatedAt: Double?
+    let sourceKind: BoardSourceKind
+    let pdfURL: String?
 
     enum CodingKeys: String, CodingKey {
         case id, name, status, width, height, url, title, dimensions, assets, pipeline
@@ -68,6 +70,8 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
         case thumbnailURL = "thumbnail_url"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+        case sourceKind = "source_kind"
+        case pdfURL = "pdf_url"
     }
 
     private struct AssetNames: Codable { let thumbnail: String?; let master: String? }
@@ -84,10 +88,12 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
 
     init(id: String, name: String, folderID: String?, status: String,
          width: Double?, height: Double?, thumbnailURL: String?, url: String?,
-         createdAt: Double?, updatedAt: Double?) {
+         createdAt: Double?, updatedAt: Double?,
+         sourceKind: BoardSourceKind = .physicalWhiteboard, pdfURL: String? = nil) {
         self.id = id; self.name = name; self.folderID = folderID; self.status = status
         self.width = width; self.height = height; self.thumbnailURL = thumbnailURL
         self.url = url; self.createdAt = createdAt; self.updatedAt = updatedAt
+        self.sourceKind = sourceKind; self.pdfURL = pdfURL
     }
 
     init(from decoder: Decoder) throws {
@@ -123,6 +129,8 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
         createdAt = try container.decodeIfPresent(Double.self, forKey: .createdAt)
             ?? lectureBoards.first(where: { $0.boardID == decodedID })?.createdAt
         updatedAt = try container.decodeIfPresent(Double.self, forKey: .updatedAt)
+        sourceKind = try container.decodeIfPresent(BoardSourceKind.self, forKey: .sourceKind) ?? .physicalWhiteboard
+        pdfURL = try container.decodeIfPresent(String.self, forKey: .pdfURL)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -137,6 +145,8 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
         try container.encodeIfPresent(url, forKey: .url)
         try container.encodeIfPresent(createdAt, forKey: .createdAt)
         try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
+        try container.encode(sourceKind, forKey: .sourceKind)
+        try container.encodeIfPresent(pdfURL, forKey: .pdfURL)
     }
 }
 
@@ -149,21 +159,52 @@ struct BoardRecord: Codable, Identifiable, Sendable {
     let assets: BoardAssets?
     let suggestedCorners: [[Double]]?
     let normalizedCorners: [[String: Double]]?
+    let sourceKind: BoardSourceKind?
+    let pdfURL: String?
+    let pdfPageNumber: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, name, dimensions, assets
         case suggestedCorners = "suggested_corners"
         case normalizedCorners = "normalized_corners"
+        case sourceKind = "source_kind"
+        case pdfURL = "pdf_url"
+        case pdfPageNumber = "pdf_page_number"
     }
 }
 
+enum BoardSourceKind: String, Codable, Hashable, Sendable {
+    case physicalWhiteboard = "physical_whiteboard"
+    case freeformPDF = "freeform_pdf"
+    case genericPDF = "generic_pdf"
+    case image
+
+    var isPDF: Bool { self == .freeformPDF || self == .genericPDF }
+}
+
 struct BoardDimensions: Codable, Sendable { let width: Double; let height: Double }
-struct BoardAssets: Codable, Sendable { let svg: String? }
+struct BoardAssets: Codable, Sendable { let svg: String?; let pdf: String? }
 
 struct UploadResponse: Codable, Sendable {
     let id: String
     let status: String
     let url: String?
+}
+
+struct PDFImportResponse: Codable, Sendable {
+    let importID: String
+    let sourceKind: BoardSourceKind
+    let pageCount: Int
+    let boards: [LibraryBoard]
+    let folderID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case importID = "import_id"
+        case sourceKind = "source_kind"
+        case pageCount = "page_count"
+        case boards
+        case folderID = "folder_id"
+    }
 }
 
 struct LectureResponse: Codable, Sendable {

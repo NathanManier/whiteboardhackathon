@@ -56,7 +56,8 @@ struct BoardStudySelection: Equatable, Sendable {
     static func isolated(boardID: String,
                          selectedIDs: Set<String>,
                          document: SVGDocument,
-                         editor: EditorState) -> BoardStudySelection? {
+                         editor: EditorState,
+                         preferredLocalBBox: CGRect? = nil) -> BoardStudySelection? {
         let editorIDs = Set(editor.objects.map(\.id))
         let professorIDs = Set(document.paths.compactMap(\.id))
         let keys = Set(selectedIDs.compactMap { id -> SelectionKey? in
@@ -69,23 +70,27 @@ struct BoardStudySelection: Equatable, Sendable {
             return nil
         })
         return build(boardID: boardID, keys: keys, item: nil,
-                     document: document, editor: editor)
+                     document: document, editor: editor,
+                     preferredLocalBBox: preferredLocalBBox)
     }
 
     static func lecture(boardID: String,
                         selectionKeys: Set<SelectionKey>,
                         item: WorkspaceBoardItem,
-                        scene: WorkspaceBoardScene) -> BoardStudySelection? {
+                        scene: WorkspaceBoardScene,
+                        preferredLocalBBox: CGRect? = nil) -> BoardStudySelection? {
         build(boardID: boardID,
               keys: Set(selectionKeys.filter { $0.boardID == boardID }),
-              item: item, document: scene.document, editor: scene.editor)
+              item: item, document: scene.document, editor: scene.editor,
+              preferredLocalBBox: preferredLocalBBox)
     }
 
     private static func build(boardID: String,
                               keys: Set<SelectionKey>,
                               item: WorkspaceBoardItem?,
                               document: SVGDocument,
-                              editor: EditorState) -> BoardStudySelection? {
+                              editor: EditorState,
+                              preferredLocalBBox: CGRect?) -> BoardStudySelection? {
         guard !keys.isEmpty else { return nil }
         let editorByID = Dictionary(uniqueKeysWithValues:
             SceneComposition.canonicalEditorObjects(editor.objects).map { ($0.id, $0) })
@@ -132,7 +137,10 @@ struct BoardStudySelection: Equatable, Sendable {
                                   y: CGFloat(transform.scaleY ?? 1))
                 }
                 let transformed = parsed.copy(using: &affine) ?? parsed
-                guard let validBounds = finiteBounds(transformed.boundingBoxOfPath) else { continue }
+                let candidate = key.objectID == PDFBoardSource.logicalID
+                    ? preferredLocalBBox ?? transformed.boundingBoxOfPath
+                    : transformed.boundingBoxOfPath
+                guard let validBounds = finiteBounds(candidate) else { continue }
                 canonicalIDs.insert(key.objectID)
                 localBounds = localBounds.union(validBounds)
             }

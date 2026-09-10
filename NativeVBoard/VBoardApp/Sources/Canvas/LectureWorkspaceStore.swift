@@ -43,6 +43,7 @@ final class LectureWorkspaceStore: ObservableObject {
     @Published private(set) var scenes: [String: WorkspaceBoardScene] = [:]
     @Published private(set) var status: WorkspacePersistenceStatus = .loading
     @Published private(set) var selectedKeys = Set<SelectionKey>()
+    @Published private(set) var selectedPDFRegions: [String: CGRect] = [:]
     @Published private(set) var focusRequest: WorkspaceFocusRequest?
     @Published private(set) var conflictServerWorkspace: LectureWorkspace?
 
@@ -206,8 +207,13 @@ final class LectureWorkspaceStore: ObservableObject {
         markDirty(api: api)
     }
 
-    func setSelection(_ keys: Set<SelectionKey>) {
+    func setSelection(_ keys: Set<SelectionKey>, pdfRegions: [String: CGRect] = [:]) {
         selectedKeys = keys
+        selectedPDFRegions = pdfRegions.filter { boardID, rect in
+            keys.contains(where: {
+                $0.boardID == boardID && $0.objectID == PDFBoardSource.logicalID
+            }) && !rect.isNull && !rect.isInfinite
+        }
     }
 
     func studySelection(for boardID: String) -> BoardStudySelection? {
@@ -216,7 +222,8 @@ final class LectureWorkspaceStore: ObservableObject {
         return BoardStudySelection.lecture(boardID: boardID,
                                            selectionKeys: selectedKeys,
                                            item: item,
-                                           scene: scene)
+                                           scene: scene,
+                                           preferredLocalBBox: selectedPDFRegions[boardID])
     }
 
     func saveBoardNow(_ boardID: String, api: APIClient) async {
@@ -443,7 +450,16 @@ final class LectureWorkspaceStore: ObservableObject {
                 async let editorRequest = api.editor(id: boardID)
                 async let svgRequest = api.professorSVG(id: boardID)
                 let (editor, source) = try await (editorRequest, svgRequest)
-                let document = try SVGDocument.parse(source)
+                let board = self?.boards.first(where: { $0.id == boardID })
+                let sourceKind = board?.sourceKind ?? .physicalWhiteboard
+                let parsedDocument = try SVGDocument.parse(source)
+                let document = PDFBoardSource.selectableDocument(parsedDocument, sourceKind: sourceKind)
+                let pdfData: Data?
+                if sourceKind.isPDF, let path = board?.pdfURL {
+                    pdfData = try await api.authorizedAsset(path: path)
+                } else {
+                    pdfData = nil
+                }
                 let definitions = document.paths.map(\.d)
                 let warmup = Task.detached(priority: .userInitiated) {
                     await SVGPathParser.prewarm(definitions)
@@ -463,6 +479,7 @@ final class LectureWorkspaceStore: ObservableObject {
                 self.scenes[boardID] = WorkspaceBoardScene(
                     boardID: boardID,
                     document: document,
+                    pdfData: pdfData,
                     editor: effectiveEditor,
                     composition: SceneComposition.build(boardID: boardID, document: document, editor: effectiveEditor)
                 )

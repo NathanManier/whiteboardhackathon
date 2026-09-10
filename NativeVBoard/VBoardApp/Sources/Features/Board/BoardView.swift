@@ -11,7 +11,7 @@ struct BoardView: View {
         Group {
             switch state {
             case .loading: ProgressView("Opening board…")
-            case .ready(let document, let editor, let composition): BoardEditorSurface(board: board, document: document, editor: editor, composition: composition)
+            case .ready(let document, let pdfData, let editor, let composition): BoardEditorSurface(board: board, document: document, pdfData: pdfData, editor: editor, composition: composition)
             case .failed(let message): ContentUnavailableView("Couldn’t open board", systemImage: "exclamationmark.triangle", description: Text(message))
             }
         }
@@ -27,13 +27,21 @@ struct BoardView: View {
             debug("BOARD OPEN START id=\(board.id)")
             // Validate the canonical board metadata route first. The SVG and
             // editor routes remain separate so the board stays isolated.
-            _ = try await api.board(id: board.id)
+            let record = try await api.board(id: board.id)
             debug("BOARD OPEN METADATA SUCCEEDED id=\(board.id)")
             let editor = try await api.editor(id: board.id)
             debug("BOARD OPEN EDITOR SUCCEEDED id=\(board.id) objects=\(editor.objects.count)")
             let source = try await api.professorSVG(id: board.id)
             debug("BOARD OPEN SVG RESPONSE SUCCEEDED id=\(board.id) chars=\(source.utf8.count)")
-            let document = try SVGDocument.parse(source)
+            let sourceKind = record.sourceKind ?? board.sourceKind
+            let parsedDocument = try SVGDocument.parse(source)
+            let document = PDFBoardSource.selectableDocument(parsedDocument, sourceKind: sourceKind)
+            let pdfData: Data?
+            if sourceKind.isPDF, let path = record.pdfURL ?? board.pdfURL {
+                pdfData = try await api.authorizedAsset(path: path)
+            } else {
+                pdfData = nil
+            }
             let definitions = document.paths.map(\.d)
             let warmup = Task.detached(priority: .userInitiated) {
                 await SVGPathParser.prewarm(definitions)
@@ -52,7 +60,7 @@ struct BoardView: View {
                 debug("BOARD OPEN RESULT DISCARDED id=\(board.id) reason=stale-load")
                 return
             }
-            state = .ready(document, editor, composition)
+            state = .ready(document, pdfData, editor, composition)
             debug("BOARD OPEN FIRST SCENE READY id=\(board.id)")
         } catch let error as APIError {
             guard !Task.isCancelled, activeLoadID == loadID else { return }
@@ -79,13 +87,14 @@ struct BoardView: View {
     }
 }
 
-private enum BoardLoadState { case loading, ready(SVGDocument, EditorState, SceneComposition), failed(String) }
+private enum BoardLoadState { case loading, ready(SVGDocument, Data?, EditorState, SceneComposition), failed(String) }
 
 private struct BoardEditorSurface: View {
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
     let board: LibraryBoard
     let document: SVGDocument
+    let pdfData: Data?
     let composition: SceneComposition
     @StateObject private var store: BoardDocumentStore
     @State private var showImport = false
@@ -96,10 +105,11 @@ private struct BoardEditorSurface: View {
     @State private var showConflict = false
     @State private var activeTool: CanvasTool = .pen
     @State private var selectedIDs = Set<String>()
+    @State private var selectedPDFRegion: CGRect?
     @State private var liveCamera: CameraRect?
 
-    init(board: LibraryBoard, document: SVGDocument, editor: EditorState, composition: SceneComposition) {
-        self.board = board; self.document = document; self.composition = composition
+    init(board: LibraryBoard, document: SVGDocument, pdfData: Data?, editor: EditorState, composition: SceneComposition) {
+        self.board = board; self.document = document; self.pdfData = pdfData; self.composition = composition
         _store = StateObject(wrappedValue: BoardDocumentStore(boardID: board.id, editor: editor))
     }
 
@@ -108,7 +118,7 @@ private struct BoardEditorSurface: View {
             // Keep one UIKit input surface alive for the board. Tool changes
             // update that surface in place so recognizers, responder focus,
             // and the live camera cannot be reset by SwiftUI identity churn.
-            NativeCanvasView(boardID: board.id, document: document, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onMove: { ids, delta in store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
+            NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
                 .ignoresSafeArea(edges: .bottom)
             HStack(spacing: 14) {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -154,7 +164,8 @@ private struct BoardEditorSurface: View {
     }
     private var studySelection: BoardStudySelection? {
         BoardStudySelection.isolated(boardID: board.id, selectedIDs: selectedIDs,
-                                     document: document, editor: store.editor)
+                                     document: document, editor: store.editor,
+                                     preferredLocalBBox: selectedPDFRegion)
     }
     private func export() async {
         do {

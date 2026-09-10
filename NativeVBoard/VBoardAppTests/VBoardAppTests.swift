@@ -15,6 +15,47 @@ private final class WebViewNavigationWaiter: NSObject, WKNavigationDelegate {
     }
 }
 
+final class PDFBoardContractTests: XCTestCase {
+    func testLibraryAndWorkspaceDecodePDFSourceMetadata() throws {
+        let board = try JSONDecoder().decode(LibraryBoard.self, from: Data("""
+        {"id":"board-pdf","name":"Freeform","folder_id":"lecture-a","status":"ready","width":612,"height":792,"source_kind":"freeform_pdf","pdf_url":"/boards/board-pdf/source.pdf"}
+        """.utf8))
+        XCTAssertEqual(board.sourceKind, .freeformPDF)
+        XCTAssertEqual(board.pdfURL, "/boards/board-pdf/source.pdf")
+        XCTAssertTrue(board.sourceKind.isPDF)
+    }
+
+    func testPDFSourceGetsExactlyOneTransparentSelectableGeometryProxy() throws {
+        let source = try SVGDocument.parse("<svg viewBox='0 0 612 792'><image id='pdf-page-1' width='612' height='792'/></svg>")
+        let first = PDFBoardSource.selectableDocument(source, sourceKind: .freeformPDF)
+        let second = PDFBoardSource.selectableDocument(first, sourceKind: .freeformPDF)
+        XCTAssertEqual(first.paths.map(\.id).compactMap { $0 }, [PDFBoardSource.logicalID])
+        XCTAssertEqual(second.paths.map(\.id).compactMap { $0 }, [PDFBoardSource.logicalID])
+        XCTAssertEqual(first.viewBox, CGRect(x: 0, y: 0, width: 612, height: 792))
+    }
+
+    func testPhysicalBoardDoesNotReceivePDFProxy() throws {
+        let source = try SVGDocument.parse("<svg viewBox='0 0 100 80'><path id='ink' d='M 1 1 L 2 2'/></svg>")
+        let result = PDFBoardSource.selectableDocument(source, sourceKind: .physicalWhiteboard)
+        XCTAssertEqual(result, source)
+    }
+
+    func testPDFLassoUsesSelectedRegionInsteadOfWholePageForStudyRequest() throws {
+        let source = try SVGDocument.parse("<svg viewBox='0 0 612 792'/>")
+        let document = PDFBoardSource.selectableDocument(source, sourceKind: .freeformPDF)
+        let editor = try JSONDecoder().decode(EditorState.self, from: Data("""
+        {"schema_version":4,"revision":0,"viewport":{"x":0,"y":0,"width":612,"height":792},"objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}
+        """.utf8))
+        let region = CGRect(x: 120, y: 240, width: 180, height: 90)
+        let selection = BoardStudySelection.isolated(
+            boardID: "pdf-board", selectedIDs: [PDFBoardSource.logicalID],
+            document: document, editor: editor, preferredLocalBBox: region
+        )
+        XCTAssertEqual(selection?.canonicalObjectIDs, [PDFBoardSource.logicalID])
+        XCTAssertEqual(selection?.localBBox.cgRect, region)
+    }
+}
+
 private final class WorkspaceURLProtocolStub: URLProtocol, @unchecked Sendable {
     static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
@@ -549,7 +590,7 @@ final class StudySelectionRequestTests: XCTestCase {
     }
 
     private func scene(document: SVGDocument, editor: EditorState) -> WorkspaceBoardScene {
-        WorkspaceBoardScene(boardID: "board-a", document: document, editor: editor,
+        WorkspaceBoardScene(boardID: "board-a", document: document, pdfData: nil, editor: editor,
                             composition: SceneComposition.build(boardID: "board-a",
                                                                 document: document,
                                                                 editor: editor))

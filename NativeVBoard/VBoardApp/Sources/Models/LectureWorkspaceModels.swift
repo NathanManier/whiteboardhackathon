@@ -40,7 +40,8 @@ extension LectureWorkspace {
                 createdAt: createdAt, capturedAt: nil, detectedBoardDate: nil,
                 unitLabel: "No Unit", unitNumber: nil, unitConfidence: 0,
                 unitSource: .none, title: board.name,
-                thumbnailURL: board.thumbnailURL, zIndex: index
+                thumbnailURL: board.thumbnailURL, sourceKind: board.sourceKind,
+                pdfURL: board.pdfURL, zIndex: index
             )
             items.append(item)
             rightmost = x + width
@@ -84,6 +85,9 @@ struct WorkspaceBoardItem: Codable, Equatable, Identifiable, Sendable {
     var unitSource: WorkspaceUnitSource
     let title: String
     let thumbnailURL: String?
+    let sourceKind: BoardSourceKind
+    let pdfURL: String?
+    let pdfPageNumber: Int?
     var zIndex: Int
 
     enum CodingKeys: String, CodingKey {
@@ -103,7 +107,56 @@ struct WorkspaceBoardItem: Codable, Equatable, Identifiable, Sendable {
         case unitSource = "unit_source"
         case title
         case thumbnailURL = "thumbnail_url"
+        case sourceKind = "source_kind"
+        case pdfURL = "pdf_url"
+        case pdfPageNumber = "pdf_page_number"
         case zIndex = "z_index"
+    }
+
+    init(id: String, kind: String, boardID: String, canvasX: Double, canvasY: Double,
+         boardWidth: Double, boardHeight: Double, effectiveContentBounds: CameraRect,
+         createdAt: Double, capturedAt: Double?, detectedBoardDate: String?,
+         unitLabel: String, unitNumber: Int?, unitConfidence: Double,
+         unitSource: WorkspaceUnitSource, title: String, thumbnailURL: String?,
+         sourceKind: BoardSourceKind = .physicalWhiteboard, pdfURL: String? = nil,
+         pdfPageNumber: Int? = nil,
+         zIndex: Int) {
+        self.id = id; self.kind = kind; self.boardID = boardID
+        self.canvasX = canvasX; self.canvasY = canvasY
+        self.boardWidth = boardWidth; self.boardHeight = boardHeight
+        self.effectiveContentBounds = effectiveContentBounds
+        self.createdAt = createdAt; self.capturedAt = capturedAt
+        self.detectedBoardDate = detectedBoardDate; self.unitLabel = unitLabel
+        self.unitNumber = unitNumber; self.unitConfidence = unitConfidence
+        self.unitSource = unitSource; self.title = title
+        self.thumbnailURL = thumbnailURL; self.sourceKind = sourceKind
+        self.pdfURL = pdfURL; self.zIndex = zIndex
+        self.pdfPageNumber = pdfPageNumber
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        kind = try c.decode(String.self, forKey: .kind)
+        boardID = try c.decode(String.self, forKey: .boardID)
+        canvasX = try c.decode(Double.self, forKey: .canvasX)
+        canvasY = try c.decode(Double.self, forKey: .canvasY)
+        boardWidth = try c.decode(Double.self, forKey: .boardWidth)
+        boardHeight = try c.decode(Double.self, forKey: .boardHeight)
+        effectiveContentBounds = try c.decode(CameraRect.self, forKey: .effectiveContentBounds)
+        createdAt = try c.decode(Double.self, forKey: .createdAt)
+        capturedAt = try c.decodeIfPresent(Double.self, forKey: .capturedAt)
+        detectedBoardDate = try c.decodeIfPresent(String.self, forKey: .detectedBoardDate)
+        unitLabel = try c.decode(String.self, forKey: .unitLabel)
+        unitNumber = try c.decodeIfPresent(Int.self, forKey: .unitNumber)
+        unitConfidence = try c.decode(Double.self, forKey: .unitConfidence)
+        unitSource = try c.decode(WorkspaceUnitSource.self, forKey: .unitSource)
+        title = try c.decode(String.self, forKey: .title)
+        thumbnailURL = try c.decodeIfPresent(String.self, forKey: .thumbnailURL)
+        sourceKind = try c.decodeIfPresent(BoardSourceKind.self, forKey: .sourceKind) ?? .physicalWhiteboard
+        pdfURL = try c.decodeIfPresent(String.self, forKey: .pdfURL)
+        pdfPageNumber = try c.decodeIfPresent(Int.self, forKey: .pdfPageNumber)
+        zIndex = try c.decode(Int.self, forKey: .zIndex)
     }
 
     var frame: CGRect {
@@ -171,12 +224,14 @@ enum BoardRepresentation: Int, Comparable, Sendable {
 struct WorkspaceBoardScene: Equatable {
     let boardID: String
     let document: SVGDocument
+    let pdfData: Data?
     var editor: EditorState
     var composition: SceneComposition
 
     static func == (lhs: WorkspaceBoardScene, rhs: WorkspaceBoardScene) -> Bool {
         lhs.boardID == rhs.boardID
             && lhs.document == rhs.document
+            && lhs.pdfData == rhs.pdfData
             && lhs.editor.revision == rhs.editor.revision
             && lhs.editor.objects == rhs.editor.objects
             && lhs.editor.importedTransforms == rhs.editor.importedTransforms

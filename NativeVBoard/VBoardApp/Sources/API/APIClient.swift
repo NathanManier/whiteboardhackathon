@@ -216,6 +216,30 @@ final class APIClient: ObservableObject {
         catch { throw APIError.decoding("Could not decode the upload response.") }
     }
 
+    func importPDF(data pdfData: Data, filename: String, folderID: String? = nil,
+                   name: String? = nil, sourceKind: BoardSourceKind = .freeformPDF) async throws -> PDFImportResponse {
+        let boundary = "VBoard-PDF-\(UUID().uuidString)"
+        var request = try request(path: "/api/import/pdf", method: "POST", accept: "application/json")
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        var body = Data()
+        func field(_ key: String, _ value: String) {
+            body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(key)\"\r\n\r\n\(value)\r\n".utf8))
+        }
+        if let folderID { field("folder_id", folderID) }
+        if let name { field("name", name) }
+        field("source_kind", sourceKind.rawValue)
+        let safeFilename = filename.replacingOccurrences(of: "\"", with: "")
+        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"pdf\"; filename=\"\(safeFilename)\"\r\nContent-Type: application/pdf\r\n\r\n".utf8))
+        body.append(pdfData)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        request.httpBody = body
+        request.timeoutInterval = 120
+        let (data, response) = try await self.data(for: request)
+        try validate(response, data: data)
+        do { return try decoder.decode(PDFImportResponse.self, from: data) }
+        catch { throw APIError.decoding("Could not decode the imported PDF response.") }
+    }
+
     func processCorners(boardID: String, corners: [[Double]]) async throws -> UploadResponse {
         var request = try request(path: "/board/\(boardID)/corners", method: "POST")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["corners": corners])

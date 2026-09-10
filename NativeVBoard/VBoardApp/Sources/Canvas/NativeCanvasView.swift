@@ -11,6 +11,7 @@ private enum InteractionState: String { case idle = "IDLE", drawing = "DRAWING",
 struct NativeCanvasView: UIViewRepresentable {
     let boardID: String
     let document: SVGDocument
+    let pdfData: Data?
     let camera: CameraRect
     let objects: [CanvasObject]
     let importedTransforms: [String: ObjectTransform]
@@ -18,6 +19,7 @@ struct NativeCanvasView: UIViewRepresentable {
     var onStroke: (UserStroke) -> Void = { _ in }
     var tool: CanvasTool = .pen
     var onSelectionChanged: (Set<String>) -> Void = { _ in }
+    var onSelectionRegionChanged: (CGRect?) -> Void = { _ in }
     var onMove: (Set<String>, CGPoint) -> Void = { _, _ in }
     var onDelete: (Set<String>) -> Void = { _ in }
     var onCameraChanged: (CameraRect) -> Void = { _ in }
@@ -25,17 +27,17 @@ struct NativeCanvasView: UIViewRepresentable {
     var onRedo: () -> Void = {}
 
     func makeUIView(context: Context) -> InfiniteCanvasUIView {
-        InfiniteCanvasUIView(boardID: boardID, document: document, camera: camera,
+        InfiniteCanvasUIView(boardID: boardID, document: document, pdfData: pdfData, camera: camera,
                              objects: objects, importedTransforms: importedTransforms,
                              composition: composition, onStroke: onStroke, tool: tool,
-                             onSelectionChanged: onSelectionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
+                             onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
     }
 
     func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) {
-        uiView.update(boardID: boardID, document: document, camera: camera,
+        uiView.update(boardID: boardID, document: document, pdfData: pdfData, camera: camera,
                       objects: objects, importedTransforms: importedTransforms,
                       composition: composition, onStroke: onStroke, tool: tool,
-                      onSelectionChanged: onSelectionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
+                      onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
     }
 }
 
@@ -48,6 +50,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     /// Every world-space layer is a descendant of this single container so a
     /// CameraRect change moves the visible pixels, not just the culling set.
     private let worldContainer = UIView()
+    private let pdfSource = PDFPageRenderView()
     private let professor = ProfessorSVGView()
     private let userLayer = CALayer()
     private let paperLayer = CAShapeLayer()
@@ -60,6 +63,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var onStroke: (UserStroke) -> Void
     private var activeTool: CanvasTool
     private var onSelectionChanged: (Set<String>) -> Void
+    private var onSelectionRegionChanged: (CGRect?) -> Void
     private var onMove: (Set<String>, CGPoint) -> Void
     private var onDelete: (Set<String>) -> Void
     private var onCameraChanged: (CameraRect) -> Void
@@ -75,6 +79,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private let interactionLayer = CAShapeLayer()
     private var boardID: String
     private var document: SVGDocument
+    private var pdfData: Data?
     private var controller: CameraController
     private var cameraInitializedForBoardID: String?
     private var persistedCamera: CameraRect
@@ -98,15 +103,17 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var lastCameraMutationReason: CameraMutationReason?
     #endif
 
-    init(boardID: String, document: SVGDocument, camera: CameraRect,
+    init(boardID: String, document: SVGDocument, pdfData: Data? = nil, camera: CameraRect,
          objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:],
          composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in },
          tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
+         onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
          onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
-        self.boardID = boardID; self.document = document; self.objects = objects
+        self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition
         self.onStroke = onStroke
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
+        self.onSelectionRegionChanged = onSelectionRegionChanged
         self.onMove = onMove; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
         controller = CameraController(camera: camera)
         persistedCamera = camera
@@ -151,11 +158,21 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         #endif
         addSubview(worldContainer)
+        worldContainer.addSubview(pdfSource)
         worldContainer.addSubview(professor)
+        worldContainer.layer.insertSublayer(pdfSource.layer, at: 0)
+        worldContainer.layer.insertSublayer(professor.layer, above: pdfSource.layer)
+        worldContainer.layer.addSublayer(userLayer)
+        worldContainer.layer.addSublayer(interactionLayer)
         // ProfessorSVGView is a render-only subview. If it participates in
         // hit-testing, the parent never receives the simulator mouse/Pencil
         // stream and every editing tool appears inert.
         professor.isUserInteractionEnabled = false
+        if let pdfData { pdfSource.display(data: pdfData) }
+        else { pdfSource.isHidden = true }
+        if pdfData != nil {
+            PDFBoardSource.apply(transform: importedTransforms[PDFBoardSource.logicalID], to: pdfSource)
+        }
         let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
         pan.minimumNumberOfTouches = 1; pan.maximumNumberOfTouches = 2
         pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue), NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
@@ -215,6 +232,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         worldContainer.bounds = CGRect(origin: .zero, size: bounds.size)
         worldContainer.layer.position = .zero
         professor.frame = worldContainer.bounds
+        pdfSource.frame = document.viewBox
         userLayer.bounds = worldContainer.bounds
         userLayer.position = .zero
         paperLayer.bounds = worldContainer.bounds
@@ -227,15 +245,17 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         applyCamera(interacting: false)
     }
 
-    func update(boardID: String, document: SVGDocument, camera: CameraRect,
+    func update(boardID: String, document: SVGDocument, pdfData: Data? = nil, camera: CameraRect,
                 objects: [CanvasObject], importedTransforms: [String: ObjectTransform],
                 composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in },
                 tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
+                onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
                 onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
         let boardChanged = self.boardID != boardID
         let documentChanged = self.document != document || self.importedTransforms != importedTransforms
+        let pdfChanged = self.pdfData != pdfData
         let objectsChanged = self.objects != objects
-        self.boardID = boardID; self.document = document; self.objects = objects
+        self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition
         if boardChanged {
             persistedCamera = camera
@@ -250,6 +270,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             #endif
         }
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
+        self.onSelectionRegionChanged = onSelectionRegionChanged
         self.onMove = onMove; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
         // Hand and simulator Space-pan own the root touch stream directly.
         // This keeps one camera owner for indirect-pointer drags; physical
@@ -264,6 +285,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         // when a board identity changes; ordinary SwiftUI refreshes must not
         // overwrite the live camera after a pan or zoom.
         if documentChanged { professor.display(document, transform: worldTransform, importedTransforms: importedTransforms, composition: composition) }
+        if pdfChanged {
+            if let pdfData { pdfSource.display(data: pdfData); pdfSource.isHidden = false }
+            else { pdfSource.clear(); pdfSource.isHidden = true }
+        }
+        if pdfData != nil {
+            PDFBoardSource.apply(transform: importedTransforms[PDFBoardSource.logicalID], to: pdfSource)
+        } else {
+            pdfSource.isHidden = true
+        }
         if objectsChanged { rebuildUserLayers() }
         resolveInitialCameraIfNeeded()
         applyCamera(interacting: false)
@@ -665,7 +695,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             print("[VBoard] SELECT HIT ids=\(Array(selectedIDs))")
             print("[VBoard] SELECTION_CHANGED count=\(selectedIDs.count) ids=\(Array(selectedIDs))")
             #endif
-            onSelectionChanged(selectedIDs); updateSelectionOverlay(); updateInputHUD()
+            onSelectionRegionChanged(nil); onSelectionChanged(selectedIDs); updateSelectionOverlay(); updateInputHUD()
         }
     }
 
@@ -723,7 +753,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 return Double(inside) / Double(points.count) >= 0.65
             }.map(\.id))
             let professorIDs = professor.ids(intersecting: bounds)
-            selectedIDs = selected.union(professorIDs); onSelectionChanged(selectedIDs); updateSelectionOverlay()
+            selectedIDs = selected.union(professorIDs)
+            let pdfRegion = selectedIDs.contains(PDFBoardSource.logicalID)
+                ? bounds.intersection(document.viewBox)
+                : nil
+            onSelectionRegionChanged(pdfRegion?.isNull == false ? pdfRegion : nil)
+            onSelectionChanged(selectedIDs); updateSelectionOverlay()
             #if DEBUG
             print("[VBoard] LASSO CANDIDATES objects=\(selected.count) professor=\(professorIDs.count)")
             print("[VBoard] SELECTION_CHANGED count=\(selectedIDs.count) ids=\(Array(selectedIDs))")
@@ -758,7 +793,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         hit.formUnion(professor.ids(intersecting: segmentBounds))
         let fresh = hit.subtracting(eraseIDs)
         guard !fresh.isEmpty else { return }
-        eraseIDs.formUnion(fresh); selectedIDs.formUnion(fresh); onDelete(fresh); onSelectionChanged(selectedIDs)
+        eraseIDs.formUnion(fresh); selectedIDs.formUnion(fresh); onSelectionRegionChanged(nil); onDelete(fresh); onSelectionChanged(selectedIDs)
         #if DEBUG
         print("[VBoard] ERASER HITS ids=\(Array(fresh))")
         #endif

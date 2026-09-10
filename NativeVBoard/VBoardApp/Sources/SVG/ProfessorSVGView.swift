@@ -20,6 +20,7 @@ final class ProfessorSVGView: UIView {
     private struct Entry {
         let bounds: CGRect
         let layer: CAShapeLayer
+        let isRegionSurface: Bool
     }
 
     override init(frame: CGRect) {
@@ -92,6 +93,10 @@ final class ProfessorSVGView: UIView {
         var selected = Set<String>()
         for id in index.query(polygonBounds) {
             guard let entry = entries[id], let path = entry.layer.path else { continue }
+            if entry.isRegionSurface, entry.bounds.intersects(polygonBounds) {
+                selected.insert(id)
+                continue
+            }
             let bounds = entry.bounds
             var samples: [CGPoint] = []
             let steps = 6
@@ -179,7 +184,8 @@ final class ProfessorSVGView: UIView {
                 applyProvenance(provenanceBySourceID[id], to: shape)
                 #endif
                 shapeLayers.append(shape)
-                entries[id] = Entry(bounds: path.boundingBoxOfPath, layer: shape)
+                entries[id] = Entry(bounds: path.boundingBoxOfPath, layer: shape,
+                                    isRegionSurface: item.dataInk == "pdf-source")
                 index.insert(id: id, bounds: path.boundingBoxOfPath)
             } catch {
                 #if DEBUG

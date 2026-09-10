@@ -130,7 +130,9 @@ struct LectureWorkspaceView: View {
                 onCameraChanged: { store.updateCamera($0, api: api) },
                 onActiveBoardChanged: { store.setActiveBoard($0, api: api) },
                 onDetailDemand: { store.requestDetail(for: $0, api: api) },
-                onSelectionChanged: { store.setSelection($0) },
+                onSelectionChanged: { keys, pdfRegions in
+                    store.setSelection(keys, pdfRegions: pdfRegions)
+                },
                 onStroke: { stroke, boardID in store.applyStroke(stroke, boardID: boardID, api: api) },
                 onMoveSelection: { keys, delta in store.moveSelection(keys, by: delta, api: api) },
                 onResizeTextObject: { key, size in store.resizeTextObject(key, to: size, api: api) },

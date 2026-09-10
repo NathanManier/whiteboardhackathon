@@ -23,7 +23,7 @@ struct LectureCanvasView: UIViewRepresentable {
     var onCameraChanged: (CameraRect) -> Void
     var onActiveBoardChanged: (String) -> Void
     var onDetailDemand: (Set<String>) -> Void
-    var onSelectionChanged: (Set<SelectionKey>) -> Void
+    var onSelectionChanged: (Set<SelectionKey>, [String: CGRect]) -> Void
     var onStroke: (UserStroke, String) -> Void
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeTextObject: (SelectionKey, CGSize) -> Void
@@ -70,7 +70,7 @@ struct LectureCanvasCallbacks {
     var onCameraChanged: (CameraRect) -> Void
     var onActiveBoardChanged: (String) -> Void
     var onDetailDemand: (Set<String>) -> Void
-    var onSelectionChanged: (Set<SelectionKey>) -> Void
+    var onSelectionChanged: (Set<SelectionKey>, [String: CGRect]) -> Void
     var onStroke: (UserStroke, String) -> Void
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeTextObject: (SelectionKey, CGSize) -> Void
@@ -479,7 +479,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             let hit = hitTest(world)
             let clickedInsideExistingSelection = !hit.isEmpty && !hit.isDisjoint(with: selectedKeys)
             if !clickedInsideExistingSelection { selectedKeys = hit }
-            callbacks.onSelectionChanged(selectedKeys)
+            callbacks.onSelectionChanged(selectedKeys, [:])
             updateSelectionOverlay()
             #if DEBUG
             let hitLabels = hit.map { "\($0.kind.rawValue):\($0.objectID)" }.sorted()
@@ -613,7 +613,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             erase(from: lastEraseWorld ?? world, to: world)
             if case .erasing(_, let erased) = interaction, !erased.isEmpty {
                 selectedKeys.subtract(erased)
-                callbacks.onSelectionChanged(selectedKeys)
+                callbacks.onSelectionChanged(selectedKeys, [:])
             }
             lastEraseWorld = nil
         case .movingSelection(let startWorld, let clickSelection):
@@ -624,7 +624,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 callbacks.onMoveSelection(selectedKeys, delta)
             } else if let clickSelection {
                 selectedKeys = clickSelection
-                callbacks.onSelectionChanged(clickSelection)
+                callbacks.onSelectionChanged(clickSelection, [:])
             }
         case .resizingText(let key, let startWorld, let startBounds):
             let size = CGSize(width: max(120, startBounds.width + world.x - startWorld.x),
@@ -682,20 +682,29 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             result = result.union(CGRect(origin: point, size: .zero))
         }
         var selected = Set<SelectionKey>()
+        var selectedPDFRegions: [String: CGRect] = [:]
         for item in spatialIndex.query(bounds) {
             guard let boardView = boardViews[item.boardID], boardView.hasFullScene else {
                 callbacks.onDetailDemand([item.boardID])
                 continue
             }
             let localPolygon = polygon.map { LectureCoordinateTransform.lectureWorldToBoardLocal($0, board: item) }
-            selected.formUnion(boardView.selectionKeys(containedBy: localPolygon))
+            let boardSelection = boardView.selectionKeys(containedBy: localPolygon)
+            selected.formUnion(boardSelection)
+            if boardSelection.contains(where: {
+                $0.kind == .professorPath && $0.objectID == PDFBoardSource.logicalID
+            }) {
+                let localBounds = bounds.offsetBy(dx: -CGFloat(item.canvasX), dy: -CGFloat(item.canvasY))
+                    .intersection(CGRect(x: 0, y: 0, width: item.boardWidth, height: item.boardHeight))
+                if !localBounds.isNull { selectedPDFRegions[item.boardID] = localBounds }
+            }
         }
         selectedKeys = selected
         lassoPoints.removeAll()
         #if DEBUG
         print("[VBoard] LECTURE LASSO boardsQueried=\(spatialIndex.query(bounds).count) selected=\(selected.count) ids=\(selected.map { "\($0.boardID):\($0.objectID)" }.sorted())")
         #endif
-        callbacks.onSelectionChanged(selected)
+        callbacks.onSelectionChanged(selected, selectedPDFRegions)
         if let boardID = selected.first?.boardID { callbacks.onActiveBoardChanged(boardID) }
         updateSelectionOverlay()
     }
@@ -896,6 +905,7 @@ private final class LectureBoardRenderView: UIView {
 
     private let paperLayer = CAShapeLayer()
     private let professor = ProfessorSVGView()
+    private let pdfSource = PDFPageRenderView()
     private let thumbnail = UIImageView()
     private let header = UILabel()
     private let loading = UIActivityIndicatorView(style: .medium)
@@ -919,6 +929,7 @@ private final class LectureBoardRenderView: UIView {
         thumbnail.contentMode = .scaleAspectFit
         thumbnail.clipsToBounds = true
         addSubview(thumbnail)
+        addSubview(pdfSource)
         addSubview(professor)
         userLayer.anchorPoint = .zero
         userLayer.position = .zero
@@ -941,6 +952,7 @@ private final class LectureBoardRenderView: UIView {
         paperLayer.frame = bounds
         paperLayer.path = UIBezierPath(rect: bounds).cgPath
         thumbnail.frame = bounds
+        pdfSource.frame = bounds
         professor.frame = bounds
         userLayer.bounds = bounds
         userLayer.position = .zero
@@ -960,6 +972,17 @@ private final class LectureBoardRenderView: UIView {
         if representation == .fullVector, let scene {
             thumbnail.isHidden = true
             professor.isHidden = false
+            if let pdfData = scene.pdfData {
+                pdfSource.display(data: pdfData)
+                pdfSource.isHidden = false
+                PDFBoardSource.apply(
+                    transform: scene.editor.importedTransforms[PDFBoardSource.logicalID],
+                    to: pdfSource
+                )
+            } else {
+                pdfSource.clear()
+                pdfSource.isHidden = true
+            }
             loading.stopAnimating()
             if sceneChanged {
                 professor.display(scene.document,
@@ -972,6 +995,7 @@ private final class LectureBoardRenderView: UIView {
             }
         } else {
             professor.isHidden = true
+            pdfSource.isHidden = true
             userLayer.isHidden = true
             thumbnail.isHidden = false
             if representation == .fullVector { loading.startAnimating() } else { loading.stopAnimating() }
