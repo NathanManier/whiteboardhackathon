@@ -5,6 +5,7 @@ enum APIError: LocalizedError {
     case transport(String)
     case server(status: Int, message: String, retryable: Bool)
     case conflict(EditorState)
+    case workspaceConflict(LectureWorkspace)
     case decoding(String)
 
     var errorDescription: String? {
@@ -13,6 +14,7 @@ enum APIError: LocalizedError {
         case .transport(let detail), .decoding(let detail): return detail
         case .server(_, let message, _): return message
         case .conflict: return "This board changed elsewhere. Reload before saving."
+        case .workspaceConflict: return "This lecture layout changed elsewhere. Reload before saving."
         }
     }
 }
@@ -39,6 +41,27 @@ final class APIClient: ObservableObject {
 
     func library() async throws -> LibraryResponse { try await get("/api/library") }
     func lecture(id: String) async throws -> LectureResponse { try await get("/api/folders/\(id)/lecture", label: "lecture") }
+    func lectureWorkspace(id: String) async throws -> LectureWorkspace {
+        let envelope: LectureWorkspaceEnvelope = try await get("/api/folders/\(id)/workspace", label: "lecture workspace")
+        return envelope.workspace
+    }
+    func saveLectureWorkspace(_ workspace: LectureWorkspace, folderID: String) async throws -> LectureWorkspace {
+        var request = try request(path: "/api/folders/\(folderID)/workspace", method: "PUT")
+        request.httpBody = try encoder.encode(LectureWorkspaceEnvelope(workspace: workspace))
+        let (data, response) = try await data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 409,
+           let envelope = try? decoder.decode(LectureWorkspaceEnvelope.self, from: data) {
+            throw APIError.workspaceConflict(envelope.workspace)
+        }
+        try validate(response, data: data)
+        do { return try decoder.decode(LectureWorkspaceEnvelope.self, from: data).workspace }
+        catch { throw APIError.decoding("Could not decode the saved lecture workspace.") }
+    }
+
+    func resolvedURL(_ path: String?) -> URL? {
+        guard let path, !path.isEmpty else { return nil }
+        return URL(string: path, relativeTo: baseURL)?.absoluteURL
+    }
     func createLecture(name: String) async throws -> LectureFolder {
         var request = try request(path: "/api/folders", method: "POST")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
@@ -146,7 +169,7 @@ final class APIClient: ObservableObject {
         catch { throw APIError.decoding("Could not decode the processed board response.") }
     }
 
-    func deleteBoard(id: String) async throws { var request = try request(path: "/api/boards/\(id)", method: "DELETE"); let (data, response) = try await data(for: request); try validate(response, data: data) }
+    func deleteBoard(id: String) async throws { let request = try request(path: "/api/boards/\(id)", method: "DELETE"); let (data, response) = try await data(for: request); try validate(response, data: data) }
 
     func explain(boardID: String, action: String = "explain", selectedText: String = "", selectedObjectIDs: [String] = []) async throws -> StudyInteractionResponse {
         var request = try request(path: "/api/boards/\(boardID)/study/explain", method: "POST")

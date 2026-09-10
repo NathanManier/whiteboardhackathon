@@ -55,11 +55,88 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
     let height: Double?
     let thumbnailURL: String?
     let url: String?
+    let createdAt: Double?
+    let updatedAt: Double?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, status, width, height, url
+        case id, name, status, width, height, url, title, dimensions, assets, pipeline
+        case lectureBoards = "lecture_boards"
+        case boardID = "board_id"
+        case masterWidth = "master_width"
+        case masterHeight = "master_height"
         case folderID = "folder_id"
         case thumbnailURL = "thumbnail_url"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    private struct AssetNames: Codable { let thumbnail: String?; let master: String? }
+    private struct PipelineState: Codable { let status: String? }
+    private struct LectureBoardSummary: Codable {
+        let boardID: String
+        let createdAt: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case boardID = "boardId"
+            case createdAt
+        }
+    }
+
+    init(id: String, name: String, folderID: String?, status: String,
+         width: Double?, height: Double?, thumbnailURL: String?, url: String?,
+         createdAt: Double?, updatedAt: Double?) {
+        self.id = id; self.name = name; self.folderID = folderID; self.status = status
+        self.width = width; self.height = height; self.thumbnailURL = thumbnailURL
+        self.url = url; self.createdAt = createdAt; self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedID = try container.decodeIfPresent(String.self, forKey: .id)
+            ?? container.decode(String.self, forKey: .boardID)
+        id = decodedID
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+            ?? container.decodeIfPresent(String.self, forKey: .title)
+            ?? "Whiteboard"
+        folderID = try container.decodeIfPresent(String.self, forKey: .folderID)
+        let pipeline = try container.decodeIfPresent(PipelineState.self, forKey: .pipeline)
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? pipeline?.status ?? "unknown"
+        let dimensions = try container.decodeIfPresent(BoardDimensions.self, forKey: .dimensions)
+        width = try container.decodeIfPresent(Double.self, forKey: .width)
+            ?? container.decodeIfPresent(Double.self, forKey: .masterWidth)
+            ?? dimensions?.width
+        height = try container.decodeIfPresent(Double.self, forKey: .height)
+            ?? container.decodeIfPresent(Double.self, forKey: .masterHeight)
+            ?? dimensions?.height
+        let assets = try container.decodeIfPresent(AssetNames.self, forKey: .assets)
+        func assetPath(_ name: String) -> String {
+            if name.hasPrefix("/") || name.hasPrefix("https://") || name.hasPrefix("http://") {
+                return name
+            }
+            return "/boards/\(decodedID)/\(name)"
+        }
+        thumbnailURL = try container.decodeIfPresent(String.self, forKey: .thumbnailURL)
+            ?? assets?.thumbnail.map(assetPath)
+            ?? assets?.master.map(assetPath)
+        url = try container.decodeIfPresent(String.self, forKey: .url)
+        let lectureBoards = try container.decodeIfPresent([LectureBoardSummary].self, forKey: .lectureBoards) ?? []
+        createdAt = try container.decodeIfPresent(Double.self, forKey: .createdAt)
+            ?? lectureBoards.first(where: { $0.boardID == decodedID })?.createdAt
+        updatedAt = try container.decodeIfPresent(Double.self, forKey: .updatedAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encodeIfPresent(folderID, forKey: .folderID)
+        try container.encode(status, forKey: .status)
+        try container.encodeIfPresent(width, forKey: .width)
+        try container.encodeIfPresent(height, forKey: .height)
+        try container.encodeIfPresent(thumbnailURL, forKey: .thumbnailURL)
+        try container.encodeIfPresent(url, forKey: .url)
+        try container.encodeIfPresent(createdAt, forKey: .createdAt)
+        try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
     }
 }
 
@@ -99,6 +176,20 @@ struct LectureResponse: Codable, Sendable {
         case folder, boards
         case studyGuide = "study_guide"
         case studyGuideStale = "study_guide_stale"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        folder = try container.decode(LectureFolder.self, forKey: .folder)
+        let decodedBoards = try container.decodeIfPresent([LibraryBoard].self, forKey: .boards) ?? []
+        boards = decodedBoards
+        studyGuide = try container.decodeIfPresent(StudyGuide.self, forKey: .studyGuide)
+        studyGuideStale = try container.decodeIfPresent(Bool.self, forKey: .studyGuideStale)
+    }
+
+    init(folder: LectureFolder, boards: [LibraryBoard], studyGuide: StudyGuide?, studyGuideStale: Bool?) {
+        self.folder = folder; self.boards = boards
+        self.studyGuide = studyGuide; self.studyGuideStale = studyGuideStale
     }
 }
 

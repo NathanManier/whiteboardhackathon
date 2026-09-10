@@ -54,6 +54,7 @@ struct BoardView: View {
             case .decoding: message = "Couldn’t decode board data returned by the server."
             case .invalidBaseURL: message = "Couldn’t load board data because the server URL is invalid."
             case .conflict: message = "This board changed elsewhere. Reload it before editing."
+            case .workspaceConflict: message = "This lecture layout changed elsewhere. Reload it before editing."
             }
             state = .failed(message); debug("BOARD OPEN FAILED id=\(board.id) userMessage=\(message) technical=\(error.localizedDescription)")
         } catch {
@@ -127,7 +128,7 @@ private struct BoardEditorSurface: View {
             Button("Keep My Changes") { Task { await store.keepLocalChanges(api: api) } }
             Button("Reload Server Version", role: .destructive) { store.reloadServerVersion() }
         } message: { Text("Your local edits are preserved locally. Choose which version should remain.") }
-        .onChange(of: store.status) { status in if status == .conflict { showConflict = true } }
+        .onChange(of: store.status) { _, status in if status == .conflict { showConflict = true } }
         .task { store.restoreLocalIfPresent(server: store.editor) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
     }
@@ -168,7 +169,7 @@ private struct ToolButton: View {
     }
 }
 
-private struct StudyActionsView: View {
+struct StudyActionsView: View {
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
     let boardID: String

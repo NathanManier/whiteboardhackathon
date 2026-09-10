@@ -222,8 +222,8 @@ final class StrokeSerializationTests: XCTestCase {
         let transform = ObjectTransform(x: -40, y: 22, scaleX: 1, scaleY: 1, deleted: false)
         let moved = ObjectTransform(x: transform.x - 15, y: transform.y + 9, scaleX: transform.scaleX, scaleY: transform.scaleY, deleted: transform.deleted)
         XCTAssertEqual(svg.paths[0].d, originalPath)
-        XCTAssertEqual(moved.x ?? .nan, -55, accuracy: 0.000001)
-        XCTAssertEqual(moved.y ?? .nan, 31, accuracy: 0.000001)
+        XCTAssertEqual(moved.x, -55, accuracy: 0.000001)
+        XCTAssertEqual(moved.y, 31, accuracy: 0.000001)
     }
 
     func testMultiSelectionWorldDeltaPreservesRelativeSpacing() {
@@ -307,5 +307,140 @@ final class SceneCompositionTests: XCTestCase {
     func testRepeatedStableProfessorPathIDHasOneRenderableOwner() throws {
         let document = try SVGDocument.parse("<svg viewBox='0 0 10 10'><path id='prof-1' d='M0 0L1 1Z'/><path id='prof-1' d='M2 2L3 3Z'/></svg>")
         XCTAssertEqual(SceneComposition.canonicalProfessorPaths(document.paths).count, 1)
+    }
+}
+
+final class LectureWorkspaceModelTests: XCTestCase {
+    func testEffectiveBoundsIncludesBoardOwnedContentOutsidePaper() throws {
+        let editor = try JSONDecoder().decode(EditorState.self, from: Data(#"""
+        {
+          "schema_version":4,"revision":2,"viewport":{"x":0,"y":0,"width":100,"height":80},
+          "objects":[{"id":"note","type":"text","x":150,"y":-40,"width":90,"height":50,"text":"Study"}],
+          "groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]
+        }
+        """#.utf8))
+        let bounds = WorkspaceEffectiveBounds.boardLocal(editor: editor, boardSize: CGSize(width: 100, height: 80))
+        XCTAssertEqual(bounds, CGRect(x: 0, y: -40, width: 240, height: 120))
+    }
+
+    private func item(_ index: Int, x: Double, y: Double = 0,
+                      width: Double = 800, height: Double = 600,
+                      effectiveWidth: Double? = nil) -> WorkspaceBoardItem {
+        let boardID = String(format: "%032x", index + 1)
+        return WorkspaceBoardItem(
+            id: "board:\(boardID)", kind: "board", boardID: boardID,
+            canvasX: x, canvasY: y, boardWidth: width, boardHeight: height,
+            effectiveContentBounds: CameraRect(x: x, y: y, width: effectiveWidth ?? width, height: height),
+            createdAt: Double(index + 1), capturedAt: nil, detectedBoardDate: nil,
+            unitLabel: "No Unit", unitNumber: nil, unitConfidence: 0,
+            unitSource: .none, title: "Board \(index + 1)", thumbnailURL: nil, zIndex: index
+        )
+    }
+
+    func testBoardLocalLectureWorldRoundTripWithNegativePlacement() {
+        let board = item(0, x: -4_200, y: 900)
+        let local = CGPoint(x: 312.5, y: -44)
+        let lecture = LectureCoordinateTransform.boardLocalToLectureWorld(local, board: board)
+        XCTAssertEqual(lecture.x, -3_887.5, accuracy: 0.000001)
+        XCTAssertEqual(lecture.y, 856, accuracy: 0.000001)
+        let roundTrip = LectureCoordinateTransform.lectureWorldToBoardLocal(lecture, board: board)
+        XCTAssertEqual(roundTrip.x, local.x, accuracy: 0.000001)
+        XCTAssertEqual(roundTrip.y, local.y, accuracy: 0.000001)
+    }
+
+    func testAutoPlacementUsesEffectiveContentRightEdge() {
+        let first = item(0, x: 0, effectiveWidth: 1_600)
+        let second = item(1, x: 2_000, width: 700, effectiveWidth: 900)
+        let placement = WorkspaceLayout.placement(for: CGSize(width: 640, height: 480), after: [first, second])
+        XCTAssertEqual(placement.x, 2_996, accuracy: 0.000001)
+        XCTAssertEqual(placement.y, 0, accuracy: 0.000001)
+    }
+
+    func testWorkspaceSpatialIndexOnlyReturnsCandidateBoards() {
+        let items = [item(0, x: -1_000), item(1, x: 0), item(2, x: 5_000)]
+        let index = WorkspaceSpatialIndex(items: items)
+        XCTAssertEqual(index.query(CGRect(x: -50, y: -50, width: 900, height: 700)).map(\.boardID), [items[1].boardID])
+    }
+
+    func testFullDetailBudgetNeverPromotesMoreThanThreeBoards() {
+        let items = (0..<12).map { item($0, x: Double($0 * 240), width: 220, height: 160) }
+        let camera = CameraRect(x: 0, y: -100, width: 3_000, height: 800)
+        let representations = BoardDetailPolicy.representations(
+            items: items, camera: camera, viewport: CGSize(width: 1_200, height: 800),
+            activeBoardID: items[8].boardID
+        )
+        XCTAssertLessThanOrEqual(representations.values.filter { $0 == .fullVector }.count, 3)
+        XCTAssertEqual(representations[items[8].boardID], .fullVector)
+        XCTAssertGreaterThan(representations.values.filter { $0 == .thumbnail }.count, 0)
+    }
+
+    func testCompositeSelectionKeysKeepCollidingSVGIDsIndependent() {
+        let first = SelectionKey(boardID: "a", objectID: "path-1", kind: .professorPath)
+        let second = SelectionKey(boardID: "b", objectID: "path-1", kind: .professorPath)
+        XCTAssertEqual(Set([first, second]).count, 2)
+    }
+
+    func testHundredBoardManifestDecodesWithoutScenePayloads() throws {
+        let itemsJSON = (0..<100).map { index -> String in
+            let boardID = String(format: "%032x", index + 1)
+            return """
+            {"id":"board:\(boardID)","kind":"board","board_id":"\(boardID)","canvas_x":\(index * 900),"canvas_y":0,"board_width":800,"board_height":600,"effective_content_bounds":{"x":\(index * 900),"y":0,"width":800,"height":600},"created_at":\(index + 1),"unit_label":"No Unit","unit_confidence":0,"unit_source":"none","title":"Board \(index + 1)","z_index":\(index)}
+            """
+        }.joined(separator: ",")
+        let data = Data("""
+        {"workspace":{"schema_version":1,"revision":4,"camera":{"x":0,"y":0,"width":1200,"height":800},"items":[\(itemsJSON)],"active_board_id":null,"last_viewed_at":1}}
+        """.utf8)
+        let workspace = try JSONDecoder().decode(LectureWorkspaceEnvelope.self, from: data).workspace
+        XCTAssertEqual(workspace.items.count, 100)
+        XCTAssertEqual(workspace.revision, 4)
+    }
+
+    func testExplicitUnitNormalizerRequiresLiteralUnitMarker() {
+        XCTAssertEqual(ExplicitUnitNormalizer.normalized("UNIT 2")?.label, "Unit 2")
+        XCTAssertEqual(ExplicitUnitNormalizer.normalized("Unit III")?.number, 3)
+        XCTAssertNil(ExplicitUnitNormalizer.normalized("Chapter 2"))
+        XCTAssertNil(ExplicitUnitNormalizer.normalized("Find the unit vector"))
+    }
+
+    func testHostedLectureBoardDecodesNestedDimensionsAssetsAndDate() throws {
+        let data = Data(#"""
+        {
+          "id":"63cb8b57e8ad25b3c71008d323d78326",
+          "board_id":"63cb8b57e8ad25b3c71008d323d78326",
+          "name":"Whiteboard 1",
+          "folder_id":"98b1a86028cc3282",
+          "dimensions":{"width":3000,"height":2266},
+          "assets":{"thumbnail":"thumbnail.png","master":"master.png"},
+          "pipeline":{"status":"ready"},
+          "lecture_boards":[
+            {"boardId":"63cb8b57e8ad25b3c71008d323d78326","createdAt":1788746697.9258761}
+          ]
+        }
+        """#.utf8)
+        let board = try JSONDecoder().decode(LibraryBoard.self, from: data)
+        XCTAssertEqual(board.width, 3000)
+        XCTAssertEqual(board.height, 2266)
+        XCTAssertEqual(board.status, "ready")
+        XCTAssertEqual(board.thumbnailURL, "/boards/63cb8b57e8ad25b3c71008d323d78326/thumbnail.png")
+        XCTAssertEqual(board.createdAt ?? 0, 1788746697.9258761, accuracy: 0.0001)
+    }
+
+    func testLegacyWorkspaceUsesRealHostedBoardGeometry() throws {
+        let folder = LectureFolder(id: "lecture", name: "Chemistry", workspaceBoardID: nil,
+                                   boardOrder: ["board-a", "board-b"])
+        let first = LibraryBoard(id: "board-a", name: "One", folderID: "lecture", status: "ready",
+                                 width: 3000, height: 2266, thumbnailURL: "/boards/board-a/thumbnail.png",
+                                 url: nil, createdAt: 100, updatedAt: nil)
+        let second = LibraryBoard(id: "board-b", name: "Two", folderID: "lecture", status: "ready",
+                                  width: 2292, height: 2164, thumbnailURL: "/boards/board-b/thumbnail.png",
+                                  url: nil, createdAt: 200, updatedAt: nil)
+        let workspace = LectureWorkspace.legacy(
+            lecture: LectureResponse(folder: folder, boards: [first, second], studyGuide: nil, studyGuideStale: nil)
+        )
+        XCTAssertEqual(workspace.items[0].boardWidth, 3000)
+        XCTAssertEqual(workspace.items[0].boardHeight, 2266)
+        XCTAssertEqual(workspace.items[1].canvasX, 3096)
+        XCTAssertEqual(workspace.camera.width, 3128)
+        XCTAssertEqual(workspace.items[1].createdAt, 200)
     }
 }

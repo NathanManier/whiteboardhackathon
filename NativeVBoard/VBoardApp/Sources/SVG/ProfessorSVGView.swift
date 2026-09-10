@@ -81,6 +81,38 @@ final class ProfessorSVGView: UIView {
 
     func ids(intersecting rect: CGRect) -> Set<String> { index.query(rect) }
 
+    /// Returns professor contours whose sampled filled area is substantially
+    /// inside a board-local lasso. The spatial index is only the candidate
+    /// reducer; stable path IDs remain the selection identity.
+    func ids(containedBy polygon: [CGPoint], threshold: Double = 0.65) -> Set<String> {
+        guard polygon.count >= 3 else { return [] }
+        let polygonBounds = polygon.reduce(into: CGRect.null) { result, point in
+            result = result.union(CGRect(origin: point, size: .zero))
+        }
+        var selected = Set<String>()
+        for id in index.query(polygonBounds) {
+            guard let entry = entries[id], let path = entry.layer.path else { continue }
+            let bounds = entry.bounds
+            var samples: [CGPoint] = []
+            let steps = 6
+            for yIndex in 0...steps {
+                for xIndex in 0...steps {
+                    let point = CGPoint(
+                        x: bounds.minX + bounds.width * CGFloat(xIndex) / CGFloat(steps),
+                        y: bounds.minY + bounds.height * CGFloat(yIndex) / CGFloat(steps)
+                    )
+                    if path.contains(point, using: entry.layer.fillRule == .evenOdd ? .evenOdd : .winding) {
+                        samples.append(point)
+                    }
+                }
+            }
+            if samples.isEmpty { samples = [CGPoint(x: bounds.midX, y: bounds.midY)] }
+            let contained = samples.filter { Self.polygonContains($0, polygon: polygon) }.count
+            if Double(contained) / Double(samples.count) >= threshold { selected.insert(id) }
+        }
+        return selected
+    }
+
     func bounds(for id: String) -> CGRect {
         entries[id]?.bounds ?? .null
     }
@@ -190,6 +222,22 @@ final class ProfessorSVGView: UIView {
             layer.setValue(node.renderLayer, forKey: "vboard.renderLayer")
         }
         #endif
+    }
+
+    private static func polygonContains(_ point: CGPoint, polygon: [CGPoint]) -> Bool {
+        var inside = false
+        for index in polygon.indices {
+            let previous = index == polygon.startIndex ? polygon.index(before: polygon.endIndex) : polygon.index(before: index)
+            let a = polygon[index]
+            let b = polygon[previous]
+            let denominator = b.y - a.y
+            if abs(denominator) > .ulpOfOne,
+               (a.y > point.y) != (b.y > point.y),
+               point.x < (b.x - a.x) * (point.y - a.y) / denominator + a.x {
+                inside.toggle()
+            }
+        }
+        return inside
     }
 }
 

@@ -26,7 +26,7 @@ struct LibraryView: View {
                                         Label("Lectures", systemImage: "rectangle.stack.fill").font(.title3.weight(.semibold))
                                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 16)], spacing: 16) {
                                             ForEach(library.folders) { folder in
-                                                NavigationLink { LectureView(folder: folder) } label: { LectureCard(folder: folder) }.buttonStyle(.plain)
+                                                NavigationLink { LectureWorkspaceView(folder: folder) } label: { LectureCard(folder: folder) }.buttonStyle(.plain)
                                             }
                                         }
                                     }
@@ -35,7 +35,7 @@ struct LibraryView: View {
                                     HStack { Label("Recent whiteboards", systemImage: "rectangle.on.rectangle").font(.title3.weight(.semibold)); Spacer(); Text("\(library.boards.count)").foregroundStyle(.secondary) }
                                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 230), spacing: 16)], spacing: 16) {
                                         ForEach(library.boards) { board in
-                                            NavigationLink { BoardView(board: board) } label: { BoardCard(board: board) }.buttonStyle(.plain)
+                                            NavigationLink { destination(for: board, in: library) } label: { BoardCard(board: board) }.buttonStyle(.plain)
                                         }
                                     }
                                 }
@@ -50,7 +50,10 @@ struct LibraryView: View {
             .toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { showImporter = true } label: { Label("Import Whiteboard", systemImage: "photo.badge.plus") }; Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "books.vertical") } } label: { Image(systemName: "plus") }.accessibilityLabel("Add to V-Board") }; ToolbarItem(placement: .secondaryAction) { Button { load() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh library") } }
             .sheet(isPresented: $showImporter) { ImportFlowView { board in launchBoard = board; showImporter = false; load() } }
             .sheet(isPresented: $showNewLecture) { NewLectureView { showNewLecture = false; load() } }
-            .navigationDestination(item: $launchBoard) { BoardView(board: $0) }
+            .navigationDestination(item: $launchBoard) { board in
+                if let library { destination(for: board, in: library) }
+                else { BoardView(board: board) }
+            }
             .task { load() }
         }
     }
@@ -61,6 +64,16 @@ struct LibraryView: View {
                 let result = try await api.library(); library = result; error = nil
                 if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-VBoardOpenID"), index + 1 < ProcessInfo.processInfo.arguments.count { launchBoard = result.boards.first(where: { $0.id == ProcessInfo.processInfo.arguments[index + 1] }) }
             } catch { self.error = "Check your connection and try again." }
+        }
+    }
+
+    @ViewBuilder
+    private func destination(for board: LibraryBoard, in library: LibraryResponse) -> some View {
+        if let folderID = board.folderID,
+           let folder = library.folders.first(where: { $0.id == folderID }) {
+            LectureWorkspaceView(folder: folder, focusBoardID: board.id)
+        } else {
+            BoardView(board: board)
         }
     }
 }
@@ -92,46 +105,6 @@ private struct LectureCard: View {
 private struct BoardCard: View {
     let board: LibraryBoard
     var body: some View { VStack(alignment: .leading, spacing: 9) { if let raw = board.thumbnailURL, let url = URL(string: raw, relativeTo: URL(string: "https://chsinteract.com")) { AsyncImage(url: url) { phase in switch phase { case .success(let image): image.resizable().scaledToFill(); default: Image(systemName: "photo").font(.largeTitle).foregroundStyle(.secondary) } }.frame(height: 130).clipped().clipShape(RoundedRectangle(cornerRadius: 8)) } else { RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.45)).frame(height: 130).overlay { Image(systemName: board.status == "ready" ? "checkmark" : "clock").font(.title2).foregroundStyle(.secondary) } }; Text(board.name).font(.headline).lineLimit(2); Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized).font(.caption).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading) }
-}
-
-struct LectureView: View {
-    @EnvironmentObject private var api: APIClient
-    let folder: LectureFolder
-    @State private var lecture: LectureResponse?
-    @State private var error: String?
-    @State private var showImporter = false
-    @State private var showGuide = false
-    @State private var showRename = false
-    @State private var showDelete = false
-    @State private var renameText = ""
-    @State private var renameBoard: LibraryBoard?
-    var body: some View {
-        Group {
-            if lecture != nil { loadedView }
-            else if let error { ContentUnavailableView("Couldn’t load lecture", systemImage: "rectangle.stack.badge.exclamationmark", description: Text(error)).overlay(alignment: .bottom) { Button("Retry") { load() }.buttonStyle(.borderedProminent).padding(.bottom, 30) } }
-            else { ProgressView("Loading lecture…") }
-        }.navigationTitle(folder.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { renameText = lecture?.folder.name ?? folder.name; showRename = true } label: { Label("Rename Lecture", systemImage: "pencil") }; Button(role: .destructive) { showDelete = true } label: { Label("Delete Lecture", systemImage: "trash") } } label: { Image(systemName: "ellipsis.circle") } } }.sheet(isPresented: $showImporter) { ImportFlowView(folderID: folder.id) { _ in showImporter = false; load() } }.sheet(isPresented: $showGuide) { StudyGuideView(folderID: folder.id, guide: lecture?.studyGuide) }.sheet(isPresented: $showRename) { RenamePrompt(title: "Rename Lecture", value: renameText) { value in Task { do { _ = try await api.renameLecture(id: folder.id, name: value); showRename = false; load() } catch { self.error = "That lecture name could not be saved." } } } }.sheet(item: $renameBoard) { board in RenamePrompt(title: "Rename Whiteboard", value: board.name) { value in Task { do { _ = try await api.updateBoard(id: board.id, name: value); renameBoard = nil; load() } catch { self.error = "That board name could not be saved." } } } }.alert("Delete lecture?", isPresented: $showDelete) { Button("Delete", role: .destructive) { Task { await deleteLecture() } }; Button("Cancel", role: .cancel) {} } message: { Text("A lecture can only be deleted when it is empty.") }.task { load() }
-    }
-    @ViewBuilder private var loadedView: some View {
-        if let lecture {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    HStack { VStack(alignment: .leading) { Text(lecture.folder.name).font(.largeTitle.bold()); Text("Your ordered whiteboards").foregroundStyle(.secondary) }; Spacer(); Button { showImporter = true } label: { Label("Add Board", systemImage: "plus") }.buttonStyle(.borderedProminent) }.padding(.horizontal)
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 16)], spacing: 16) {
-                        ForEach(lecture.boards) { board in
-                            NavigationLink { BoardView(board: board) } label: { BoardCard(board: board) }.buttonStyle(.plain).contextMenu { Button { renameBoard = board } label: { Label("Rename", systemImage: "pencil") }; Button(role: .destructive) { Task { await delete(board) } } label: { Label("Delete", systemImage: "trash") } }
-                        }
-                    }.padding(.horizontal)
-                    Button { showGuide = true } label: { Label(lecture.studyGuide == nil ? "Create Study Guide" : "Open Study Guide", systemImage: "text.book.closed") }.buttonStyle(.bordered).padding(.horizontal)
-                }.padding(.vertical, 24)
-            }
-        }
-    }
-    private func load() { Task { do { lecture = try await api.lecture(id: folder.id); error = nil } catch { self.error = "Your lecture could not be loaded." } } }
-    private func deleteLecture() async { do { try await api.deleteLecture(id: folder.id); dismissLecture() } catch { self.error = "The lecture could not be deleted. Remove its boards first." } }
-    private func delete(_ board: LibraryBoard) async { do { try await api.deleteBoard(id: board.id); load() } catch { self.error = "The whiteboard could not be deleted." } }
-    @Environment(\.dismiss) private var dismiss
-    private func dismissLecture() { dismiss() }
 }
 
 private struct RenamePrompt: View {
@@ -187,7 +160,7 @@ private struct CameraCaptureView: UIViewControllerRepresentable {
     final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate { let onCapture: (Data) -> Void; init(onCapture: @escaping (Data) -> Void) { self.onCapture = onCapture }; func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]) { if let image = info[.originalImage] as? UIImage, let data = image.jpegData(compressionQuality: 0.94) { onCapture(data) } }; func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {} }
 }
 
-private struct StudyGuideView: View {
+struct StudyGuideView: View {
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
     let folderID: String
