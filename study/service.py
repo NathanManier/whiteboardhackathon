@@ -977,36 +977,60 @@ def explain_board(
     else:
         LOGGER.debug(log_line)
     current_id = source_board_id_for_selection(editor, selected_ids, board_id)
-    lecture_pack = lecture_ai_pack(
-        folder_id=folder_id,
-        library=library,
-        host_id=board_id,
-        editor=editor,
-        action=action,
-        atomic_json=atomic_json,
-        current_board_id=current_id,
+    def execute_explanation() -> dict[str, Any]:
+        lecture_pack = lecture_ai_pack(
+            folder_id=folder_id,
+            library=library,
+            host_id=board_id,
+            editor=editor,
+            action=action,
+            atomic_json=atomic_json,
+            current_board_id=current_id,
+        )
+        selection_context["lecture_context"] = lecture_pack.get("context")
+        selection_context["board_sequence"] = lecture_pack.get("sequence")
+        selection_context["current_board"] = lecture_pack.get("current_board")
+        images = {
+            "selected": views["selected"],
+            "context": views["context"],
+            "overview": lecture_pack.get("current_master") or master_overview or views["overview"],
+        }
+        if lecture_pack.get("images"):
+            images["lecture_boards"] = lecture_pack["images"]
+        return explain_selection(
+            question=question,
+            board_title=board_title,
+            folder_name=folder_name,
+            object_meta=views.get("objects") or [],
+            board_context=compact_board_context(board_context),
+            lecture_context=lecture_pack.get("context"),
+            selection_context=selection_context,
+            action=action,
+            images=images,
+        )
+
+    result = execute_explanation()
+    insufficient = (
+        str(result.get("confidence") or "").lower() == "low"
+        or str(result.get("verdict") or "").lower() == "insufficient_evidence"
     )
-    selection_context["lecture_context"] = lecture_pack.get("context")
-    selection_context["board_sequence"] = lecture_pack.get("sequence")
-    selection_context["current_board"] = lecture_pack.get("current_board")
-    images = {
-        "selected": views["selected"],
-        "context": views["context"],
-        "overview": lecture_pack.get("current_master") or master_overview or views["overview"],
-    }
-    if lecture_pack.get("images"):
-        images["lecture_boards"] = lecture_pack["images"]
-    result = explain_selection(
-        question=question,
-        board_title=board_title,
-        folder_name=folder_name,
-        object_meta=views.get("objects") or [],
-        board_context=compact_board_context(board_context),
-        lecture_context=lecture_pack.get("context"),
-        selection_context=selection_context,
-        action=action,
-        images=images,
-    )
+    if insufficient:
+        from study.routing import current_ai_request, override_active_route
+
+        active_request = current_ai_request()
+        if active_request and active_request.route.escalation_depth == 0:
+            if folder_id:
+                retry_route = active_request.route.escalate_context_once(has_lecture=True)
+            else:
+                retry_route = active_request.route.escalate_difficulty()
+            LOGGER.info(
+                "AI RETRY request=%s scope=%s difficulty=%s reason=insufficient_evidence",
+                active_request.context.request_id or "none",
+                retry_route.scope.value,
+                retry_route.difficulty.value,
+            )
+            with override_active_route(retry_route):
+                result = execute_explanation()
     selection_bbox = views.get("selection_bbox") or bbox
     anchor = canvas_anchor(payload, selection_bbox)
     try:
@@ -1339,6 +1363,12 @@ def lecture_ai_pack(
     folder = folder_by_id(library, folder_id)
     if folder is None:
         return empty
+    from study.routing import ContextScope, current_ai_request
+
+    active_request = current_ai_request()
+    scope = active_request.route.scope if active_request else ContextScope.BOARD
+    if scope in {ContextScope.LOCAL, ContextScope.BOARD}:
+        return empty
     member_ids = folder_board_ids(library, folder_id)
     try:
         placements = validate_source_boards(editor.get("source_boards"))
@@ -1360,7 +1390,7 @@ def lecture_ai_pack(
     context = public_lecture_context(folder.get("lecture_context"))
     images: list[dict[str, str]] = []
     current_master = None
-    if action in {"explain_across_boards", "where_from", "check_my_work"} or current_id != host_id:
+    if scope in {ContextScope.LECTURE, ContextScope.COURSE}:
         from app import BOARDS_DIR, read_metadata
 
         if current_id != host_id:
@@ -1372,8 +1402,21 @@ def lecture_ai_pack(
                     current_master = encode_master_overview(path) if path else None
                 except Exception:
                     current_master = None
-        if action in {"explain_across_boards", "where_from", "check_my_work"}:
-            for item in sequence:
+        if scope in {ContextScope.LECTURE, ContextScope.COURSE}:
+            current_index = next(
+                (index for index, item in enumerate(sequence) if item["board_id"] == current_id),
+                0,
+            )
+            # Prefer nearby/previous boards over dumping a whole lecture. A
+            # hard cap remains in place for very large courses.
+            ordered_context = sorted(
+                sequence,
+                key=lambda item: (
+                    abs(sequence.index(item) - current_index),
+                    sequence.index(item),
+                ),
+            )
+            for item in ordered_context:
                 if item["board_id"] in {host_id, current_id}:
                     continue
                 member_dir = BOARDS_DIR / item["board_id"]

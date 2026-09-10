@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from study.routing import (
+    AIRoute,
     AIModelPolicy,
     AIRequestContext,
     ContextScope,
@@ -60,6 +61,20 @@ class AIRouterTests(unittest.TestCase):
         self.assertEqual(lecture.scope, ContextScope.LECTURE)
         self.assertEqual(hard.difficulty, ReasoningDifficulty.HARD)
         self.assertEqual(hard.escalation_depth, 3)
+
+    def test_single_context_retry_jumps_to_usable_lecture_scope(self):
+        route = AIRoute(
+            scope=ContextScope.LOCAL,
+            difficulty=ReasoningDifficulty.SIMPLE,
+            needs_visual=True,
+            needs_retrieval=False,
+            confidence=0.95,
+        )
+        retry = route.escalate_context_once(has_lecture=True)
+        self.assertEqual(retry.scope, ContextScope.LECTURE)
+        self.assertEqual(retry.difficulty, ReasoningDifficulty.SIMPLE)
+        self.assertEqual(retry.escalation_depth, 1)
+        self.assertTrue(retry.needs_retrieval)
 
     def test_model_policy_centralizes_configured_roles(self):
         policy = AIModelPolicy({

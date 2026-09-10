@@ -87,6 +87,21 @@ class AIRoute:
             escalation_depth=self.escalation_depth + 1,
         )
 
+    def escalate_context_once(self, *, has_lecture: bool) -> "AIRoute":
+        """One retry may jump directly to useful lecture context."""
+        next_scope = ContextScope.LECTURE if has_lecture and self.scope in {
+            ContextScope.LOCAL, ContextScope.BOARD
+        } else self.escalate_scope().scope
+        return AIRoute(
+            scope=next_scope,
+            difficulty=self.difficulty,
+            needs_visual=self.needs_visual,
+            needs_retrieval=next_scope != ContextScope.LOCAL,
+            confidence=self.confidence,
+            source="insufficient_context_retry",
+            escalation_depth=self.escalation_depth + 1,
+        )
+
 
 _PREVIOUS = re.compile(r"\b(previous|earlier|before|yesterday|last\s+lecture|prior\s+board)\b", re.I)
 _LECTURE = re.compile(r"\b(this\s+lecture|the\s+lecture|across\s+(?:these\s+)?boards?|whiteboards?\s+in\s+this\s+lecture)\b", re.I)
@@ -277,6 +292,20 @@ _ACTIVE: contextvars.ContextVar[ActiveAIRequest | None] = contextvars.ContextVar
 
 def current_ai_request() -> ActiveAIRequest | None:
     return _ACTIVE.get()
+
+
+@contextmanager
+def override_active_route(route: AIRoute) -> Iterator[AIRoute]:
+    """Temporarily preserve request identity while making one bounded retry."""
+    active = current_ai_request()
+    if active is None:
+        yield route
+        return
+    token = _ACTIVE.set(ActiveAIRequest(active.context, route))
+    try:
+        yield route
+    finally:
+        _ACTIVE.reset(token)
 
 
 @contextmanager
