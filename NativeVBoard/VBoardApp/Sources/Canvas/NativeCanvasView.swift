@@ -308,7 +308,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         assert(self.transform == .identity, "Root canvas must remain untransformed")
         assert(worldContainer.layer.affineTransform() == current.affineTransform, "World container transform must equal CameraRect transform")
         assert(interactionLayer.affineTransform() == .identity, "World overlay must not receive a second camera transform")
-        print("[VBoard] CAMERA APPLY reason=\(reason) interacting=\(interacting) camera=\(controller.camera) previousCamera=\(previousCamera) worldTransformOld=\(String(describing: previousWorldTransform)) worldTransformNew=\(worldContainer.layer.affineTransform()) worldContainerFrame=\(worldContainer.frame) worldContainerBounds=\(worldContainer.bounds) worldContainerPosition=\(worldContainer.layer.position) visibleWorldRect=\(visible)")
+        print("[VBoard] CAMERA APPLY reason=\(reason) interacting=\(interacting) camera=\(controller.camera) previousCamera=\(String(describing: previousCamera)) worldTransformOld=\(String(describing: previousWorldTransform)) worldTransformNew=\(worldContainer.layer.affineTransform()) worldContainerFrame=\(worldContainer.frame) worldContainerBounds=\(worldContainer.bounds) worldContainerPosition=\(worldContainer.layer.position) visibleWorldRect=\(visible)")
         #endif
     }
 
