@@ -54,6 +54,105 @@ enum PencilPressureResponse {
     }
 }
 
+enum BoardVectorLoadState: Equatable, Sendable {
+    case unloaded
+    case previewReady
+    case vectorLoading
+    case vectorPartial
+    case vectorReady
+    case vectorFailed
+
+    var isWorking: Bool { self == .vectorLoading || self == .vectorPartial }
+    var userLabel: String {
+        switch self {
+        case .vectorLoading: return "Preparing editable ink…"
+        case .vectorPartial: return "Refining editable ink…"
+        case .vectorFailed: return "Editable ink unavailable"
+        default: return ""
+        }
+    }
+}
+
+enum VectorLoadingIndicatorPolicy {
+    static let appearanceDelay: TimeInterval = 0.20
+    static let minimumVisibleDuration: TimeInterval = 0.50
+}
+
+/// A board-local indicator whose lifetime follows actual professor-path
+/// progress. Delays only prevent flicker; they never mark unfinished work as
+/// complete.
+final class BoardVectorLoadingIndicator: UIView {
+    private let spinner = UIActivityIndicatorView(style: .medium)
+    private let label = UILabel()
+    private var transitionTask: Task<Void, Never>?
+    private var visibleSince: TimeInterval?
+    private(set) var state: BoardVectorLoadState = .unloaded
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.92)
+        layer.cornerRadius = 12
+        layer.borderWidth = 0.5
+        layer.borderColor = UIColor.separator.withAlphaComponent(0.35).cgColor
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabel
+        let stack = UIStackView(arrangedSubviews: [spinner, label])
+        stack.axis = .horizontal
+        stack.spacing = 7
+        stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7)
+        ])
+        alpha = 0
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func transition(to next: BoardVectorLoadState) {
+        guard state != next else { return }
+        state = next
+        transitionTask?.cancel()
+        label.text = next.userLabel
+        if next.isWorking {
+            spinner.startAnimating()
+            if !isHidden {
+                return
+            }
+            transitionTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(VectorLoadingIndicatorPolicy.appearanceDelay * 1_000_000_000))
+                guard !Task.isCancelled, let self, self.state.isWorking else { return }
+                self.isHidden = false
+                self.visibleSince = CACurrentMediaTime()
+                UIView.animate(withDuration: 0.16) { self.alpha = 1 }
+            }
+        } else if !isHidden {
+            let elapsed = CACurrentMediaTime() - (visibleSince ?? CACurrentMediaTime())
+            let delay = max(0, VectorLoadingIndicatorPolicy.minimumVisibleDuration - elapsed)
+            transitionTask = Task { @MainActor [weak self] in
+                if delay > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+                guard !Task.isCancelled, let self, !self.state.isWorking else { return }
+                UIView.animate(withDuration: 0.16, animations: { self.alpha = 0 }) { _ in
+                    guard !self.state.isWorking else { return }
+                    self.isHidden = true
+                    self.visibleSince = nil
+                    self.spinner.stopAnimating()
+                }
+            }
+        } else {
+            spinner.stopAnimating()
+        }
+    }
+}
+
 enum SelectionResizeHandle: CaseIterable, Sendable {
     case topLeft, topRight, bottomRight, bottomLeft
 
@@ -252,6 +351,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private var panRecognizer: UIPanGestureRecognizer!
     private var pinchRecognizer: UIPinchGestureRecognizer!
     private var lastHandledSqueezeTimestamp: TimeInterval = -1
+    private var previousViewportSize: CGSize = .zero
 
     init(workspace: LectureWorkspace,
          scenes: [String: WorkspaceBoardScene],
@@ -413,6 +513,17 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        let newViewportSize = bounds.size
+        if previousViewportSize.width > 0, previousViewportSize.height > 0,
+           newViewportSize != previousViewportSize {
+            controller.resizeViewport(from: previousViewportSize, to: newViewportSize)
+            let resizedCamera = controller.camera
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.callbacks.onCameraChanged(resizedCamera)
+            }
+        }
+        previousViewportSize = newViewportSize
         worldContainer.bounds = CGRect(origin: .zero, size: bounds.size)
         worldContainer.layer.position = .zero
         regionContainer.frame = worldContainer.bounds
@@ -1177,7 +1288,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         let screenSpaceInset = 10 / max(worldTransform.scale, 0.001)
         let path = UIBezierPath(rect: union.insetBy(dx: -screenSpaceInset,
                                                     dy: -screenSpaceInset))
-        let radius = max(5, 11 / max(worldTransform.scale, 0.001))
+        let radius = 6 / max(worldTransform.scale, 0.001)
         for handle in SelectionResizeHandle.allCases {
             let center = handle.point(in: union)
             path.append(UIBezierPath(ovalIn: CGRect(x: center.x - radius,
@@ -1209,7 +1320,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     }
 
     private func resizeHandle(at world: CGPoint, bounds: CGRect) -> SelectionResizeHandle? {
-        let tolerance = max(8, 20 / max(worldTransform.scale, 0.001))
+        let tolerance = 16 / max(worldTransform.scale, 0.001)
         return SelectionResizeHandle.allCases.first {
             let point = $0.point(in: bounds)
             return hypot(world.x - point.x, world.y - point.y) <= tolerance
@@ -1317,7 +1428,7 @@ private final class LectureBoardRenderView: UIView {
     private let pdfSource = PDFPageRenderView()
     private let thumbnail = UIImageView()
     private let header = UILabel()
-    private let loading = UIActivityIndicatorView(style: .medium)
+    private let vectorIndicator = BoardVectorLoadingIndicator()
     private let userLayer = CALayer()
     private var objectLayers: [String: CALayer] = [:]
     private var resizePreviewPositions: [String: CGPoint] = [:]
@@ -1349,8 +1460,9 @@ private final class LectureBoardRenderView: UIView {
             let incomplete = progress < 0.999
             self.thumbnail.isHidden = !incomplete
             self.thumbnail.alpha = incomplete ? max(0.18, 1 - progress * 0.82) : 0
-            if incomplete { self.loading.startAnimating() }
-            else { self.loading.stopAnimating() }
+            self.vectorIndicator.transition(to: incomplete
+                                            ? (progress > 0 ? .vectorPartial : .vectorLoading)
+                                            : .vectorReady)
         }
         userLayer.anchorPoint = .zero
         userLayer.position = .zero
@@ -1363,7 +1475,7 @@ private final class LectureBoardRenderView: UIView {
         header.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         header.layer.masksToBounds = true
         addSubview(header)
-        addSubview(loading)
+        addSubview(vectorIndicator)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -1379,7 +1491,15 @@ private final class LectureBoardRenderView: UIView {
         userLayer.bounds = bounds
         userLayer.position = .zero
         header.frame = CGRect(x: 0, y: -40, width: bounds.width, height: 40)
-        loading.center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let indicatorSize = vectorIndicator.systemLayoutSizeFitting(
+            UIView.layoutFittingCompressedSize
+        )
+        vectorIndicator.frame = CGRect(
+            x: bounds.midX - indicatorSize.width / 2,
+            y: max(12, bounds.maxY - indicatorSize.height - 18),
+            width: indicatorSize.width,
+            height: indicatorSize.height
+        )
     }
 
     func configure(item: WorkspaceBoardItem,
@@ -1398,6 +1518,7 @@ private final class LectureBoardRenderView: UIView {
             : UIColor.clear.cgColor
         paperLayer.strokeColor = UIColor.separator.withAlphaComponent(showPaper ? 0.32 : 0.16).cgColor
         if representation == .fullVector, let scene {
+            if sceneChanged { vectorIndicator.transition(to: .vectorLoading) }
             professor.isHidden = false
             if let pdfData = scene.pdfData {
                 pdfSource.display(data: pdfData)
@@ -1424,7 +1545,7 @@ private final class LectureBoardRenderView: UIView {
             }
             if vectorProgress >= 0.999 {
                 thumbnail.isHidden = true
-                loading.stopAnimating()
+                vectorIndicator.transition(to: .vectorReady)
             }
         } else {
             professor.isHidden = true
@@ -1432,7 +1553,8 @@ private final class LectureBoardRenderView: UIView {
             userLayer.isHidden = true
             thumbnail.isHidden = false
             thumbnail.alpha = item.sourceKind.isPDF || physicalBoardShowsPaper ? 1 : 0.24
-            if representation == .fullVector { loading.startAnimating() } else { loading.stopAnimating() }
+            vectorIndicator.transition(to: representation == .fullVector
+                                         ? .vectorLoading : .previewReady)
             loadThumbnail(thumbnailURL, loadAsset: loadAsset)
         }
         if scene != nil { userLayer.isHidden = false }

@@ -46,15 +46,6 @@ struct BoardView: View {
             } else {
                 pdfData = nil
             }
-            let definitions = document.paths.map(\.d)
-            let warmup = Task.detached(priority: .userInitiated) {
-                await SVGPathParser.prewarm(definitions)
-            }
-            await withTaskCancellationHandler(operation: {
-                await warmup.value
-            }, onCancel: {
-                warmup.cancel()
-            })
             debug("BOARD OPEN SVG PARSE SUCCEEDED id=\(board.id) paths=\(document.paths.count)")
             let composition = SceneComposition.build(boardID: board.id, document: document, editor: editor)
             let uniqueIDs = Set(composition.nodes.map(\.logicalID)).count
@@ -115,7 +106,7 @@ private struct BoardEditorSurface: View {
     @State private var selectedPDFRegion: CGRect?
     @State private var liveCamera: CameraRect?
     @State private var studyInitialAction: String?
-    @AppStorage("vboard.study.panelWidth") private var studyPanelWidth = 360.0
+    @AppStorage("vboard.study.inspectorWidth") private var studyPanelWidth = 0.0
     @AppStorage("vboard.study.panelCollapsed") private var studyPanelCollapsed = false
     @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
     @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.dots.rawValue
@@ -124,6 +115,9 @@ private struct BoardEditorSurface: View {
     @AppStorage("vboard.marker.color") private var markerColor = CanvasStrokeStyle.marker.colorHex
     @AppStorage("vboard.marker.width") private var markerWidth = CanvasStrokeStyle.marker.width
     @AppStorage("vboard.marker.opacity") private var markerOpacity = CanvasStrokeStyle.marker.opacity
+    #if DEBUG
+    @AppStorage("vboard.developer.diagnostics") private var developerDiagnostics = false
+    #endif
 
     init(board: LibraryBoard, document: SVGDocument, pdfData: Data?, editor: EditorState, composition: SceneComposition) {
         self.board = board; self.document = document; self.pdfData = pdfData; self.composition = composition
@@ -134,18 +128,21 @@ private struct BoardEditorSurface: View {
         GeometryReader { outer in
             let docked = outer.size.width >= 820
             let panelWidth = showStudy && docked
-                ? (studyPanelCollapsed ? 46 : min(max(studyPanelWidth, 300), outer.size.width * 0.58))
+                ? StudyPanelSizing.width(preferred: studyPanelWidth,
+                                         availableWidth: outer.size.width,
+                                         collapsed: studyPanelCollapsed)
                 : 0
-            HStack(spacing: 0) {
+            ZStack(alignment: .trailing) {
                 editorCanvas
-                    .frame(width: max(outer.size.width - panelWidth, 320))
+                    .frame(width: outer.size.width, height: outer.size.height)
                 if showStudy && docked {
                     StudyDock(width: $studyPanelWidth, collapsed: $studyPanelCollapsed,
                               availableWidth: outer.size.width,
                               onClose: { showStudy = false }) {
                         studyPanel(compact: true)
                     }
-                    .frame(width: panelWidth)
+                    .frame(width: panelWidth, height: outer.size.height)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
             .sheet(isPresented: Binding(
@@ -164,6 +161,9 @@ private struct BoardEditorSurface: View {
                         ForEach(WorkspaceBackgroundStyle.allCases) { style in Text(style.title).tag(style.rawValue) }
                     }
                     if pdfData == nil { Toggle("Show Whiteboard Paper", isOn: $physicalBoardShowsPaper) }
+                    #if DEBUG
+                    Toggle("Developer Diagnostics", isOn: $developerDiagnostics)
+                    #endif
                     Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
@@ -186,7 +186,7 @@ private struct BoardEditorSurface: View {
             // Keep one UIKit input surface alive for the board. Tool changes
             // update that surface in place so recognizers, responder focus,
             // and the live camera cannot be reset by SwiftUI identity churn.
-            NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), showsPaper: pdfData != nil || physicalBoardShowsPaper, backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots, penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1), markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
+            NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), showsPaper: pdfData != nil || physicalBoardShowsPaper, backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots, penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1), markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity), showsDeveloperDiagnostics: developerDiagnosticsIfAvailable, onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
                 .ignoresSafeArea(edges: .bottom)
             WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
                                  penColor: $penColor, penWidth: $penWidth,
@@ -209,6 +209,14 @@ private struct BoardEditorSurface: View {
             Button("") { store.redo(api: api) }.keyboardShortcut("z", modifiers: [.command, .shift]).frame(width: 0, height: 0).opacity(0.001)
             }
         }
+    }
+
+    private var developerDiagnosticsIfAvailable: Bool {
+        #if DEBUG
+        developerDiagnostics
+        #else
+        false
+        #endif
     }
 
     @ViewBuilder private func studyPanel(compact: Bool) -> some View {

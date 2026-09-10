@@ -37,6 +37,29 @@ final class WorkspaceAppearanceTests: XCTestCase {
         XCTAssertLessThan(smoothed, 1)
     }
 
+    func testStudyInspectorUsesNarrowDefaultAndPersistsWithinSafeLimits() {
+        XCTAssertEqual(StudyPanelSizing.width(preferred: 0, availableWidth: 1_366,
+                                              collapsed: false),
+                       273.2, accuracy: 0.01)
+        XCTAssertEqual(StudyPanelSizing.width(preferred: 900, availableWidth: 1_366,
+                                              collapsed: false),
+                       683, accuracy: 0.01)
+        XCTAssertEqual(StudyPanelSizing.width(preferred: 340, availableWidth: 1_366,
+                                              collapsed: true),
+                       StudyPanelSizing.collapsedWidth)
+    }
+
+    func testVectorIndicatorTimingIsAntiFlickerOnly() {
+        XCTAssertGreaterThanOrEqual(VectorLoadingIndicatorPolicy.appearanceDelay, 0.15)
+        XCTAssertLessThanOrEqual(VectorLoadingIndicatorPolicy.appearanceDelay, 0.25)
+        XCTAssertGreaterThanOrEqual(VectorLoadingIndicatorPolicy.minimumVisibleDuration, 0.4)
+        XCTAssertLessThanOrEqual(VectorLoadingIndicatorPolicy.minimumVisibleDuration, 0.7)
+        XCTAssertTrue(BoardVectorLoadState.vectorLoading.isWorking)
+        XCTAssertTrue(BoardVectorLoadState.vectorPartial.isWorking)
+        XCTAssertFalse(BoardVectorLoadState.vectorReady.isWorking)
+        XCTAssertEqual(BoardVectorLoadState.vectorPartial.userLabel, "Refining editable ink…")
+    }
+
     #if DEBUG
     func testDebugAuthenticationIsNeverEligibleOnProduction() {
         XCTAssertFalse(DebugAPIEnvironment.production.allowsTestUser)
@@ -163,6 +186,105 @@ final class SelectionResizeTests: XCTestCase {
         XCTAssertEqual(store.editor.objects.first(where: { $0.id == "note-1" })?.height, 100)
         XCTAssertEqual(store.editor.objects.first(where: { $0.id == "note-1" })?.sourceMarkdown,
                        "Keep source")
+    }
+}
+
+final class ThreeWayMergeTests: XCTestCase {
+    private func object(id: String, text: String = "Original",
+                        translation: WorldPoint? = nil) -> CanvasObject {
+        CanvasObject(id: id, type: "text", color: "#183153", width: 240, opacity: 1,
+                     points: nil, translation: translation, sourceMarkdown: text, text: text,
+                     x: 40, y: 50, height: 120, fontSize: 24)
+    }
+
+    private func editor(revision: Int, viewport: CameraRect,
+                        objects: [CanvasObject]) -> EditorState {
+        EditorState(schemaVersion: 4, revision: revision, updatedAt: nil,
+                    viewport: viewport, objects: objects, groups: [],
+                    importedTransforms: [:], sourceBoards: [], mergedBoardIDs: [])
+    }
+
+    func testEditorMergeCombinesDifferentFieldsOnSameStableObject() {
+        let camera = CameraRect(x: 0, y: 0, width: 800, height: 600)
+        let baseObject = object(id: "note-1")
+        let localObject = baseObject.translated(by: CGPoint(x: 70, y: -20))
+        let serverObject = object(id: "note-1", text: "Server wording")
+        let result = EditorThreeWayMerger.merge(
+            base: editor(revision: 4, viewport: camera, objects: [baseObject]),
+            local: editor(revision: 4,
+                          viewport: CameraRect(x: -200, y: 40, width: 800, height: 600),
+                          objects: [localObject]),
+            server: editor(revision: 5,
+                           viewport: CameraRect(x: 90, y: 90, width: 800, height: 600),
+                           objects: [serverObject])
+        )
+
+        XCTAssertTrue(result.isAutomatic)
+        XCTAssertEqual(result.editor.revision, 5)
+        XCTAssertEqual(result.editor.viewport.x, -200, "Camera is local-device state")
+        XCTAssertEqual(result.editor.objects.first?.translation?.x, 70)
+        XCTAssertEqual(result.editor.objects.first?.translation?.y, -20)
+        XCTAssertEqual(result.editor.objects.first?.sourceMarkdown, "Server wording")
+    }
+
+    func testEditorMergeUnionsDistinctLocalAndServerAdditions() {
+        let camera = CameraRect(x: 0, y: 0, width: 800, height: 600)
+        let result = EditorThreeWayMerger.merge(
+            base: editor(revision: 2, viewport: camera, objects: []),
+            local: editor(revision: 2, viewport: camera,
+                          objects: [object(id: "local-note")]),
+            server: editor(revision: 3, viewport: camera,
+                           objects: [object(id: "server-note")])
+        )
+        XCTAssertTrue(result.isAutomatic)
+        XCTAssertEqual(Set(result.editor.objects.map(\.id)), ["local-note", "server-note"])
+    }
+
+    func testEditorMergeMarksOnlySameFieldCollisionAsUnresolved() {
+        let camera = CameraRect(x: 0, y: 0, width: 800, height: 600)
+        let result = EditorThreeWayMerger.merge(
+            base: editor(revision: 2, viewport: camera,
+                         objects: [object(id: "note-1")]),
+            local: editor(revision: 2, viewport: camera,
+                          objects: [object(id: "note-1", text: "Local wording")]),
+            server: editor(revision: 3, viewport: camera,
+                           objects: [object(id: "note-1", text: "Server wording")])
+        )
+        XCTAssertEqual(result.unresolvedObjectIDs, ["note-1"])
+        XCTAssertEqual(result.editor.objects.first?.sourceMarkdown, "Local wording")
+    }
+
+    private func workspaceItem(id: String, x: Double, unit: String = "No Unit") -> WorkspaceBoardItem {
+        WorkspaceBoardItem(id: "board:\(id)", kind: "board", boardID: id,
+                           canvasX: x, canvasY: 0, boardWidth: 800, boardHeight: 600,
+                           effectiveContentBounds: CameraRect(x: x, y: 0, width: 800, height: 900),
+                           createdAt: 1, capturedAt: nil, detectedBoardDate: nil,
+                           unitLabel: unit, unitNumber: nil, unitConfidence: 0,
+                           unitSource: .none, title: id, thumbnailURL: nil, zIndex: 0)
+    }
+
+    func testWorkspaceMergeCombinesDifferentBoardsAndNeverConflictsOnCamera() {
+        let base = LectureWorkspace(schemaVersion: 1, revision: 8,
+                                    camera: CameraRect(x: 0, y: 0, width: 1_200, height: 800),
+                                    items: [workspaceItem(id: "a", x: 0),
+                                            workspaceItem(id: "b", x: 1_000)],
+                                    activeBoardID: "a", lastViewedAt: 1)
+        var local = base
+        local.camera.x = -500
+        local.items[0].canvasX = 120
+        var server = base
+        server.revision = 9
+        server.items[1].unitLabel = "Unit 2"
+        server.items[1].unitNumber = 2
+        server.items[1].unitConfidence = 1
+        server.items[1].unitSource = .manual
+
+        let merged = LectureWorkspaceThreeWayMerger.merge(base: base, local: local,
+                                                           server: server)
+        XCTAssertEqual(merged.revision, 9)
+        XCTAssertEqual(merged.camera.x, -500)
+        XCTAssertEqual(merged.items.first(where: { $0.boardID == "a" })?.canvasX, 120)
+        XCTAssertEqual(merged.items.first(where: { $0.boardID == "b" })?.unitLabel, "Unit 2")
     }
 }
 
@@ -622,7 +744,54 @@ private final class WorkspaceURLProtocolStub: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
+private func requestBodyData(_ request: URLRequest) throws -> Data {
+    if let body = request.httpBody { return body }
+    guard let stream = request.httpBodyStream else {
+        throw URLError(.cannotDecodeContentData)
+    }
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    let bufferSize = 16_384
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+    defer { buffer.deallocate() }
+    while stream.hasBytesAvailable {
+        let count = stream.read(buffer, maxLength: bufferSize)
+        if count < 0 { throw stream.streamError ?? URLError(.cannotDecodeContentData) }
+        if count == 0 { break }
+        data.append(buffer, count: count)
+    }
+    return data
+}
+
 final class WorldScreenTransformTests: XCTestCase {
+    func testPortraitLandscapeResizePreservesCenterAndWorldScale() {
+        let portrait = CGSize(width: 820, height: 1_180)
+        let landscape = CGSize(width: 1_180, height: 820)
+        let original = CameraRect(x: -420, y: 175, width: 820, height: 1_180)
+        var controller = CameraController(camera: original)
+        let originalScale = WorldScreenTransform(camera: original, viewport: portrait).scale
+        let originalCenter = original.center
+
+        controller.resizeViewport(from: portrait, to: landscape)
+
+        let rotated = controller.camera
+        XCTAssertEqual(rotated.center.x, originalCenter.x, accuracy: 0.000_001)
+        XCTAssertEqual(rotated.center.y, originalCenter.y, accuracy: 0.000_001)
+        XCTAssertEqual(WorldScreenTransform(camera: rotated, viewport: landscape).scale,
+                       originalScale, accuracy: 0.000_001)
+        let roundTrip = WorldScreenTransform(camera: rotated, viewport: landscape)
+        let screen = roundTrip.screenPoint(for: originalCenter)
+        XCTAssertEqual(screen.x, landscape.width / 2, accuracy: 0.000_001)
+        XCTAssertEqual(screen.y, landscape.height / 2, accuracy: 0.000_001)
+
+        controller.resizeViewport(from: landscape, to: portrait)
+        XCTAssertEqual(controller.camera.x, original.x, accuracy: 0.000_001)
+        XCTAssertEqual(controller.camera.y, original.y, accuracy: 0.000_001)
+        XCTAssertEqual(controller.camera.width, original.width, accuracy: 0.000_001)
+        XCTAssertEqual(controller.camera.height, original.height, accuracy: 0.000_001)
+    }
+
     func testWorldOverlayLayerIsPinnedToUntransformedCanvasOrigin() {
         let layer = CALayer()
         let bounds = CGRect(x: 0, y: 0, width: 1194, height: 742)
@@ -1606,6 +1775,131 @@ final class LectureWorkspacePersistenceTests: XCTestCase {
         XCTAssertEqual(store.status, .clean)
         XCTAssertEqual(store.editor.revision, 5)
         XCTAssertEqual(store.editor.objects.map(\.id), ["stroke-a"])
+    }
+
+    func testFiftyRapidBoardEditsUseOneInFlightSaveAndCoalesceNewestGeneration() async throws {
+        let boardID = "serialized-\(UUID().uuidString)"
+        let initial = EditorState(
+            schemaVersion: 4, revision: 10, updatedAt: nil,
+            viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+            objects: [], groups: [], importedTransforms: [:], sourceBoards: [],
+            mergedBoardIDs: []
+        )
+        let firstRequestStarted = expectation(description: "first save started")
+        let savesCompleted = expectation(description: "coalesced saves completed")
+        savesCompleted.expectedFulfillmentCount = 2
+        let lock = NSLock()
+        var activeRequests = 0
+        var maximumActiveRequests = 0
+        var requestCount = 0
+
+        WorkspaceURLProtocolStub.handler = { request in
+            let sequence = lock.withLock { () -> Int in
+                activeRequests += 1
+                maximumActiveRequests = max(maximumActiveRequests, activeRequests)
+                requestCount += 1
+                return requestCount
+            }
+            if sequence == 1 { firstRequestStarted.fulfill() }
+            Thread.sleep(forTimeInterval: 0.15)
+            var candidate = try JSONDecoder().decode(EditorState.self,
+                                                     from: requestBodyData(request))
+            candidate.revision = 10 + sequence
+            candidate.updatedAt = Double(sequence)
+            let data = try JSONEncoder().encode(EditorEnvelope(editor: candidate))
+            lock.withLock { activeRequests -= 1 }
+            savesCompleted.fulfill()
+            return (HTTPURLResponse(url: request.url!, statusCode: 200,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!, data)
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://serialized.test")!,
+                            session: URLSession(configuration: configuration))
+        let store = BoardDocumentStore(boardID: boardID, editor: initial)
+        store.applyStroke(UserStroke(id: "stroke-0",
+                                     points: [StrokePoint(x: 0, y: 0, pressure: 1)]), api: api)
+        await fulfillment(of: [firstRequestStarted], timeout: 2)
+        for index in 1..<50 {
+            store.applyStroke(UserStroke(id: "stroke-\(index)",
+                                         points: [StrokePoint(x: Double(index),
+                                                              y: Double(index), pressure: 1)]),
+                              api: api)
+        }
+        await store.saveNow(api: api)
+        await fulfillment(of: [savesCompleted], timeout: 2)
+
+        let (observedMaximum, observedCount) = lock.withLock {
+            (maximumActiveRequests, requestCount)
+        }
+        XCTAssertEqual(observedMaximum, 1)
+        XCTAssertEqual(observedCount, 2)
+        XCTAssertEqual(store.status, .clean)
+        XCTAssertEqual(store.editor.revision, 12)
+        XCTAssertEqual(store.editor.objects.count, 50)
+        XCTAssertNil(store.conflictServerEditor)
+    }
+
+    func testRevisionConflictAutomaticallyRebasesDistinctChangesAndRetriesOnce() async throws {
+        let boardID = "auto-rebase-\(UUID().uuidString)"
+        let initial = EditorState(
+            schemaVersion: 4, revision: 4, updatedAt: nil,
+            viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+            objects: [], groups: [], importedTransforms: [:], sourceBoards: [],
+            mergedBoardIDs: []
+        )
+        let serverNote = CanvasObject(
+            id: "server-note", type: "text", color: "#183153", width: 280,
+            opacity: 1, points: nil, translation: nil,
+            sourceMarkdown: "Server note", text: "Server note", x: 40, y: 60,
+            height: 120, fontSize: 20
+        )
+        let serverAtConflict = EditorState(
+            schemaVersion: 4, revision: 5, updatedAt: 100,
+            viewport: initial.viewport, objects: [serverNote], groups: [],
+            importedTransforms: [:], sourceBoards: [], mergedBoardIDs: []
+        )
+        let lock = NSLock()
+        var requestCount = 0
+        var retriedIDs = Set<String>()
+
+        WorkspaceURLProtocolStub.handler = { request in
+            let sequence = lock.withLock { () -> Int in
+                requestCount += 1
+                return requestCount
+            }
+            if sequence == 1 {
+                let body = try JSONEncoder().encode(EditorEnvelope(editor: serverAtConflict))
+                return (HTTPURLResponse(url: request.url!, statusCode: 409,
+                                        httpVersion: "HTTP/1.1",
+                                        headerFields: ["Content-Type": "application/json"])!, body)
+            }
+            var candidate = try JSONDecoder().decode(EditorState.self,
+                                                     from: requestBodyData(request))
+            retriedIDs = Set(candidate.objects.map(\.id))
+            candidate.revision = 6
+            let body = try JSONEncoder().encode(EditorEnvelope(editor: candidate))
+            return (HTTPURLResponse(url: request.url!, statusCode: 200,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!, body)
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://rebase.test")!,
+                            session: URLSession(configuration: configuration))
+        let store = BoardDocumentStore(boardID: boardID, editor: initial)
+        store.applyStroke(UserStroke(id: "local-stroke",
+                                     points: [StrokePoint(x: 12, y: 18, pressure: 1)]), api: api)
+        await store.saveNow(api: api)
+
+        XCTAssertEqual(lock.withLock { requestCount }, 2)
+        XCTAssertEqual(retriedIDs, Set(["local-stroke", "server-note"]))
+        XCTAssertEqual(store.status, .clean)
+        XCTAssertEqual(store.editor.revision, 6)
+        XCTAssertNil(store.conflictServerEditor)
     }
 
     func testUndoAndRedoRebaseHistoryOntoAcceptedServerRevision() async throws {

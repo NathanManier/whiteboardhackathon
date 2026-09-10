@@ -29,6 +29,7 @@ struct NativeCanvasView: UIViewRepresentable {
     var backgroundStyle = WorkspaceBackgroundStyle.dots
     var penStyle = CanvasStrokeStyle.pen
     var markerStyle = CanvasStrokeStyle.marker
+    var showsDeveloperDiagnostics = false
     var onStroke: (UserStroke) -> Void = { _ in }
     var tool: CanvasTool = .pen
     var onSelectionChanged: (Set<String>) -> Void = { _ in }
@@ -44,6 +45,7 @@ struct NativeCanvasView: UIViewRepresentable {
                              objects: objects, importedTransforms: importedTransforms,
                              composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
                              penStyle: penStyle, markerStyle: markerStyle,
+                             showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                              onStroke: onStroke, tool: tool,
                              onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
     }
@@ -53,6 +55,7 @@ struct NativeCanvasView: UIViewRepresentable {
                       objects: objects, importedTransforms: importedTransforms,
                       composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
                       penStyle: penStyle, markerStyle: markerStyle,
+                      showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                       onStroke: onStroke, tool: tool,
                       onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
     }
@@ -70,6 +73,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private let worldContainer = UIView()
     private let pdfSource = PDFPageRenderView()
     private let professor = ProfessorSVGView()
+    private let vectorIndicator = BoardVectorLoadingIndicator()
     private let userLayer = CALayer()
     private let paperLayer = CAShapeLayer()
     private var userObjectLayers: [String: CALayer] = [:]
@@ -111,6 +115,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var backgroundStyle: WorkspaceBackgroundStyle
     private var penStyle: CanvasStrokeStyle
     private var markerStyle: CanvasStrokeStyle
+    private var showsDeveloperDiagnostics: Bool
+    private var previousViewportSize: CGSize = .zero
     private var panStart = CGPoint.zero
     private var panStartCamera = CameraRect(x: 0, y: 0, width: 1, height: 1)
     private var panGesture: UIPanGestureRecognizer!
@@ -132,6 +138,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
          composition: SceneComposition, showsPaper: Bool = true,
          backgroundStyle: WorkspaceBackgroundStyle = .dots,
          penStyle: CanvasStrokeStyle = .pen, markerStyle: CanvasStrokeStyle = .marker,
+         showsDeveloperDiagnostics: Bool = false,
          onStroke: @escaping (UserStroke) -> Void = { _ in },
          tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
          onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
@@ -139,6 +146,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
+        self.showsDeveloperDiagnostics = showsDeveloperDiagnostics
         self.backgroundStyle = backgroundStyle
         self.onStroke = onStroke
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
@@ -195,6 +203,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             DispatchQueue.main.async { self?.updatePerformanceOverlay(stats) }
         }
         #endif
+        professor.onProgress = { [weak self] progress in
+            self?.vectorIndicator.transition(to: progress >= 0.999
+                                             ? .vectorReady
+                                             : (progress > 0 ? .vectorPartial : .vectorLoading))
+        }
         addSubview(worldContainer)
         // The paper is the bottom-most board source. Keeping it inside the
         // user layer placed an opaque rectangle above PDF/professor content,
@@ -205,6 +218,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         worldContainer.addSubview(professor)
         worldContainer.layer.addSublayer(userLayer)
         worldContainer.layer.addSublayer(interactionLayer)
+        addSubview(vectorIndicator)
         // ProfessorSVGView is a render-only subview. If it participates in
         // hit-testing, the parent never receives the simulator mouse/Pencil
         // stream and every editing tool appears inert.
@@ -239,6 +253,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         perfLabel.numberOfLines = 3
         perfLabel.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.82)
         perfLabel.layer.cornerRadius = 6; perfLabel.layer.masksToBounds = true
+        perfLabel.isHidden = !showsDeveloperDiagnostics
         addSubview(perfLabel)
         updateInputHUD()
         debugViewHierarchy()
@@ -274,6 +289,21 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        let newViewportSize = bounds.size
+        if previousViewportSize.width > 0, previousViewportSize.height > 0,
+           newViewportSize != previousViewportSize,
+           cameraInitializedForBoardID == boardID {
+            controller.resizeViewport(from: previousViewportSize, to: newViewportSize)
+            let resizedCamera = controller.camera
+            let resizedBoardID = boardID
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.boardID == resizedBoardID,
+                      self.cameraInitializedForBoardID == resizedBoardID else { return }
+                self.onCameraChanged(resizedCamera)
+            }
+        }
+        previousViewportSize = newViewportSize
         gridLayer.frame = bounds
         // Never assign `frame` to a transformed layer. Establish the stable
         // untransformed geometry first, then apply the camera transform in
@@ -291,6 +321,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         #if DEBUG
         perfLabel.frame = CGRect(x: 8, y: 8, width: 360, height: 112)
         #endif
+        let indicatorSize = vectorIndicator.systemLayoutSizeFitting(
+            UIView.layoutFittingCompressedSize
+        )
+        vectorIndicator.frame = CGRect(
+            x: bounds.midX - indicatorSize.width / 2,
+            y: max(12, bounds.maxY - indicatorSize.height - 18),
+            width: indicatorSize.width,
+            height: indicatorSize.height
+        )
         resolveInitialCameraIfNeeded()
         applyCamera(interacting: false)
     }
@@ -300,6 +339,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 composition: SceneComposition, showsPaper: Bool = true,
                 backgroundStyle: WorkspaceBackgroundStyle = .dots,
                 penStyle: CanvasStrokeStyle = .pen, markerStyle: CanvasStrokeStyle = .marker,
+                showsDeveloperDiagnostics: Bool = false,
                 onStroke: @escaping (UserStroke) -> Void = { _ in },
                 tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
                 onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
@@ -311,6 +351,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
+        self.showsDeveloperDiagnostics = showsDeveloperDiagnostics
+        #if DEBUG
+        perfLabel.isHidden = !showsDeveloperDiagnostics
+        if !showsDeveloperDiagnostics { crosshairLayer.isHidden = true }
+        #endif
         self.backgroundStyle = backgroundStyle
         paperLayer.fillColor = boardSurfaceColor(showsPaper: showsPaper).cgColor
         paperLayer.strokeColor = boardBoundaryColor().cgColor
@@ -596,7 +641,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         let windowFrame = self.superview?.convert(self.frame, to: self.window)
         print("[VBoard] INPUT \(phase) source=\(activeInputSource.rawValue) tool=\(activeTool.rawValue) rawPoint=(\(raw.x),\(raw.y)) canvasPoint=(\(screen.x),\(screen.y)) worldPoint=(\(world.x),\(world.y)) roundTrip=(\(roundTrip.x),\(roundTrip.y)) error=\(error) canvasFrame=\(self.frame) canvasFrameInWindow=\(String(describing: windowFrame)) canvasBounds=\(self.bounds) canvasTransform=\(self.transform) professorFrame=\(professor.frame) professorTransform=\(professor.layer.affineTransform()) camera=\(controller.camera) state=\(interactionState.rawValue)")
         if error >= 0.5 { print("[VBoard] ROUND_TRIP_FAILURE error=\(error) raw=\(raw) canvas=\(screen) world=\(world) roundTrip=\(roundTrip)") }
-        updateCrosshair(screen: screen, roundTrip: roundTrip)
+        if showsDeveloperDiagnostics { updateCrosshair(screen: screen, roundTrip: roundTrip) }
     }
     private func debugInputOperation(_ operation: String) {
         print("[VBoard] \(operation) tool=\(activeTool.rawValue) state=\(interactionState.rawValue) selected=\(selectedIDs.count)")
@@ -613,6 +658,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         dump(self, 0)
     }
     private func updateInputHUD() {
+        guard showsDeveloperDiagnostics else { return }
         renderDebugHUD()
     }
     #else
@@ -1083,6 +1129,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     #if DEBUG
     private func updatePerformanceOverlay(_ stats: RenderStats) {
         lastRenderStats = stats
+        guard showsDeveloperDiagnostics else { return }
         renderDebugHUD()
     }
 

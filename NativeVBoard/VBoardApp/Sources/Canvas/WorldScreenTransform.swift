@@ -133,6 +133,26 @@ struct CameraController: Equatable {
 
     mutating func setCamera(_ camera: CameraRect) { self.camera = camera }
 
+    /// Keeps the same world point under the viewport center and preserves the
+    /// current world-units-per-screen-point scale while the UIKit canvas
+    /// changes shape. Rotation therefore reveals a wider or taller region
+    /// instead of restoring a stale camera or fitting the board again.
+    mutating func resizeViewport(from oldViewport: CGSize, to newViewport: CGSize) {
+        guard oldViewport.width > 0, oldViewport.height > 0,
+              newViewport.width > 0, newViewport.height > 0,
+              camera.width > 0, camera.height > 0 else { return }
+        let oldTransform = WorldScreenTransform(camera: camera, viewport: oldViewport)
+        let scale = max(oldTransform.scale, .leastNonzeroMagnitude)
+        let center = oldTransform.worldPoint(for: CGPoint(x: oldViewport.width / 2,
+                                                           y: oldViewport.height / 2))
+        let width = Double(newViewport.width / scale)
+        let height = Double(newViewport.height / scale)
+        camera = CameraRect(x: Double(center.x) - width / 2,
+                            y: Double(center.y) - height / 2,
+                            width: width,
+                            height: height)
+    }
+
     mutating func pan(screenTranslation: CGPoint, viewport: CGSize) {
         let transform = WorldScreenTransform(camera: camera, viewport: viewport)
         camera.x -= Double(screenTranslation.x / transform.scale)
@@ -185,13 +205,4 @@ struct CameraController: Equatable {
         camera = candidate
     }
 
-    mutating func resizeViewport(from old: CGSize, to new: CGSize) {
-        guard old.width > 0, old.height > 0, new.width > 0, new.height > 0 else { return }
-        let center = camera.center
-        let oldAspect = old.width / old.height
-        let newAspect = new.width / new.height
-        if newAspect > oldAspect { camera.width = camera.height * Double(newAspect) }
-        else { camera.height = camera.width / Double(newAspect) }
-        camera.x = center.x - camera.width / 2; camera.y = center.y - camera.height / 2
-    }
 }

@@ -26,7 +26,7 @@ struct LectureWorkspaceView: View {
     @State private var pencilQuickPalettePoint: CGPoint?
     @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.dots.rawValue
     @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
-    @AppStorage("vboard.study.panelWidth") private var studyPanelWidth = 360.0
+    @AppStorage("vboard.study.inspectorWidth") private var studyPanelWidth = 0.0
     @AppStorage("vboard.study.panelCollapsed") private var studyPanelCollapsed = false
     @AppStorage("vboard.pen.color") private var penColor = CanvasStrokeStyle.pen.colorHex
     @AppStorage("vboard.pen.width") private var penWidth = CanvasStrokeStyle.pen.width
@@ -162,25 +162,31 @@ struct LectureWorkspaceView: View {
             let docked = proxy.size.width >= 820
             let dockedNavigator = showNavigator && proxy.size.width >= 700
             let navigatorWidth: CGFloat = dockedNavigator ? 250 : 0
+            let canvasWidth = max(proxy.size.width - navigatorWidth, 320)
             let panelWidth = showStudy && docked
-                ? (studyPanelCollapsed ? 46 : min(max(studyPanelWidth, 300), proxy.size.width * 0.58))
+                ? StudyPanelSizing.width(preferred: studyPanelWidth,
+                                         availableWidth: canvasWidth,
+                                         collapsed: studyPanelCollapsed)
                 : 0
             HStack(spacing: 0) {
                 if dockedNavigator {
                     LectureNavigatorSidebar(store: store, api: api) { showNavigator = false }
                         .frame(width: navigatorWidth)
                 }
-                canvasSurface(workspace)
-                    .frame(width: max(proxy.size.width - panelWidth - navigatorWidth, 320))
-                if showStudy && docked {
-                    StudyDock(
-                        width: $studyPanelWidth,
-                        collapsed: $studyPanelCollapsed,
-                        availableWidth: proxy.size.width,
-                        onClose: { showStudy = false },
-                        content: { studyContent(compact: true) }
-                    )
-                    .frame(width: panelWidth)
+                ZStack(alignment: .trailing) {
+                    canvasSurface(workspace)
+                        .frame(width: canvasWidth, height: proxy.size.height)
+                    if showStudy && docked {
+                        StudyDock(
+                            width: $studyPanelWidth,
+                            collapsed: $studyPanelCollapsed,
+                            availableWidth: canvasWidth,
+                            onClose: { showStudy = false },
+                            content: { studyContent(compact: true) }
+                        )
+                        .frame(width: panelWidth, height: proxy.size.height)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                    }
                 }
             }
             .sheet(isPresented: Binding(
@@ -523,6 +529,25 @@ enum SelectionToolbarLayout {
     }
 }
 
+enum StudyPanelSizing {
+    static let collapsedWidth: CGFloat = 46
+
+    static func limits(availableWidth: CGFloat) -> ClosedRange<CGFloat> {
+        let minimum = min(280, max(250, availableWidth * 0.18))
+        let maximum = max(minimum, availableWidth * 0.50)
+        return minimum...maximum
+    }
+
+    static func width(preferred: Double,
+                      availableWidth: CGFloat,
+                      collapsed: Bool) -> CGFloat {
+        guard !collapsed else { return collapsedWidth }
+        let limits = limits(availableWidth: availableWidth)
+        let requested = preferred > 0 ? CGFloat(preferred) : availableWidth * 0.20
+        return min(limits.upperBound, max(limits.lowerBound, requested))
+    }
+}
+
 struct StudyDock<Content: View>: View {
     @Binding var width: Double
     @Binding var collapsed: Bool
@@ -546,9 +571,15 @@ struct StudyDock<Content: View>: View {
                     .frame(width: 1)
                     .contentShape(Rectangle().inset(by: -10))
                     .gesture(DragGesture().onChanged { value in
-                        let start = dragStartWidth ?? width
-                        if dragStartWidth == nil { dragStartWidth = width }
-                        width = min(max(start - Double(value.translation.width), 300), Double(availableWidth * 0.58))
+                        let resolved = Double(StudyPanelSizing.width(preferred: width,
+                                                                    availableWidth: availableWidth,
+                                                                    collapsed: false))
+                        let start = dragStartWidth ?? resolved
+                        if dragStartWidth == nil { dragStartWidth = resolved }
+                        let limits = StudyPanelSizing.limits(availableWidth: availableWidth)
+                        width = min(max(start - Double(value.translation.width),
+                                        Double(limits.lowerBound)),
+                                    Double(limits.upperBound))
                     }.onEnded { _ in dragStartWidth = nil })
             }
             VStack(spacing: 0) {
