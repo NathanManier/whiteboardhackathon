@@ -14,6 +14,23 @@ struct LectureWorkspaceView: View {
     @State private var showNote = false
     @State private var showDelete = false
     @State private var showConflict = false
+    @State private var showRenameBoard = false
+    @State private var showSetUnit = false
+    @State private var showDeleteBoard = false
+    @State private var showShare = false
+    @State private var exportURL: URL?
+    @State private var actionError: String?
+    @State private var selectionScreenBounds: CGRect?
+    @State private var studyInitialAction: String?
+    @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.subtleGrid.rawValue
+    @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
+    @AppStorage("vboard.study.panelWidth") private var studyPanelWidth = 360.0
+    @AppStorage("vboard.study.panelCollapsed") private var studyPanelCollapsed = false
+    @AppStorage("vboard.pen.color") private var penColor = CanvasStrokeStyle.pen.colorHex
+    @AppStorage("vboard.pen.width") private var penWidth = CanvasStrokeStyle.pen.width
+    @AppStorage("vboard.marker.color") private var markerColor = CanvasStrokeStyle.marker.colorHex
+    @AppStorage("vboard.marker.width") private var markerWidth = CanvasStrokeStyle.marker.width
+    @AppStorage("vboard.marker.opacity") private var markerOpacity = CanvasStrokeStyle.marker.opacity
 
     init(folder: LectureFolder, focusBoardID: String? = nil) {
         self.folder = folder
@@ -45,13 +62,28 @@ struct LectureWorkspaceView: View {
                     .disabled(!store.canUndo)
                 Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }
                     .disabled(!store.canRedo)
-                Button { showNavigator = true } label: { Image(systemName: "list.bullet.rectangle") }
+                Button { showNavigator = true } label: { Image(systemName: "sidebar.left") }
                     .accessibilityLabel("Lecture navigator")
+                Button { showImporter = true } label: { Image(systemName: "plus") }
+                    .accessibilityLabel("Add to lecture")
+                Button { showGuide = true } label: { Image(systemName: "text.book.closed") }
+                    .accessibilityLabel("Study Guide")
                 Menu {
-                    Button { showImporter = true } label: { Label("Add Whiteboard", systemImage: "photo.badge.plus") }
-                    Button { showGuide = true } label: { Label("Study Guide", systemImage: "text.book.closed") }
+                    if activeBoard != nil {
+                        Button { showRenameBoard = true } label: { Label("Rename Whiteboard", systemImage: "pencil") }
+                        Button { showSetUnit = true } label: { Label("Set Unit", systemImage: "tag") }
+                        Button { Task { await exportActiveBoard() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }
+                        Divider()
+                    }
                     Button { showNote = true } label: { Label("Add Note", systemImage: "note.text.badge.plus") }
                         .disabled(store.activeBoardStore == nil)
+                    Picker("Workspace Background", selection: $backgroundRaw) {
+                        ForEach(WorkspaceBackgroundStyle.allCases) { style in Text(style.title).tag(style.rawValue) }
+                    }
+                    Toggle("Show Whiteboard Paper", isOn: $physicalBoardShowsPaper)
+                    if activeBoard != nil {
+                        Button(role: .destructive) { showDeleteBoard = true } label: { Label("Delete Whiteboard", systemImage: "trash") }
+                    }
                     Button(role: .destructive) { showDelete = true } label: { Label("Delete Lecture", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
@@ -62,9 +94,6 @@ struct LectureWorkspaceView: View {
                 Task { await store.refreshAfterImport(boardID: board.id, api: api) }
             }
         }
-        .sheet(isPresented: $showNavigator) {
-            LectureNavigatorSheet(store: store, api: api)
-        }
         .sheet(isPresented: $showGuide) {
             StudyGuideView(folderID: folder.id, guide: store.lecture?.studyGuide)
         }
@@ -74,21 +103,20 @@ struct LectureWorkspaceView: View {
                 showNote = false
             }
         }
-        .sheet(isPresented: $showStudy) {
-            if selectedBoardIDs.count > 1 {
-                LectureSelectionStudyView(
-                    folderID: folder.id,
-                    selectedObjectIDsByBoard: selectedObjectIDsByBoard
-                )
-            } else if let boardID = studyBoardID,
-                      let selection = store.studySelection(for: boardID) {
-                StudyActionsView(selection: selection,
-                                 prepareSelection: { await store.saveBoardNow(boardID, api: api) }) { problems, interactionID in
-                    store.applyPracticeProblems(problems, interactionID: interactionID,
-                                                boardID: boardID, api: api)
+        .sheet(isPresented: $showRenameBoard) {
+            if let board = activeBoard {
+                WorkspaceRenameSheet(name: board.name) { name in renameActiveBoard(name) }
+            }
+        }
+        .sheet(isPresented: $showSetUnit) {
+            if let boardID = store.activeBoardID {
+                UnitPickerSheet(current: activeUnitLabel) { label, number in
+                    store.setUnit(boardID: boardID, label: label, number: number, api: api)
+                    showSetUnit = false
                 }
             }
         }
+        .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
         .alert("Delete lecture?", isPresented: $showDelete) {
             Button("Delete", role: .destructive) {
                 Task {
@@ -106,6 +134,13 @@ struct LectureWorkspaceView: View {
         } message: {
             Text("Your local camera and whiteboard placements are saved on this iPad. Choose which layout should remain.")
         }
+        .confirmationDialog("Delete this whiteboard?", isPresented: $showDeleteBoard, titleVisibility: .visible) {
+            Button("Delete Whiteboard", role: .destructive) { deleteActiveBoard() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("The selected whiteboard and its edits will be permanently removed.") }
+        .alert("Couldn’t complete that action", isPresented: Binding(
+            get: { actionError != nil }, set: { if !$0 { actionError = nil } }
+        )) { Button("OK", role: .cancel) {} } message: { Text(actionError ?? "") }
         .onChange(of: store.status) { _, status in
             if status == .conflict { showConflict = true }
         }
@@ -116,71 +151,134 @@ struct LectureWorkspaceView: View {
     }
 
     private func workspaceSurface(_ workspace: LectureWorkspace) -> some View {
-        ZStack(alignment: .bottom) {
-            LectureCanvasView(
-                workspace: workspace,
-                scenes: store.scenes,
-                selectedKeys: store.selectedKeys,
-                tool: activeTool,
-                thumbnailURLs: Dictionary(uniqueKeysWithValues: workspace.items.compactMap { item in
-                    api.resolvedURL(item.thumbnailURL).map { (item.boardID, $0) }
-                }),
-                loadAsset: { try await api.authorizedAsset(path: $0) },
-                focusRequest: store.focusRequest,
-                onCameraChanged: { store.updateCamera($0, api: api) },
-                onActiveBoardChanged: { store.setActiveBoard($0, api: api) },
-                onDetailDemand: { store.requestDetail(for: $0, api: api) },
-                onSelectionChanged: { keys, pdfRegions in
-                    store.setSelection(keys, pdfRegions: pdfRegions)
-                },
-                onStroke: { stroke, boardID in store.applyStroke(stroke, boardID: boardID, api: api) },
-                onMoveSelection: { keys, delta in store.moveSelection(keys, by: delta, api: api) },
-                onResizeTextObject: { key, size in store.resizeTextObject(key, to: size, api: api) },
-                onDelete: { store.deleteSelection($0, api: api) },
-                onMoveBoard: { boardID, delta in store.moveBoard(boardID: boardID, by: delta, api: api) },
-                onUndo: { store.undo(api: api) },
-                onRedo: { store.redo(api: api) }
-            )
-            .ignoresSafeArea(edges: .bottom)
-
-            HStack(spacing: 10) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(CanvasTool.allCases, id: \.self) { tool in
-                            WorkspaceToolButton(tool: tool, selected: activeTool == tool) { activeTool = tool }
-                        }
-                    }
+        GeometryReader { proxy in
+            let docked = proxy.size.width >= 820
+            let dockedNavigator = showNavigator && proxy.size.width >= 700
+            let navigatorWidth: CGFloat = dockedNavigator ? 250 : 0
+            let panelWidth = showStudy && docked
+                ? (studyPanelCollapsed ? 46 : min(max(studyPanelWidth, 300), proxy.size.width * 0.58))
+                : 0
+            HStack(spacing: 0) {
+                if dockedNavigator {
+                    LectureNavigatorSidebar(store: store, api: api) { showNavigator = false }
+                        .frame(width: navigatorWidth)
                 }
-                Divider().frame(height: 28)
-                Text(store.status.userLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Button { showStudy = true } label: {
-                    Label("Study", systemImage: "sparkles")
+                canvasSurface(workspace)
+                    .frame(width: max(proxy.size.width - panelWidth - navigatorWidth, 320))
+                if showStudy && docked {
+                    StudyDock(
+                        width: $studyPanelWidth,
+                        collapsed: $studyPanelCollapsed,
+                        availableWidth: proxy.size.width,
+                        onClose: { showStudy = false },
+                        content: { studyContent(compact: true) }
+                    )
+                    .frame(width: panelWidth)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(!LectureStudyRouting.isAvailable(
-                    selectedBoardIDs: selectedBoardIDs
-                ))
-                Button { showImporter = true } label: { Image(systemName: "plus") }
-                    .buttonStyle(.bordered)
-                    .accessibilityLabel("Add Whiteboard")
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .padding(.horizontal, 14)
-            .padding(.bottom, 12)
-
-            Button("") { store.undo(api: api) }
-                .keyboardShortcut("z", modifiers: .command)
-                .frame(width: 0, height: 0).opacity(0.001)
-            Button("") { store.redo(api: api) }
-                .keyboardShortcut("z", modifiers: [.command, .shift])
-                .frame(width: 0, height: 0).opacity(0.001)
+            .sheet(isPresented: Binding(
+                get: { showStudy && !docked },
+                set: { if !$0 { showStudy = false } }
+            )) { studyContent(compact: false) }
+            .sheet(isPresented: Binding(
+                get: { showNavigator && !dockedNavigator },
+                set: { if !$0 { showNavigator = false } }
+            )) { LectureNavigatorSheet(store: store, api: api) }
         }
+    }
+
+    private func canvasSurface(_ workspace: LectureWorkspace) -> some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .bottom) {
+                LectureCanvasView(
+                    workspace: workspace,
+                    scenes: store.scenes,
+                    selectedKeys: store.selectedKeys,
+                    tool: activeTool,
+                    backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .subtleGrid,
+                    physicalBoardShowsPaper: physicalBoardShowsPaper,
+                    penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),
+                    markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity),
+                    thumbnailURLs: Dictionary(uniqueKeysWithValues: workspace.items.compactMap { item in
+                        api.resolvedURL(item.thumbnailURL).map { (item.boardID, $0) }
+                    }),
+                    loadAsset: { try await api.authorizedAsset(path: $0) },
+                    focusRequest: store.focusRequest,
+                    onCameraChanged: { store.updateCamera($0, api: api) },
+                    onActiveBoardChanged: { store.setActiveBoard($0, api: api) },
+                    onDetailDemand: { store.requestDetail(for: $0, api: api) },
+                    onSelectionChanged: { keys, pdfRegions in store.setSelection(keys, pdfRegions: pdfRegions) },
+                    onSelectionScreenBoundsChanged: { bounds in
+                        DispatchQueue.main.async {
+                            if selectionScreenBounds != bounds { selectionScreenBounds = bounds }
+                        }
+                    },
+                    onStroke: { stroke, boardID in store.applyStroke(stroke, boardID: boardID, api: api) },
+                    onMoveSelection: { keys, delta in store.moveSelection(keys, by: delta, api: api) },
+                    onResizeTextObject: { key, size in store.resizeTextObject(key, to: size, api: api) },
+                    onDelete: { store.deleteSelection($0, api: api) },
+                    onMoveBoard: { boardID, delta in store.moveBoard(boardID: boardID, by: delta, api: api) },
+                    onUndo: { store.undo(api: api) },
+                    onRedo: { store.redo(api: api) }
+                )
+                .ignoresSafeArea(edges: .bottom)
+
+                WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
+                                     penColor: $penColor, penWidth: $penWidth,
+                                     markerColor: $markerColor, markerWidth: $markerWidth,
+                                     markerOpacity: $markerOpacity)
+                    .padding(.bottom, 12)
+
+                if !store.selectedKeys.isEmpty, let selectionScreenBounds {
+                    SelectionActionBar(
+                        canCheckWork: selectionCanCheckWork,
+                        explain: { openStudy(action: "explain") },
+                        practice: { openStudy(action: "practice_problems") },
+                        check: { openStudy(action: "check_my_work") },
+                        delete: { store.deleteSelection(store.selectedKeys, api: api) }
+                    )
+                    .position(SelectionToolbarLayout.position(for: selectionScreenBounds, viewport: proxy.size))
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                }
+
+                if workspace.items.isEmpty {
+                    EmptyWorkspaceAction(addWhiteboard: { showImporter = true })
+                }
+
+                Button("") { store.undo(api: api) }
+                    .keyboardShortcut("z", modifiers: .command)
+                    .frame(width: 0, height: 0).opacity(0.001)
+                Button("") { store.redo(api: api) }
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+                    .frame(width: 0, height: 0).opacity(0.001)
+            }
+        }
+    }
+
+    @ViewBuilder private func studyContent(compact: Bool) -> some View {
+        if selectedBoardIDs.count > 1 {
+            LectureSelectionStudyView(folderID: folder.id,
+                                      selectedObjectIDsByBoard: selectedObjectIDsByBoard,
+                                      compact: compact)
+        } else if let boardID = studyBoardID,
+                  let selection = store.studySelection(for: boardID) {
+            StudyActionsView(selection: selection,
+                             prepareSelection: { await store.saveBoardNow(boardID, api: api) },
+                             initialAction: studyInitialAction,
+                             compact: compact) { problems, interactionID in
+                store.applyPracticeProblems(problems, interactionID: interactionID,
+                                            boardID: boardID, api: api)
+            }
+        } else {
+            ContentUnavailableView("Select ink to study", systemImage: "lasso",
+                                   description: Text("Use Select or Lasso, then choose an action beside the selection."))
+        }
+    }
+
+    private func openStudy(action: String?) {
+        studyInitialAction = action
+        studyPanelCollapsed = false
+        showStudy = true
     }
 
     private var studyBoardID: String? {
@@ -195,15 +293,317 @@ struct LectureWorkspaceView: View {
             .mapValues { keys in Array(Set(keys.map(\.objectID))).sorted() }
     }
 
+    private var selectionCanCheckWork: Bool {
+        let selectedObjects = store.selectedKeys.compactMap { key in
+            store.scenes[key.boardID]?.editor.objects.first(where: { $0.id == key.objectID })
+        }
+        let hasProblem = selectedObjects.contains { $0.role == "ai_practice_problem" }
+        let hasWork = selectedObjects.contains { $0.role != "ai_practice_problem" }
+            || store.selectedKeys.contains { $0.kind == .professorPath }
+        return hasProblem && hasWork
+    }
+
     private var activeUnitLabel: String {
         store.workspace?.items.first(where: { $0.boardID == store.activeBoardID })?.unitLabel ?? "No Unit"
     }
 
+    private var activeBoard: LibraryBoard? {
+        guard let activeBoardID = store.activeBoardID else { return nil }
+        return store.boards.first(where: { $0.id == activeBoardID })
+    }
+
+    private func renameActiveBoard(_ name: String) {
+        guard let board = activeBoard else { return }
+        showRenameBoard = false
+        Task {
+            do {
+                await store.saveNow(api: api)
+                _ = try await api.updateBoard(id: board.id, name: name)
+                await store.load(api: api, focusBoardID: board.id)
+            } catch { actionError = "The whiteboard name could not be saved." }
+        }
+    }
+
+    private func deleteActiveBoard() {
+        guard let board = activeBoard else { return }
+        Task {
+            do {
+                try await api.deleteBoard(id: board.id)
+                await store.load(api: api)
+            } catch { actionError = "The whiteboard could not be deleted." }
+        }
+    }
+
+    private func exportActiveBoard() async {
+        guard let board = activeBoard else { return }
+        do {
+            let data = try await api.exportSVG(boardID: board.id)
+            let safe = board.name.replacingOccurrences(of: "[^A-Za-z0-9 _-]", with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VBoardExports", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent((safe.isEmpty ? "V-Board" : safe) + ".svg")
+            try data.write(to: url, options: .atomic)
+            exportURL = url
+            showShare = true
+        } catch { actionError = "The SVG could not be exported right now." }
+    }
+
+}
+
+struct WorkspaceToolPalette: View {
+    @Binding var activeTool: CanvasTool
+    let status: String
+    @Binding var penColor: String
+    @Binding var penWidth: Double
+    @Binding var markerColor: String
+    @Binding var markerWidth: Double
+    @Binding var markerOpacity: Double
+    @State private var showOptions = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(CanvasTool.allCases, id: \.self) { tool in
+                WorkspaceToolButton(tool: tool, selected: activeTool == tool) {
+                    if activeTool == tool && (tool == .pen || tool == .highlighter) { showOptions = true }
+                    activeTool = tool
+                }
+            }
+            if activeTool == .pen || activeTool == .highlighter {
+                Button { showOptions = true } label: { Image(systemName: "slider.horizontal.3").frame(width: 30, height: 30) }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Tool options")
+                    .popover(isPresented: $showOptions, arrowEdge: .bottom) {
+                        CanvasToolOptions(
+                            title: activeTool == .pen ? "Pen" : "Marker",
+                            color: activeTool == .pen ? $penColor : $markerColor,
+                            width: activeTool == .pen ? $penWidth : $markerWidth,
+                            opacity: activeTool == .pen ? .constant(1) : $markerOpacity,
+                            showsOpacity: activeTool == .highlighter
+                        )
+                        .presentationCompactAdaptation(.popover)
+                    }
+            }
+            Divider().frame(height: 24).padding(.horizontal, 3)
+            Text(status)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(minWidth: 42)
+        }
+        .padding(6)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.separator.opacity(0.45), lineWidth: 0.5) }
+    }
+}
+
+private struct CanvasToolOptions: View {
+    let title: String
+    @Binding var color: String
+    @Binding var width: Double
+    @Binding var opacity: Double
+    let showsOpacity: Bool
+    private let colors = ["#183153", "#111111", "#C62828", "#1565C0", "#2E7D32", "#FFD60A", "#FF8A00"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title).font(.headline)
+            HStack(spacing: 10) {
+                ForEach(colors, id: \.self) { value in
+                    Button { color = value } label: {
+                        Circle().fill(Color(uiColor: UIColor(svgHex: value)))
+                            .frame(width: 28, height: 28)
+                            .overlay { if color == value { Circle().stroke(.primary, lineWidth: 2).padding(-3) } }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Choose color")
+                }
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Width").font(.caption).foregroundStyle(.secondary)
+                Slider(value: $width, in: showsOpacity ? 10...40 : 1.5...14)
+            }
+            if showsOpacity {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Opacity").font(.caption).foregroundStyle(.secondary)
+                    Slider(value: $opacity, in: 0.15...0.7)
+                }
+            }
+        }
+        .padding(18)
+        .frame(width: 300)
+    }
+}
+
+struct SelectionActionBar: View {
+    let canCheckWork: Bool
+    let explain: () -> Void
+    let practice: () -> Void
+    let check: () -> Void
+    let delete: () -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            action("Explain", "text.magnifyingglass", explain)
+            action("Practice", "list.bullet.clipboard", practice)
+            if canCheckWork { action("Check", "checkmark.circle", check) }
+            Menu {
+                Button(role: .destructive, action: delete) { Label("Erase Selection", systemImage: "trash") }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 32, height: 30)
+            }
+            .buttonStyle(.plain)
+        }
+        .font(.caption.weight(.semibold))
+        .padding(5)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(.separator.opacity(0.55), lineWidth: 0.5) }
+    }
+
+    private func action(_ title: String, _ icon: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .padding(.horizontal, 7)
+                .frame(height: 30)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+enum SelectionToolbarLayout {
+    static let size = CGSize(width: 310, height: 42)
+
+    static func position(for rect: CGRect, viewport: CGSize) -> CGPoint {
+        let x = min(max(rect.midX, size.width / 2 + 12), viewport.width - size.width / 2 - 12)
+        let above = rect.minY - size.height / 2 - 12
+        let y = above >= 12
+            ? above
+            : min(rect.maxY + size.height / 2 + 12, viewport.height - size.height / 2 - 72)
+        return CGPoint(x: x, y: y)
+    }
+}
+
+struct StudyDock<Content: View>: View {
+    @Binding var width: Double
+    @Binding var collapsed: Bool
+    let availableWidth: CGFloat
+    let onClose: () -> Void
+    let content: Content
+    @State private var dragStartWidth: Double?
+
+    init(width: Binding<Double>, collapsed: Binding<Bool>, availableWidth: CGFloat,
+         onClose: @escaping () -> Void, @ViewBuilder content: () -> Content) {
+        _width = width; _collapsed = collapsed
+        self.availableWidth = availableWidth; self.onClose = onClose
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if !collapsed {
+                Rectangle()
+                    .fill(.separator.opacity(0.45))
+                    .frame(width: 1)
+                    .contentShape(Rectangle().inset(by: -10))
+                    .gesture(DragGesture().onChanged { value in
+                        let start = dragStartWidth ?? width
+                        if dragStartWidth == nil { dragStartWidth = width }
+                        width = min(max(start - Double(value.translation.width), 300), Double(availableWidth * 0.58))
+                    }.onEnded { _ in dragStartWidth = nil })
+            }
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Button { collapsed.toggle() } label: {
+                        Image(systemName: collapsed ? "sidebar.right" : "chevron.right")
+                    }
+                    .accessibilityLabel(collapsed ? "Expand Study" : "Collapse Study")
+                    if !collapsed {
+                        Text("Study").font(.headline)
+                        Spacer()
+                        Button(action: onClose) { Image(systemName: "xmark") }
+                            .accessibilityLabel("Close Study")
+                    }
+                }
+                .padding(.horizontal, collapsed ? 10 : 14)
+                .frame(height: 44)
+                Divider().opacity(collapsed ? 0 : 1)
+                content
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(collapsed ? 0 : 1)
+                    .allowsHitTesting(!collapsed)
+                    .accessibilityHidden(collapsed)
+                    .clipped()
+            }
+            .background(Color(uiColor: .systemBackground))
+        }
+    }
+}
+
+private struct EmptyWorkspaceAction: View {
+    let addWhiteboard: () -> Void
+    var body: some View {
+        VStack(spacing: 10) {
+            Text("Add your first whiteboard").font(.title3.weight(.semibold))
+            Text("Photograph a board or import a Freeform PDF.")
+                .font(.subheadline).foregroundStyle(.secondary)
+            Button("Add Whiteboard", action: addWhiteboard).buttonStyle(.borderedProminent)
+        }
+        .padding(20)
+        .background(Color(uiColor: .systemBackground).opacity(0.92), in: RoundedRectangle(cornerRadius: 12))
+    }
 }
 
 enum LectureStudyRouting {
     static func isAvailable(selectedBoardIDs: Set<String>) -> Bool {
         !selectedBoardIDs.isEmpty
+    }
+}
+
+private struct WorkspaceRenameSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let onSave: (String) -> Void
+    @State private var name: String
+
+    init(name: String, onSave: @escaping (String) -> Void) {
+        _name = State(initialValue: name); self.onSave = onSave
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form { TextField("Whiteboard name", text: $name) }
+                .navigationTitle("Rename Whiteboard")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Save") { onSave(name.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                            .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+        }
+    }
+}
+
+private struct UnitPickerSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let current: String
+    let onSelect: (String, Int?) -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Button { onSelect("No Unit", nil) } label: { row("No Unit") }
+                ForEach(1...12, id: \.self) { number in
+                    Button { onSelect("Unit \(number)", number) } label: { row("Unit \(number)") }
+                }
+            }
+            .navigationTitle("Set Unit")
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+        }
+    }
+
+    private func row(_ title: String) -> some View {
+        HStack { Text(title); Spacer(); if title == current { Image(systemName: "checkmark").foregroundStyle(.tint) } }
     }
 }
 
@@ -248,14 +648,28 @@ private struct LectureSelectionStudyView: View {
     @Environment(\.dismiss) private var dismiss
     let folderID: String
     let selectedObjectIDsByBoard: [String: [String]]
+    var compact = false
     @State private var question = ""
     @State private var loading = false
     @State private var result: StudyInteractionResponse?
     @State private var error: String?
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 18) {
+        Group {
+            if compact {
+                content
+            } else {
+                NavigationStack {
+                    content
+                        .navigationTitle("Study Across Boards")
+                        .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+                }
+            }
+        }
+    }
+
+    private var content: some View {
+        VStack(spacing: compact ? 12 : 18) {
                 if loading {
                     ProgressView("Connecting the selected whiteboards…")
                 } else if let interaction = result?.interaction {
@@ -281,11 +695,8 @@ private struct LectureSelectionStudyView: View {
                     Text("Select content from up to eight whiteboards at a time.").foregroundStyle(.orange)
                 }
                 if let error { Text(error).foregroundStyle(.red) }
-            }
-            .padding(28)
-            .navigationTitle("Study Across Boards")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         }
+        .padding(compact ? 16 : 28)
     }
 
     private func explain() {
@@ -328,6 +739,7 @@ private struct WorkspaceToolButton: View {
     private var title: String {
         switch tool {
         case .navigation: return "Hand"
+        case .highlighter: return "Marker"
         case .objectEraser: return "Erase"
         default: return tool.rawValue.capitalized
         }
@@ -403,5 +815,55 @@ private struct LectureNavigatorSheet: View {
         formatter.dateStyle = .medium
         formatter.timeStyle = .none
         return formatter.string(from: Date(timeIntervalSince1970: timestamp))
+    }
+}
+
+private struct LectureNavigatorSidebar: View {
+    @ObservedObject var store: LectureWorkspaceStore
+    let api: APIClient
+    let close: () -> Void
+
+    private var sections: [(String, [WorkspaceBoardItem])] {
+        guard let items = store.workspace?.items else { return [] }
+        let grouped = Dictionary(grouping: items.sorted { $0.createdAt < $1.createdAt }, by: \.unitLabel)
+        return grouped.keys.sorted { lhs, rhs in
+            if lhs == "No Unit" { return false }
+            if rhs == "No Unit" { return true }
+            return lhs.localizedStandardCompare(rhs) == .orderedAscending
+        }.map { ($0, grouped[$0] ?? []) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Lecture").font(.headline)
+                Spacer()
+                Button(action: close) { Image(systemName: "sidebar.left") }
+                    .accessibilityLabel("Close lecture navigator")
+            }
+            .padding(.horizontal, 14).frame(height: 44)
+            Divider()
+            List {
+                ForEach(sections, id: \.0) { section in
+                    Section(section.0) {
+                        ForEach(section.1) { item in
+                            Button {
+                                store.setActiveBoard(item.boardID, api: api, requestFocus: true)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(item.title).lineLimit(2).foregroundStyle(.primary)
+                                    Text(Date(timeIntervalSince1970: item.createdAt).formatted(date: .abbreviated, time: .omitted))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+        }
+        .background(Color(uiColor: .systemBackground))
+        .overlay(alignment: .trailing) { Rectangle().fill(.separator.opacity(0.45)).frame(width: 0.5) }
     }
 }

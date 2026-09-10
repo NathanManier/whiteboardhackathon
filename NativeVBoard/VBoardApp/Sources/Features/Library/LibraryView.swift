@@ -14,47 +14,50 @@ struct LibraryView: View {
     @State private var launchBoard: LibraryBoard?
     @State private var showAccount = false
     @State private var pendingImport: PendingImport?
+    @State private var section: LibrarySection = .lectures
+    @State private var renameTarget: LibraryRenameTarget?
+    @State private var deleteTarget: LibraryDeleteTarget?
+    @AppStorage("vboard.library.layout") private var layoutRaw = LibraryLayout.grid.rawValue
 
     var body: some View {
         NavigationStack {
             Group {
                 if let library {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 28) {
-                            LibraryHero { showImporter = true }
+                        VStack(alignment: .leading, spacing: 22) {
+                            LibraryHeader { showImporter = true }
                             if library.folders.isEmpty && library.boards.isEmpty {
                                 EmptyLibraryView { showImporter = true }
                             } else {
-                                if !library.folders.isEmpty {
-                                    VStack(alignment: .leading, spacing: 12) {
-                                        Label("Lectures", systemImage: "rectangle.stack.fill").font(.title3.weight(.semibold))
-                                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 16)], spacing: 16) {
-                                            ForEach(library.folders) { folder in
-                                                NavigationLink { LectureWorkspaceView(folder: folder) } label: { LectureCard(folder: folder) }.buttonStyle(.plain)
-                                            }
-                                        }
-                                    }
-                                }
-                                VStack(alignment: .leading, spacing: 12) {
-                                    HStack { Label("Recent whiteboards", systemImage: "rectangle.on.rectangle").font(.title3.weight(.semibold)); Spacer(); Text("\(library.boards.count)").foregroundStyle(.secondary) }
-                                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 230), spacing: 16)], spacing: 16) {
-                                        ForEach(library.boards) { board in
-                                            NavigationLink { destination(for: board, in: library) } label: { BoardCard(board: board) }.buttonStyle(.plain)
-                                        }
-                                    }
+                                libraryControls
+                                if section == .lectures {
+                                    lectureCollection(library)
+                                } else {
+                                    boardCollection(library)
                                 }
                             }
-                        }.padding(24).frame(maxWidth: 1100, alignment: .leading)
+                        }.padding(.horizontal, 24).padding(.vertical, 18).frame(maxWidth: 1200, alignment: .leading)
                     }
                 } else if let error {
                     ContentUnavailableView("Couldn’t load your library", systemImage: "wifi.exclamationmark", description: Text(error)).overlay(alignment: .bottom) { Button("Retry") { load() }.buttonStyle(.borderedProminent).padding(.bottom, 32) }
                 } else { ProgressView("Loading your library…") }
             }
             .navigationTitle("V-Board")
-            .toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { showImporter = true } label: { Label("Import Whiteboard", systemImage: "photo.badge.plus") }; Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "books.vertical") } } label: { Image(systemName: "plus") }.accessibilityLabel("Add to V-Board") }; ToolbarItemGroup(placement: .secondaryAction) { Button { load() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh library"); Button { showAccount = true } label: { Image(systemName: "person.crop.circle") }.accessibilityLabel("Account") } }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "folder.badge.plus") }
+                }
+                ToolbarItemGroup(placement: .secondaryAction) {
+                    Button { load() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh library")
+                    Button { showAccount = true } label: { Image(systemName: "person.crop.circle") }.accessibilityLabel("Account")
+                }
+            }
             .sheet(isPresented: $showImporter) { ImportFlowView { board in launchBoard = board; showImporter = false; load() } }
             .sheet(isPresented: $showNewLecture) { NewLectureView { showNewLecture = false; load() } }
             .sheet(isPresented: $showAccount) { AccountView(user: account) }
+            .sheet(item: $renameTarget) { target in
+                RenamePrompt(title: target.title, value: target.name) { newName in rename(target, to: newName) }
+            }
             .sheet(item: $pendingImport) { item in
                 ImportFlowView(pendingImport: item) { board in
                     PendingImportStore.remove(item)
@@ -69,6 +72,106 @@ struct LibraryView: View {
             }
             .task { load(); discoverPendingImport() }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in discoverPendingImport() }
+            .confirmationDialog(deleteTarget?.title ?? "Delete?", isPresented: Binding(
+                get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } }
+            ), titleVisibility: .visible) {
+                Button("Delete", role: .destructive) { deleteSelectedTarget() }
+                Button("Cancel", role: .cancel) { deleteTarget = nil }
+            } message: { Text(deleteTarget?.message ?? "") }
+        }
+    }
+
+    private var libraryControls: some View {
+        HStack {
+            Picker("Library Section", selection: $section) {
+                ForEach(LibrarySection.allCases) { section in Text(section.title).tag(section) }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 340)
+            Spacer()
+            Picker("Layout", selection: $layoutRaw) {
+                Label("Grid", systemImage: "square.grid.2x2").tag(LibraryLayout.grid.rawValue)
+                Label("List", systemImage: "list.bullet").tag(LibraryLayout.list.rawValue)
+            }
+            .pickerStyle(.menu)
+        }
+    }
+
+    @ViewBuilder private func lectureCollection(_ library: LibraryResponse) -> some View {
+        if library.folders.isEmpty {
+            ContentUnavailableView("No lectures yet", systemImage: "books.vertical",
+                                   description: Text("Create a lecture to keep related whiteboards together."))
+        } else if layoutRaw == LibraryLayout.list.rawValue {
+            LazyVStack(spacing: 0) {
+                ForEach(library.folders) { folder in lectureLink(folder, library: library, list: true) }
+            }
+        } else {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 280, maximum: 380), spacing: 18)], spacing: 18) {
+                ForEach(library.folders) { folder in lectureLink(folder, library: library, list: false) }
+            }
+        }
+    }
+
+    @ViewBuilder private func boardCollection(_ library: LibraryResponse) -> some View {
+        let recent = library.boards.sorted { ($0.updatedAt ?? $0.createdAt ?? 0) > ($1.updatedAt ?? $1.createdAt ?? 0) }
+        if recent.isEmpty {
+            ContentUnavailableView("No recent whiteboards", systemImage: "rectangle.on.rectangle")
+        } else if layoutRaw == LibraryLayout.list.rawValue {
+            LazyVStack(spacing: 0) {
+                ForEach(recent) { board in boardLink(board, library: library, list: true) }
+            }
+        } else {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 18)], spacing: 18) {
+                ForEach(recent) { board in boardLink(board, library: library, list: false) }
+            }
+        }
+    }
+
+    private func lectureLink(_ folder: LectureFolder, library: LibraryResponse, list: Bool) -> some View {
+        NavigationLink { LectureWorkspaceView(folder: folder) } label: {
+            LectureCard(folder: folder,
+                        boards: folder.boardOrder.compactMap { id in library.boards.first(where: { $0.id == id }) },
+                        list: list)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("Rename") { renameTarget = .lecture(folder) }
+            Button("Delete", role: .destructive) { deleteTarget = .lecture(folder) }
+        }
+    }
+
+    private func boardLink(_ board: LibraryBoard, library: LibraryResponse, list: Bool) -> some View {
+        NavigationLink { destination(for: board, in: library) } label: { BoardCard(board: board, list: list) }
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button("Rename") { renameTarget = .board(board) }
+                Button("Delete", role: .destructive) { deleteTarget = .board(board) }
+            }
+    }
+
+    private func rename(_ target: LibraryRenameTarget, to name: String) {
+        Task {
+            do {
+                switch target {
+                case .lecture(let folder): _ = try await api.renameLecture(id: folder.id, name: name)
+                case .board(let board): _ = try await api.updateBoard(id: board.id, name: name)
+                }
+                load()
+            } catch { self.error = "That name could not be saved." }
+        }
+    }
+
+    private func deleteSelectedTarget() {
+        guard let target = deleteTarget else { return }
+        deleteTarget = nil
+        Task {
+            do {
+                switch target {
+                case .lecture(let folder): try await api.deleteLecture(id: folder.id, recursive: true)
+                case .board(let board): try await api.deleteBoard(id: board.id)
+                }
+                load()
+            } catch { self.error = "That item could not be deleted." }
         }
     }
 
@@ -97,17 +200,51 @@ struct LibraryView: View {
     }
 }
 
-private struct LibraryHero: View {
+private enum LibrarySection: String, CaseIterable, Identifiable {
+    case lectures, recent
+    var id: String { rawValue }
+    var title: String { self == .lectures ? "Lectures" : "Recent" }
+}
+
+private enum LibraryLayout: String { case grid, list }
+
+private enum LibraryRenameTarget: Identifiable {
+    case lecture(LectureFolder)
+    case board(LibraryBoard)
+    var id: String {
+        switch self { case .lecture(let item): return "lecture:\(item.id)"; case .board(let item): return "board:\(item.id)" }
+    }
+    var name: String { switch self { case .lecture(let item): return item.name; case .board(let item): return item.name } }
+    var title: String { switch self { case .lecture: return "Rename Lecture"; case .board: return "Rename Whiteboard" } }
+}
+
+private enum LibraryDeleteTarget {
+    case lecture(LectureFolder)
+    case board(LibraryBoard)
+    var title: String { switch self { case .lecture: return "Delete lecture?"; case .board: return "Delete whiteboard?" } }
+    var message: String {
+        switch self {
+        case .lecture(let item): return "\(item.name) and all of its whiteboards will be removed."
+        case .board(let item): return "\(item.name) will be permanently removed."
+        }
+    }
+}
+
+private struct LibraryHeader: View {
     let add: () -> Void
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("V-Board").font(.title.weight(.semibold))
-            Text("Turn a physical whiteboard into editable ink you can study.").font(.title2).fixedSize(horizontal: false, vertical: true)
-            Text("Import a photo, keep the professor’s geometry intact, and annotate the same board.").foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Button(action: add) { Label("Import Whiteboard", systemImage: "photo.badge.plus") }.buttonStyle(.borderedProminent).controlSize(.large).padding(.top, 4)
+        HStack(alignment: .firstTextBaseline, spacing: 20) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Your lectures").font(.largeTitle.weight(.bold))
+                Text("Editable professor ink, notes, and study tools in one canvas.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button(action: add) { Label("New Whiteboard", systemImage: "plus") }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
         }
-        .frame(maxWidth: 620, alignment: .leading)
-        .padding(.vertical, 12)
+        .padding(.top, 4)
     }
 }
 
@@ -118,34 +255,125 @@ private struct EmptyLibraryView: View {
 
 private struct LectureCard: View {
     let folder: LectureFolder
-    var body: some View { VStack(alignment: .leading, spacing: 8) { Label(folder.name, systemImage: "books.vertical").font(.headline); Text("\(folder.boardOrder.count) whiteboard\(folder.boardOrder.count == 1 ? "" : "s")").font(.subheadline).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 14).overlay(alignment: .bottom) { Rectangle().fill(.quaternary).frame(height: 1) } }
+    let boards: [LibraryBoard]
+    let list: Bool
+
+    var body: some View {
+        Group {
+            if list {
+                HStack(spacing: 16) {
+                    LectureMontage(boards: boards).frame(width: 150, height: 82)
+                    labels
+                    Spacer()
+                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                }
+                .padding(.vertical, 12)
+                .overlay(alignment: .bottom) { Divider() }
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    LectureMontage(boards: boards).frame(height: 148)
+                    labels
+                }
+                .padding(12)
+                .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(.separator.opacity(0.35), lineWidth: 0.5) }
+            }
+        }
+    }
+
+    private var labels: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(folder.name).font(.headline).lineLimit(2)
+            Text("\(folder.boardOrder.count) whiteboard\(folder.boardOrder.count == 1 ? "" : "s")")
+                .font(.subheadline).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
 
 private struct BoardCard: View {
+    let board: LibraryBoard
+    let list: Bool
+
+    var body: some View {
+        Group {
+            if list {
+                HStack(spacing: 16) {
+                    RemoteBoardThumbnail(board: board).frame(width: 150, height: 82)
+                    labels
+                    Spacer()
+                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                }
+                .padding(.vertical, 12).overlay(alignment: .bottom) { Divider() }
+            } else {
+                VStack(alignment: .leading, spacing: 9) {
+                    RemoteBoardThumbnail(board: board).frame(height: 132)
+                    labels
+                }
+                .padding(10)
+                .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(.separator.opacity(0.35), lineWidth: 0.5) }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var labels: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(board.name).font(.headline).lineLimit(2)
+            Text(boardDate)
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var boardDate: String {
+        guard let timestamp = board.updatedAt ?? board.createdAt else {
+            return board.status.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+        return Date(timeIntervalSince1970: timestamp).formatted(date: .abbreviated, time: .omitted)
+    }
+}
+
+private struct LectureMontage: View {
+    let boards: [LibraryBoard]
+    var body: some View {
+        GeometryReader { proxy in
+            let shown = Array(boards.prefix(3))
+            ZStack {
+                RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.35))
+                if shown.isEmpty {
+                    Image(systemName: "rectangle.stack").font(.title2).foregroundStyle(.secondary)
+                } else {
+                    HStack(spacing: 2) {
+                        ForEach(shown) { board in
+                            RemoteBoardThumbnail(board: board)
+                                .frame(width: (proxy.size.width - CGFloat(max(shown.count - 1, 0)) * 2) / CGFloat(shown.count))
+                        }
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+}
+
+private struct RemoteBoardThumbnail: View {
     @EnvironmentObject private var api: APIClient
     let board: LibraryBoard
     @State private var thumbnail: UIImage?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(.quaternary.opacity(0.45))
-                .frame(height: 130)
-                .overlay {
-                    if let thumbnail {
-                        Image(uiImage: thumbnail).resizable().scaledToFill()
-                    } else {
-                        Image(systemName: board.status == "ready" ? "photo" : "clock")
-                            .font(.title2).foregroundStyle(.secondary)
-                    }
-                }
-                .clipped()
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-            Text(board.name).font(.headline).lineLimit(2)
-            Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized)
-                .font(.caption).foregroundStyle(.secondary)
+        ZStack {
+            Color(uiColor: .tertiarySystemFill)
+            if let thumbnail {
+                Image(uiImage: thumbnail).resizable().scaledToFill()
+            } else {
+                Image(systemName: board.status == "ready" ? "scribble.variable" : "clock")
+                    .font(.title3).foregroundStyle(.secondary)
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
         .task(id: board.thumbnailURL) {
             guard let path = board.thumbnailURL else { return }
             thumbnail = (try? await api.authorizedAsset(path: path)).flatMap(UIImage.init(data:))
@@ -235,7 +463,55 @@ struct ImportFlowView: View {
                 importState.cancel()
             }
     }
-    private var chooseView: some View { VStack(spacing: 18) { Image(systemName: "photo.badge.plus").font(.system(size: 52)).foregroundStyle(.tint); Text("Add to V-Board").font(.largeTitle.bold()); Text(folderID == nil ? "Import a physical whiteboard or a digital canvas." : "Add another board to this lecture.").foregroundStyle(.secondary); VStack(spacing: 12) { Button { showCamera = true } label: { Label("Take Photo", systemImage: "camera") }.buttonStyle(.borderedProminent).controlSize(.large); PhotosPicker(selection: $pickerItem, matching: .images) { Label("Choose from Photos", systemImage: "photo.on.rectangle") }.buttonStyle(.bordered).controlSize(.large); Button { importFileKind = .pdf; fileImporter = true } label: { Label("Freeform / PDF", systemImage: "doc.richtext") }.buttonStyle(.bordered).controlSize(.large); Button { importFileKind = .image; fileImporter = true } label: { Label("Import Image File", systemImage: "folder") }.buttonStyle(.bordered).controlSize(.large) }.padding(.top, 12); Text("In Freeform, export your board as a PDF and share or import it into V-Board.").font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center) }.frame(maxWidth: 520).padding(30) }
+    private var chooseView: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(folderID == nil ? "New Whiteboard" : "Add to Lecture").font(.title2.weight(.semibold))
+                Text("Choose a source. Photos continue through board detection and corner confirmation; PDFs stay as their original page surface.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+            }
+            VStack(spacing: 0) {
+                sourceButton("Take Photo", detail: "Use the camera", icon: "camera") { showCamera = true }
+                Divider().padding(.leading, 52)
+                PhotosPicker(selection: $pickerItem, matching: .images) {
+                    sourceLabel("Choose from Photos", detail: "Photo library", icon: "photo.on.rectangle")
+                }
+                .buttonStyle(.plain)
+                Divider().padding(.leading, 52)
+                sourceButton("Freeform or PDF", detail: "Import one board per page", icon: "doc.richtext") {
+                    importFileKind = .pdf; fileImporter = true
+                }
+                Divider().padding(.leading, 52)
+                sourceButton("Image File", detail: "JPEG, PNG, or HEIC", icon: "folder") {
+                    importFileKind = .image; fileImporter = true
+                }
+            }
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+            .overlay { RoundedRectangle(cornerRadius: 12).stroke(.separator.opacity(0.35), lineWidth: 0.5) }
+        }
+        .frame(maxWidth: 540)
+        .padding(24)
+    }
+
+    private func sourceButton(_ title: String, detail: String, icon: String,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) { sourceLabel(title, detail: detail, icon: icon) }.buttonStyle(.plain)
+    }
+
+    private func sourceLabel(_ title: String, detail: String, icon: String) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: icon).font(.title3).foregroundStyle(.tint).frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.body.weight(.medium)).foregroundStyle(.primary)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+        }
+        .contentShape(Rectangle())
+        .padding(.horizontal, 14)
+        .frame(minHeight: 58)
+    }
     private var previewView: some View { ScrollView { VStack(spacing: 18) { if let previewImage { Image(uiImage: previewImage).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: 16)).padding(.horizontal) }; if pdfData != nil { Label(pdfPageCount == 1 ? "1 PDF page" : "\(pdfPageCount) PDF pages", systemImage: "doc.richtext").font(.headline); if pdfPageCount > 1 { Text("Each page will become a separate board in source order.").font(.subheadline).foregroundStyle(.secondary) } }; TextField("Board name (optional)", text: $name).textFieldStyle(.roundedBorder).padding(.horizontal); destinationControls; Button(pdfData == nil ? "Use This Photo" : "Import PDF") { pdfData == nil ? beginImageUpload() : beginPDFUpload() }.buttonStyle(.borderedProminent).controlSize(.large).disabled(importState.phase.isBusy); if let error { Text(error).foregroundStyle(.red).multilineTextAlignment(.center) } }.padding(.vertical, 20).frame(maxWidth: 700) }.frame(maxWidth: .infinity) }
     @ViewBuilder private var destinationControls: some View { if folderID == nil { VStack(alignment: .leading, spacing: 10) { Toggle("Create a new lecture", isOn: $createLecture); if createLecture { TextField("Lecture name", text: $newLectureName).textFieldStyle(.roundedBorder) } else if !availableLectures.isEmpty { Picker("Add to lecture", selection: $selectedFolderID) { Text("No lecture").tag(String?.none); ForEach(availableLectures) { lecture in Text(lecture.name).tag(Optional(lecture.id)) } }.pickerStyle(.menu) } }.padding(.horizontal) } }
     private var cornerView: some View {

@@ -5,6 +5,15 @@ enum CanvasTool: String, CaseIterable, Sendable {
     case navigation, pen, highlighter, select, lasso, objectEraser
 }
 
+struct CanvasStrokeStyle: Equatable, Sendable {
+    var colorHex: String
+    var width: Double
+    var opacity: Double
+
+    static let pen = CanvasStrokeStyle(colorHex: "#183153", width: 4, opacity: 1)
+    static let marker = CanvasStrokeStyle(colorHex: "#FFD60A", width: 22, opacity: 0.32)
+}
+
 private enum InputSource: String { case pencil, touch, indirectPointer, mouse, trackpad }
 private enum InteractionState: String { case idle = "IDLE", drawing = "DRAWING", panning = "PANNING", pinching = "PINCHING", lassoing = "LASSOING", erasing = "ERASING", selecting = "SELECTING", movingSelection = "MOVING_SELECTION" }
 
@@ -16,6 +25,10 @@ struct NativeCanvasView: UIViewRepresentable {
     let objects: [CanvasObject]
     let importedTransforms: [String: ObjectTransform]
     let composition: SceneComposition
+    var showsPaper = true
+    var backgroundStyle = WorkspaceBackgroundStyle.subtleGrid
+    var penStyle = CanvasStrokeStyle.pen
+    var markerStyle = CanvasStrokeStyle.marker
     var onStroke: (UserStroke) -> Void = { _ in }
     var tool: CanvasTool = .pen
     var onSelectionChanged: (Set<String>) -> Void = { _ in }
@@ -29,14 +42,18 @@ struct NativeCanvasView: UIViewRepresentable {
     func makeUIView(context: Context) -> InfiniteCanvasUIView {
         InfiniteCanvasUIView(boardID: boardID, document: document, pdfData: pdfData, camera: camera,
                              objects: objects, importedTransforms: importedTransforms,
-                             composition: composition, onStroke: onStroke, tool: tool,
+                             composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
+                             penStyle: penStyle, markerStyle: markerStyle,
+                             onStroke: onStroke, tool: tool,
                              onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
     }
 
     func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) {
         uiView.update(boardID: boardID, document: document, pdfData: pdfData, camera: camera,
                       objects: objects, importedTransforms: importedTransforms,
-                      composition: composition, onStroke: onStroke, tool: tool,
+                      composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
+                      penStyle: penStyle, markerStyle: markerStyle,
+                      onStroke: onStroke, tool: tool,
                       onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
     }
 }
@@ -45,6 +62,7 @@ struct NativeCanvasView: UIViewRepresentable {
 /// content is transformed as one GPU-composited layer; expensive visibility
 /// refinement only runs after a gesture ends.
 final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
+    private let gridLayer = CAShapeLayer()
     /// The root view is intentionally never camera-transformed. It owns the
     /// input stream and stays in the same coordinate space as UIKit events.
     /// Every world-space layer is a descendant of this single container so a
@@ -87,6 +105,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var objects: [CanvasObject]
     private var importedTransforms: [String: ObjectTransform]
     private var composition: SceneComposition
+    private var showsPaper: Bool
+    private var backgroundStyle: WorkspaceBackgroundStyle
+    private var penStyle: CanvasStrokeStyle
+    private var markerStyle: CanvasStrokeStyle
     private var panStart = CGPoint.zero
     private var panStartCamera = CameraRect(x: 0, y: 0, width: 1, height: 1)
     private var panGesture: UIPanGestureRecognizer!
@@ -105,12 +127,17 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     init(boardID: String, document: SVGDocument, pdfData: Data? = nil, camera: CameraRect,
          objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:],
-         composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in },
+         composition: SceneComposition, showsPaper: Bool = true,
+         backgroundStyle: WorkspaceBackgroundStyle = .subtleGrid,
+         penStyle: CanvasStrokeStyle = .pen, markerStyle: CanvasStrokeStyle = .marker,
+         onStroke: @escaping (UserStroke) -> Void = { _ in },
          tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
          onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
          onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
         self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
-        self.importedTransforms = importedTransforms; self.composition = composition
+        self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
+        self.penStyle = penStyle; self.markerStyle = markerStyle
+        self.backgroundStyle = backgroundStyle
         self.onStroke = onStroke
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
@@ -118,9 +145,17 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         controller = CameraController(camera: camera)
         persistedCamera = camera
         super.init(frame: .zero)
-        backgroundColor = .systemBackground
+        backgroundColor = UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0.075, green: 0.08, blue: 0.09, alpha: 1)
+                : UIColor(red: 0.965, green: 0.968, blue: 0.972, alpha: 1)
+        }
         isMultipleTouchEnabled = true
         clipsToBounds = true
+        gridLayer.fillColor = UIColor.clear.cgColor
+        gridLayer.lineWidth = 1
+        gridLayer.contentsScale = UIScreen.main.scale
+        layer.addSublayer(gridLayer)
         worldContainer.backgroundColor = .clear
         worldContainer.clipsToBounds = false
         worldContainer.isUserInteractionEnabled = false
@@ -131,7 +166,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
         paperLayer.anchorPoint = .zero
         paperLayer.position = .zero
-        paperLayer.fillColor = UIColor(red: 0.985, green: 0.982, blue: 0.965, alpha: 1).cgColor
+        paperLayer.fillColor = showsPaper
+            ? UIColor(red: 0.985, green: 0.982, blue: 0.965, alpha: 1).cgColor
+            : UIColor.clear.cgColor
         paperLayer.strokeColor = UIColor.separator.withAlphaComponent(0.35).cgColor
         paperLayer.lineWidth = 2
         paperLayer.name = "VBoardPaper"
@@ -192,6 +229,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         #endif
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(didPinch(_:)))
         pinch.delegate = self; addGestureRecognizer(pinch)
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (view: InfiniteCanvasUIView, _) in
+            view.updateWorkspaceBackground()
+        }
         rebuildUserLayers()
         #if DEBUG
         perfLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
@@ -234,6 +274,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        gridLayer.frame = bounds
         // Never assign `frame` to a transformed layer. Establish the stable
         // untransformed geometry first, then apply the camera transform in
         // `applyCamera`.
@@ -256,7 +297,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     func update(boardID: String, document: SVGDocument, pdfData: Data? = nil, camera: CameraRect,
                 objects: [CanvasObject], importedTransforms: [String: ObjectTransform],
-                composition: SceneComposition, onStroke: @escaping (UserStroke) -> Void = { _ in },
+                composition: SceneComposition, showsPaper: Bool = true,
+                backgroundStyle: WorkspaceBackgroundStyle = .subtleGrid,
+                penStyle: CanvasStrokeStyle = .pen, markerStyle: CanvasStrokeStyle = .marker,
+                onStroke: @escaping (UserStroke) -> Void = { _ in },
                 tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
                 onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
                 onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in }, onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
@@ -265,7 +309,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         let pdfChanged = self.pdfData != pdfData
         let objectsChanged = self.objects != objects
         self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
-        self.importedTransforms = importedTransforms; self.composition = composition
+        self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
+        self.penStyle = penStyle; self.markerStyle = markerStyle
+        self.backgroundStyle = backgroundStyle
+        paperLayer.fillColor = showsPaper
+            ? UIColor(red: 0.985, green: 0.982, blue: 0.965, alpha: 1).cgColor
+            : UIColor.clear.cgColor
+        updateWorkspaceBackground()
         if boardChanged {
             persistedCamera = camera
             cameraInitializedForBoardID = nil
@@ -334,6 +384,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         // canonical world-space geometry and are moved as one composited
         // surface by Core Animation.
         worldContainer.layer.setAffineTransform(current.affineTransform)
+        updateWorkspaceBackground()
         professor.updateCamera(current, interacting: interacting)
         userLayer.setAffineTransform(.identity)
         interactionLayer.setAffineTransform(.identity)
@@ -347,6 +398,53 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         assert(interactionLayer.affineTransform() == .identity, "World overlay must not receive a second camera transform")
         print("[VBoard] CAMERA APPLY reason=\(reason) interacting=\(interacting) camera=\(controller.camera) previousCamera=\(String(describing: previousCamera)) worldTransformOld=\(String(describing: previousWorldTransform)) worldTransformNew=\(worldContainer.layer.affineTransform()) worldContainerFrame=\(worldContainer.frame) worldContainerBounds=\(worldContainer.bounds) worldContainerPosition=\(worldContainer.layer.position) visibleWorldRect=\(visible)")
         #endif
+    }
+
+    private func updateWorkspaceBackground() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        gridLayer.isHidden = backgroundStyle == .blank
+        guard backgroundStyle != .blank else { gridLayer.path = nil; return }
+        let transform = worldTransform
+        let candidates: [CGFloat] = [8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096]
+        let worldSpacing = candidates.first(where: { $0 * transform.scale >= 34 }) ?? 4_096
+        let spacing = max(worldSpacing * transform.scale, 1)
+        let origin = transform.screenPoint(for: .zero)
+        let firstX = origin.x.truncatingRemainder(dividingBy: spacing)
+        let firstY = origin.y.truncatingRemainder(dividingBy: spacing)
+        let path = UIBezierPath()
+        if backgroundStyle == .dots {
+            let radius: CGFloat = traitCollection.userInterfaceStyle == .dark ? 0.9 : 0.75
+            var x = firstX - spacing
+            while x <= bounds.maxX + spacing {
+                var y = firstY - spacing
+                while y <= bounds.maxY + spacing {
+                    path.append(UIBezierPath(ovalIn: CGRect(x: x - radius, y: y - radius,
+                                                            width: radius * 2, height: radius * 2)))
+                    y += spacing
+                }
+                x += spacing
+            }
+            gridLayer.fillColor = workspaceGridColor(alpha: 0.16).cgColor
+            gridLayer.strokeColor = UIColor.clear.cgColor
+        } else {
+            var x = firstX - spacing
+            while x <= bounds.maxX + spacing {
+                path.move(to: CGPoint(x: x, y: bounds.minY)); path.addLine(to: CGPoint(x: x, y: bounds.maxY)); x += spacing
+            }
+            var y = firstY - spacing
+            while y <= bounds.maxY + spacing {
+                path.move(to: CGPoint(x: bounds.minX, y: y)); path.addLine(to: CGPoint(x: bounds.maxX, y: y)); y += spacing
+            }
+            gridLayer.fillColor = UIColor.clear.cgColor
+            gridLayer.strokeColor = workspaceGridColor(alpha: 0.10).cgColor
+        }
+        gridLayer.path = path.cgPath
+    }
+
+    private func workspaceGridColor(alpha: CGFloat) -> UIColor {
+        traitCollection.userInterfaceStyle == .dark
+            ? UIColor.white.withAlphaComponent(alpha)
+            : UIColor(red: 0.18, green: 0.25, blue: 0.32, alpha: alpha)
     }
 
     private func resolveInitialCameraIfNeeded() {
@@ -877,10 +975,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if layer.superlayer == nil { userLayer.addSublayer(layer) }
     }
 
-    private var strokeColorHex: String { activeTool == .highlighter ? "#FFD60A" : "#183153" }
+    private var activeStrokeStyle: CanvasStrokeStyle { activeTool == .highlighter ? markerStyle : penStyle }
+    private var strokeColorHex: String { activeStrokeStyle.colorHex }
     private var strokeColor: UIColor { UIColor(svgHex: strokeColorHex).withAlphaComponent(CGFloat(strokeOpacity)) }
-    private var strokeWidth: CGFloat { activeTool == .highlighter ? 22 : 4 }
-    private var strokeOpacity: Double { activeTool == .highlighter ? 0.32 : 1 }
+    private var strokeWidth: CGFloat { CGFloat(activeStrokeStyle.width) }
+    private var strokeOpacity: Double { activeStrokeStyle.opacity }
 
     private func rebuildUserLayers() {
         userObjectLayers.values.forEach { $0.removeFromSuperlayer() }

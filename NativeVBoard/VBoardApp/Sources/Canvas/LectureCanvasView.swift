@@ -1,6 +1,21 @@
 import SwiftUI
 import UIKit
 
+enum WorkspaceBackgroundStyle: String, CaseIterable, Identifiable, Sendable {
+    case subtleGrid
+    case dots
+    case blank
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .subtleGrid: return "Subtle Grid"
+        case .dots: return "Dots"
+        case .blank: return "Blank"
+        }
+    }
+}
+
 private enum LectureInteraction {
     case idle
     case panning(startScreen: CGPoint, startCamera: CameraRect)
@@ -17,6 +32,10 @@ struct LectureCanvasView: UIViewRepresentable {
     let scenes: [String: WorkspaceBoardScene]
     let selectedKeys: Set<SelectionKey>
     let tool: CanvasTool
+    let backgroundStyle: WorkspaceBackgroundStyle
+    let physicalBoardShowsPaper: Bool
+    let penStyle: CanvasStrokeStyle
+    let markerStyle: CanvasStrokeStyle
     let thumbnailURLs: [String: URL]
     var loadAsset: (String) async throws -> Data
     let focusRequest: WorkspaceFocusRequest?
@@ -24,6 +43,7 @@ struct LectureCanvasView: UIViewRepresentable {
     var onActiveBoardChanged: (String) -> Void
     var onDetailDemand: (Set<String>) -> Void
     var onSelectionChanged: (Set<SelectionKey>, [String: CGRect]) -> Void
+    var onSelectionScreenBoundsChanged: (CGRect?) -> Void
     var onStroke: (UserStroke, String) -> Void
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeTextObject: (SelectionKey, CGSize) -> Void
@@ -38,6 +58,10 @@ struct LectureCanvasView: UIViewRepresentable {
             scenes: scenes,
             selectedKeys: selectedKeys,
             tool: tool,
+            backgroundStyle: backgroundStyle,
+            physicalBoardShowsPaper: physicalBoardShowsPaper,
+            penStyle: penStyle,
+            markerStyle: markerStyle,
             thumbnailURLs: thumbnailURLs,
             loadAsset: loadAsset,
             callbacks: callbacks
@@ -46,7 +70,10 @@ struct LectureCanvasView: UIViewRepresentable {
 
     func updateUIView(_ view: LectureCanvasUIView, context: Context) {
         view.update(workspace: workspace, scenes: scenes, selectedKeys: selectedKeys,
-                    tool: tool, thumbnailURLs: thumbnailURLs,
+                    tool: tool, backgroundStyle: backgroundStyle,
+                    physicalBoardShowsPaper: physicalBoardShowsPaper,
+                    penStyle: penStyle, markerStyle: markerStyle,
+                    thumbnailURLs: thumbnailURLs,
                     loadAsset: loadAsset,
                     focusRequest: focusRequest, callbacks: callbacks)
     }
@@ -56,6 +83,7 @@ struct LectureCanvasView: UIViewRepresentable {
                                onActiveBoardChanged: onActiveBoardChanged,
                                onDetailDemand: onDetailDemand,
                                onSelectionChanged: onSelectionChanged,
+                               onSelectionScreenBoundsChanged: onSelectionScreenBoundsChanged,
                                onStroke: onStroke,
                                onMoveSelection: onMoveSelection,
                                onResizeTextObject: onResizeTextObject,
@@ -71,6 +99,7 @@ struct LectureCanvasCallbacks {
     var onActiveBoardChanged: (String) -> Void
     var onDetailDemand: (Set<String>) -> Void
     var onSelectionChanged: (Set<SelectionKey>, [String: CGRect]) -> Void
+    var onSelectionScreenBoundsChanged: (CGRect?) -> Void
     var onStroke: (UserStroke, String) -> Void
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeTextObject: (SelectionKey, CGSize) -> Void
@@ -81,13 +110,21 @@ struct LectureCanvasCallbacks {
 }
 
 final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
+    private let gridMinorLayer = CAShapeLayer()
+    private let gridMajorLayer = CAShapeLayer()
     private let worldContainer = UIView()
+    private let regionContainer = UIView()
     private let interactionLayer = CAShapeLayer()
     private var boardViews: [String: LectureBoardRenderView] = [:]
+    private var regionLayers: [String: CAShapeLayer] = [:]
     private var workspace: LectureWorkspace
     private var scenes: [String: WorkspaceBoardScene]
     private var selectedKeys: Set<SelectionKey>
     private var activeTool: CanvasTool
+    private var backgroundStyle: WorkspaceBackgroundStyle
+    private var physicalBoardShowsPaper: Bool
+    private var penStyle: CanvasStrokeStyle
+    private var markerStyle: CanvasStrokeStyle
     private var thumbnailURLs: [String: URL]
     private var loadAsset: (String) async throws -> Data
     private var callbacks: LectureCanvasCallbacks
@@ -115,6 +152,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
          scenes: [String: WorkspaceBoardScene],
          selectedKeys: Set<SelectionKey>,
          tool: CanvasTool,
+         backgroundStyle: WorkspaceBackgroundStyle,
+         physicalBoardShowsPaper: Bool,
+         penStyle: CanvasStrokeStyle,
+         markerStyle: CanvasStrokeStyle,
          thumbnailURLs: [String: URL],
          loadAsset: @escaping (String) async throws -> Data,
          callbacks: LectureCanvasCallbacks) {
@@ -122,6 +163,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.scenes = scenes
         self.selectedKeys = selectedKeys
         self.activeTool = tool
+        self.backgroundStyle = backgroundStyle
+        self.physicalBoardShowsPaper = physicalBoardShowsPaper
+        self.penStyle = penStyle
+        self.markerStyle = markerStyle
         self.thumbnailURLs = thumbnailURLs
         self.loadAsset = loadAsset
         self.callbacks = callbacks
@@ -129,15 +174,26 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         spatialIndex = WorkspaceSpatialIndex(items: workspace.items)
         super.init(frame: .zero)
 
-        backgroundColor = UIColor.systemGray6
+        backgroundColor = UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0.075, green: 0.08, blue: 0.09, alpha: 1)
+                : UIColor(red: 0.965, green: 0.968, blue: 0.972, alpha: 1)
+        }
         clipsToBounds = true
         isMultipleTouchEnabled = true
+        configureGridLayer(gridMinorLayer)
+        configureGridLayer(gridMajorLayer)
+        layer.addSublayer(gridMinorLayer)
+        layer.addSublayer(gridMajorLayer)
         worldContainer.backgroundColor = .clear
         worldContainer.clipsToBounds = false
         worldContainer.isUserInteractionEnabled = false
         worldContainer.layer.anchorPoint = .zero
         worldContainer.layer.position = .zero
         addSubview(worldContainer)
+        regionContainer.backgroundColor = .clear
+        regionContainer.isUserInteractionEnabled = false
+        worldContainer.addSubview(regionContainer)
 
         interactionLayer.fillColor = UIColor.systemBlue.withAlphaComponent(0.08).cgColor
         interactionLayer.strokeColor = UIColor.systemBlue.cgColor
@@ -164,6 +220,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         addGestureRecognizer(pinch)
         pinchRecognizer = pinch
 
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (view: LectureCanvasUIView, _) in
+            view.updateWorkspaceBackground()
+            view.updateRegionDecorations()
+        }
         becomeFirstResponder()
     }
 
@@ -180,6 +240,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         super.layoutSubviews()
         worldContainer.bounds = CGRect(origin: .zero, size: bounds.size)
         worldContainer.layer.position = .zero
+        regionContainer.frame = worldContainer.bounds
+        gridMinorLayer.frame = bounds
+        gridMajorLayer.frame = bounds
         WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
         applyCamera(interacting: false)
         refineRepresentations()
@@ -189,6 +252,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 scenes: [String: WorkspaceBoardScene],
                 selectedKeys: Set<SelectionKey>,
                 tool: CanvasTool,
+                backgroundStyle: WorkspaceBackgroundStyle,
+                physicalBoardShowsPaper: Bool,
+                penStyle: CanvasStrokeStyle,
+                markerStyle: CanvasStrokeStyle,
                 thumbnailURLs: [String: URL],
                 loadAsset: @escaping (String) async throws -> Data,
                 focusRequest: WorkspaceFocusRequest?,
@@ -199,6 +266,12 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.scenes = scenes
         self.selectedKeys = selectedKeys
         self.activeTool = tool
+        let appearanceChanged = self.backgroundStyle != backgroundStyle
+            || self.physicalBoardShowsPaper != physicalBoardShowsPaper
+        self.backgroundStyle = backgroundStyle
+        self.physicalBoardShowsPaper = physicalBoardShowsPaper
+        self.penStyle = penStyle
+        self.markerStyle = markerStyle
         self.thumbnailURLs = thumbnailURLs
         self.loadAsset = loadAsset
         self.callbacks = callbacks
@@ -206,7 +279,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             controller.setCamera(workspace.camera)
         }
         if placementsChanged { spatialIndex = WorkspaceSpatialIndex(items: workspace.items) }
-        if placementsChanged || scenesChanged { refineRepresentations(force: true) }
+        if placementsChanged || scenesChanged || appearanceChanged { refineRepresentations(force: true) }
         updateSelectionOverlay()
         if let focusRequest, focusRequest.id != lastFocusRequestID, bounds.width > 0, bounds.height > 0 {
             lastFocusRequestID = focusRequest.id
@@ -263,11 +336,99 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         CATransaction.setDisableActions(true)
         worldContainer.layer.setAffineTransform(worldTransform.affineTransform)
         CATransaction.commit()
+        updateWorkspaceBackground()
+        for (boardID, region) in regionLayers {
+            region.lineWidth = (boardID == workspace.activeBoardID ? 1.5 : 1) / max(worldTransform.scale, 0.001)
+        }
         for (boardID, view) in boardViews {
             guard let item = workspace.items.first(where: { $0.boardID == boardID }) else { continue }
             let localCamera = LectureCoordinateTransform.lectureWorldToBoardLocal(controller.camera.cgRect, board: item)
             view.updateVisibility(localCamera: localCamera, viewport: bounds.size, interacting: interacting)
         }
+        if !selectedKeys.isEmpty { updateSelectionOverlay() }
+    }
+
+    private func configureGridLayer(_ layer: CAShapeLayer) {
+        layer.fillColor = UIColor.clear.cgColor
+        layer.lineWidth = 1
+        layer.contentsScale = UIScreen.main.scale
+        layer.isHidden = true
+    }
+
+    /// Draws a small viewport-sized path only when the camera changes. The
+    /// pattern is screen-space for a stable one-pixel stroke, but its origin
+    /// is derived from world coordinates so it remains spatially anchored.
+    private func updateWorkspaceBackground() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        gridMinorLayer.isHidden = backgroundStyle == .blank
+        gridMajorLayer.isHidden = backgroundStyle != .subtleGrid
+        guard backgroundStyle != .blank else { return }
+
+        let transform = worldTransform
+        let candidates: [CGFloat] = [8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096]
+        let worldSpacing = candidates.first(where: { $0 * transform.scale >= 34 }) ?? 4_096
+        let screenSpacing = max(worldSpacing * transform.scale, 1)
+        let worldOrigin = transform.screenPoint(for: .zero)
+        let firstX = worldOrigin.x.truncatingRemainder(dividingBy: screenSpacing)
+        let firstY = worldOrigin.y.truncatingRemainder(dividingBy: screenSpacing)
+
+        let minor = UIBezierPath()
+        if backgroundStyle == .dots {
+            let radius = traitCollection.userInterfaceStyle == .dark ? 0.9 : 0.75
+            var x = firstX - screenSpacing
+            while x <= bounds.maxX + screenSpacing {
+                var y = firstY - screenSpacing
+                while y <= bounds.maxY + screenSpacing {
+                    minor.append(UIBezierPath(ovalIn: CGRect(x: x - radius, y: y - radius,
+                                                             width: radius * 2, height: radius * 2)))
+                    y += screenSpacing
+                }
+                x += screenSpacing
+            }
+            gridMinorLayer.fillColor = gridColor(alpha: 0.16).cgColor
+            gridMinorLayer.strokeColor = UIColor.clear.cgColor
+        } else {
+            var x = firstX - screenSpacing
+            while x <= bounds.maxX + screenSpacing {
+                minor.move(to: CGPoint(x: x, y: bounds.minY))
+                minor.addLine(to: CGPoint(x: x, y: bounds.maxY))
+                x += screenSpacing
+            }
+            var y = firstY - screenSpacing
+            while y <= bounds.maxY + screenSpacing {
+                minor.move(to: CGPoint(x: bounds.minX, y: y))
+                minor.addLine(to: CGPoint(x: bounds.maxX, y: y))
+                y += screenSpacing
+            }
+            gridMinorLayer.fillColor = UIColor.clear.cgColor
+            gridMinorLayer.strokeColor = gridColor(alpha: 0.10).cgColor
+        }
+        gridMinorLayer.path = minor.cgPath
+
+        guard backgroundStyle == .subtleGrid else {
+            gridMajorLayer.path = nil
+            return
+        }
+        let majorSpacing = screenSpacing * 4
+        let majorOriginX = worldOrigin.x.truncatingRemainder(dividingBy: majorSpacing)
+        let majorOriginY = worldOrigin.y.truncatingRemainder(dividingBy: majorSpacing)
+        let major = UIBezierPath()
+        var x = majorOriginX - majorSpacing
+        while x <= bounds.maxX + majorSpacing {
+            major.move(to: CGPoint(x: x, y: bounds.minY)); major.addLine(to: CGPoint(x: x, y: bounds.maxY)); x += majorSpacing
+        }
+        var y = majorOriginY - majorSpacing
+        while y <= bounds.maxY + majorSpacing {
+            major.move(to: CGPoint(x: bounds.minX, y: y)); major.addLine(to: CGPoint(x: bounds.maxX, y: y)); y += majorSpacing
+        }
+        gridMajorLayer.strokeColor = gridColor(alpha: 0.14).cgColor
+        gridMajorLayer.path = major.cgPath
+    }
+
+    private func gridColor(alpha: CGFloat) -> UIColor {
+        traitCollection.userInterfaceStyle == .dark
+            ? UIColor.white.withAlphaComponent(alpha)
+            : UIColor(red: 0.18, green: 0.25, blue: 0.32, alpha: alpha)
     }
 
     private func refineRepresentations(force: Bool = false) {
@@ -279,6 +440,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
                                                      interactingBoardID: interactingBoardID)
         if !force, next == representations { return }
         representations = next
+        updateRegionDecorations()
         let desiredFull = Set(next.compactMap { $0.value == .fullVector ? $0.key : nil })
         #if DEBUG
         let thumbnailCount = next.values.filter { $0 == .thumbnail }.count
@@ -306,6 +468,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             boardView.configure(item: item,
                                 scene: representation == .fullVector ? scenes[item.boardID] : nil,
                                 representation: representation,
+                                physicalBoardShowsPaper: physicalBoardShowsPaper,
                                 thumbnailURL: thumbnailURLs[item.boardID],
                                 loadAsset: loadAsset)
         }
@@ -318,6 +481,48 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         applyCamera(interacting: false)
     }
 
+    private func updateRegionDecorations() {
+        let currentIDs = Set(workspace.items.map(\.boardID))
+        for stale in regionLayers.keys where !currentIDs.contains(stale) {
+            regionLayers.removeValue(forKey: stale)?.removeFromSuperlayer()
+        }
+        for item in workspace.items {
+            let region = regionLayers[item.boardID] ?? {
+                let layer = CAShapeLayer()
+                layer.fillColor = UIColor.clear.cgColor
+                layer.lineJoin = .round
+                regionContainer.layer.addSublayer(layer)
+                regionLayers[item.boardID] = layer
+                return layer
+            }()
+            let initial = CGRect(x: item.canvasX,
+                                 y: item.canvasY,
+                                 width: item.boardWidth,
+                                 height: item.boardHeight * WorkspaceEffectiveBounds.initialRegionHeightMultiplier)
+            let effective = initial.union(item.effectiveFrame)
+            let inset = max(10, min(item.boardWidth, item.boardHeight) * 0.012)
+            let boundary = effective.insetBy(dx: -inset, dy: -inset)
+            let nextPath = UIBezierPath(roundedRect: boundary, cornerRadius: max(12, inset)).cgPath
+            if let previous = region.path, previous.boundingBox != nextPath.boundingBox,
+               !UIAccessibility.isReduceMotionEnabled {
+                let animation = CABasicAnimation(keyPath: "path")
+                animation.fromValue = previous
+                animation.toValue = nextPath
+                animation.duration = 0.18
+                animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                region.add(animation, forKey: "region-boundary")
+            }
+            region.path = nextPath
+            let isActive = item.boardID == workspace.activeBoardID
+            let isPDF = item.sourceKind.isPDF
+            region.fillColor = (isPDF
+                ? UIColor.systemBackground.withAlphaComponent(0.10)
+                : UIColor.systemBackground.withAlphaComponent(isActive ? 0.11 : 0.055)).cgColor
+            region.strokeColor = UIColor.separator.withAlphaComponent(isActive ? 0.42 : 0.24).cgColor
+            region.lineWidth = (isActive ? 1.5 : 1) / max(worldTransform.scale, 0.001)
+        }
+    }
+
     private var interactingBoardID: String? {
         switch interaction {
         case .drawing(let boardID, _), .movingBoard(let boardID, _): return boardID
@@ -328,8 +533,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     private func focus(boardID: String) {
         guard let item = workspace.items.first(where: { $0.boardID == boardID }) else { return }
-        let headerAndPaper = item.frame.insetBy(dx: -32, dy: -32).union(
-            CGRect(x: item.frame.minX, y: item.frame.minY - 52, width: item.frame.width, height: 52)
+        let initialRegion = CGRect(x: item.frame.minX, y: item.frame.minY,
+                                   width: item.frame.width,
+                                   height: item.frame.height * WorkspaceEffectiveBounds.initialRegionHeightMultiplier)
+        let headerAndPaper = initialRegion.union(item.effectiveFrame).insetBy(dx: -32, dy: -32).union(
+            CGRect(x: item.frame.minX, y: item.frame.minY - 40, width: item.frame.width, height: 40)
         )
         let camera = CameraResolver.fitBoard(boardRect: headerAndPaper, viewport: bounds.size)
         controller.setCamera(camera)
@@ -342,14 +550,14 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private func boardItem(at lecturePoint: CGPoint, includeHeader: Bool = false) -> WorkspaceBoardItem? {
         workspace.items.sorted { $0.zIndex > $1.zIndex }.first { item in
             let rect = includeHeader
-                ? item.frame.union(CGRect(x: item.frame.minX, y: item.frame.minY - 52, width: item.frame.width, height: 52))
+                ? item.frame.union(CGRect(x: item.frame.minX, y: item.frame.minY - 40, width: item.frame.width, height: 40))
                 : item.effectiveFrame.union(item.frame)
             return rect.contains(lecturePoint)
         }
     }
 
     private func isHeader(_ point: CGPoint, item: WorkspaceBoardItem) -> Bool {
-        CGRect(x: item.frame.minX, y: item.frame.minY - 52, width: item.frame.width, height: 52).contains(point)
+        CGRect(x: item.frame.minX, y: item.frame.minY - 40, width: item.frame.width, height: 40).contains(point)
     }
 
     // MARK: - Two-finger camera navigation
@@ -562,6 +770,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             let delta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
             if let item = workspace.items.first(where: { $0.boardID == boardID }) {
                 boardViews[boardID]?.frame = item.frame.offsetBy(dx: delta.x, dy: delta.y)
+                regionLayers[boardID]?.setAffineTransform(CGAffineTransform(translationX: delta.x, y: delta.y))
             }
         case .idle: break
         }
@@ -633,6 +842,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             callbacks.onResizeTextObject(key, size)
         case .movingBoard(let boardID, let startWorld):
             let delta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
+            regionLayers[boardID]?.setAffineTransform(.identity)
             if delta != .zero { callbacks.onMoveBoard(boardID, delta) }
         case .idle: break
         }
@@ -656,6 +866,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if case .movingBoard(let boardID, _) = interaction,
            let item = workspace.items.first(where: { $0.boardID == boardID }) {
             boardViews[boardID]?.frame = item.frame
+            regionLayers[boardID]?.setAffineTransform(.identity)
         }
         lassoPoints.removeAll()
         liveStrokePoints.removeAll()
@@ -769,6 +980,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         guard var union = resizePreviewBounds ?? selectionWorldBounds() else {
             interactionLayer.isHidden = true
             interactionLayer.path = nil
+            callbacks.onSelectionScreenBoundsChanged(nil)
             return
         }
         configureInteractionStrokeForCurrentZoom()
@@ -785,6 +997,14 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         interactionLayer.path = path.cgPath
         interactionLayer.isHidden = false
+        let topLeft = worldTransform.screenPoint(for: CGPoint(x: union.minX, y: union.minY))
+        let bottomRight = worldTransform.screenPoint(for: CGPoint(x: union.maxX, y: union.maxY))
+        callbacks.onSelectionScreenBoundsChanged(CGRect(
+            x: min(topLeft.x, bottomRight.x),
+            y: min(topLeft.y, bottomRight.y),
+            width: abs(bottomRight.x - topLeft.x),
+            height: abs(bottomRight.y - topLeft.y)
+        ))
     }
 
     /// The overlay lives in world space with the board layers, but its chrome
@@ -848,9 +1068,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         return StrokePoint(x: local.x, y: local.y, pressure: pressure)
     }
 
-    private var strokeColor: String { activeTool == .highlighter ? "#FFD60A" : "#183153" }
-    private var strokeWidth: Double { activeTool == .highlighter ? 22 : 4 }
-    private var strokeOpacity: Double { activeTool == .highlighter ? 0.32 : 1 }
+    private var activeStrokeStyle: CanvasStrokeStyle { activeTool == .highlighter ? markerStyle : penStyle }
+    private var strokeColor: String { activeStrokeStyle.colorHex }
+    private var strokeWidth: Double { activeStrokeStyle.width }
+    private var strokeOpacity: Double { activeStrokeStyle.opacity }
 
     // MARK: - Keyboard development controls
 
@@ -937,9 +1158,9 @@ private final class LectureBoardRenderView: UIView {
         layer.addSublayer(userLayer)
         header.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.96)
         header.textColor = .label
-        header.font = .systemFont(ofSize: 22, weight: .semibold)
-        header.numberOfLines = 2
-        header.layer.cornerRadius = 10
+        header.font = .systemFont(ofSize: 17, weight: .semibold)
+        header.numberOfLines = 1
+        header.layer.cornerRadius = 8
         header.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         header.layer.masksToBounds = true
         addSubview(header)
@@ -958,19 +1179,25 @@ private final class LectureBoardRenderView: UIView {
         professor.frame = bounds
         userLayer.bounds = bounds
         userLayer.position = .zero
-        header.frame = CGRect(x: 0, y: -52, width: bounds.width, height: 52)
+        header.frame = CGRect(x: 0, y: -40, width: bounds.width, height: 40)
         loading.center = CGPoint(x: bounds.midX, y: bounds.midY)
     }
 
     func configure(item: WorkspaceBoardItem,
                    scene: WorkspaceBoardScene?,
                    representation: BoardRepresentation,
+                   physicalBoardShowsPaper: Bool,
                    thumbnailURL: URL?,
                    loadAsset: @escaping (String) async throws -> Data) {
         let sceneChanged = self.scene != scene
         self.item = item
         self.scene = scene
-        header.text = "  \(item.title)\n  \(dateLabel(item.createdAt)) • \(item.unitLabel)"
+        header.text = "  \(item.title)   ·   \(dateLabel(item.createdAt))   ·   \(item.unitLabel)"
+        let showPaper = item.sourceKind.isPDF || physicalBoardShowsPaper
+        paperLayer.fillColor = showPaper
+            ? UIColor.systemBackground.withAlphaComponent(item.sourceKind.isPDF ? 1 : 0.9).cgColor
+            : UIColor.clear.cgColor
+        paperLayer.strokeColor = UIColor.separator.withAlphaComponent(showPaper ? 0.32 : 0.16).cgColor
         if representation == .fullVector, let scene {
             thumbnail.isHidden = true
             professor.isHidden = false
@@ -1000,6 +1227,7 @@ private final class LectureBoardRenderView: UIView {
             pdfSource.isHidden = true
             userLayer.isHidden = true
             thumbnail.isHidden = false
+            thumbnail.alpha = item.sourceKind.isPDF || physicalBoardShowsPaper ? 1 : 0.24
             if representation == .fullVector { loading.startAnimating() } else { loading.stopAnimating() }
             loadThumbnail(thumbnailURL, loadAsset: loadAsset)
         }

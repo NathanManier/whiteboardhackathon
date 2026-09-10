@@ -36,7 +36,7 @@ extension LectureWorkspace {
             let item = WorkspaceBoardItem(
                 id: "board:\(board.id)", kind: "board", boardID: board.id,
                 canvasX: x, canvasY: 0, boardWidth: width, boardHeight: height,
-                effectiveContentBounds: CameraRect(x: x, y: 0, width: width, height: height),
+                effectiveContentBounds: CameraRect(x: x, y: 0, width: width, height: height * 1.5),
                 createdAt: createdAt, capturedAt: nil, detectedBoardDate: nil,
                 unitLabel: "No Unit", unitNumber: nil, unitConfidence: 0,
                 unitSource: .none, title: board.name,
@@ -298,10 +298,15 @@ enum WorkspaceLayout {
 /// rectangle is derived navigation/layout metadata; it never replaces or
 /// rewrites the canonical object coordinates in the board editor document.
 enum WorkspaceEffectiveBounds {
+    /// A photographed board begins with a useful writing apron below the
+    /// source image. The apron is layout metadata only: it never changes the
+    /// professor SVG viewBox or canonical editor coordinates.
+    static let initialRegionHeightMultiplier = 1.5
+
     static func boardLocal(editor: EditorState, boardSize: CGSize) -> CGRect {
         var result = CGRect(origin: .zero,
                             size: CGSize(width: max(boardSize.width, 1),
-                                         height: max(boardSize.height, 1)))
+                                         height: max(boardSize.height * initialRegionHeightMultiplier, 1)))
         for object in SceneComposition.canonicalEditorObjects(editor.objects) {
             result = result.union(objectBounds(object))
         }

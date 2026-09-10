@@ -1008,6 +1008,22 @@ final class StudySelectionRequestTests: XCTestCase {
 }
 
 final class LectureWorkspaceModelTests: XCTestCase {
+    func testSelectionToolbarFlipsBelowAndClampsToViewportEdges() {
+        let viewport = CGSize(width: 1_024, height: 768)
+        let nearTopLeft = SelectionToolbarLayout.position(
+            for: CGRect(x: 0, y: 2, width: 24, height: 30), viewport: viewport
+        )
+        XCTAssertGreaterThanOrEqual(nearTopLeft.x - SelectionToolbarLayout.size.width / 2, 12)
+        XCTAssertGreaterThan(nearTopLeft.y, 32)
+
+        let nearRight = SelectionToolbarLayout.position(
+            for: CGRect(x: 1_010, y: 500, width: 20, height: 20), viewport: viewport
+        )
+        XCTAssertLessThanOrEqual(nearRight.x + SelectionToolbarLayout.size.width / 2,
+                                 viewport.width - 12)
+        XCTAssertLessThan(nearRight.y, 500)
+    }
+
     func testEffectiveBoundsIncludesBoardOwnedContentOutsidePaper() throws {
         let editor = try JSONDecoder().decode(EditorState.self, from: Data(#"""
         {
@@ -1017,7 +1033,19 @@ final class LectureWorkspaceModelTests: XCTestCase {
         }
         """#.utf8))
         let bounds = WorkspaceEffectiveBounds.boardLocal(editor: editor, boardSize: CGSize(width: 100, height: 80))
-        XCTAssertEqual(bounds, CGRect(x: 0, y: -40, width: 240, height: 120))
+        XCTAssertEqual(bounds, CGRect(x: 0, y: -40, width: 240, height: 160))
+    }
+
+    func testPhysicalBoardRegionStartsWithFiftyPercentWritingApron() throws {
+        let editor = try JSONDecoder().decode(EditorState.self, from: Data(#"""
+        {
+          "schema_version":4,"revision":0,"viewport":{"x":0,"y":0,"width":100,"height":80},
+          "objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]
+        }
+        """#.utf8))
+        let bounds = WorkspaceEffectiveBounds.boardLocal(editor: editor,
+                                                          boardSize: CGSize(width: 100, height: 80))
+        XCTAssertEqual(bounds, CGRect(x: 0, y: 0, width: 100, height: 120))
     }
 
     private func item(_ index: Int, x: Double, y: Double = 0,

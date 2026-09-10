@@ -111,6 +111,16 @@ private struct BoardEditorSurface: View {
     @State private var selectedIDs = Set<String>()
     @State private var selectedPDFRegion: CGRect?
     @State private var liveCamera: CameraRect?
+    @State private var studyInitialAction: String?
+    @AppStorage("vboard.study.panelWidth") private var studyPanelWidth = 360.0
+    @AppStorage("vboard.study.panelCollapsed") private var studyPanelCollapsed = false
+    @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
+    @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.subtleGrid.rawValue
+    @AppStorage("vboard.pen.color") private var penColor = CanvasStrokeStyle.pen.colorHex
+    @AppStorage("vboard.pen.width") private var penWidth = CanvasStrokeStyle.pen.width
+    @AppStorage("vboard.marker.color") private var markerColor = CanvasStrokeStyle.marker.colorHex
+    @AppStorage("vboard.marker.width") private var markerWidth = CanvasStrokeStyle.marker.width
+    @AppStorage("vboard.marker.opacity") private var markerOpacity = CanvasStrokeStyle.marker.opacity
 
     init(board: LibraryBoard, document: SVGDocument, pdfData: Data?, editor: EditorState, composition: SceneComposition) {
         self.board = board; self.document = document; self.pdfData = pdfData; self.composition = composition
@@ -118,44 +128,44 @@ private struct BoardEditorSurface: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            // Keep one UIKit input surface alive for the board. Tool changes
-            // update that surface in place so recognizers, responder focus,
-            // and the live camera cannot be reset by SwiftUI identity churn.
-            NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
-                .ignoresSafeArea(edges: .bottom)
-            HStack(spacing: 14) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(CanvasTool.allCases, id: \.self) { tool in
-                            ToolButton(title: tool.title, icon: tool.icon, selected: activeTool == tool) { activeTool = tool }
-                        }
+        GeometryReader { outer in
+            let docked = outer.size.width >= 820
+            let panelWidth = showStudy && docked
+                ? (studyPanelCollapsed ? 46 : min(max(studyPanelWidth, 300), outer.size.width * 0.58))
+                : 0
+            HStack(spacing: 0) {
+                editorCanvas
+                    .frame(width: max(outer.size.width - panelWidth, 320))
+                if showStudy && docked {
+                    StudyDock(width: $studyPanelWidth, collapsed: $studyPanelCollapsed,
+                              availableWidth: outer.size.width,
+                              onClose: { showStudy = false }) {
+                        studyPanel(compact: true)
                     }
+                    .frame(width: panelWidth)
                 }
-                Divider().frame(height: 28)
-                Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1).frame(minWidth: 76, alignment: .leading)
-                Button { showStudy = true } label: { Label("Explain", systemImage: "text.magnifyingglass") }.buttonStyle(.borderedProminent).controlSize(.small).disabled(studySelection == nil)
-                Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis").font(.headline).frame(width: 32, height: 32) }.accessibilityLabel("Board actions")
-            }.padding(.horizontal, 14).padding(.vertical, 8).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous)).padding(.horizontal, 14).padding(.bottom, 12)
-            // SwiftUI's command system is the reliable keyboard path when the
-            // simulator captures the Mac keyboard; the canvas also exposes
-            // the same commands through UIKeyCommand for device input.
-            Button("") { store.undo(api: api) }.keyboardShortcut("z", modifiers: .command).frame(width: 0, height: 0).opacity(0.001)
-            Button("") { store.redo(api: api) }.keyboardShortcut("z", modifiers: [.command, .shift]).frame(width: 0, height: 0).opacity(0.001)
-        }.navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItemGroup(placement: .navigationBarTrailing) { Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo); Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo); Button { showStudy = true } label: { Image(systemName: "text.magnifyingglass") }.accessibilityLabel("Explain selection").disabled(studySelection == nil) } }
-        .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
-        .sheet(isPresented: $showStudy) {
-            if let selection = studySelection {
-                StudyActionsView(selection: selection,
-                                 prepareSelection: { await store.saveNow(api: api) }) {
-                    problems, interactionID in
-                    store.applyPracticeProblems(problems, interactionID: interactionID, api: api)
-                }
-            } else {
-                ContentUnavailableView("Select ink first", systemImage: "lasso",
-                                       description: Text("Use Select or Lasso, then open Explain again."))
+            }
+            .sheet(isPresented: Binding(
+                get: { showStudy && !docked },
+                set: { if !$0 { showStudy = false } }
+            )) { studyPanel(compact: false) }
+        }
+        .navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo)
+                Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo)
+                Button { showImport = true } label: { Image(systemName: "plus") }.accessibilityLabel("Add Whiteboard")
+                Menu {
+                    Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }
+                    Picker("Workspace Background", selection: $backgroundRaw) {
+                        ForEach(WorkspaceBackgroundStyle.allCases) { style in Text(style.title).tag(style.rawValue) }
+                    }
+                    if pdfData == nil { Toggle("Show Whiteboard Paper", isOn: $physicalBoardShowsPaper) }
+                    Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") }
+                } label: { Image(systemName: "ellipsis.circle") }
             }
         }
+        .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
         .alert("Couldn’t export board", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) { Button("OK", role: .cancel) {} } message: { Text(exportError ?? "") }
         .alert("Board changed on the server", isPresented: $showConflict) {
@@ -166,10 +176,76 @@ private struct BoardEditorSurface: View {
         .task { store.restoreLocalIfPresent(server: store.editor) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
     }
+
+    private var editorCanvas: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .bottom) {
+            // Keep one UIKit input surface alive for the board. Tool changes
+            // update that surface in place so recognizers, responder focus,
+            // and the live camera cannot be reset by SwiftUI identity churn.
+            NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), showsPaper: pdfData != nil || physicalBoardShowsPaper, backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .subtleGrid, penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1), markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity), onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
+                .ignoresSafeArea(edges: .bottom)
+            WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
+                                 penColor: $penColor, penWidth: $penWidth,
+                                 markerColor: $markerColor, markerWidth: $markerWidth,
+                                 markerOpacity: $markerOpacity)
+            .padding(.bottom, 12)
+
+            if let rect = selectionScreenRect(viewport: proxy.size) {
+                SelectionActionBar(canCheckWork: selectionCanCheckWork,
+                                   explain: { openStudy("explain") },
+                                   practice: { openStudy("practice_problems") },
+                                   check: { openStudy("check_my_work") },
+                                   delete: { store.deleteObjects(ids: selectedIDs, api: api) })
+                    .position(SelectionToolbarLayout.position(for: rect, viewport: proxy.size))
+            }
+            // SwiftUI's command system is the reliable keyboard path when the
+            // simulator captures the Mac keyboard; the canvas also exposes
+            // the same commands through UIKeyCommand for device input.
+            Button("") { store.undo(api: api) }.keyboardShortcut("z", modifiers: .command).frame(width: 0, height: 0).opacity(0.001)
+            Button("") { store.redo(api: api) }.keyboardShortcut("z", modifiers: [.command, .shift]).frame(width: 0, height: 0).opacity(0.001)
+            }
+        }
+    }
+
+    @ViewBuilder private func studyPanel(compact: Bool) -> some View {
+        if let selection = studySelection {
+            StudyActionsView(selection: selection,
+                             prepareSelection: { await store.saveNow(api: api) },
+                             initialAction: studyInitialAction,
+                             compact: compact) { problems, interactionID in
+                store.applyPracticeProblems(problems, interactionID: interactionID, api: api)
+            }
+        } else {
+            ContentUnavailableView("Select ink first", systemImage: "lasso",
+                                   description: Text("Use Select or Lasso, then choose a study action."))
+        }
+    }
+
+    private func openStudy(_ action: String) {
+        studyInitialAction = action
+        studyPanelCollapsed = false
+        showStudy = true
+    }
+
+    private func selectionScreenRect(viewport: CGSize) -> CGRect? {
+        guard let selection = studySelection else { return nil }
+        let transform = WorldScreenTransform(camera: liveCamera ?? store.editor.viewport, viewport: viewport)
+        let a = transform.screenPoint(for: CGPoint(x: selection.localBBox.x, y: selection.localBBox.y))
+        let b = transform.screenPoint(for: CGPoint(x: selection.localBBox.x + selection.localBBox.width,
+                                                    y: selection.localBBox.y + selection.localBBox.height))
+        return CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
+    }
+
     private var studySelection: BoardStudySelection? {
         BoardStudySelection.isolated(boardID: board.id, selectedIDs: selectedIDs,
                                      document: document, editor: store.editor,
                                      preferredLocalBBox: selectedPDFRegion)
+    }
+    private var selectionCanCheckWork: Bool {
+        let selectedObjects = store.editor.objects.filter { selectedIDs.contains($0.id) }
+        return selectedObjects.contains(where: { $0.role == "ai_practice_problem" })
+            && selectedObjects.contains(where: { $0.role != "ai_practice_problem" })
     }
     private func export() async {
         do {
@@ -186,43 +262,46 @@ private struct BoardEditorSurface: View {
     private func deleteBoard() async { do { try await api.deleteBoard(id: board.id); dismiss() } catch { exportError = "The board could not be deleted." } }
 }
 
-private extension CanvasTool {
-    var title: String { rawValue == "objectEraser" ? "Erase" : rawValue == "navigation" ? "Hand" : rawValue.capitalized }
-    var icon: String { switch self { case .navigation: return "hand.draw"; case .pen: return "pencil.tip"; case .highlighter: return "highlighter"; case .select: return "cursorarrow"; case .lasso: return "lasso"; case .objectEraser: return "eraser" } }
-}
-
-private struct ToolButton: View {
-    let title: String
-    let icon: String
-    let selected: Bool
-    let action: () -> Void
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: icon).font(.system(size: 17, weight: .medium)).frame(width: 36, height: 34)
-        }
-        .buttonStyle(.bordered)
-        .tint(selected ? .accentColor : .secondary)
-        .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .accessibilityLabel(title)
-        .help(title)
-    }
-}
-
 struct StudyActionsView: View {
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
     let selection: BoardStudySelection
     let prepareSelection: () async -> Void
+    var initialAction: String? = nil
+    var compact = false
     let onPracticeProblems: ([PracticeProblem], String?) -> Void
     @StateObject private var submissionGate = StudySubmissionGate()
     @State private var loading = false
     @State private var result: StudyInteractionResponse?
     @State private var error: String?
     @State private var followUpQuestion = ""
+    @State private var launchedInitialAction: String?
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 18) {
+        Group {
+            if compact {
+                studyBody
+            } else {
+                NavigationStack {
+                    studyBody
+                        .navigationTitle("Study")
+                        .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+                }
+            }
+        }
+        .task(id: initialAction) {
+            guard let initialAction, launchedInitialAction != initialAction else { return }
+            launchedInitialAction = initialAction
+            switch initialAction {
+            case "practice_problems": submitInitial(followUpAction: "practice_problems")
+            case "check_my_work": submitInitial(action: "check_my_work")
+            default: submitInitial()
+            }
+        }
+    }
+
+    private var studyBody: some View {
+        VStack(spacing: compact ? 12 : 18) {
                 if loading {
                     ProgressView("Reading the selected board…")
                 } else if let result {
@@ -257,10 +336,10 @@ struct StudyActionsView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(followUpQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                    .frame(maxWidth: 700)
+                    .frame(maxWidth: compact ? .infinity : 700)
                 } else {
-                    Image(systemName: "text.magnifyingglass").font(.largeTitle).foregroundStyle(.tint)
-                    Text("Study the selected ink").font(.title2.bold())
+                    Image(systemName: "text.magnifyingglass").font(compact ? .title2 : .largeTitle).foregroundStyle(.tint)
+                    Text("Study the selected ink").font(compact ? .headline : .title2.bold())
                     Text("Explain a selected concept, create two practice problems, or check a handwritten solution.")
                         .multilineTextAlignment(.center).foregroundStyle(.secondary)
                     Button("Explain") { submitInitial() }.buttonStyle(.borderedProminent)
@@ -268,11 +347,8 @@ struct StudyActionsView: View {
                     Button("Check My Work") { submitInitial(action: "check_my_work") }.buttonStyle(.bordered)
                 }
                 if let error { Text(error).foregroundStyle(.red) }
-            }
-            .padding(28)
-            .navigationTitle("Study")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         }
+        .padding(compact ? 16 : 28)
     }
 
     private func displayAnswer(_ response: StudyInteractionResponse) -> String {
@@ -347,7 +423,7 @@ struct StudyActionsView: View {
     }
 }
 
-private struct ShareSheet: UIViewControllerRepresentable {
+struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController { UIActivityViewController(activityItems: items, applicationActivities: nil) }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
