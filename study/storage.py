@@ -32,6 +32,7 @@ def stored_board_context(value: Any) -> dict[str, Any] | None:
             public["keyTopics"],
             public["visualContext"],
             public["importantObservations"],
+            public["explicitUnitText"],
         ]
     ):
         return None
@@ -42,6 +43,8 @@ def stored_board_context(value: Any) -> dict[str, Any] | None:
         "key_topics": public["keyTopics"],
         "visual_context": public["visualContext"],
         "important_observations": public["importantObservations"],
+        "explicit_unit_text": public["explicitUnitText"],
+        "unit_confidence": public["unitConfidence"],
     }
 
 
@@ -61,7 +64,24 @@ def public_board_context(value: Any) -> dict[str, Any] | None:
         "keyTopics": [str(item)[:160] for item in topics[:24] if item],
         "visualContext": str(value.get("visual_context") or value.get("visualContext") or "")[:4_000],
         "importantObservations": [str(item)[:240] for item in observations[:24] if item],
+        "explicitUnitText": (
+            str(value.get("explicit_unit_text") or value.get("explicitUnitText") or "").strip()[:80]
+            or None
+        ),
+        "unitConfidence": _bounded_confidence(
+            value.get("unit_confidence", value.get("unitConfidence"))
+        ),
     }
+
+
+def _bounded_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if confidence != confidence or confidence in (float("inf"), float("-inf")):
+        return 0.0
+    return max(0.0, min(1.0, confidence))
 
 
 def read_study_state(board_dir: Path) -> dict[str, Any]:

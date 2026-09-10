@@ -353,6 +353,8 @@ You are looking at the Enhanced Master image of a professor's physical whiteboar
 
 Analyze apparent subject, major topics, equations, diagrams, labels, terminology, relationships, lecture structure, visible handwriting, important regions, and likely conceptual organization. Perfect OCR is not required.
 
+Also report an explicit course-unit marker only when the image visibly contains the literal word "Unit" followed by a number or Roman numeral, such as "Unit 2" or "UNIT IV". Do not infer a unit from topic, chapter, difficulty, board order, or phrases such as "unit vector". Copy the shortest visible evidence verbatim; otherwise return null.
+
 Do not invent unread labels. Distinguish observation from inference. Keep the result compact.
 
 Return JSON only:
@@ -361,7 +363,9 @@ Return JSON only:
   "summary": "2-6 sentence visual summary of the board",
   "key_topics": ["short topic", "..."],
   "visual_context": "spatial/organizational notes a later model should remember",
-  "important_observations": ["brief observation", "..."]
+  "important_observations": ["brief observation", "..."],
+  "explicit_unit_text": "Unit 2" or null,
+  "unit_confidence": 0.0
 }
 """
 
@@ -776,7 +780,24 @@ def _parse_board_context(raw: str) -> dict[str, Any]:
         "key_topics": [str(item)[:160] for item in topics[:24] if item],
         "visual_context": str(value.get("visual_context") or value.get("visualContext") or "")[:4_000],
         "important_observations": [str(item)[:240] for item in observations[:24] if item],
+        "explicit_unit_text": (
+            str(value.get("explicit_unit_text") or value.get("explicitUnitText") or "").strip()[:80]
+            or None
+        ),
+        "unit_confidence": _normalise_unit_confidence(
+            value.get("unit_confidence", value.get("unitConfidence"))
+        ),
     }
+
+
+def _normalise_unit_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if confidence != confidence or confidence in (float("inf"), float("-inf")):
+        return 0.0
+    return max(0.0, min(1.0, confidence))
 
 
 def _load_json_object(raw: str) -> dict[str, Any]:

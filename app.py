@@ -514,6 +514,28 @@ def _reconcile_lecture_workspace(
     }
     items = [existing[board_id] for board_id in member_ids if board_id in existing]
     changed = len(items) != len(workspace.get("items", []))
+    for order, item in enumerate(items):
+        board_id = item.get("board_id")
+        if not isinstance(board_id, str) or item.get("unit_source") == "manual":
+            continue
+        board_dir = BOARDS_DIR / board_id
+        if not board_dir.is_dir():
+            continue
+        try:
+            metadata = read_metadata(board_dir)
+        except Exception:
+            continue
+        catalog = library.get("boards", {}).get(board_id)
+        catalog = catalog if isinstance(catalog, dict) else {}
+        canonical = _workspace_board_item(
+            board_id, metadata, catalog,
+            x=float(item.get("canvas_x") or 0),
+            y=float(item.get("canvas_y") or 0), z_index=order,
+        )
+        for key in ("unit_label", "unit_number", "unit_confidence", "unit_source"):
+            if item.get(key) != canonical.get(key):
+                item[key] = canonical.get(key)
+                changed = True
     rightmost = max(
         (
             float(item.get("effective_content_bounds", {}).get("x", item.get("canvas_x", 0)))
@@ -3204,6 +3226,7 @@ def analyze_board_context_route(board_id: str) -> Response | tuple[Response, int
             folder_name=folder_name_for(library, folder_id if isinstance(folder_id, str) else None),
             folder_id=folder_id if isinstance(folder_id, str) else None,
             atomic_json=atomic_json,
+            update_metadata=update_metadata,
         )
     except StudyAIError as exc:
         if exc.status == 503:

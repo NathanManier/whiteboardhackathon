@@ -112,6 +112,40 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertEqual(stale.status_code, 409)
         self.assertEqual(stale.get_json()["workspace"]["revision"], 1)
 
+    def test_workspace_reconciles_explicit_unit_metadata_without_overwriting_manual_unit(self):
+        folder = self.client.post("/api/folders", json={"name": "Units"}).get_json()["folder"]
+        board_id = "6" * 32
+        board_dir = self._ready_board(board_id, "Unit board", folder["id"])
+        library = board_app.read_library()
+        library["boards"][board_id] = {
+            "name": "Unit board", "folder_id": folder["id"], "created_at": 1,
+        }
+        board_app.write_library(library)
+        original = self.client.get(f"/api/folders/{folder['id']}/workspace").get_json()["workspace"]
+
+        metadata = json.loads((board_dir / "board.json").read_text(encoding="utf-8"))
+        metadata["unit_metadata"] = {
+            "unit_label": "Unit 4", "unit_number": 4,
+            "unit_confidence": 0.92, "unit_source": "explicit_ai", "evidence": "UNIT IV",
+        }
+        board_app.atomic_json(board_dir / "board.json", metadata)
+        reconciled = self.client.get(f"/api/folders/{folder['id']}/workspace").get_json()["workspace"]
+        self.assertEqual(reconciled["items"][0]["unit_label"], "Unit 4")
+        self.assertEqual(reconciled["items"][0]["unit_source"], "explicit_ai")
+        self.assertEqual(reconciled["revision"], original["revision"] + 1)
+
+        reconciled["items"][0].update({
+            "unit_label": "Unit 7", "unit_number": 7,
+            "unit_confidence": 1, "unit_source": "manual",
+        })
+        manual = self.client.put(
+            f"/api/folders/{folder['id']}/workspace", json={"workspace": reconciled}
+        ).get_json()["workspace"]
+        final = self.client.get(f"/api/folders/{folder['id']}/workspace").get_json()["workspace"]
+        self.assertEqual(final["items"][0]["unit_label"], "Unit 7")
+        self.assertEqual(final["items"][0]["unit_source"], "manual")
+        self.assertEqual(final["revision"], manual["revision"])
+
     def test_new_lecture_board_reconciles_to_right_of_effective_content(self):
         folder = self.client.post("/api/folders", json={"name": "Chronology"}).get_json()["folder"]
         first_id, second_id = "4" * 32, "5" * 32

@@ -27,6 +27,7 @@ from lecture import (
     folder_board_ids,
     folder_by_id,
     imported_id_prefix,
+    normalize_explicit_unit_text,
     public_lecture_context,
     stored_lecture_context,
     stored_study_guide,
@@ -213,11 +214,13 @@ def ensure_board_ai_context(
     atomic_json: AtomicJson,
     folder_id: str | None = None,
     force: bool = False,
+    update_metadata: Callable[[Path, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any] | None:
     with _context_lock(board_id):
         state = read_study_state(board_dir)
         existing = stored_board_context(state.get("board_ai_context"))
         if existing and not force:
+            _update_explicit_unit_metadata(board_dir, metadata, existing, update_metadata)
             return existing
         path = master_path(board_dir, metadata)
         if path is None:
@@ -235,7 +238,49 @@ def ensure_board_ai_context(
             return existing
         state["board_ai_context"] = context
         write_study_state(board_dir, state, atomic_json)
+        _update_explicit_unit_metadata(board_dir, metadata, context, update_metadata)
         return context
+
+
+def _update_explicit_unit_metadata(
+    board_dir: Path,
+    metadata: dict[str, Any],
+    context: dict[str, Any],
+    update_metadata: Callable[[Path, dict[str, Any]], None] | None,
+) -> None:
+    if update_metadata is None:
+        return
+    current = metadata.get("unit_metadata")
+    current = current if isinstance(current, dict) else {}
+    if current.get("unit_source") == "manual":
+        return
+    explicit_text = context.get("explicit_unit_text") or context.get("explicitUnitText")
+    normalized = normalize_explicit_unit_text(explicit_text)
+    if normalized:
+        label, number = normalized
+        try:
+            confidence = float(context.get("unit_confidence", context.get("unitConfidence", 0)))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        next_value = {
+            "unit_label": label,
+            "unit_number": number,
+            "unit_confidence": max(0.0, min(1.0, confidence)),
+            "unit_source": "explicit_ai",
+            "evidence": str(explicit_text)[:80],
+        }
+    else:
+        next_value = {
+            "unit_label": "No Unit",
+            "unit_number": None,
+            "unit_confidence": 0.0,
+            "unit_source": "none",
+            "evidence": None,
+        }
+    if current == next_value:
+        return
+    metadata["unit_metadata"] = next_value
+    update_metadata(board_dir, metadata)
 
 
 def board_size(metadata: dict[str, Any]) -> dict[str, float]:

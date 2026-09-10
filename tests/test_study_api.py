@@ -569,6 +569,8 @@ class StudyApiTests(unittest.TestCase):
                 "key_topics": ["velocity", "acceleration"],
                 "visual_context": "Equations on the right, graph on the left.",
                 "important_observations": ["A v-t graph is boxed."],
+                "explicit_unit_text": "UNIT IV",
+                "unit_confidence": 0.94,
             },
         ) as analyze:
             response = self.client.post(f"/api/boards/{self.board_id}/study/analyze")
@@ -580,6 +582,34 @@ class StudyApiTests(unittest.TestCase):
         saved = json.loads((self.board_dir / "study.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["board_ai_context"]["subject"], "Physics")
         self.assertIn("visual_context", saved["board_ai_context"])
+        metadata = json.loads((self.board_dir / "board.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["unit_metadata"]["unit_label"], "Unit 4")
+        self.assertEqual(metadata["unit_metadata"]["unit_number"], 4)
+        self.assertEqual(metadata["unit_metadata"]["unit_source"], "explicit_ai")
+
+    def test_board_analysis_does_not_overwrite_manual_unit(self):
+        from PIL import Image
+
+        Image.new("RGB", (80, 60), (247, 246, 242)).save(self.board_dir / "master.png")
+        metadata = json.loads((self.board_dir / "board.json").read_text(encoding="utf-8"))
+        metadata["unit_metadata"] = {
+            "unit_label": "Unit 7", "unit_number": 7,
+            "unit_confidence": 1, "unit_source": "manual", "evidence": None,
+        }
+        board_app.atomic_json(self.board_dir / "board.json", metadata)
+        with patch(
+            "study.service.analyze_board",
+            return_value={
+                "subject": "Physics", "summary": "A board.", "key_topics": [],
+                "visual_context": "", "important_observations": [],
+                "explicit_unit_text": "Unit 2", "unit_confidence": 0.99,
+            },
+        ):
+            response = self.client.post(f"/api/boards/{self.board_id}/study/analyze")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        saved = json.loads((self.board_dir / "board.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["unit_metadata"]["unit_label"], "Unit 7")
+        self.assertEqual(saved["unit_metadata"]["unit_source"], "manual")
 
     def test_explain_uses_stored_board_context_without_reanalyzing(self):
         views = {
