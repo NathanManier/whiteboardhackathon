@@ -120,7 +120,7 @@ private struct BoardEditorSurface: View {
                 }
                 Divider().frame(height: 28)
                 Text(store.status.userLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1).frame(minWidth: 76, alignment: .leading)
-                Button { showStudy = true } label: { Label("Explain", systemImage: "text.magnifyingglass") }.buttonStyle(.borderedProminent).controlSize(.small)
+                Button { showStudy = true } label: { Label("Explain", systemImage: "text.magnifyingglass") }.buttonStyle(.borderedProminent).controlSize(.small).disabled(studySelection == nil)
                 Menu { Button { showImport = true } label: { Label("Add Whiteboard", systemImage: "plus") }; Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }; Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") } } label: { Image(systemName: "ellipsis").font(.headline).frame(width: 32, height: 32) }.accessibilityLabel("Board actions")
             }.padding(.horizontal, 14).padding(.vertical, 8).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous)).padding(.horizontal, 14).padding(.bottom, 12)
             // SwiftUI's command system is the reliable keyboard path when the
@@ -128,9 +128,20 @@ private struct BoardEditorSurface: View {
             // the same commands through UIKeyCommand for device input.
             Button("") { store.undo(api: api) }.keyboardShortcut("z", modifiers: .command).frame(width: 0, height: 0).opacity(0.001)
             Button("") { store.redo(api: api) }.keyboardShortcut("z", modifiers: [.command, .shift]).frame(width: 0, height: 0).opacity(0.001)
-        }.navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItemGroup(placement: .navigationBarTrailing) { Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo); Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo); Button { showStudy = true } label: { Image(systemName: "text.magnifyingglass") }.accessibilityLabel("Explain selection") } }
+        }.navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItemGroup(placement: .navigationBarTrailing) { Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo); Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo); Button { showStudy = true } label: { Image(systemName: "text.magnifyingglass") }.accessibilityLabel("Explain selection").disabled(studySelection == nil) } }
         .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
-        .sheet(isPresented: $showStudy) { StudyActionsView(boardID: board.id, selectedObjectIDs: Array(selectedIDs)) { problems, interactionID in store.applyPracticeProblems(problems, interactionID: interactionID, api: api) } }
+        .sheet(isPresented: $showStudy) {
+            if let selection = studySelection {
+                StudyActionsView(selection: selection,
+                                 prepareSelection: { await store.saveNow(api: api) }) {
+                    problems, interactionID in
+                    store.applyPracticeProblems(problems, interactionID: interactionID, api: api)
+                }
+            } else {
+                ContentUnavailableView("Select ink first", systemImage: "lasso",
+                                       description: Text("Use Select or Lasso, then open Explain again."))
+            }
+        }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
         .alert("Couldn’t export board", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) { Button("OK", role: .cancel) {} } message: { Text(exportError ?? "") }
         .alert("Board changed on the server", isPresented: $showConflict) {
@@ -140,6 +151,10 @@ private struct BoardEditorSurface: View {
         .onChange(of: store.status) { _, status in if status == .conflict { showConflict = true } }
         .task { store.restoreLocalIfPresent(server: store.editor) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
+    }
+    private var studySelection: BoardStudySelection? {
+        BoardStudySelection.isolated(boardID: board.id, selectedIDs: selectedIDs,
+                                     document: document, editor: store.editor)
     }
     private func export() async {
         do {
@@ -181,9 +196,10 @@ private struct ToolButton: View {
 struct StudyActionsView: View {
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
-    let boardID: String
-    let selectedObjectIDs: [String]
+    let selection: BoardStudySelection
+    let prepareSelection: () async -> Void
     let onPracticeProblems: ([PracticeProblem], String?) -> Void
+    @StateObject private var submissionGate = StudySubmissionGate()
     @State private var loading = false
     @State private var result: StudyInteractionResponse?
     @State private var error: String?
@@ -232,9 +248,9 @@ struct StudyActionsView: View {
                     Text("Study the selected ink").font(.title2.bold())
                     Text("Explain a selected concept, create two practice problems, or check a handwritten solution.")
                         .multilineTextAlignment(.center).foregroundStyle(.secondary)
-                    Button("Explain") { explain() }.buttonStyle(.borderedProminent)
-                    Button("Practice Problems") { beginWithFollowUp(action: "practice_problems") }.buttonStyle(.bordered)
-                    Button("Check My Work") { explain(action: "check_my_work") }.buttonStyle(.bordered)
+                    Button("Explain") { submitInitial() }.buttonStyle(.borderedProminent)
+                    Button("Practice Problems") { submitInitial(followUpAction: "practice_problems") }.buttonStyle(.bordered)
+                    Button("Check My Work") { submitInitial(action: "check_my_work") }.buttonStyle(.bordered)
                 }
                 if let error { Text(error).foregroundStyle(.red) }
             }
@@ -253,33 +269,39 @@ struct StudyActionsView: View {
             ?? "No study response was returned."
     }
 
-    private func explain(action: String = "explain") {
-        loading = true; error = nil
-        Task {
-            do {
-                result = try await api.explain(boardID: boardID, action: action,
-                                               selectedObjectIDs: selectedObjectIDs)
-                loading = false
-            } catch {
-                loading = false; self.error = "AI is temporarily unavailable."
-            }
+    private func submitInitial(action: String = "explain", followUpAction: String? = nil) {
+        let request = BoardStudyExplainRequest.make(selection: selection, action: action)
+        guard submissionGate.begin(requestID: request.requestId) else {
+            #if DEBUG
+            print("[VBoard] STUDY REQUEST REJECTED reason=already-in-flight activeRequestID=\(submissionGate.activeRequestID ?? "<none>") attemptedRequestID=\(request.requestId)")
+            #endif
+            return
         }
-    }
-
-    private func beginWithFollowUp(action: String) {
-        loading = true; error = nil
+        loading = true
+        error = nil
         Task {
+            defer {
+                submissionGate.end(requestID: request.requestId)
+                loading = false
+            }
             do {
-                let initial = try await api.explain(boardID: boardID,
-                                                    selectedObjectIDs: selectedObjectIDs)
-                guard let interactionID = initial.interaction?.id else {
-                    throw APIError.decoding("The explanation did not include an interaction ID.")
+                await prepareSelection()
+                let initial = try await api.explain(request: request)
+                if let followUpAction {
+                    guard let interactionID = initial.interaction?.id else {
+                        throw APIError.decoding("The explanation did not include an interaction ID.")
+                    }
+                    let response = try await api.followUp(
+                        boardID: selection.boardID,
+                        interactionID: interactionID,
+                        action: followUpAction
+                    )
+                    apply(response)
+                } else {
+                    result = initial
                 }
-                let response = try await api.followUp(boardID: boardID,
-                                                      interactionID: interactionID, action: action)
-                apply(response)
             } catch {
-                loading = false; self.error = "AI is temporarily unavailable."
+                self.error = "AI is temporarily unavailable."
             }
         }
     }
@@ -290,7 +312,7 @@ struct StudyActionsView: View {
         loading = true; error = nil
         Task {
             do {
-                let response = try await api.followUp(boardID: boardID,
+                let response = try await api.followUp(boardID: selection.boardID,
                                                       interactionID: interactionID,
                                                       action: action, question: question)
                 followUpQuestion = ""

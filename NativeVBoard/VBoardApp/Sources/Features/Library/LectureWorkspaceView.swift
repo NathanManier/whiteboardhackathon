@@ -80,9 +80,10 @@ struct LectureWorkspaceView: View {
                     folderID: folder.id,
                     selectedObjectIDsByBoard: selectedObjectIDsByBoard
                 )
-            } else if let boardID = studyBoardID {
-                StudyActionsView(boardID: boardID,
-                                 selectedObjectIDs: studyObjectIDs) { problems, interactionID in
+            } else if let boardID = studyBoardID,
+                      let selection = store.studySelection(for: boardID) {
+                StudyActionsView(selection: selection,
+                                 prepareSelection: { await store.saveBoardNow(boardID, api: api) }) { problems, interactionID in
                     store.applyPracticeProblems(problems, interactionID: interactionID,
                                                 boardID: boardID, api: api)
                 }
@@ -158,8 +159,7 @@ struct LectureWorkspaceView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .disabled(!LectureStudyRouting.isAvailable(
-                    selectedBoardIDs: selectedBoardIDs,
-                    activeBoardID: store.activeBoardID
+                    selectedBoardIDs: selectedBoardIDs
                 ))
                 Button { showImporter = true } label: { Image(systemName: "plus") }
                     .buttonStyle(.bordered)
@@ -182,7 +182,6 @@ struct LectureWorkspaceView: View {
 
     private var studyBoardID: String? {
         if selectedBoardIDs.count == 1 { return selectedBoardIDs.first }
-        if selectedBoardIDs.isEmpty { return store.activeBoardID }
         return nil
     }
 
@@ -197,15 +196,11 @@ struct LectureWorkspaceView: View {
         store.workspace?.items.first(where: { $0.boardID == store.activeBoardID })?.unitLabel ?? "No Unit"
     }
 
-    private var studyObjectIDs: [String] {
-        guard let boardID = studyBoardID else { return [] }
-        return store.selectedKeys.filter { $0.boardID == boardID }.map(\.objectID)
-    }
 }
 
 enum LectureStudyRouting {
-    static func isAvailable(selectedBoardIDs: Set<String>, activeBoardID: String?) -> Bool {
-        !selectedBoardIDs.isEmpty || activeBoardID != nil
+    static func isAvailable(selectedBoardIDs: Set<String>) -> Bool {
+        !selectedBoardIDs.isEmpty
     }
 }
 

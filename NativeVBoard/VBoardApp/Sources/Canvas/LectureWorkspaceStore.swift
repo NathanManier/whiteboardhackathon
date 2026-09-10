@@ -210,6 +210,19 @@ final class LectureWorkspaceStore: ObservableObject {
         selectedKeys = keys
     }
 
+    func studySelection(for boardID: String) -> BoardStudySelection? {
+        guard let item = workspace?.items.first(where: { $0.boardID == boardID }),
+              let scene = scenes[boardID] else { return nil }
+        return BoardStudySelection.lecture(boardID: boardID,
+                                           selectionKeys: selectedKeys,
+                                           item: item,
+                                           scene: scene)
+    }
+
+    func saveBoardNow(_ boardID: String, api: APIClient) async {
+        await boardStores[boardID]?.saveNow(api: api)
+    }
+
     func requestDetail(for boardIDs: Set<String>, api: APIClient) {
         guard let workspace else { return }
         let valid = Set(workspace.items.map(\.boardID))

@@ -29,6 +29,7 @@
 		A022 /* dompurify */ = {isa = PBXBuildFile; fileRef = A122; };
 		A023 /* study-render.js */ = {isa = PBXBuildFile; fileRef = A123; };
 		A024 /* Assets.xcassets */ = {isa = PBXBuildFile; fileRef = A124; };
+		A025 /* StudySelectionRequest.swift */ = {isa = PBXBuildFile; fileRef = A125; };
 		A010 /* Tests */ = {isa = PBXBuildFile; fileRef = A110; };
 /* End PBXBuildFile section */
 /* Begin PBXFileReference section */
@@ -55,13 +56,14 @@
 		A122 = {isa = PBXFileReference; lastKnownFileType = folder; name = dompurify; path = ../static/vendor/dompurify; sourceTree = "<group>"; };
 		A123 = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = "study-render.js"; path = ../static/study-render.js; sourceTree = "<group>"; };
 		A124 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
+		A125 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Study/StudySelectionRequest.swift; sourceTree = "<group>"; };
 		A110 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VBoardAppTests.swift; sourceTree = "<group>"; };
 		B001 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 /* Begin PBXGroup section */
 		C001 = {isa = PBXGroup; children = (C002, C003, C004, B001, B002); sourceTree = "<group>"; };
-		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113, A118, A124); };
+		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113, A118, A125, A124); };
 		C003 = {isa = PBXGroup; path = VBoardAppTests; sourceTree = "<group>"; children = (A110); };
 		C004 = {isa = PBXGroup; name = "Study Renderer Resources"; sourceTree = "<group>"; children = (A119, A120, A121, A122, A123); };
 /* End PBXGroup section */
@@ -77,7 +79,7 @@
 		F005 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013, A018); runOnlyForDeploymentPostprocessing = 0; };
+		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013, A018, A025); runOnlyForDeploymentPostprocessing = 0; };
 		F004 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A010); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXFrameworksBuildPhase section */

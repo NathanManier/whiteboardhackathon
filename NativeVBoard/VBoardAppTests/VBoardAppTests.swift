@@ -526,6 +526,209 @@ final class SceneCompositionTests: XCTestCase {
     }
 }
 
+final class StudySelectionRequestTests: XCTestCase {
+    private func item(boardID: String = "board-a", x: Double = 1_200,
+                      y: Double = -700) -> WorkspaceBoardItem {
+        WorkspaceBoardItem(
+            id: "board:\(boardID)", kind: "board", boardID: boardID,
+            canvasX: x, canvasY: y, boardWidth: 800, boardHeight: 600,
+            effectiveContentBounds: CameraRect(x: x - 200, y: y - 100,
+                                                width: 1_200, height: 900),
+            createdAt: 1, capturedAt: nil, detectedBoardDate: nil,
+            unitLabel: "Unit 1", unitNumber: 1, unitConfidence: 1,
+            unitSource: .manual, title: "Board A", thumbnailURL: nil, zIndex: 0
+        )
+    }
+
+    private func editor(objects: [CanvasObject],
+                        transforms: [String: ObjectTransform] = [:]) -> EditorState {
+        EditorState(schemaVersion: 4, revision: 2, updatedAt: nil,
+                    viewport: CameraRect(x: -300, y: -200, width: 1_200, height: 900),
+                    objects: objects, groups: [], importedTransforms: transforms,
+                    sourceBoards: [], mergedBoardIDs: [])
+    }
+
+    private func scene(document: SVGDocument, editor: EditorState) -> WorkspaceBoardScene {
+        WorkspaceBoardScene(boardID: "board-a", document: document, editor: editor,
+                            composition: SceneComposition.build(boardID: "board-a",
+                                                                document: document,
+                                                                editor: editor))
+    }
+
+    func testLectureSelectionConvertsToBoardLocalBBoxAndCanonicalIDs() throws {
+        let document = try SVGDocument.parse(
+            "<svg viewBox='0 0 800 600'><path id='prof-1' d='M 20 30 L 60 30 L 60 70 L 20 70 Z'/></svg>"
+        )
+        let stroke = CanvasObject(
+            id: "stroke-1", type: "stroke", color: "#183153", width: 4, opacity: 1,
+            points: [WorldPoint(x: -80, y: -40, pressure: 1),
+                     WorldPoint(x: -20, y: 10, pressure: 1)],
+            translation: nil, sourceMarkdown: nil, text: nil,
+            x: nil, y: nil, height: nil, fontSize: nil
+        )
+        let currentEditor = editor(objects: [stroke])
+        let keys: Set<SelectionKey> = [
+            SelectionKey(boardID: "board-a", objectID: "prof-1", kind: .professorPath),
+            SelectionKey(boardID: "board-a", objectID: "stroke-1", kind: .editorObject),
+            SelectionKey(boardID: "board-b", objectID: "board-b:foreign", kind: .editorObject)
+        ]
+
+        let selection = try XCTUnwrap(BoardStudySelection.lecture(
+            boardID: "board-a", selectionKeys: keys, item: item(),
+            scene: scene(document: document, editor: currentEditor)
+        ))
+
+        XCTAssertEqual(selection.canonicalObjectIDs, ["prof-1", "stroke-1"])
+        XCTAssertFalse(selection.canonicalObjectIDs.contains("board-a:prof-1"))
+        XCTAssertEqual(selection.localBBox.cgRect, CGRect(x: -80, y: -40, width: 140, height: 110))
+        XCTAssertEqual(selection.lectureWorldBBox,
+                       CGRect(x: 1_120, y: -740, width: 140, height: 110))
+    }
+
+    func testMovedProfessorPathUsesImportedTransformExactlyOnce() throws {
+        let document = try SVGDocument.parse(
+            "<svg viewBox='0 0 100 100'><path id='prof-moved' d='M 0 0 L 10 0 L 10 20 L 0 20 Z'/></svg>"
+        )
+        let currentEditor = editor(objects: [], transforms: [
+            "prof-moved": ObjectTransform(x: -40, y: 25, scaleX: 2, scaleY: 3, deleted: false)
+        ])
+        let selection = try XCTUnwrap(BoardStudySelection.lecture(
+            boardID: "board-a",
+            selectionKeys: [SelectionKey(boardID: "board-a", objectID: "prof-moved",
+                                          kind: .professorPath)],
+            item: item(), scene: scene(document: document, editor: currentEditor)
+        ))
+
+        XCTAssertEqual(selection.canonicalObjectIDs, ["prof-moved"])
+        XCTAssertEqual(selection.localBBox.x, -40, accuracy: 0.000001)
+        XCTAssertEqual(selection.localBBox.y, 25, accuracy: 0.000001)
+        XCTAssertEqual(selection.localBBox.width, 20, accuracy: 0.000001)
+        XCTAssertEqual(selection.localBBox.height, 60, accuracy: 0.000001)
+    }
+
+    func testTextAndPracticeObjectsUseCanonicalIDsAndPayloadMetadata() throws {
+        let document = try SVGDocument.parse("<svg viewBox='0 0 800 600'></svg>")
+        let note = CanvasObject(
+            id: "note-1", type: "text", color: "#183153", width: 320, opacity: 1,
+            points: nil, translation: WorldPoint(x: -20, y: 15, pressure: nil),
+            sourceMarkdown: "Keep $x^2$ exact.", text: "Keep $x^2$ exact.",
+            x: -500, y: 80, height: 140, fontSize: 28
+        )
+        let practice = CanvasObject(
+            id: "problem-1", type: "text", color: "#183153", width: 360, opacity: 1,
+            points: nil, translation: nil, sourceMarkdown: "Solve $x=2$.",
+            text: "Solve $x=2$.", x: 300, y: 100, height: 180, fontSize: 32,
+            role: "ai_practice_problem", sourceStudyInteractionID: "0123456789abcdef"
+        )
+        let currentEditor = editor(objects: [note, practice])
+        let selection = try XCTUnwrap(BoardStudySelection.lecture(
+            boardID: "board-a",
+            selectionKeys: [
+                SelectionKey(boardID: "board-a", objectID: "note-1", kind: .editorObject),
+                SelectionKey(boardID: "board-a", objectID: "problem-1", kind: .editorObject)
+            ],
+            item: item(), scene: scene(document: document, editor: currentEditor)
+        ))
+
+        XCTAssertEqual(selection.canonicalObjectIDs, ["note-1", "problem-1"])
+        XCTAssertEqual(selection.localBBox.x, -520, accuracy: 0.000001)
+        XCTAssertEqual(selection.selectedTextObjects.map(\.id), ["note-1", "problem-1"])
+        XCTAssertEqual(selection.selectedTextObjects.last?.practiceProblemId, "problem-1")
+        XCTAssertEqual(selection.selectedTextObjects.last?.sourceStudyInteractionId,
+                       "0123456789abcdef")
+    }
+
+    func testExplainRequestEncodesExactCurrentServerKeysAndRequestIDFormat() throws {
+        let selection = BoardStudySelection(
+            boardID: "board-a", canonicalObjectIDs: ["prof-1"],
+            localBBox: StudySelectionBBox(rect: CGRect(x: -10, y: 20, width: 40, height: 60))!,
+            selectedTextObjects: [], lectureWorldBBox: nil
+        )
+        let request = BoardStudyExplainRequest.make(
+            selection: selection, requestID: "0123456789abcdef"
+        )
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(request)
+        ) as? [String: Any])
+        let expectedKeys: Set<String> = [
+            "selectedObjectIds", "selectedTextObjects", "selectionBBox",
+            "anchorX", "anchorY", "anchorOffsetNx", "anchorOffsetNy",
+            "studyInteractionId", "requestId", "question", "action"
+        ]
+
+        XCTAssertEqual(Set(json.keys), expectedKeys)
+        XCTAssertNil(json["boardID"])
+        XCTAssertNil(json["selected_object_ids"])
+        XCTAssertEqual(json["selectedObjectIds"] as? [String], ["prof-1"])
+        XCTAssertEqual(json["requestId"] as? String, "0123456789abcdef")
+        XCTAssertNotNil((json["selectionBBox"] as? [String: Any])?["width"])
+        XCTAssertTrue(BoardStudyExplainRequest.makeRequestID().range(
+            of: "^[0-9a-f]{16}$", options: .regularExpression
+        ) != nil)
+    }
+
+    func testSelectionBBoxRejectsNonFiniteAndServerOutOfRangeGeometry() {
+        XCTAssertNil(StudySelectionBBox(rect: CGRect(x: CGFloat.nan, y: 0,
+                                                     width: 10, height: 10)))
+        XCTAssertNil(StudySelectionBBox(rect: CGRect(x: 10_000_001, y: 0,
+                                                     width: 10, height: 10)))
+        let pointSelection = StudySelectionBBox(rect: CGRect(x: -20, y: -30,
+                                                              width: 0, height: 0))
+        XCTAssertEqual(pointSelection?.width, 1)
+        XCTAssertEqual(pointSelection?.height, 1)
+        XCTAssertLessThan(pointSelection?.x ?? 0, 0)
+        XCTAssertLessThan(pointSelection?.y ?? 0, 0)
+    }
+
+    @MainActor
+    func testOneExplainActionCreatesOneNetworkRequestAnd400BodyIsLogged() async throws {
+        var requestCount = 0
+        var logs: [String] = []
+        WorkspaceURLProtocolStub.handler = { request in
+            requestCount += 1
+            return (HTTPURLResponse(url: request.url!, statusCode: 400,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!,
+                    Data("{\"error\":\"Select something on the board first.\"}".utf8))
+        }
+        defer { WorkspaceURLProtocolStub.handler = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://study.test")!,
+                            session: URLSession(configuration: configuration),
+                            diagnostics: { logs.append($0) })
+        let selection = BoardStudySelection(
+            boardID: "board-a", canonicalObjectIDs: ["prof-1"],
+            localBBox: StudySelectionBBox(rect: CGRect(x: 1, y: 2, width: 3, height: 4))!,
+            selectedTextObjects: [], lectureWorldBBox: nil
+        )
+        let request = BoardStudyExplainRequest.make(
+            selection: selection, requestID: "0123456789abcdef"
+        )
+        let gate = StudySubmissionGate()
+        let firstInvocationOwnsRequest = gate.begin(requestID: request.requestId)
+        let duplicateInvocationOwnsRequest = gate.begin(requestID: "fedcba9876543210")
+
+        if firstInvocationOwnsRequest {
+            do { _ = try await api.explain(request: request) }
+            catch APIError.server(let status, _, _) { XCTAssertEqual(status, 400) }
+            gate.end(requestID: request.requestId)
+        }
+        if duplicateInvocationOwnsRequest {
+            _ = try? await api.explain(request: request)
+        }
+
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertFalse(duplicateInvocationOwnsRequest)
+        let failure = try XCTUnwrap(logs.first { $0.contains("STUDY REQUEST FAILED") })
+        XCTAssertTrue(failure.contains("status=400"))
+        XCTAssertTrue(failure.contains("Select something on the board first."))
+        XCTAssertTrue(failure.contains("selectedBoardID=board-a"))
+        XCTAssertTrue(failure.contains("selectedCanonicalIDs=[\"prof-1\"]"))
+        XCTAssertTrue(failure.contains("requestID=0123456789abcdef"))
+    }
+}
+
 final class LectureWorkspaceModelTests: XCTestCase {
     func testEffectiveBoundsIncludesBoardOwnedContentOutsidePaper() throws {
         let editor = try JSONDecoder().decode(EditorState.self, from: Data(#"""
@@ -670,13 +873,10 @@ final class LectureWorkspacePersistenceTests: XCTestCase {
 
     func testLectureStudyRemainsAvailableForCrossBoardSelection() {
         XCTAssertTrue(LectureStudyRouting.isAvailable(
-            selectedBoardIDs: ["board-a", "board-b"], activeBoardID: "board-b"
-        ))
-        XCTAssertTrue(LectureStudyRouting.isAvailable(
-            selectedBoardIDs: [], activeBoardID: "board-a"
+            selectedBoardIDs: ["board-a", "board-b"]
         ))
         XCTAssertFalse(LectureStudyRouting.isAvailable(
-            selectedBoardIDs: [], activeBoardID: nil
+            selectedBoardIDs: []
         ))
     }
 

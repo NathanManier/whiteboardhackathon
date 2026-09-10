@@ -26,8 +26,10 @@ final class APIClient: ObservableObject {
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
     private let baseURL: URL
+    private let diagnostics: ((String) -> Void)?
 
-    init(baseURL: URL? = nil, session: URLSession = .shared) {
+    init(baseURL: URL? = nil, session: URLSession = .shared,
+         diagnostics: ((String) -> Void)? = nil) {
         // The bundled HTTPS endpoint is the production default. A Run-scheme
         // environment value remains available for a local Flask development server.
         let configured = ProcessInfo.processInfo.environment["VBoardAPIBaseURL"]
@@ -37,6 +39,7 @@ final class APIClient: ObservableObject {
         self.session = session
         self.decoder = JSONDecoder()
         self.encoder = JSONEncoder()
+        self.diagnostics = diagnostics
     }
 
     func library() async throws -> LibraryResponse { try await get("/api/library") }
@@ -171,10 +174,18 @@ final class APIClient: ObservableObject {
 
     func deleteBoard(id: String) async throws { let request = try request(path: "/api/boards/\(id)", method: "DELETE"); let (data, response) = try await data(for: request); try validate(response, data: data) }
 
-    func explain(boardID: String, action: String = "explain", selectedText: String = "", selectedObjectIDs: [String] = []) async throws -> StudyInteractionResponse {
-        var request = try request(path: "/api/boards/\(boardID)/study/explain", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["action": action, "selected_text": selectedText, "selected_object_ids": selectedObjectIDs])
-        let (data, response) = try await data(for: request); try validate(response, data: data)
+    func explain(request payload: BoardStudyExplainRequest) async throws -> StudyInteractionResponse {
+        let path = "/api/boards/\(payload.boardID)/study/explain"
+        var request = try request(path: path, method: "POST")
+        request.httpBody = try encoder.encode(payload)
+        debugLog("STUDY REQUEST START url=\(request.url?.absoluteString ?? path) board=\(payload.boardID) action=\(payload.action) requestID=\(payload.requestId) canonicalIDs=\(payload.selectedObjectIds) localBBox=\(payload.selectionBBox)")
+        let (data, response) = try await data(for: request)
+        if let http = response as? HTTPURLResponse,
+           !(200..<300).contains(http.statusCode) {
+            debugStudyFailure(request: request, payload: payload,
+                              status: http.statusCode, data: data)
+        }
+        try validate(response, data: data)
         do { return try decoder.decode(StudyInteractionResponse.self, from: data) }
         catch { throw APIError.decoding("Could not decode the study response.") }
     }
@@ -299,7 +310,20 @@ final class APIClient: ObservableObject {
         #endif
     }
 
+    private func debugStudyFailure(request: URLRequest,
+                                   payload: BoardStudyExplainRequest,
+                                   status: Int,
+                                   data: Data) {
+        #if DEBUG
+        let responseBody = String(data: data.prefix(8_192), encoding: .utf8)?
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ") ?? "<non-UTF8 response>"
+        debugLog("STUDY REQUEST FAILED url=\(request.url?.absoluteString ?? "<missing>") status=\(status) outgoingJSON=\(payload.sanitizedJSON) responseBody=\(responseBody) selectedBoardID=\(payload.boardID) selectedCanonicalIDs=\(payload.selectedObjectIds) localBBox=\(payload.selectionBBox) action=\(payload.action) requestID=\(payload.requestId)")
+        #endif
+    }
+
     private func debugLog(_ message: String) {
+        diagnostics?(message)
         #if DEBUG
         print("[VBoard] \(message)")
         #endif
