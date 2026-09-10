@@ -13,6 +13,7 @@ struct LectureWorkspaceView: View {
     @State private var showStudy = false
     @State private var showNote = false
     @State private var showDelete = false
+    @State private var showConflict = false
 
     init(folder: LectureFolder, focusBoardID: String? = nil) {
         self.folder = folder
@@ -97,6 +98,15 @@ struct LectureWorkspaceView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("This removes the lecture and all of its whiteboards.")
+        }
+        .alert("Lecture layout changed", isPresented: $showConflict) {
+            Button("Keep My Layout") { store.keepLocalChanges(api: api) }
+            Button("Reload Server Layout", role: .destructive) { store.reloadServerVersion() }
+        } message: {
+            Text("Your local camera and whiteboard placements are saved on this iPad. Choose which layout should remain.")
+        }
+        .onChange(of: store.status) { _, status in
+            if status == .conflict { showConflict = true }
         }
         .task { await store.load(api: api, focusBoardID: initialFocusBoardID) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in

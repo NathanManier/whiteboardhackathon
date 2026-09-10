@@ -44,6 +44,7 @@ final class LectureWorkspaceStore: ObservableObject {
     @Published private(set) var status: WorkspacePersistenceStatus = .loading
     @Published private(set) var selectedKeys = Set<SelectionKey>()
     @Published private(set) var focusRequest: WorkspaceFocusRequest?
+    @Published private(set) var conflictServerWorkspace: LectureWorkspace?
 
     let folderID: String
     private var boardStores: [String: BoardDocumentStore] = [:]
@@ -90,6 +91,7 @@ final class LectureWorkspaceStore: ObservableObject {
                 #endif
             }
             self.lecture = lecture
+            conflictServerWorkspace = nil
             let local = readOutbox()
             if let local, local.baseRevision == serverWorkspace.revision {
                 workspace = local.workspace
@@ -363,13 +365,36 @@ final class LectureWorkspaceStore: ObservableObject {
                 persistOutbox()
                 scheduleSave(api: api)
             }
-        } catch APIError.workspaceConflict(_) {
+        } catch APIError.workspaceConflict(let serverWorkspace) {
+            conflictServerWorkspace = serverWorkspace
             status = .conflict
             persistOutbox()
         } catch {
             status = .offlinePending
             persistOutbox()
         }
+    }
+
+    func keepLocalChanges(api: APIClient) {
+        guard var local = workspace, let server = conflictServerWorkspace else { return }
+        local.revision = server.revision
+        workspace = local
+        baseRevision = server.revision
+        conflictServerWorkspace = nil
+        mutationGeneration += 1
+        status = .dirty
+        persistOutbox()
+        scheduleSave(api: api)
+    }
+
+    func reloadServerVersion() {
+        guard let server = conflictServerWorkspace else { return }
+        workspace = server
+        baseRevision = server.revision
+        conflictServerWorkspace = nil
+        selectedKeys.removeAll()
+        status = .clean
+        removeOutbox()
     }
 
     private func loadScene(boardID: String, api: APIClient) {
