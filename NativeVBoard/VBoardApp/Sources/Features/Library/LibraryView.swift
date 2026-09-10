@@ -441,6 +441,15 @@ struct ImportFlowView: View {
     @State private var createLecture = false
     @State private var newLectureName = ""
     @State private var activeTask: Task<Void, Never>?
+    @State private var processingTipIndex = 0
+    @State private var showsProcessingTip = false
+    private let processingTips = [
+        "Lasso an equation and tap Explain.",
+        "Two fingers pan and zoom without changing your Pencil tool.",
+        "Practice Problems are added directly to the canvas.",
+        "Your professor’s original ink stays editable.",
+        "Imported Freeform PDFs remain high fidelity."
+    ]
     init(folderID: String? = nil, pendingImport: PendingImport? = nil,
          onComplete: @escaping (LibraryBoard) -> Void) {
         self.folderID = folderID; self.pendingImport = pendingImport; self.onComplete = onComplete
@@ -584,7 +593,53 @@ struct ImportFlowView: View {
             .padding(.bottom, 18)
         }
     }
-    private var processingView: some View { VStack(spacing: 22) { ProgressView().controlSize(.large); Text(importState.phase.processingTitle).font(.title2.weight(.semibold)); Text(pdfData == nil ? "Preparing image • Correcting perspective • Finding ink • Creating vectors" : "Preserving source quality • Preparing page previews • Adding boards to your lecture").multilineTextAlignment(.center).foregroundStyle(.secondary).padding(.horizontal, 30) }.frame(maxWidth: .infinity, maxHeight: .infinity) }
+    private var processingView: some View {
+        VStack(spacing: 20) {
+            if let previewImage {
+                Image(uiImage: previewImage)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 560, maxHeight: 300)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay { RoundedRectangle(cornerRadius: 16).stroke(.separator.opacity(0.35), lineWidth: 0.5) }
+                    .shadow(color: .black.opacity(0.08), radius: 14, y: 6)
+            }
+            ProgressView().controlSize(.large)
+            Text(importState.phase.processingTitle).font(.title2.weight(.semibold))
+            Text(pdfData == nil
+                 ? "The server is correcting perspective, enhancing the board, finding marker ink, and creating editable vectors."
+                 : "V-Board is preserving source quality, preparing page previews, and adding boards to your lecture.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 30)
+                .frame(maxWidth: 680)
+            if showsProcessingTip {
+                Label(processingTips[processingTipIndex], systemImage: "lightbulb")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.secondary.opacity(0.08), in: Capsule())
+                    .transition(.opacity)
+            }
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task(id: importState.phase) {
+            showsProcessingTip = false
+            processingTipIndex = 0
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled, importState.phase.isBusy else { return }
+            withAnimation(.easeInOut(duration: 0.2)) { showsProcessingTip = true }
+            while !Task.isCancelled, importState.phase.isBusy {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled, importState.phase.isBusy else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    processingTipIndex = (processingTipIndex + 1) % processingTips.count
+                }
+            }
+        }
+    }
     private func loadImageData(_ data: Data) async {
         let normalized = await Task.detached(priority: .userInitiated) {
             NormalizedImageAsset.make(data: data)
