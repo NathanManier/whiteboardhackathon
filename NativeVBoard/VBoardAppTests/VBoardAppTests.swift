@@ -765,6 +765,40 @@ private func requestBodyData(_ request: URLRequest) throws -> Data {
 }
 
 final class WorldScreenTransformTests: XCTestCase {
+    @MainActor
+    func testEndingLectureNavigationRefinesAgainstLatestCamera() async throws {
+        let document = try SVGDocument.parse("""
+        <svg viewBox="0 0 1000 100">
+          <path id="near" d="M 5 5 L 25 5 L 25 25 L 5 25 Z" fill="#000000"/>
+          <path id="far" d="M 905 5 L 925 5 L 925 25 L 905 25 Z" fill="#000000"/>
+        </svg>
+        """)
+        let view = ProfessorSVGView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let ready = expectation(description: "all canonical paths indexed")
+        view.onProgress = { progress in
+            if progress >= 0.999 { ready.fulfill() }
+        }
+        view.display(document,
+                     transform: WorldScreenTransform(
+                        camera: CameraRect(x: 0, y: 0, width: 100, height: 100),
+                        viewport: CGSize(width: 100, height: 100)
+                     ))
+        await fulfillment(of: [ready], timeout: 2)
+        XCTAssertEqual(view.visiblePathIDsForTesting, Set(["near"]))
+
+        view.beginNavigation()
+        view.updateCamera(
+            WorldScreenTransform(
+                camera: CameraRect(x: 900, y: 0, width: 100, height: 100),
+                viewport: CGSize(width: 100, height: 100)
+            ),
+            interacting: true
+        )
+        view.endNavigationUsingCurrentCamera()
+
+        XCTAssertEqual(view.visiblePathIDsForTesting, Set(["far"]))
+    }
+
     func testPortraitLandscapeResizePreservesCenterAndWorldScale() {
         let portrait = CGSize(width: 820, height: 1_180)
         let landscape = CGSize(width: 1_180, height: 820)

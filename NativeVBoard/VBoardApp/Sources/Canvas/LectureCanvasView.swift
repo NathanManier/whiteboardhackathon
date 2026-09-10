@@ -1570,8 +1570,7 @@ private final class LectureBoardRenderView: UIView {
 
     func beginNavigation() { professor.beginNavigation() }
     func endNavigation() {
-        guard let item else { return }
-        professor.endNavigation(WorldScreenTransform(camera: CameraRect(x: 0, y: 0, width: item.boardWidth, height: item.boardHeight), viewport: bounds.size))
+        professor.endNavigationUsingCurrentCamera()
     }
 
     func hitTestKeys(at point: CGPoint) -> Set<SelectionKey> {

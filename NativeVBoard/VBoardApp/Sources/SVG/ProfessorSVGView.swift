@@ -17,6 +17,8 @@ final class ProfessorSVGView: UIView {
     private var rebuildGeneration = UUID()
     var onProgress: ((Double) -> Void)?
 
+    var visiblePathIDsForTesting: Set<String> { visibleIDs }
+
     #if DEBUG
     var onStats: ((RenderStats) -> Void)?
     #endif
@@ -81,6 +83,15 @@ final class ProfessorSVGView: UIView {
     func endNavigation(_ transform: WorldScreenTransform) {
         isInteracting = false
         refine(transform: transform)
+    }
+
+    /// Lecture boards receive their current board-local camera through
+    /// `updateCamera` on every authoritative workspace camera change. Ending
+    /// navigation must refine against that latest value, never a synthetic
+    /// full-board camera that can reveal paths outside the visible viewport.
+    func endNavigationUsingCurrentCamera() {
+        isInteracting = false
+        if let currentTransform { refine(transform: currentTransform) }
     }
 
     func hitTest(_ point: CGPoint, tolerance: CGFloat = 12) -> String? {
