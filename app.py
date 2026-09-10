@@ -429,8 +429,13 @@ def _workspace_board_item(
         else None
     )
     stored_unit = metadata.get("unit_metadata") if isinstance(metadata.get("unit_metadata"), dict) else {}
-    explicit = normalize_explicit_unit_text(stored_unit.get("unit_label"))
-    unit_label = str(stored_unit.get("unit_label") or (explicit[0] if explicit else "No Unit"))[:40]
+    stored_label = stored_unit.get("unit_label")
+    explicit = normalize_explicit_unit_text(stored_label)
+    unit_source = str(stored_unit.get("unit_source") or "none")
+    if unit_source == "manual" and isinstance(stored_label, str) and stored_label.strip():
+        unit_label = stored_label.strip()[:40]
+    else:
+        unit_label = explicit[0] if explicit else "No Unit"
     unit_number = stored_unit.get("unit_number")
     if unit_number is None and explicit:
         unit_number = explicit[1]
@@ -452,7 +457,7 @@ def _workspace_board_item(
         "unit_label": unit_label,
         "unit_number": int(unit_number) if isinstance(unit_number, (int, float)) else None,
         "unit_confidence": float(stored_unit.get("unit_confidence") or 0),
-        "unit_source": str(stored_unit.get("unit_source") or "none"),
+        "unit_source": unit_source,
         "title": str(catalog.get("name") or metadata.get("name") or f"Whiteboard {z_index + 1}")[:80],
         "thumbnail_url": thumbnail_url,
         "z_index": z_index,
@@ -1919,6 +1924,51 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
     return data
 
 
+def lecture_board_summary(
+    board_id: str,
+    metadata: dict[str, Any],
+    library: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the O(1)-per-board manifest record needed by native lectures.
+
+    ``frontend_board_data`` intentionally carries the complete legacy web
+    bootstrap contract, including every sibling in ``lecture_boards``. Using
+    it for every member of a lecture produces an O(n²) JSON response. The
+    native workspace loads board scenes separately on viewport demand, so its
+    lecture endpoint owns only summary metadata and thumbnail references.
+    """
+    catalog = library.get("boards", {}).get(board_id)
+    catalog = catalog if isinstance(catalog, dict) else {}
+    dimensions = metadata.get("dimensions")
+    if not isinstance(dimensions, dict):
+        source = metadata.get("source") if isinstance(metadata.get("source"), dict) else {}
+        dimensions = {"width": source.get("width"), "height": source.get("height")}
+    assets = metadata.get("assets") if isinstance(metadata.get("assets"), dict) else {}
+    allowed = asset_paths(metadata)
+    thumbnail = assets.get("thumbnail")
+    if not isinstance(thumbnail, str) or thumbnail not in allowed:
+        thumbnail = assets.get("master")
+    thumbnail_url = (
+        url_for("board_file", board_id=board_id, asset=thumbnail)
+        if isinstance(thumbnail, str) and thumbnail in allowed
+        else None
+    )
+    pipeline = metadata.get("pipeline") if isinstance(metadata.get("pipeline"), dict) else {}
+    return {
+        "id": board_id,
+        "board_id": board_id,
+        "name": catalog.get("name") or metadata.get("name") or f"Board {board_id[:8]}",
+        "folder_id": catalog.get("folder_id") or metadata.get("folder_id"),
+        "status": pipeline.get("status", "unknown"),
+        "width": dimensions.get("width"),
+        "height": dimensions.get("height"),
+        "thumbnail_url": thumbnail_url,
+        "url": url_for("board", board_id=board_id),
+        "created_at": catalog.get("created_at", metadata.get("created_at")),
+        "updated_at": catalog.get("updated_at", metadata.get("updated_at")),
+    }
+
+
 def lecture_payload_for_board(
     board_id: str,
     metadata: dict[str, Any],
@@ -2941,7 +2991,7 @@ def get_lecture(folder_id: str) -> Response | tuple[Response, int]:
         if not member_dir.is_dir():
             continue
         try:
-            members.append(frontend_board_data(member_id, read_metadata(member_dir)))
+            members.append(lecture_board_summary(member_id, read_metadata(member_dir), library))
         except Exception:
             continue
     return jsonify(

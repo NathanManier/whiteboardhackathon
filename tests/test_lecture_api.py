@@ -79,6 +79,29 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertFalse((board_app.BOARDS_DIR / first_id / "editor.json").exists())
         self.assertFalse((board_app.BOARDS_DIR / second_id / "editor.json").exists())
 
+    def test_hundred_board_lecture_endpoint_is_a_linear_summary_manifest(self):
+        folder = self.client.post("/api/folders", json={"name": "Large Lecture"}).get_json()["folder"]
+        library = board_app.read_library()
+        board_ids = [f"{index + 1:032x}" for index in range(100)]
+        for index, board_id in enumerate(board_ids):
+            self._ready_board(board_id, f"Board {index + 1}", folder["id"])
+            library["boards"][board_id] = {
+                "name": f"Board {index + 1}",
+                "folder_id": folder["id"],
+                "created_at": index + 1,
+            }
+        board_app.write_library(library)
+
+        response = self.client.get(f"/api/folders/{folder['id']}/lecture")
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        payload = response.get_json()
+        self.assertEqual(len(payload["boards"]), 100)
+        self.assertLess(len(response.data), 100_000)
+        self.assertNotIn("lecture_boards", payload["boards"][0])
+        self.assertNotIn("user_strokes", payload["boards"][0])
+        self.assertEqual(payload["boards"][46]["name"], "Board 47")
+
     def test_workspace_revision_conflict_and_manual_placement_round_trip(self):
         folder = self.client.post("/api/folders", json={"name": "Placement"}).get_json()["folder"]
         board_id = "3" * 32
@@ -125,12 +148,13 @@ class LectureWorkspaceTests(unittest.TestCase):
 
         metadata = json.loads((board_dir / "board.json").read_text(encoding="utf-8"))
         metadata["unit_metadata"] = {
-            "unit_label": "Unit 4", "unit_number": 4,
+            "unit_label": "UNIT IV", "unit_number": None,
             "unit_confidence": 0.92, "unit_source": "explicit_ai", "evidence": "UNIT IV",
         }
         board_app.atomic_json(board_dir / "board.json", metadata)
         reconciled = self.client.get(f"/api/folders/{folder['id']}/workspace").get_json()["workspace"]
         self.assertEqual(reconciled["items"][0]["unit_label"], "Unit 4")
+        self.assertEqual(reconciled["items"][0]["unit_number"], 4)
         self.assertEqual(reconciled["items"][0]["unit_source"], "explicit_ai")
         self.assertEqual(reconciled["revision"], original["revision"] + 1)
 
