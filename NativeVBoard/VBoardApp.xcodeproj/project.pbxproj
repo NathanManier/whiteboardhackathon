@@ -30,6 +30,8 @@
 		A023 /* study-render.js */ = {isa = PBXBuildFile; fileRef = A123; };
 		A024 /* Assets.xcassets */ = {isa = PBXBuildFile; fileRef = A124; };
 		A025 /* StudySelectionRequest.swift */ = {isa = PBXBuildFile; fileRef = A125; };
+		A026 /* AuthSessionStore.swift */ = {isa = PBXBuildFile; fileRef = A126; };
+		A027 /* LoginView.swift */ = {isa = PBXBuildFile; fileRef = A127; };
 		A010 /* Tests */ = {isa = PBXBuildFile; fileRef = A110; };
 /* End PBXBuildFile section */
 /* Begin PBXFileReference section */
@@ -57,13 +59,15 @@
 		A123 = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = "study-render.js"; path = ../static/study-render.js; sourceTree = "<group>"; };
 		A124 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
 		A125 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Study/StudySelectionRequest.swift; sourceTree = "<group>"; };
+		A126 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Auth/AuthSessionStore.swift; sourceTree = "<group>"; };
+		A127 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Auth/LoginView.swift; sourceTree = "<group>"; };
 		A110 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VBoardAppTests.swift; sourceTree = "<group>"; };
 		B001 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 /* Begin PBXGroup section */
 		C001 = {isa = PBXGroup; children = (C002, C003, C004, B001, B002); sourceTree = "<group>"; };
-		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113, A118, A125, A124); };
+		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A126, A127, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113, A118, A125, A124); };
 		C003 = {isa = PBXGroup; path = VBoardAppTests; sourceTree = "<group>"; children = (A110); };
 		C004 = {isa = PBXGroup; name = "Study Renderer Resources"; sourceTree = "<group>"; children = (A119, A120, A121, A122, A123); };
 /* End PBXGroup section */
@@ -72,14 +76,14 @@
 		D002 = {isa = PBXNativeTarget; buildConfigurationList = E002; buildPhases = (F004, F005, F006); buildRules = (); dependencies = (G001); name = VBoardAppTests; productName = VBoardAppTests; productReference = B002; productType = "com.apple.product-type.bundle.unit-test"; };
 /* End PBXNativeTarget section */
 /* Begin PBXProject section */
-		P001 = {isa = PBXProject; attributes = { LastUpgradeCheck = 1620; TargetAttributes = { D001 = { CreatedOnToolsVersion = 16.2; }; D002 = { CreatedOnToolsVersion = 16.2; TestTargetID = D001; }; }; }; buildConfigurationList = E003; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = C001; productRefGroup = C001; projectDirPath = ""; projectRoot = ""; targets = (D001, D002); };
+		P001 = {isa = PBXProject; attributes = { LastUpgradeCheck = 1620; TargetAttributes = { D001 = { CreatedOnToolsVersion = 16.2; SystemCapabilities = { com.apple.SignInWithApple = { enabled = 1; }; }; }; D002 = { CreatedOnToolsVersion = 16.2; TestTargetID = D001; }; }; }; buildConfigurationList = E003; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = C001; productRefGroup = C001; projectDirPath = ""; projectRoot = ""; targets = (D001, D002); };
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
 		F002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A019, A020, A021, A022, A023, A024); runOnlyForDeploymentPostprocessing = 0; };
 		F005 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013, A018, A025); runOnlyForDeploymentPostprocessing = 0; };
+		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A026, A027, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013, A018, A025); runOnlyForDeploymentPostprocessing = 0; };
 		F004 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A010); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXFrameworksBuildPhase section */
@@ -93,8 +97,8 @@
 		G002 = {isa = PBXContainerItemProxy; containerPortal = P001; proxyType = 1; remoteGlobalIDString = D001; remoteInfo = VBoardApp; };
 /* End PBXContainerItemProxy section */
 /* Begin XCBuildConfiguration section */
-		H001 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad; PRODUCT_NAME = VBoardApp; MARKETING_VERSION = 0.1.0; CURRENT_PROJECT_VERSION = 1; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; ENABLE_TESTABILITY = YES; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VBoardApp/Resources/Info.plist; }; name = Debug; };
-		H002 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad; PRODUCT_NAME = VBoardApp; MARKETING_VERSION = 0.1.0; CURRENT_PROJECT_VERSION = 1; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VBoardApp/Resources/Info-Release.plist; }; name = Release; };
+		H001 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad; PRODUCT_NAME = VBoardApp; MARKETING_VERSION = 0.1.0; CURRENT_PROJECT_VERSION = 1; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; ENABLE_TESTABILITY = YES; CODE_SIGN_ENTITLEMENTS = VBoardApp/VBoardApp.entitlements; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VBoardApp/Resources/Info.plist; }; name = Debug; };
+		H002 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad; PRODUCT_NAME = VBoardApp; MARKETING_VERSION = 0.1.0; CURRENT_PROJECT_VERSION = 1; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; CODE_SIGN_ENTITLEMENTS = VBoardApp/VBoardApp.entitlements; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VBoardApp/Resources/Info-Release.plist; }; name = Release; };
 		H003 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.tests; PRODUCT_NAME = VBoardAppTests; SDKROOT = iphoneos; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; GENERATE_INFOPLIST_FILE = YES; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VBoardApp.app/VBoardApp"; BUNDLE_LOADER = "$(TEST_HOST)"; }; name = Debug; };
 		H004 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.tests; PRODUCT_NAME = VBoardAppTests; SDKROOT = iphoneos; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; GENERATE_INFOPLIST_FILE = YES; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VBoardApp.app/VBoardApp"; BUNDLE_LOADER = "$(TEST_HOST)"; }; name = Release; };
 		H005 = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; }; name = Debug; };

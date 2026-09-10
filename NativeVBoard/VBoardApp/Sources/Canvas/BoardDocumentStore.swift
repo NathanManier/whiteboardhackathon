@@ -336,7 +336,7 @@ final class BoardDocumentStore: ObservableObject {
 
     private var outboxURL: URL {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("VBoard/outbox", isDirectory: true)
+            .appendingPathComponent("VBoard/accounts/\(LocalAccountNamespace.value)/outbox", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root.appendingPathComponent("\(boardID).json")
     }

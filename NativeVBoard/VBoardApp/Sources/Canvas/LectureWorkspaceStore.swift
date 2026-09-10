@@ -585,7 +585,7 @@ final class LectureWorkspaceStore: ObservableObject {
 
     private var outboxURL: URL {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("VBoard/workspace-outbox", isDirectory: true)
+            .appendingPathComponent("VBoard/accounts/\(LocalAccountNamespace.value)/workspace-outbox", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root.appendingPathComponent("\(folderID).json")
     }

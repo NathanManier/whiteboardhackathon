@@ -18,6 +18,7 @@ struct LectureCanvasView: UIViewRepresentable {
     let selectedKeys: Set<SelectionKey>
     let tool: CanvasTool
     let thumbnailURLs: [String: URL]
+    let authorizationHeader: String?
     let focusRequest: WorkspaceFocusRequest?
     var onCameraChanged: (CameraRect) -> Void
     var onActiveBoardChanged: (String) -> Void
@@ -38,6 +39,7 @@ struct LectureCanvasView: UIViewRepresentable {
             selectedKeys: selectedKeys,
             tool: tool,
             thumbnailURLs: thumbnailURLs,
+            authorizationHeader: authorizationHeader,
             callbacks: callbacks
         )
     }
@@ -45,6 +47,7 @@ struct LectureCanvasView: UIViewRepresentable {
     func updateUIView(_ view: LectureCanvasUIView, context: Context) {
         view.update(workspace: workspace, scenes: scenes, selectedKeys: selectedKeys,
                     tool: tool, thumbnailURLs: thumbnailURLs,
+                    authorizationHeader: authorizationHeader,
                     focusRequest: focusRequest, callbacks: callbacks)
     }
 
@@ -86,6 +89,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var selectedKeys: Set<SelectionKey>
     private var activeTool: CanvasTool
     private var thumbnailURLs: [String: URL]
+    private var authorizationHeader: String?
     private var callbacks: LectureCanvasCallbacks
     private var controller: CameraController
     private var spatialIndex: WorkspaceSpatialIndex
@@ -112,12 +116,14 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
          selectedKeys: Set<SelectionKey>,
          tool: CanvasTool,
          thumbnailURLs: [String: URL],
+         authorizationHeader: String?,
          callbacks: LectureCanvasCallbacks) {
         self.workspace = workspace
         self.scenes = scenes
         self.selectedKeys = selectedKeys
         self.activeTool = tool
         self.thumbnailURLs = thumbnailURLs
+        self.authorizationHeader = authorizationHeader
         self.callbacks = callbacks
         controller = CameraController(camera: workspace.camera)
         spatialIndex = WorkspaceSpatialIndex(items: workspace.items)
@@ -184,6 +190,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 selectedKeys: Set<SelectionKey>,
                 tool: CanvasTool,
                 thumbnailURLs: [String: URL],
+                authorizationHeader: String?,
                 focusRequest: WorkspaceFocusRequest?,
                 callbacks: LectureCanvasCallbacks) {
         let placementsChanged = self.workspace.items != workspace.items
@@ -193,6 +200,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.selectedKeys = selectedKeys
         self.activeTool = tool
         self.thumbnailURLs = thumbnailURLs
+        self.authorizationHeader = authorizationHeader
         self.callbacks = callbacks
         if controller.camera != workspace.camera, !isInteracting {
             controller.setCamera(workspace.camera)
@@ -298,7 +306,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             boardView.configure(item: item,
                                 scene: representation == .fullVector ? scenes[item.boardID] : nil,
                                 representation: representation,
-                                thumbnailURL: thumbnailURLs[item.boardID])
+                                thumbnailURL: thumbnailURLs[item.boardID],
+                                authorizationHeader: authorizationHeader)
         }
         if let activeBoardID = workspace.activeBoardID, let activeView = boardViews[activeBoardID] {
             worldContainer.bringSubviewToFront(activeView)
@@ -942,7 +951,8 @@ private final class LectureBoardRenderView: UIView {
     func configure(item: WorkspaceBoardItem,
                    scene: WorkspaceBoardScene?,
                    representation: BoardRepresentation,
-                   thumbnailURL: URL?) {
+                   thumbnailURL: URL?,
+                   authorizationHeader: String?) {
         let sceneChanged = self.scene != scene
         self.item = item
         self.scene = scene
@@ -965,7 +975,7 @@ private final class LectureBoardRenderView: UIView {
             userLayer.isHidden = true
             thumbnail.isHidden = false
             if representation == .fullVector { loading.startAnimating() } else { loading.stopAnimating() }
-            loadThumbnail(thumbnailURL)
+            loadThumbnail(thumbnailURL, authorizationHeader: authorizationHeader)
         }
         if scene != nil { userLayer.isHidden = false }
         setNeedsLayout()
@@ -1181,7 +1191,7 @@ private final class LectureBoardRenderView: UIView {
         return inside
     }
 
-    private func loadThumbnail(_ url: URL?) {
+    private func loadThumbnail(_ url: URL?, authorizationHeader: String?) {
         guard representedThumbnailURL != url else { return }
         representedThumbnailURL = url
         thumbnail.image = nil
@@ -1190,7 +1200,11 @@ private final class LectureBoardRenderView: UIView {
             thumbnail.image = cached
             return
         }
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+        var request = URLRequest(url: url)
+        if let authorizationHeader {
+            request.setValue(authorizationHeader, forHTTPHeaderField: "Authorization")
+        }
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             guard let data, let image = UIImage(data: data) else { return }
             Self.thumbnailCache.setObject(image, forKey: url as NSURL, cost: data.count)
             DispatchQueue.main.async {

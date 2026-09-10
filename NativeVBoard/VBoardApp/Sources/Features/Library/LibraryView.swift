@@ -5,11 +5,13 @@ import UIKit
 
 struct LibraryView: View {
     @EnvironmentObject private var api: APIClient
+    let account: AccountUser
     @State private var library: LibraryResponse?
     @State private var error: String?
     @State private var showImporter = false
     @State private var showNewLecture = false
     @State private var launchBoard: LibraryBoard?
+    @State private var showAccount = false
 
     var body: some View {
         NavigationStack {
@@ -47,9 +49,10 @@ struct LibraryView: View {
                 } else { ProgressView("Loading your library…") }
             }
             .navigationTitle("V-Board")
-            .toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { showImporter = true } label: { Label("Import Whiteboard", systemImage: "photo.badge.plus") }; Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "books.vertical") } } label: { Image(systemName: "plus") }.accessibilityLabel("Add to V-Board") }; ToolbarItem(placement: .secondaryAction) { Button { load() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh library") } }
+            .toolbar { ToolbarItem(placement: .primaryAction) { Menu { Button { showImporter = true } label: { Label("Import Whiteboard", systemImage: "photo.badge.plus") }; Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "books.vertical") } } label: { Image(systemName: "plus") }.accessibilityLabel("Add to V-Board") }; ToolbarItemGroup(placement: .secondaryAction) { Button { load() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh library"); Button { showAccount = true } label: { Image(systemName: "person.crop.circle") }.accessibilityLabel("Account") } }
             .sheet(isPresented: $showImporter) { ImportFlowView { board in launchBoard = board; showImporter = false; load() } }
             .sheet(isPresented: $showNewLecture) { NewLectureView { showNewLecture = false; load() } }
+            .sheet(isPresented: $showAccount) { AccountView(user: account) }
             .navigationDestination(item: $launchBoard) { board in
                 if let library { destination(for: board, in: library) }
                 else { BoardView(board: board) }
@@ -103,8 +106,35 @@ private struct LectureCard: View {
 }
 
 private struct BoardCard: View {
+    @EnvironmentObject private var api: APIClient
     let board: LibraryBoard
-    var body: some View { VStack(alignment: .leading, spacing: 9) { if let raw = board.thumbnailURL, let url = URL(string: raw, relativeTo: URL(string: "https://chsinteract.com")) { AsyncImage(url: url) { phase in switch phase { case .success(let image): image.resizable().scaledToFill(); default: Image(systemName: "photo").font(.largeTitle).foregroundStyle(.secondary) } }.frame(height: 130).clipped().clipShape(RoundedRectangle(cornerRadius: 8)) } else { RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.45)).frame(height: 130).overlay { Image(systemName: board.status == "ready" ? "checkmark" : "clock").font(.title2).foregroundStyle(.secondary) } }; Text(board.name).font(.headline).lineLimit(2); Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized).font(.caption).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading) }
+    @State private var thumbnail: UIImage?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.quaternary.opacity(0.45))
+                .frame(height: 130)
+                .overlay {
+                    if let thumbnail {
+                        Image(uiImage: thumbnail).resizable().scaledToFill()
+                    } else {
+                        Image(systemName: board.status == "ready" ? "photo" : "clock")
+                            .font(.title2).foregroundStyle(.secondary)
+                    }
+                }
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            Text(board.name).font(.headline).lineLimit(2)
+            Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized)
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .task(id: board.thumbnailURL) {
+            guard let path = board.thumbnailURL else { return }
+            thumbnail = (try? await api.authorizedAsset(path: path)).flatMap(UIImage.init(data:))
+        }
+    }
 }
 
 private struct RenamePrompt: View {

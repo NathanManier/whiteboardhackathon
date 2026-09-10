@@ -27,6 +27,9 @@ final class APIClient: ObservableObject {
     private let encoder: JSONEncoder
     private let baseURL: URL
     private let diagnostics: ((String) -> Void)?
+    private var credentials: AuthCredentials?
+    @Published private(set) var authorizationHeader: String?
+    var onCredentialsChanged: ((AuthCredentials?) -> Void)?
 
     init(baseURL: URL? = nil, session: URLSession = .shared,
          diagnostics: ((String) -> Void)? = nil) {
@@ -40,6 +43,49 @@ final class APIClient: ObservableObject {
         self.decoder = JSONDecoder()
         self.encoder = JSONEncoder()
         self.diagnostics = diagnostics
+    }
+
+    func install(credentials: AuthCredentials?) {
+        self.credentials = credentials
+        authorizationHeader = credentials.map { "Bearer \($0.accessToken)" }
+        onCredentialsChanged?(credentials)
+    }
+
+    func authenticateWithApple(_ payload: AppleSignInPayload) async throws -> AuthEnvelope {
+        var request = try request(path: "/api/auth/apple", method: "POST", authenticated: false)
+        request.httpBody = try encoder.encode(payload)
+        let (data, response) = try await data(for: request, refreshOnUnauthorized: false)
+        try validate(response, data: data)
+        return try decoder.decode(AuthEnvelope.self, from: data)
+    }
+
+    #if DEBUG
+    func debugAuthentication(testUser: String) async throws -> AuthEnvelope {
+        var request = try request(path: "/api/auth/debug", method: "POST", authenticated: false)
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["testUser": testUser])
+        let (data, response) = try await data(for: request, refreshOnUnauthorized: false)
+        try validate(response, data: data)
+        return try decoder.decode(AuthEnvelope.self, from: data)
+    }
+    #endif
+
+    func currentAccount() async throws -> AccountUser {
+        let envelope: AccountEnvelope = try await get("/api/auth/me", label: "account")
+        return envelope.user
+    }
+
+    func logout() async throws {
+        let request = try request(path: "/api/auth/logout", method: "POST")
+        let (data, response) = try await data(for: request, refreshOnUnauthorized: false)
+        try validate(response, data: data)
+        install(credentials: nil)
+    }
+
+    func deleteAccount() async throws {
+        let request = try request(path: "/api/account", method: "DELETE")
+        let (data, response) = try await data(for: request, refreshOnUnauthorized: false)
+        try validate(response, data: data)
+        install(credentials: nil)
     }
 
     func library() async throws -> LibraryResponse { try await get("/api/library") }
@@ -119,6 +165,13 @@ final class APIClient: ObservableObject {
     func asset(boardID: String, name: String) async throws -> Data {
         let path = "/board/\(boardID)/asset/\(name)"
         let request = try request(path: path, accept: "image/*")
+        let (data, response) = try await data(for: request)
+        try validate(response, data: data)
+        return data
+    }
+
+    func authorizedAsset(path: String) async throws -> Data {
+        let request = try request(path: path, accept: "image/*,application/pdf")
         let (data, response) = try await data(for: request)
         try validate(response, data: data)
         return data
@@ -256,19 +309,55 @@ final class APIClient: ObservableObject {
         }
     }
 
-    private func request(path: String, method: String = "GET", accept: String = "application/json") throws -> URLRequest {
+    private func request(path: String, method: String = "GET", accept: String = "application/json", authenticated: Bool = true) throws -> URLRequest {
         guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else { throw APIError.invalidBaseURL }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue(accept, forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if authenticated, let token = credentials?.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         request.timeoutInterval = 30
         return request
     }
 
-    private func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-        do { return try await session.data(for: request) }
-        catch { throw APIError.transport("Could not reach V-Board: \(error.localizedDescription)") }
+    private func data(for request: URLRequest, refreshOnUnauthorized: Bool = true) async throws -> (Data, URLResponse) {
+        do {
+            let first = try await session.data(for: request)
+            guard refreshOnUnauthorized,
+                  (first.1 as? HTTPURLResponse)?.statusCode == 401,
+                  request.url?.path != "/api/auth/refresh",
+                  let refreshed = try await refreshSession() else {
+                return first
+            }
+            var retry = request
+            retry.setValue("Bearer \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
+            return try await session.data(for: retry)
+        } catch let error as APIError {
+            throw error
+        } catch {
+            throw APIError.transport("Could not reach V-Board: \(error.localizedDescription)")
+        }
+    }
+
+    private func refreshSession() async throws -> AuthCredentials? {
+        guard let current = credentials,
+              current.refreshExpiresAt > Date().timeIntervalSince1970 else {
+            install(credentials: nil)
+            return nil
+        }
+        var refreshRequest = try request(path: "/api/auth/refresh", method: "POST", authenticated: false)
+        refreshRequest.httpBody = try encoder.encode(["refreshToken": current.refreshToken])
+        let (data, response) = try await session.data(for: refreshRequest)
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              var envelope = try? decoder.decode(AuthEnvelope.self, from: data) else {
+            install(credentials: nil)
+            return nil
+        }
+        envelope.session.appleUserIdentifier = current.appleUserIdentifier
+        install(credentials: envelope.session)
+        return envelope.session
     }
 
     private func validate(_ response: URLResponse, data: Data) throws {

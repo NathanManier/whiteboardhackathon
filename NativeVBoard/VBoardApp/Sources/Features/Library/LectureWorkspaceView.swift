@@ -125,6 +125,7 @@ struct LectureWorkspaceView: View {
                 thumbnailURLs: Dictionary(uniqueKeysWithValues: workspace.items.compactMap { item in
                     api.resolvedURL(item.thumbnailURL).map { (item.boardID, $0) }
                 }),
+                authorizationHeader: api.authorizationHeader,
                 focusRequest: store.focusRequest,
                 onCameraChanged: { store.updateCamera($0, api: api) },
                 onActiveBoardChanged: { store.setActiveBoard($0, api: api) },
