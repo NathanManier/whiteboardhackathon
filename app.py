@@ -38,6 +38,7 @@ from flask import (
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
 
+from pdf_import import PDFImportError, import_pdf_pages
 from vboard_auth import AppleCredential, AppleTokenVerifier, AuthDatabase, AuthUser
 from vboard_auth.apple import AppleVerificationError
 from study.routing import AIRequestContext, routed_request
@@ -75,9 +76,9 @@ BOARD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 FOLDER_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 ASSET_NAMES = {
     "original", "corrected", "master", "analysis", "mask", "digitized",
-    "comparison", "detection", "confidence", "thumbnail",
+    "comparison", "detection", "confidence", "thumbnail", "pdf",
 }
-SAFE_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".json"}
+SAFE_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".json", ".pdf"}
 STROKE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 MAX_IMAGE_PIXELS = 40_000_000
@@ -95,6 +96,11 @@ MAX_WORLD_COORDINATE = 10_000_000.0
 MAX_DEBUG_RASTER_DIMENSION = 1600
 MAX_DEBUG_SVG_BYTES = 16 * 1024 * 1024
 MAX_DEBUG_SVG_PATHS = 2_500
+MAX_IMAGE_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 16 * 1024 * 1024))
+MAX_PDF_UPLOAD_BYTES = int(os.environ.get("MAX_PDF_UPLOAD_BYTES", 64 * 1024 * 1024))
+MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", 100))
+MAX_PDF_PAGE_DIMENSION = float(os.environ.get("MAX_PDF_PAGE_DIMENSION", 100_000))
+PDF_PREVIEW_MAX_EDGE = int(os.environ.get("PDF_PREVIEW_MAX_EDGE", 2_048))
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -104,7 +110,7 @@ LOGGER = logging.getLogger("boardlift.pipeline")
 
 app = Flask(__name__)
 app.config.update(
-    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_UPLOAD_BYTES", 16 * 1024 * 1024)),
+    MAX_CONTENT_LENGTH=max(MAX_IMAGE_UPLOAD_BYTES, MAX_PDF_UPLOAD_BYTES),
     SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
 )
 BOARDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -625,6 +631,13 @@ def _workspace_board_item(
         "unit_source": unit_source,
         "title": str(catalog.get("name") or metadata.get("name") or f"Whiteboard {z_index + 1}")[:80],
         "thumbnail_url": thumbnail_url,
+        "source_kind": str(metadata.get("source_kind") or source.get("kind") or "physical_whiteboard"),
+        "pdf_url": (
+            url_for("board_file", board_id=board_id, asset=assets.get("pdf"))
+            if isinstance(assets.get("pdf"), str) and assets.get("pdf") in asset_paths(metadata)
+            else None
+        ),
+        "pdf_page_number": source.get("page_number"),
         "z_index": z_index,
     }
 
@@ -2080,6 +2093,13 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
         "user_strokes": strokes,
         "user_ink": strokes,
         "pipeline": metadata.get("pipeline", {}),
+        "source_kind": str(metadata.get("source_kind") or metadata.get("source", {}).get("kind") or "physical_whiteboard"),
+        "pdf_url": (
+            url_for("board_file", board_id=board_id, asset=assets["pdf"])
+            if "pdf" in assets
+            else None
+        ),
+        "pdf_page_number": metadata.get("source", {}).get("page_number"),
     }
     if isinstance(metadata.get("normalized_corners"), list):
         data["normalized_corners"] = metadata["normalized_corners"]
@@ -2128,6 +2148,12 @@ def lecture_board_summary(
         "width": dimensions.get("width"),
         "height": dimensions.get("height"),
         "thumbnail_url": thumbnail_url,
+        "source_kind": str(metadata.get("source_kind") or metadata.get("source", {}).get("kind") or "physical_whiteboard"),
+        "pdf_url": (
+            url_for("board_file", board_id=board_id, asset=assets.get("pdf"))
+            if isinstance(assets.get("pdf"), str) and assets.get("pdf") in allowed
+            else None
+        ),
         "url": url_for("board", board_id=board_id),
         "created_at": catalog.get("created_at", metadata.get("created_at")),
         "updated_at": catalog.get("updated_at", metadata.get("updated_at")),
@@ -2549,8 +2575,11 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
 
 @app.errorhandler(RequestEntityTooLarge)
 def too_large(_: RequestEntityTooLarge) -> tuple[str, int] | tuple[Response, int]:
-    limit_mb = app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
-    message = f"That photo is too large. Choose an image under {limit_mb:.0f} MB."
+    is_pdf = request.path.rstrip("/") == "/api/import/pdf"
+    limit = MAX_PDF_UPLOAD_BYTES if is_pdf else MAX_IMAGE_UPLOAD_BYTES
+    noun = "PDF" if is_pdf else "photo"
+    limit_mb = limit / (1024 * 1024)
+    message = f"That {noun} is too large. Choose a file under {limit_mb:.0f} MB."
     if request.accept_mimetypes["application/json"] > request.accept_mimetypes["text/html"]:
         return jsonify(error=message), 413
     return (
@@ -2718,6 +2747,9 @@ def delete_account() -> Response | tuple[Response, int]:
     for lecture_id in lecture_ids:
         lecture_workspace_path(lecture_id).unlink(missing_ok=True)
         (BOARDS_DIR / ".workspaces" / f"{lecture_id}.study.json").unlink(missing_ok=True)
+    import_dir = BOARDS_DIR / ".imports" / user.id
+    if import_dir.is_dir() and not import_dir.is_symlink():
+        shutil.rmtree(import_dir)
     LOGGER.info(
         "ACCOUNT DELETED user=%s boards=%d lectures=%d",
         user.id,
@@ -2767,14 +2799,14 @@ def upload() -> Response | tuple[str, int]:
             "We couldn't read that image type. Choose a JPG, PNG, or WEBP photo.",
             415,
         )
-    data = uploaded.read(app.config["MAX_CONTENT_LENGTH"] + 1)
+    data = uploaded.read(MAX_IMAGE_UPLOAD_BYTES + 1)
     LOGGER.info(
         "UPLOAD COMPLETE filename=%s bytes=%d elapsed=%.3fs",
         Path(uploaded.filename).name,
         len(data),
         time.perf_counter() - upload_started,
     )
-    if len(data) > app.config["MAX_CONTENT_LENGTH"]:
+    if len(data) > MAX_IMAGE_UPLOAD_BYTES:
         raise RequestEntityTooLarge()
     try:
         load_started = time.perf_counter()
@@ -2954,6 +2986,190 @@ def upload() -> Response | tuple[str, int]:
         time.perf_counter() - upload_started,
     )
     return upload_success(board_id, metadata, status="needs_corners")
+
+
+@app.post("/api/import/pdf")
+@require_authenticated
+def import_pdf() -> Response | tuple[Response, int]:
+    """Import a supported PDF without routing it through the photo CV pipeline."""
+    started = time.perf_counter()
+    uploaded = request.files.get("pdf")
+    if uploaded is None or not uploaded.filename:
+        return jsonify(error="Choose a PDF to import."), 400
+    if Path(uploaded.filename).suffix.lower() != ".pdf" or (
+        uploaded.mimetype or ""
+    ).lower() not in {"application/pdf", "application/x-pdf"}:
+        return jsonify(error="Choose a PDF exported from Freeform or Files."), 415
+    data = uploaded.read(MAX_PDF_UPLOAD_BYTES + 1)
+    if len(data) > MAX_PDF_UPLOAD_BYTES:
+        raise RequestEntityTooLarge()
+
+    library = read_library()
+    requested_folder = str(request.form.get("folder_id") or "").strip() or None
+    if requested_folder is not None:
+        if requested_folder not in folder_ids(library):
+            return jsonify(error="The selected lecture no longer exists."), 404
+        require_lecture_owner(requested_folder)
+    requested_kind = str(request.form.get("source_kind") or "freeform_pdf").strip()
+    if requested_kind not in {"freeform_pdf", "generic_pdf"}:
+        return jsonify(error="The PDF source type is invalid."), 400
+    raw_name = str(request.form.get("name") or "").strip()
+    default_name = Path(uploaded.filename).stem.replace("_", " ").strip() or "Imported PDF"
+    try:
+        base_name = validate_display_name(raw_name or default_name, "Board name")
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    try:
+        pages = list(import_pdf_pages(
+            data,
+            max_pages=MAX_PDF_PAGES,
+            max_page_dimension=MAX_PDF_PAGE_DIMENSION,
+            preview_max_edge=PDF_PREVIEW_MAX_EDGE,
+        ))
+    except PDFImportError as exc:
+        LOGGER.info("PDF IMPORT REJECTED category=%s", type(exc).__name__)
+        return jsonify(error=str(exc)), 400
+    except Exception:
+        LOGGER.exception("PDF IMPORT FAILED stage=decode")
+        return jsonify(error="That PDF could not be imported safely."), 500
+
+    imported_at = time.time()
+    import_id = secrets.token_hex(16)
+    user = current_user()
+    source_dir = BOARDS_DIR / ".imports" / user.id / import_id
+    created_board_ids: list[str] = []
+    summaries: list[dict[str, Any]] = []
+    try:
+        atomic_bytes(source_dir / "source.pdf", data, create_parent=True)
+        for page in pages:
+            board_id = secrets.token_hex(16)
+            page_label = base_name if len(pages) == 1 else f"{base_name} — Page {page.index + 1}"
+            board_name = unique_board_name(library, page_label, requested_folder)
+            board_dir = board_directory(board_id, create=True)
+            created_board_ids.append(board_id)
+            atomic_bytes(board_dir / "source.pdf", page.page_pdf)
+            atomic_bytes(board_dir / "thumbnail.png", page.preview_png)
+            atomic_bytes(board_dir / "master.png", page.preview_png)
+            atomic_bytes(board_dir / "board.svg", page.proxy_svg)
+            metadata: dict[str, Any] = {
+                "schema_version": 1,
+                "id": board_id,
+                "name": board_name,
+                "folder_id": requested_folder,
+                "source_kind": requested_kind,
+                "created_at": imported_at + page.index * 0.001,
+                "updated_at": imported_at,
+                "source": {
+                    "kind": requested_kind,
+                    "filename": Path(uploaded.filename).name[:255],
+                    "content_type": "application/pdf",
+                    "bytes": len(page.page_pdf),
+                    "page_number": page.index + 1,
+                    "page_count": len(pages),
+                    "width": page.width,
+                    "height": page.height,
+                    "import_id": import_id,
+                    "imported_at": imported_at,
+                },
+                "assets": {
+                    "pdf": "source.pdf",
+                    "thumbnail": "thumbnail.png",
+                    "master": "master.png",
+                    "svg": "board.svg",
+                },
+                "dimensions": {"width": page.width, "height": page.height},
+                "pipeline": {
+                    "status": "ready",
+                    "kind": "pdf_source",
+                    "timings_ms": {},
+                    "errors": [],
+                },
+                "unit_metadata": {
+                    "unit_label": "No Unit",
+                    "unit_number": None,
+                    "unit_confidence": 0.0,
+                    "unit_source": "none",
+                    "evidence": None,
+                },
+            }
+            update_metadata(board_dir, metadata)
+            # Extracted text is semantic evidence, never visual truth. Keeping
+            # it in the AI sidecar avoids re-extracting it while the PDF proxy
+            # remains the evidence shown to the model.
+            if page.extracted_text.strip():
+                atomic_json(board_dir / "study.json", {
+                    "schema_version": 2,
+                    "interactions": [],
+                    "board_ai_context": {
+                        "schema_version": 1,
+                        "analysis_version": "pdf-text-v1",
+                        "analyzed_at": imported_at,
+                        "subject": "",
+                        "summary": page.extracted_text.strip()[:4_000],
+                        "key_topics": [],
+                        "visual_context": "Imported PDF page",
+                        "important_observations": [],
+                        "explicit_unit_text": None,
+                        "unit_confidence": 0.0,
+                        "recognized_text": page.extracted_text.strip()[:8_000],
+                        "concepts": [],
+                        "equations": [],
+                    },
+                })
+            library["boards"][board_id] = {
+                "name": board_name,
+                "folder_id": requested_folder,
+                "created_at": metadata["created_at"],
+                "updated_at": metadata["updated_at"],
+            }
+            claim_board_for_current_user(
+                board_id,
+                folder_id=requested_folder,
+                title=board_name,
+                source_kind=requested_kind,
+            )
+            summaries.append(lecture_board_summary(board_id, metadata, library))
+
+        if requested_folder:
+            folder = folder_by_id(library, requested_folder)
+            if folder:
+                sync_folder_board_order(library, requested_folder)
+                mark_study_guide_stale(folder)
+                folder["lecture_context"] = None
+        write_library(library)
+        if requested_folder:
+            read_lecture_workspace(library, requested_folder)
+    except Exception:
+        LOGGER.exception("PDF IMPORT FAILED stage=persist import=%s", import_id)
+        for board_id in created_board_ids:
+            board_dir = BOARDS_DIR / board_id
+            if board_dir.is_dir() and not board_dir.is_symlink():
+                shutil.rmtree(board_dir)
+            library.get("boards", {}).pop(board_id, None)
+            if not user.is_test_user:
+                AUTH_DB.delete_board_record(user.id, board_id)
+        if source_dir.is_dir() and not source_dir.is_symlink():
+            shutil.rmtree(source_dir)
+        write_library(library)
+        return jsonify(error="The PDF could not be saved. Try again."), 500
+
+    LOGGER.info(
+        "PDF IMPORT COMPLETE user=%s import=%s pages=%d lecture=%s bytes=%d elapsed=%.3fs",
+        user.id,
+        import_id,
+        len(pages),
+        requested_folder or "none",
+        len(data),
+        time.perf_counter() - started,
+    )
+    return jsonify(
+        import_id=import_id,
+        source_kind=requested_kind,
+        page_count=len(pages),
+        boards=summaries,
+        folder_id=requested_folder,
+    ), 201
 
 
 @app.get("/board/<board_id>")
@@ -3166,6 +3382,14 @@ def get_library() -> Response:
                 "width": dimensions.get("width") if isinstance(dimensions, dict) else None,
                 "height": dimensions.get("height") if isinstance(dimensions, dict) else None,
                 "thumbnail_url": thumbnail_url,
+                "source_kind": str(metadata.get("source_kind") or source.get("kind") or "physical_whiteboard"),
+                "pdf_url": (
+                    url_for("board_file", board_id=board_id, asset=assets.get("pdf"))
+                    if isinstance(assets, dict)
+                    and isinstance(assets.get("pdf"), str)
+                    and assets.get("pdf") in allowed
+                    else None
+                ),
                 "url": url_for("board", board_id=board_id),
                 "workspace_board_id": workspace_id,
             }

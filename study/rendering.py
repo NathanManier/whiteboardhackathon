@@ -103,6 +103,16 @@ def _transformed_element_box(
         box = path_bounds(element.get("d") or "")
     elif tag == "text":
         box = text_bounds(element)
+    elif tag == "image":
+        try:
+            box = {
+                "x": float(element.get("x") or 0),
+                "y": float(element.get("y") or 0),
+                "width": max(1.0, float(element.get("width") or 1)),
+                "height": max(1.0, float(element.get("height") or 1)),
+            }
+        except (TypeError, ValueError):
+            box = None
     if not box:
         return None
     return _transform_box(
