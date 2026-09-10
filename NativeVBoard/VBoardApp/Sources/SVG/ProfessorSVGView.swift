@@ -6,6 +6,10 @@ import UIKit
 final class ProfessorSVGView: UIView {
     private let contentLayer = CALayer()
     private var entries: [String: Entry] = [:]
+    /// Canonical path bounds are independent of temporary CAShapeLayer
+    /// lifetime. Keeping them across imported-transform rebuilds lets hit
+    /// testing and selection chrome follow stable path IDs continuously.
+    private var sourceBounds: [String: CGRect] = [:]
     private var index = SpatialIndex()
     private var visibleIDs = Set<String>()
     private var document: SVGDocument?
@@ -139,7 +143,14 @@ final class ProfessorSVGView: UIView {
     }
 
     func bounds(for id: String) -> CGRect {
-        entries[id]?.bounds ?? .null
+        if let entry = entries[id] { return entry.bounds }
+        guard let source = sourceBounds[id] else { return .null }
+        guard let imported = importedTransforms[id] else { return source }
+        let transform = CGAffineTransform.identity
+            .translatedBy(x: CGFloat(imported.x), y: CGFloat(imported.y))
+            .scaledBy(x: CGFloat(imported.scaleX ?? 1),
+                      y: CGFloat(imported.scaleY ?? 1))
+        return source.applying(transform)
     }
 
     /// Applies a transient world-space translation to selected professor
@@ -178,6 +189,7 @@ final class ProfessorSVGView: UIView {
         rebuildTask?.cancel()
         rebuildGeneration = UUID()
         let generation = rebuildGeneration
+        if self.document != document { sourceBounds.removeAll(keepingCapacity: true) }
         self.document = document
         self.importedTransforms = importedTransforms
         self.composition = composition
@@ -212,11 +224,13 @@ final class ProfessorSVGView: UIView {
                         .scaledBy(x: CGFloat(imported.scaleX ?? 1),
                                   y: CGFloat(imported.scaleY ?? 1))
                 }
-                let parsed: [CGPath?] = await Task.detached(priority: .userInitiated) {
+                let parsed: [(displayPath: CGPath?, sourceBounds: CGRect)] = await Task.detached(priority: .userInitiated) {
                     zip(definitions, transforms).map { definition, transform in
-                        guard let source = try? SVGPathParser.cachedPath(from: definition) else { return nil }
+                        guard let source = try? SVGPathParser.cachedPath(from: definition) else {
+                            return (nil, .null)
+                        }
                         var transform = transform
-                        return source.copy(using: &transform)
+                        return (source.copy(using: &transform), source.boundingBoxOfPath)
                     }
                 }.value
                 guard let self, !Task.isCancelled,
@@ -225,10 +239,11 @@ final class ProfessorSVGView: UIView {
                 let displayScale = self.window?.screen.scale ?? UIScreen.main.scale
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
-                for (offset, path) in parsed.enumerated() {
-                    guard let path else { continue }
+                for (offset, parsedPath) in parsed.enumerated() {
+                    guard let path = parsedPath.displayPath else { continue }
                     let item = paths[completed + offset]
                     guard let id = item.id else { continue }
+                    self.sourceBounds[id] = parsedPath.sourceBounds
                     let shape = CAShapeLayer()
                     shape.path = path
                     shape.fillColor = item.fill.cgColor

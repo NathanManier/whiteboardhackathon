@@ -833,6 +833,44 @@ final class WorldScreenTransformTests: XCTestCase {
         XCTAssertEqual(view.visiblePathIDsForTesting, Set(["far"]))
     }
 
+    @MainActor
+    func testProfessorBoundsRemainAvailableDuringImportedTransformRebuild() async throws {
+        let document = try SVGDocument.parse("""
+        <svg viewBox="0 0 100 100">
+          <path id="prof-1" d="M 5 5 L 25 5 L 25 25 L 5 25 Z" fill="#000000"/>
+        </svg>
+        """)
+        let camera = WorldScreenTransform(
+            camera: CameraRect(x: 0, y: 0, width: 100, height: 100),
+            viewport: CGSize(width: 100, height: 100)
+        )
+        let view = ProfessorSVGView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let ready = expectation(description: "source path bounds cached")
+        view.onProgress = { progress in
+            if progress >= 0.999 { ready.fulfill() }
+        }
+        view.display(document, transform: camera)
+        await fulfillment(of: [ready], timeout: 2)
+
+        view.display(
+            document,
+            transform: camera,
+            importedTransforms: [
+                "prof-1": ObjectTransform(x: 100, y: -40,
+                                           scaleX: 2, scaleY: 2, deleted: false)
+            ]
+        )
+
+        // The progressive renderer has removed the old display layer at this
+        // point. Selection geometry must still be derivable from the stable
+        // professor path ID and canonical source bounds.
+        let bounds = view.bounds(for: "prof-1")
+        XCTAssertEqual(bounds.minX, 110, accuracy: 0.001)
+        XCTAssertEqual(bounds.minY, -30, accuracy: 0.001)
+        XCTAssertEqual(bounds.width, 40, accuracy: 0.001)
+        XCTAssertEqual(bounds.height, 40, accuracy: 0.001)
+    }
+
     func testPortraitLandscapeResizePreservesCenterAndWorldScale() {
         let portrait = CGSize(width: 820, height: 1_180)
         let landscape = CGSize(width: 1_180, height: 820)
