@@ -10,15 +10,15 @@
 | Mouse/trackpad drawing fallback | Indirect-pointer drags use canonical `UserStroke` | Verified | Re-test |
 | Selection/lasso/object erase | World-coordinate tool routing with spatial candidate reduction | Verified | Re-test |
 | Local outbox/autosave | `BoardDocumentStore` Application Support snapshot | XCTest/integration pass | Re-test |
-| Practice problem persistence | `role=ai_practice_problem` editor objects | Simulator flow required | Re-test |
+| Practice problem persistence | `role=ai_practice_problem` editor objects | Generated two independent cards; move, resize, close, and reopen verified | Re-test |
 | Hover, double-tap, squeeze, barrel roll | Not yet wired | N/A | Required |
 | Palm rejection and Pencil/finger latency | UIKit routing in place | N/A | Required |
 | Real camera capture | `UIImagePickerController` entry point | Falls back to photo library | Required |
 | Shared lecture camera/placements | Revisioned workspace manifest and local outbox | Verified with two hosted boards, pan, zoom, close, and reopen | Re-test |
-| Lecture board LOD | Three-board vector budget plus thumbnail proxies | XCTest; two-board visual pass | Profile with a large real lecture |
+| Lecture board LOD | Three-board vector budget plus thumbnail proxies | Profiled with 100-board staging fixture; full-detail count stayed at 3 and scene cache stayed at 6 | Re-test |
 | Cross-board lasso | Board spatial query plus board-local 65% containment | Verified with hosted professor content | Re-test |
-| Text/practice resize | Bottom-right handle mutates board-owned text object | XCTest; manual UI pass pending Mac unlock | Re-test |
-| Local math/chemistry | Bundled KaTeX, mhchem, markdown-it, DOMPurify | Build/resource/test pass; manual UI pass pending Mac unlock | Re-test |
+| Text/practice resize | Bottom-right handle mutates board-owned text object | XCTest and manual move/resize/reopen pass | Re-test |
+| Local math/chemistry | Bundled KaTeX, mhchem, markdown-it, DOMPurify | XCTest/JavaScript pass and manual rich Study/Explain rendering pass | Re-test |
 
 Before TestFlight, run the Pencil and camera rows on a physical iPad and
 record the OS/device combination. Basic import, upload, corner confirmation,
@@ -56,10 +56,59 @@ lecture workspace:
 - [x] Lasso produces composite board/object selection and visible chrome
 - [x] Mouse Pen creates a canonical board-owned stroke; undo and redo work
 - [x] Full native vector demand remains capped at three board IDs
+- [x] 100-board fixture opened from a compact manifest; the scene cache stayed
+      bounded to six and distant scenes were evicted as focus moved
+- [x] Dense 4,943-path board promoted to native full detail without loading the
+      remaining 99 full SVG/editor documents
+- [x] Navigator normalized and displayed Unit 1, `UNIT 2`, and `Unit IV` as
+      Unit 1, Unit 2, and Unit 4; unassigned boards remained No Unit
+- [x] Navigator focus from Unit 2 to Board 14 kept the same lecture canvas and
+      focused the requested board
+- [x] Photos selection, preview, upload, draggable corner confirmation,
+      processing, automatic editor transition, and professor SVG rendering
+      completed against the staging backend
+- [x] One-board Explain, follow-up, exactly two Practice cards, Check My Work,
+      Study Guide, and cross-board Explain completed against staging
+- [x] Native Export SVG produced a 1,315,298-byte XML-valid file with 868 path
+      elements and opened the native Share Sheet
 - [ ] Host trackpad pinch could not be synthesized by the available simulator
       automation; normal iOS two-touch pan/pinch recognizers and Cmd +/-/0
       fallbacks are implemented
-- [ ] Photos/corners/process/new-rightmost-board needs a fresh live pass after
-      the workspace routes are deployed to `chsinteract.com`
+- [ ] Repeat Photos/corners/process/rightward placement and cross-device
+      workspace persistence against `chsinteract.com` after the new workspace
+      routes are deployed there
 - [ ] Physical Pencil, touch/Pencil coexistence, real camera, and latency still
       require a signed physical-iPad pass
+
+## Hosted-production blocker
+
+On September 9, 2026, `https://chsinteract.com/api/library` returned HTTP 200,
+but the new lecture workspace endpoint still returned HTTP 404. The local and
+staging application contains and exercises the workspace and grouped-study
+contracts. Deploying/reloading those routes on PythonAnywhere requires access
+to the production account or checkout; no production credential is stored in
+the native application or repository. Until that deployment is performed, the
+hosted workspace remains unverified and the native client correctly retains
+its local cache/outbox fallback for offline recovery.
+
+## Performance snapshot
+
+The staging stress lecture contains 100 manifest entries, including a dense
+4,943-path professor SVG. After the compact-manifest backend change, the
+lecture response was about 40.8 KB in 0.15 seconds instead of about 3.94 MB in
+10.3 seconds. Runtime diagnostics showed at most three full-detail boards and
+six cached scenes. The dense board's main-layer installation measured about
+48 ms after background path prewarming; steady refinement measured roughly
+3.8 to 6.0 ms. Two stationary process samples read 0.0% CPU. Simulator memory
+for the dense-board session was approximately 419 MB RSS. These are development
+measurements, not physical-device energy or frame-rate claims.
+
+## Release validation
+
+The unsigned device archive and Release simulator build both succeeded with
+Xcode 16.2. The archived app uses only `https://chsinteract.com`, contains no
+localhost App Transport Security exception, supports all four iPad interface
+orientations, contains the compiled AppIcon assets, and targets iPadOS 17 or
+newer. A Release launch on the iPad Pro 13-inch (M4), iOS 18.2 simulator loaded
+the production library without the DEBUG input/performance HUD. Signing and
+App Store Connect upload remain intentionally outside this validation.

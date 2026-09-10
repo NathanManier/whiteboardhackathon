@@ -24,16 +24,6 @@
     <true/>
     <key>NSCameraUsageDescription</key>
     <string>Take a photo of a physical whiteboard to make it editable.</string>
-    <key>NSAppTransportSecurity</key>
-    <dict>
-        <key>NSExceptionDomains</key>
-        <dict>
-            <key>localhost</key>
-            <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
-            <key>127.0.0.1</key>
-            <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
-        </dict>
-    </dict>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
     <key>UISupportedInterfaceOrientations~ipad</key>
