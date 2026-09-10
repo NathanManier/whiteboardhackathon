@@ -35,13 +35,45 @@ enum AuthSessionUpdateReason: String, Sendable {
     case sessionExpired
 }
 
+#if DEBUG
+enum DebugAPIEnvironment: String, CaseIterable, Identifiable {
+    case production
+    case localDevelopment
+    case staging
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .production: return "Production"
+        case .localDevelopment: return "Local Development"
+        case .staging: return "Staging"
+        }
+    }
+
+    var baseURL: URL {
+        switch self {
+        case .production:
+            return URL(string: "https://chsinteract.com")!
+        case .localDevelopment:
+            return URL(string: "http://127.0.0.1:5000")!
+        case .staging:
+            let configured = ProcessInfo.processInfo.environment["VBoardStagingBaseURL"]
+                ?? "https://staging.chsinteract.com"
+            return URL(string: configured)!
+        }
+    }
+
+    var allowsTestUser: Bool { self != .production }
+}
+#endif
+
 @MainActor
 final class APIClient: ObservableObject {
     static let shared = APIClient()
     private let session: URLSession
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
-    private let baseURL: URL
+    private var baseURL: URL
     private let diagnostics: ((String) -> Void)?
     private let sourceAssetCache: SourceAssetCache
     private var credentials: AuthCredentials?
@@ -49,6 +81,9 @@ final class APIClient: ObservableObject {
     private(set) var accessTokenGeneration = 0
     private var sourceAssetTasks: [String: Task<Data, Error>] = [:]
     private(set) var hasInstalledCredentials = false
+    #if DEBUG
+    @Published private(set) var debugEnvironment: DebugAPIEnvironment
+    #endif
     var onCredentialsChanged: ((AuthCredentials?) -> Void)?
     var onAuthenticationExpired: (() -> Void)?
 
@@ -61,6 +96,15 @@ final class APIClient: ObservableObject {
             ?? Bundle.main.object(forInfoDictionaryKey: "VBoardAPIBaseURL") as? String
             ?? "https://chsinteract.com"
         self.baseURL = baseURL ?? URL(string: configured)!
+        #if DEBUG
+        if self.baseURL.host == "127.0.0.1" || self.baseURL.host == "localhost" {
+            self.debugEnvironment = .localDevelopment
+        } else if self.baseURL.host == URL(string: "https://chsinteract.com")?.host {
+            self.debugEnvironment = .production
+        } else {
+            self.debugEnvironment = .staging
+        }
+        #endif
         self.session = session
         self.decoder = JSONDecoder()
         self.encoder = JSONEncoder()
@@ -86,7 +130,16 @@ final class APIClient: ObservableObject {
     }
 
     #if DEBUG
+    func selectDebugEnvironment(_ environment: DebugAPIEnvironment) {
+        baseURL = environment.baseURL
+        debugEnvironment = environment
+        debugLog("DEBUG API ENVIRONMENT changed=\(environment.rawValue) baseURL=\(baseURL.absoluteString)")
+    }
+
     func debugAuthentication(testUser: String) async throws -> AuthEnvelope {
+        guard debugEnvironment.allowsTestUser else {
+            throw APIError.forbidden
+        }
         var request = try request(path: "/api/auth/debug", method: "POST")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["testUser": testUser])
         let (data, response) = try await data(for: request, authenticated: false,
@@ -324,8 +377,10 @@ final class APIClient: ObservableObject {
         let path = "/api/boards/\(payload.boardID)/study/explain"
         var request = try request(path: path, method: "POST")
         request.httpBody = try encoder.encode(payload)
+        let started = Date().timeIntervalSinceReferenceDate
         debugLog("STUDY REQUEST START url=\(request.url?.absoluteString ?? path) board=\(payload.boardID) action=\(payload.action) requestID=\(payload.requestId) canonicalIDs=\(payload.selectedObjectIds) localBBox=\(payload.selectionBBox)")
         let (data, response) = try await data(for: request)
+        debugLog("AI TIMELINE request=\(payload.requestId) stage=responseReceived status=\((response as? HTTPURLResponse)?.statusCode ?? -1) bytes=\(data.count) milliseconds=\((Date().timeIntervalSinceReferenceDate - started) * 1_000)")
         if let http = response as? HTTPURLResponse,
            !(200..<300).contains(http.statusCode) {
             debugStudyFailure(request: request, payload: payload,
@@ -347,7 +402,9 @@ final class APIClient: ObservableObject {
             payload["question"] = question
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let started = Date().timeIntervalSinceReferenceDate
         let (data, response) = try await data(for: request)
+        debugLog("AI TIMELINE request=\(payload["requestId"] ?? "unknown") stage=followUpResponse action=\(action) status=\((response as? HTTPURLResponse)?.statusCode ?? -1) bytes=\(data.count) milliseconds=\((Date().timeIntervalSinceReferenceDate - started) * 1_000)")
         try validate(response, data: data)
         do { return try decoder.decode(StudyInteractionResponse.self, from: data) }
         catch { throw APIError.decoding("Could not decode the study follow-up response.") }

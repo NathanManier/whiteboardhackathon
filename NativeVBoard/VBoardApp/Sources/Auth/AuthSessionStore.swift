@@ -248,7 +248,15 @@ final class AuthSessionStore: ObservableObject {
     }
 
     #if DEBUG
-    func signInAsSimulatorTestUser(_ name: String = "simulator") async {
+    func selectDebugEnvironment(_ environment: DebugAPIEnvironment) {
+        api.install(credentials: nil, reason: .logout)
+        keychain.clear()
+        LocalAccountNamespace.clear()
+        api.selectDebugEnvironment(environment)
+        state = .signedOut
+    }
+
+    func signInAsSimulatorTestUser(_ name: String = "simulator-nate") async {
         state = .authenticating
         do {
             let envelope = try await api.debugAuthentication(testUser: name)

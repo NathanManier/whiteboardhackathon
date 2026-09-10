@@ -3,6 +3,7 @@ import SwiftUI
 
 struct LoginView: View {
     @EnvironmentObject private var auth: AuthSessionStore
+    @EnvironmentObject private var api: APIClient
 
     var body: some View {
         VStack(spacing: 22) {
@@ -41,12 +42,38 @@ struct LoginView: View {
                     .multilineTextAlignment(.center)
             }
             #if DEBUG
-            if ProcessInfo.processInfo.environment["VBOARD_SHOW_DEBUG_LOGIN"] == "1" {
-                Button("Use Simulator Test Account") {
-                    Task { await auth.signInAsSimulatorTestUser() }
+            VStack(spacing: 12) {
+                Divider()
+                Text("Developer Testing")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Picker("API Environment", selection: Binding(
+                    get: { api.debugEnvironment },
+                    set: { auth.selectDebugEnvironment($0) }
+                )) {
+                    ForEach(DebugAPIEnvironment.allCases) { environment in
+                        Text(environment.title).tag(environment)
+                    }
                 }
-                .buttonStyle(.bordered)
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 520)
+                if api.debugEnvironment.allowsTestUser {
+                    Button("Continue as Test User") {
+                        Task { await auth.signInAsSimulatorTestUser() }
+                    }
+                    .buttonStyle(.bordered)
+                    Text(api.debugEnvironment == .localDevelopment
+                         ? "Requires Flask debug mode and AUTH_DEBUG_BYPASS=1 on this Mac."
+                         : "Requires debug authentication on the staging server.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Test accounts are unavailable on production.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
+            .padding(.top, 6)
             #endif
             Spacer()
             HStack(spacing: 20) {
