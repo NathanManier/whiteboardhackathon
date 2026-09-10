@@ -2046,42 +2046,95 @@ def run_downstream(
     )
 
 
+class CornerValidationError(ValueError):
+    """A client-actionable corner rejection with safe diagnostic context."""
+
+    def __init__(self, reason: str, message: str, **context: Any) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.context = context
+
+
 def validate_corners(value: Any, image: np.ndarray) -> np.ndarray:
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except json.JSONDecodeError as exc:
-            raise ValueError("Corners must be valid JSON.") from exc
+            raise CornerValidationError(
+                "invalid_json", "Corners must be valid JSON."
+            ) from exc
     if isinstance(value, list) and all(isinstance(point, dict) for point in value):
         try:
             value = [[point["x"], point["y"]] for point in value]
         except KeyError as exc:
-            raise ValueError("Each corner requires x and y coordinates.") from exc
-    points = np.asarray(value, dtype=np.float32)
-    if points.shape != (4, 2) or not np.isfinite(points).all():
-        raise ValueError("Exactly four finite [x, y] corner points are required.")
+            raise CornerValidationError(
+                "missing_coordinate", "Each corner requires x and y coordinates."
+            ) from exc
+    try:
+        points = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise CornerValidationError(
+            "invalid_shape", "Exactly four finite [x, y] corner points are required."
+        ) from exc
+    if points.shape != (4, 2):
+        count = len(value) if isinstance(value, list) else None
+        raise CornerValidationError(
+            "invalid_count", "Exactly four finite [x, y] corner points are required.",
+            count=count,
+        )
+    if not np.isfinite(points).all():
+        indices = np.argwhere(~np.isfinite(points))
+        first = indices[0].tolist() if len(indices) else [None, None]
+        raise CornerValidationError(
+            "non_finite", "Exactly four finite [x, y] corner points are required.",
+            index=first[0], coordinate=first[1],
+        )
     height, width = image.shape[:2]
-    if (
-        np.any(points[:, 0] < 0)
-        or np.any(points[:, 0] >= width)
-        or np.any(points[:, 1] < 0)
-        or np.any(points[:, 1] >= height)
-    ):
-        raise ValueError("Corner points must lie inside the original image.")
+    for index, point in enumerate(points):
+        x, y = float(point[0]), float(point[1])
+        if x < 0 or x >= width:
+            raise CornerValidationError(
+                "x_out_of_bounds", "Corner points must lie inside the original image.",
+                index=index, x=x, image_width=width,
+            )
+        if y < 0 or y >= height:
+            raise CornerValidationError(
+                "y_out_of_bounds", "Corner points must lie inside the original image.",
+                index=index, y=y, image_height=height,
+            )
     minimum_separation = max(2.0, min(width, height) * 0.005)
     for first in range(4):
         for second in range(first + 1, 4):
-            if float(np.linalg.norm(points[first] - points[second])) < minimum_separation:
-                raise ValueError("Each corner must be a distinct point.")
+            separation = float(np.linalg.norm(points[first] - points[second]))
+            if separation < minimum_separation:
+                raise CornerValidationError(
+                    "duplicate_points", "Each corner must be a distinct point.",
+                    first=first, second=second, separation=round(separation, 4),
+                    minimum_separation=round(minimum_separation, 4),
+                )
     ordered = order_corners(points)
     contour = ordered.astype(np.float32)
     if not cv2.isContourConvex(contour):
-        raise ValueError("The selected corners must form a valid quadrilateral.")
+        raise CornerValidationError(
+            "degenerate_quad", "The selected corners must form a valid quadrilateral."
+        )
     edges = np.roll(ordered, -1, axis=0) - ordered
-    if np.any(np.linalg.norm(edges, axis=1) < minimum_separation):
-        raise ValueError("The selected board edges are too short.")
-    if cv2.contourArea(contour) < width * height * 0.01:
-        raise ValueError("The selected board area is too small.")
+    edge_lengths = np.linalg.norm(edges, axis=1)
+    if np.any(edge_lengths < minimum_separation):
+        index = int(np.argmin(edge_lengths))
+        raise CornerValidationError(
+            "edge_too_short", "The selected board edges are too short.",
+            index=index, length=round(float(edge_lengths[index]), 4),
+            minimum_separation=round(minimum_separation, 4),
+        )
+    area = float(cv2.contourArea(contour))
+    minimum_area = width * height * 0.01
+    if area < minimum_area:
+        raise CornerValidationError(
+            "area_too_small", "The selected board area is too small.",
+            area=round(area, 4), minimum_area=round(minimum_area, 4),
+        )
     return ordered
 
 
@@ -3297,11 +3350,22 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
     raw_corners = payload.get("corners") if isinstance(payload, dict) else request.form.get("corners")
     try:
         corners = validate_corners(raw_corners, image)
-    except (ValueError, TypeError) as exc:
-        LOGGER.info("BOARD CORNERS FAILED board=%s status=400 reason=invalid", board_id)
+    except CornerValidationError as exc:
+        context = " ".join(f"{key}={value}" for key, value in sorted(exc.context.items()))
+        LOGGER.info(
+            "BOARD CORNERS FAILED board=%s status=400 reason=%s%s",
+            board_id,
+            exc.reason,
+            f" {context}" if context else "",
+        )
         if request.is_json:
-            return jsonify(error=str(exc)), 400
-        return str(exc), 400
+            return jsonify(
+                code="invalid_corners",
+                reason=exc.reason,
+                message=exc.message,
+                error=exc.message,
+            ), 400
+        return exc.message, 400
     metadata["confirmed_corners"] = corners.tolist()
     metadata["corners_confirmed_at"] = time.time()
     if isinstance(payload, dict) and isinstance(payload.get("normalized_corners"), list):

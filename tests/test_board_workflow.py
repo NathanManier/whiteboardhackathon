@@ -178,15 +178,42 @@ class BoardWorkflowTests(unittest.TestCase):
         with patch("app.detect_corners", return_value=(self.corners, 0.0)):
             board_id = self.upload().get_json()["id"]
         duplicate = [[20, 20], [20, 20], [299, 219], [20, 219]]
-        self.assertEqual(
-            self.client.post(f"/board/{board_id}/corners", json={"corners": duplicate}).status_code,
-            400,
+        duplicate_response = self.client.post(
+            f"/board/{board_id}/corners", json={"corners": duplicate}
         )
+        self.assertEqual(duplicate_response.status_code, 400)
+        self.assertEqual(duplicate_response.get_json()["code"], "invalid_corners")
+        self.assertEqual(duplicate_response.get_json()["reason"], "duplicate_points")
         outside = [[-1, 20], [299, 20], [299, 219], [20, 219]]
-        self.assertEqual(
-            self.client.post(f"/board/{board_id}/corners", json={"corners": outside}).status_code,
-            400,
+        outside_response = self.client.post(
+            f"/board/{board_id}/corners", json={"corners": outside}
         )
+        self.assertEqual(outside_response.status_code, 400)
+        self.assertEqual(outside_response.get_json()["reason"], "x_out_of_bounds")
+
+    def test_large_iphone_source_pixel_corners_validate_at_last_pixel(self):
+        image = np.lib.stride_tricks.as_strided(
+            np.zeros(1, dtype=np.uint8), shape=(3024, 4032, 3), strides=(0, 0, 0)
+        )
+        corners = [[0, 0], [4031, 0], [4031, 3023], [0, 3023]]
+        validated = board_app.validate_corners(corners, image)
+        np.testing.assert_allclose(validated, corners)
+
+    def test_corner_validator_reports_specific_failure_reasons(self):
+        image = np.zeros((100, 160, 3), dtype=np.uint8)
+        cases = [
+            ([[0, 0], [160, 0], [159, 99], [0, 99]], "x_out_of_bounds"),
+            ([[0, -1], [159, 0], [159, 99], [0, 99]], "y_out_of_bounds"),
+            ([[0, 0], [159, 0], [159, float("nan")], [0, 99]], "non_finite"),
+            ([[0, 0], [159, 0], [159, 99]], "invalid_count"),
+            ([[0, 0], [50, 0], [100, 0], [159, 0]], "degenerate_quad"),
+        ]
+        for corners, expected in cases:
+            with self.subTest(expected=expected), self.assertRaises(
+                board_app.CornerValidationError
+            ) as raised:
+                board_app.validate_corners(corners, image)
+            self.assertEqual(raised.exception.reason, expected)
 
     def test_add_board_to_lecture_preserves_order_and_opens_new_board(self):
         folder = self.client.post("/api/folders", json={"name": "Physics"}).get_json()["folder"]
