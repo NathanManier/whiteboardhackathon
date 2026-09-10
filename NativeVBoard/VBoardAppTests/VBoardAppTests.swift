@@ -238,6 +238,34 @@ final class StrokeSerializationTests: XCTestCase {
 }
 
 final class ServerContractDecodingTests: XCTestCase {
+    func testStudyFollowUpDecodesPracticeProblemsFromCanonicalServerShape() throws {
+        let response = try JSONDecoder().decode(StudyInteractionResponse.self, from: Data(#"""
+        {
+          "interaction": {
+            "id": "0123456789abcdef",
+            "title": "Limits",
+            "answer": "Start with the definition.",
+            "followUps": [{
+              "id": "fedcba9876543210",
+              "kind": "practice_problems",
+              "question": "Create practice",
+              "answer": "",
+              "problems": [
+                {"id": "p1", "problem": "Evaluate the first limit."},
+                {"id": "p2", "problem": "Evaluate the second limit."}
+              ]
+            }]
+          },
+          "problems": [
+            {"id": "p1", "problem": "Evaluate the first limit."},
+            {"id": "p2", "problem": "Evaluate the second limit."}
+          ]
+        }
+        """#.utf8))
+        XCTAssertEqual(response.interaction?.followUps?.last?.kind, "practice_problems")
+        XCTAssertEqual(response.problems?.map(\.id), ["p1", "p2"])
+    }
+
     func testEditorEnvelopeAndOmittedCollectionsUseServerDefaults() throws {
         let json = """
         {"editor":{"schema_version":4,"revision":7,"viewport":{"x":-20,"y":-10,"width":800,"height":600},"objects":[],"imported_transforms":null,"source_boards":null,"merged_board_ids":null}}

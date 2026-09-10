@@ -209,6 +209,15 @@ struct StudyInteraction: Codable, Sendable {
     let title: String?
     let answer: String?
     let id: String?
+    let followUps: [StudyFollowUp]?
+}
+
+struct StudyFollowUp: Codable, Identifiable, Sendable {
+    let id: String
+    let kind: String?
+    let question: String?
+    let answer: String?
+    let problems: [PracticeProblem]?
 }
 
 struct PracticeProblem: Codable, Identifiable, Sendable {

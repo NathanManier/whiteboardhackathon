@@ -179,6 +179,23 @@ final class APIClient: ObservableObject {
         catch { throw APIError.decoding("Could not decode the study response.") }
     }
 
+    func followUp(boardID: String, interactionID: String,
+                  action: String = "followup", question: String = "") async throws -> StudyInteractionResponse {
+        var request = try request(path: "/api/boards/\(boardID)/study/\(interactionID)/followup", method: "POST")
+        var payload: [String: Any] = [
+            "action": action,
+            "requestId": String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(16))
+        ]
+        if !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payload["question"] = question
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let (data, response) = try await data(for: request)
+        try validate(response, data: data)
+        do { return try decoder.decode(StudyInteractionResponse.self, from: data) }
+        catch { throw APIError.decoding("Could not decode the study follow-up response.") }
+    }
+
     func generateStudyGuide(folderID: String) async throws -> StudyGuide? {
         var request = try request(path: "/api/folders/\(folderID)/study-guide", method: "POST")
         request.httpBody = Data("{}".utf8)

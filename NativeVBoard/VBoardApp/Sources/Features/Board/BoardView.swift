@@ -178,8 +178,129 @@ struct StudyActionsView: View {
     @State private var loading = false
     @State private var result: StudyInteractionResponse?
     @State private var error: String?
-    var body: some View { NavigationStack { VStack(spacing: 18) { if loading { ProgressView("Reading the selected board…") } else if let result { Text(result.interaction?.title ?? (result.problems == nil ? "Board explanation" : "Practice Problems")).font(.title2.bold()); ScrollView { Text(result.interaction?.answer ?? result.problem ?? result.problems?.map(\.text).joined(separator: "\n\n") ?? "No study response was returned.").frame(maxWidth: 700, alignment: .leading).textSelection(.enabled) }; if let problems = result.problems, !problems.isEmpty { Label("Added to this board", systemImage: "rectangle.on.rectangle") .foregroundStyle(.secondary); Button("Add Again") { onPracticeProblems(problems, result.interaction?.id) }.buttonStyle(.bordered) }; HStack { Button("Explain Again") { explain() }.buttonStyle(.bordered); Button("Check My Work") { explain(action: "check_my_work") }.buttonStyle(.bordered) } } else { Image(systemName: "text.magnifyingglass").font(.largeTitle).foregroundStyle(.tint); Text("Study the selected ink").font(.title2.bold()); Text("Explain a selected concept, create two practice problems, or check a handwritten solution.").multilineTextAlignment(.center).foregroundStyle(.secondary); Button("Explain") { explain() }.buttonStyle(.borderedProminent); Button("Practice Problems") { explain(action: "practice_problems") }.buttonStyle(.bordered); Button("Check My Work") { explain(action: "check_my_work") }.buttonStyle(.bordered) }; if let error { Text(error).foregroundStyle(.red) } }.padding(28).navigationTitle("Study").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } } } }
-    private func explain(action: String = "explain") { loading = true; error = nil; Task { do { result = try await api.explain(boardID: boardID, action: action, selectedObjectIDs: selectedObjectIDs); if action == "practice_problems", let problems = result?.problems { onPracticeProblems(problems, result?.interaction?.id) }; loading = false } catch { loading = false; self.error = "AI is temporarily unavailable." } } }
+    @State private var followUpQuestion = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 18) {
+                if loading {
+                    ProgressView("Reading the selected board…")
+                } else if let result {
+                    Text(result.interaction?.title ?? (result.problems == nil ? "Board explanation" : "Practice Problems"))
+                        .font(.title2.bold())
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            Text(displayAnswer(result))
+                                .frame(maxWidth: 700, alignment: .leading)
+                                .textSelection(.enabled)
+                            if let problems = result.problems, !problems.isEmpty {
+                                ForEach(Array(problems.prefix(2))) { problem in
+                                    Text(problem.text)
+                                        .padding(14)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                                }
+                                Label("Added to this whiteboard", systemImage: "rectangle.on.rectangle")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    HStack {
+                        Button("Practice Problems") { followUp(action: "practice_problems") }
+                            .buttonStyle(.bordered)
+                        Button("Check My Work") { followUp(action: "check_my_work") }
+                            .buttonStyle(.bordered)
+                    }
+                    HStack {
+                        TextField("Ask a follow-up…", text: $followUpQuestion)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { followUp() }
+                        Button("Send") { followUp() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(followUpQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    .frame(maxWidth: 700)
+                } else {
+                    Image(systemName: "text.magnifyingglass").font(.largeTitle).foregroundStyle(.tint)
+                    Text("Study the selected ink").font(.title2.bold())
+                    Text("Explain a selected concept, create two practice problems, or check a handwritten solution.")
+                        .multilineTextAlignment(.center).foregroundStyle(.secondary)
+                    Button("Explain") { explain() }.buttonStyle(.borderedProminent)
+                    Button("Practice Problems") { beginWithFollowUp(action: "practice_problems") }.buttonStyle(.bordered)
+                    Button("Check My Work") { explain(action: "check_my_work") }.buttonStyle(.bordered)
+                }
+                if let error { Text(error).foregroundStyle(.red) }
+            }
+            .padding(28)
+            .navigationTitle("Study")
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+
+    private func displayAnswer(_ response: StudyInteractionResponse) -> String {
+        if let follow = response.interaction?.followUps?.last,
+           follow.kind != "practice_problems", let answer = follow.answer, !answer.isEmpty { return answer }
+        return response.interaction?.answer
+            ?? response.problem
+            ?? response.problems?.map(\.text).joined(separator: "\n\n")
+            ?? "No study response was returned."
+    }
+
+    private func explain(action: String = "explain") {
+        loading = true; error = nil
+        Task {
+            do {
+                result = try await api.explain(boardID: boardID, action: action,
+                                               selectedObjectIDs: selectedObjectIDs)
+                loading = false
+            } catch {
+                loading = false; self.error = "AI is temporarily unavailable."
+            }
+        }
+    }
+
+    private func beginWithFollowUp(action: String) {
+        loading = true; error = nil
+        Task {
+            do {
+                let initial = try await api.explain(boardID: boardID,
+                                                    selectedObjectIDs: selectedObjectIDs)
+                guard let interactionID = initial.interaction?.id else {
+                    throw APIError.decoding("The explanation did not include an interaction ID.")
+                }
+                let response = try await api.followUp(boardID: boardID,
+                                                      interactionID: interactionID, action: action)
+                apply(response)
+            } catch {
+                loading = false; self.error = "AI is temporarily unavailable."
+            }
+        }
+    }
+
+    private func followUp(action: String = "followup") {
+        guard let interactionID = result?.interaction?.id else { return }
+        let question = followUpQuestion
+        loading = true; error = nil
+        Task {
+            do {
+                let response = try await api.followUp(boardID: boardID,
+                                                      interactionID: interactionID,
+                                                      action: action, question: question)
+                followUpQuestion = ""
+                apply(response)
+            } catch {
+                loading = false; self.error = "AI is temporarily unavailable."
+            }
+        }
+    }
+
+    private func apply(_ response: StudyInteractionResponse) {
+        result = response
+        if let problems = response.problems, !problems.isEmpty {
+            onPracticeProblems(Array(problems.prefix(2)), response.interaction?.id)
+        }
+        loading = false
+    }
 }
 
 private struct ShareSheet: UIViewControllerRepresentable {
