@@ -114,6 +114,7 @@ class AccountAndOwnershipTests(unittest.TestCase):
         self.original_boards = board_app.BOARDS_DIR
         self.original_db = board_app.AUTH_DB
         self.original_verifier = board_app.APPLE_VERIFIER
+        self.original_rate_limits = dict(board_app.RATE_LIMIT_POLICIES)
         board_app.BOARDS_DIR = self.root / "boards"
         board_app.BOARDS_DIR.mkdir()
         board_app.AUTH_DB = AuthDatabase(f"sqlite:///{self.root / 'accounts.sqlite3'}")
@@ -125,6 +126,8 @@ class AccountAndOwnershipTests(unittest.TestCase):
         board_app.BOARDS_DIR = self.original_boards
         board_app.AUTH_DB = self.original_db
         board_app.APPLE_VERIFIER = self.original_verifier
+        board_app.RATE_LIMIT_POLICIES.clear()
+        board_app.RATE_LIMIT_POLICIES.update(self.original_rate_limits)
         board_app.app.config.update(AUTH_TEST_BYPASS=True)
         self.temp.cleanup()
 
@@ -180,6 +183,23 @@ class AccountAndOwnershipTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/auth/me", headers=self.headers(rotated)).status_code, 200)
         self.assertEqual(self.client.post("/api/auth/logout", headers=self.headers(rotated)).status_code, 200)
         self.assertEqual(self.client.get("/api/auth/me", headers=self.headers(rotated)).status_code, 401)
+
+    def test_login_rate_limit_returns_retry_metadata_without_echoing_credentials(self):
+        board_app.RATE_LIMIT_POLICIES["login"] = (2, 60)
+        payload = {
+            "identityToken": "private-invalid-token",
+            "authorizationCode": "private-code",
+            "nonce": "private-nonce",
+            "user": "rate-limited-apple-subject",
+        }
+        self.assertEqual(self.client.post("/api/auth/apple", json=payload).status_code, 401)
+        self.assertEqual(self.client.post("/api/auth/apple", json=payload).status_code, 401)
+        limited = self.client.post("/api/auth/apple", json=payload)
+        self.assertEqual(limited.status_code, 429, limited.get_data(as_text=True))
+        self.assertGreater(int(limited.headers["Retry-After"]), 0)
+        body = limited.get_data(as_text=True)
+        self.assertNotIn(payload["identityToken"], body)
+        self.assertNotIn(payload["authorizationCode"], body)
 
     def test_user_library_and_board_routes_are_isolated(self):
         account_a = self.login("apple-a")

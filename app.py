@@ -148,6 +148,41 @@ AUTH_DB = AuthDatabase(DATABASE_URL) if DATABASE_URL else AuthDatabase.local(BAS
 APPLE_VERIFIER: AppleTokenVerifier | None = None
 
 
+def _positive_environment_integer(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+RATE_LIMIT_POLICIES: dict[str, tuple[int, int]] = {
+    "login": (
+        _positive_environment_integer("RATE_LIMIT_LOGIN_COUNT", 12),
+        _positive_environment_integer("RATE_LIMIT_LOGIN_WINDOW", 300),
+    ),
+    "upload": (
+        _positive_environment_integer("RATE_LIMIT_UPLOAD_COUNT", 30),
+        _positive_environment_integer("RATE_LIMIT_UPLOAD_WINDOW", 3600),
+    ),
+    "explain": (
+        _positive_environment_integer("RATE_LIMIT_EXPLAIN_COUNT", 120),
+        _positive_environment_integer("RATE_LIMIT_EXPLAIN_WINDOW", 3600),
+    ),
+    "practice": (
+        _positive_environment_integer("RATE_LIMIT_PRACTICE_COUNT", 60),
+        _positive_environment_integer("RATE_LIMIT_PRACTICE_WINDOW", 3600),
+    ),
+    "check_work": (
+        _positive_environment_integer("RATE_LIMIT_CHECK_WORK_COUNT", 120),
+        _positive_environment_integer("RATE_LIMIT_CHECK_WORK_WINDOW", 3600),
+    ),
+    "study_guide": (
+        _positive_environment_integer("RATE_LIMIT_STUDY_GUIDE_COUNT", 30),
+        _positive_environment_integer("RATE_LIMIT_STUDY_GUIDE_WINDOW", 3600),
+    ),
+}
+
+
 def _auth_test_bypass_enabled() -> bool:
     return bool(app.config.get("TESTING")) and bool(app.config.get("AUTH_TEST_BYPASS", True))
 
@@ -197,6 +232,53 @@ def current_user() -> AuthUser:
     if user is None:
         abort(401)
     return user
+
+
+def enforce_rate_limit(action: str, *, unauthenticated_hint: str | None = None) -> Response | None:
+    limit, window_seconds = RATE_LIMIT_POLICIES[action]
+    user = authenticated_user()
+    if user is not None:
+        subjects = [f"user:{user.id}"]
+        safe_user_id = user.id
+    else:
+        # Login is necessarily pre-authentication. Enforce both an origin
+        # bucket and, when available, a claimed-identity bucket. Only hashes
+        # reach persistent storage.
+        network_origin = str(request.remote_addr or "unknown")
+        subjects = [f"login-origin:{network_origin}"]
+        if unauthenticated_hint:
+            subjects.append(f"login-identity:{unauthenticated_hint}")
+        safe_user_id = "anonymous"
+    retry_after = 0
+    for subject in subjects:
+        decision = AUTH_DB.consume_rate_limit(
+            subject=subject,
+            action=action,
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+        if not decision.allowed:
+            retry_after = max(retry_after, decision.retry_after)
+    if retry_after == 0:
+        return None
+    LOGGER.warning("RATE LIMIT action=%s user=%s", action, safe_user_id)
+    response = jsonify(
+        error="Too many requests. Please wait a moment and try again.",
+        code="rate_limited",
+        retryAfterSeconds=retry_after,
+    )
+    response.status_code = 429
+    response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
+def study_rate_limit_action(action: str) -> str:
+    normalized = action.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"practice", "practice_problem", "practice_problems", "problems"}:
+        return "practice"
+    if normalized in {"check", "check_work", "check_my_work", "grade"}:
+        return "check_work"
+    return "explain"
 
 
 def require_board_owner(board_id: str) -> None:
@@ -2644,6 +2726,10 @@ def authenticate_with_apple() -> Response | tuple[Response, int]:
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify(error="A JSON request body is required."), 415
+    if limited := enforce_rate_limit(
+        "login", unauthenticated_hint=str(payload.get("user") or "").strip() or None
+    ):
+        return limited
     try:
         given = str(payload.get("givenName") or "").strip()
         family = str(payload.get("familyName") or "").strip()
@@ -2778,6 +2864,8 @@ def terms() -> str:
 @app.post("/upload")
 @require_authenticated
 def upload() -> Response | tuple[str, int]:
+    if limited := enforce_rate_limit("upload"):
+        return limited
     upload_started = time.perf_counter()
     LOGGER.info(
         "UPLOAD START content_length=%s content_type=%s",
@@ -2994,6 +3082,8 @@ def upload() -> Response | tuple[str, int]:
 @require_authenticated
 def import_pdf() -> Response | tuple[Response, int]:
     """Import a supported PDF without routing it through the photo CV pipeline."""
+    if limited := enforce_rate_limit("upload"):
+        return limited
     started = time.perf_counter()
     uploaded = request.files.get("pdf")
     if uploaded is None or not uploaded.filename:
@@ -3633,6 +3723,8 @@ def analyze_lecture_route(folder_id: str) -> Response | tuple[Response, int]:
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
     require_lecture_owner(folder_id)
+    if limited := enforce_rate_limit("explain"):
+        return limited
     from study.ai import StudyAIError
     from study.service import ensure_lecture_ai_context
 
@@ -3673,6 +3765,8 @@ def generate_study_guide_route(folder_id: str) -> Response | tuple[Response, int
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
     require_lecture_owner(folder_id)
+    if limited := enforce_rate_limit("study_guide"):
+        return limited
     from study.ai import StudyAIError
     from study.service import generate_lecture_study_guide
 
@@ -3868,6 +3962,8 @@ def analyze_board_context_route(board_id: str) -> Response | tuple[Response, int
     from study.storage import public_board_context
 
     require_board_owner(board_id)
+    if limited := enforce_rate_limit("explain"):
+        return limited
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     library = read_library()
@@ -3912,6 +4008,8 @@ def explain_lecture_selection_route(folder_id: str) -> Response | tuple[Response
     if not FOLDER_ID_RE.fullmatch(folder_id):
         abort(404)
     require_lecture_owner(folder_id)
+    if limited := enforce_rate_limit("explain"):
+        return limited
     from study.ai import StudyAIError
     from study.service import explain_lecture_selection
 
@@ -3972,12 +4070,14 @@ def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify(error="A JSON request body is required."), 415
+    action = str(payload.get("action") or payload.get("kind") or "explain")
+    if limited := enforce_rate_limit(study_rate_limit_action(action)):
+        return limited
     library = read_library()
     catalog = library["boards"].get(board_id)
     folder_id = catalog.get("folder_id") if isinstance(catalog, dict) else metadata.get("folder_id")
     try:
         selected_ids = payload.get("selectedObjectIds") or payload.get("selected_object_ids") or []
-        action = str(payload.get("action") or payload.get("kind") or "explain")
         route_context = ai_context(
             action=action,
             question=str(payload.get("question") or action.replace("_", " ")),
@@ -4029,6 +4129,8 @@ def follow_up_route(board_id: str, interaction_id: str) -> Response | tuple[Resp
     if not isinstance(payload, dict):
         return jsonify(error="A JSON request body is required."), 415
     action = str(payload.get("action") or payload.get("kind") or "").strip().lower()
+    if limited := enforce_rate_limit(study_rate_limit_action(action)):
+        return limited
     practice = action in {"practice_problems", "practice_problem", "problems"}
     request_id = str(payload.get("requestId") or interaction_id)
     if not re.fullmatch(r"[0-9a-f]{16}", request_id):

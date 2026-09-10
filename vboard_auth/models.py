@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from sqlalchemy import Boolean, Float, ForeignKey, Index, String, Text, create_engine, event, select
+from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, create_engine, delete, event, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -105,6 +106,22 @@ class WorkspaceRecord(Base):
     updated_at: Mapped[float] = mapped_column(Float, nullable=False, default=_now)
 
 
+class RateLimitBucketRecord(Base):
+    __tablename__ = "rate_limit_buckets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    subject_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    window_started_at: Mapped[float] = mapped_column(Float, nullable=False)
+    window_ends_at: Mapped[float] = mapped_column(Float, nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("ix_rate_limit_subject_action", "subject_hash", "action"),
+        Index("ix_rate_limit_expiry", "window_ends_at"),
+    )
+
+
 @dataclass(frozen=True)
 class AuthUser:
     id: str
@@ -131,6 +148,13 @@ class SessionTokens:
             "accessExpiresAt": self.access_expires_at,
             "refreshExpiresAt": self.refresh_expires_at,
         }
+
+
+@dataclass(frozen=True)
+class RateLimitDecision:
+    allowed: bool
+    retry_after: int
+    remaining: int
 
 
 class AuthDatabase:
@@ -266,6 +290,72 @@ class AuthDatabase:
                 return False
             session.revoked_at = _now()
             return True
+
+    def consume_rate_limit(
+        self,
+        *,
+        subject: str,
+        action: str,
+        limit: int,
+        window_seconds: int,
+        now: float | None = None,
+    ) -> RateLimitDecision:
+        """Consume one fixed-window allowance without persisting the raw subject.
+
+        PostgreSQL-compatible row locking keeps an existing bucket atomic. A
+        concurrent first insert may race, so the transaction is retried after
+        the unique-key winner commits. SQLite serializes the write transaction.
+        """
+        timestamp = _now() if now is None else now
+        limit = max(1, int(limit))
+        window_seconds = max(1, int(window_seconds))
+        window_started_at = float(int(timestamp // window_seconds) * window_seconds)
+        window_ends_at = window_started_at + window_seconds
+        subject_hash = _digest(subject)
+        bucket_id = _digest(f"{subject_hash}:{action}:{int(window_started_at)}")
+
+        for attempt in range(2):
+            try:
+                with self.sessions.begin() as db:
+                    # Bound storage growth for active subjects without logging or
+                    # storing the Apple identifier, IP address, or session token.
+                    db.execute(delete(RateLimitBucketRecord).where(
+                        RateLimitBucketRecord.subject_hash == subject_hash,
+                        RateLimitBucketRecord.action == action,
+                        RateLimitBucketRecord.window_ends_at <= window_started_at,
+                    ))
+                    record = db.scalar(
+                        select(RateLimitBucketRecord)
+                        .where(RateLimitBucketRecord.id == bucket_id)
+                        .with_for_update()
+                    )
+                    if record is None:
+                        record = RateLimitBucketRecord(
+                            id=bucket_id,
+                            subject_hash=subject_hash,
+                            action=action[:64],
+                            window_started_at=window_started_at,
+                            window_ends_at=window_ends_at,
+                            count=0,
+                        )
+                        db.add(record)
+                        db.flush()
+                    if record.count >= limit:
+                        return RateLimitDecision(
+                            allowed=False,
+                            retry_after=max(1, int(window_ends_at - timestamp + 0.999)),
+                            remaining=0,
+                        )
+                    record.count += 1
+                    return RateLimitDecision(
+                        allowed=True,
+                        retry_after=0,
+                        remaining=max(0, limit - record.count),
+                    )
+            except IntegrityError:
+                if attempt:
+                    raise
+        raise RuntimeError("Could not update the rate-limit bucket.")
 
     def user_by_id(self, user_id: str) -> AuthUser | None:
         with self.sessions() as db:
