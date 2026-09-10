@@ -7,7 +7,7 @@ private enum LectureInteraction {
     case drawing(boardID: String, strokeID: String)
     case lassoing
     case erasing(boardID: String?, erased: Set<SelectionKey>)
-    case movingSelection(startWorld: CGPoint)
+    case movingSelection(startWorld: CGPoint, clickSelection: Set<SelectionKey>?)
     case resizingText(key: SelectionKey, startWorld: CGPoint, startBounds: CGRect)
     case movingBoard(boardID: String, startWorld: CGPoint)
 }
@@ -138,6 +138,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         interactionLayer.lineWidth = 2
         interactionLayer.lineDashPattern = [8, 5]
         interactionLayer.isHidden = true
+        WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
         worldContainer.layer.addSublayer(interactionLayer)
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(twoFingerPan(_:)))
@@ -173,8 +174,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         super.layoutSubviews()
         worldContainer.bounds = CGRect(origin: .zero, size: bounds.size)
         worldContainer.layer.position = .zero
-        interactionLayer.bounds = worldContainer.bounds
-        interactionLayer.position = .zero
+        WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
         applyCamera(interacting: false)
         refineRepresentations()
     }
@@ -445,7 +445,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if activeTool == .lasso,
            let bounds = selectionWorldBounds(),
            bounds.insetBy(dx: -10, dy: -10).contains(world) {
-            interaction = .movingSelection(startWorld: world)
+            interaction = .movingSelection(startWorld: world, clickSelection: nil)
             return
         }
         if activeTool == .lasso {
@@ -468,11 +468,23 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         if activeTool == .select {
             let hit = hitTest(world)
-            if selectedKeys.isEmpty || hit.isDisjoint(with: selectedKeys) { selectedKeys = hit }
+            let clickedInsideExistingSelection = !hit.isEmpty && !hit.isDisjoint(with: selectedKeys)
+            if !clickedInsideExistingSelection { selectedKeys = hit }
             callbacks.onSelectionChanged(selectedKeys)
             updateSelectionOverlay()
+            #if DEBUG
+            let hitLabels = hit.map { "\($0.kind.rawValue):\($0.objectID)" }.sorted()
+            let selectedLabels = selectedKeys.map { "\($0.kind.rawValue):\($0.objectID)" }.sorted()
+            print("[VBoard] LECTURE SELECT HIT hit=\(hitLabels) selected=\(selectedLabels) preservesGroupForDrag=\(clickedInsideExistingSelection)")
+            #endif
             if !selectedKeys.isEmpty {
-                interaction = .movingSelection(startWorld: world)
+                // Preserve a multi-selection long enough to support dragging
+                // it as a group. If the pointer is released without a drag,
+                // touchesEnded collapses to the single topmost click hit.
+                interaction = .movingSelection(
+                    startWorld: world,
+                    clickSelection: clickedInsideExistingSelection ? hit : nil
+                )
                 if let boardID = selectedKeys.first?.boardID { callbacks.onActiveBoardChanged(boardID) }
             }
             return
@@ -528,7 +540,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         case .erasing:
             erase(from: lastEraseWorld ?? world, to: world)
             lastEraseWorld = world
-        case .movingSelection(let startWorld):
+        case .movingSelection(let startWorld, _):
             movePreviewDelta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
             previewSelectionMove(movePreviewDelta)
         case .resizingText(let key, let startWorld, let startBounds):
@@ -595,10 +607,16 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 callbacks.onSelectionChanged(selectedKeys)
             }
             lastEraseWorld = nil
-        case .movingSelection(let startWorld):
+        case .movingSelection(let startWorld, let clickSelection):
             let delta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
             clearSelectionMovePreview()
-            if delta != .zero { callbacks.onMoveSelection(selectedKeys, delta) }
+            let screenDistance = hypot(delta.x, delta.y) * worldTransform.scale
+            if screenDistance >= 3 {
+                callbacks.onMoveSelection(selectedKeys, delta)
+            } else if let clickSelection {
+                selectedKeys = clickSelection
+                callbacks.onSelectionChanged(clickSelection)
+            }
         case .resizingText(let key, let startWorld, let startBounds):
             let size = CGSize(width: max(120, startBounds.width + world.x - startWorld.x),
                               height: max(80, startBounds.height + world.y - startWorld.y))
@@ -719,6 +737,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     private func updateInteractionOverlay() {
         guard !lassoPoints.isEmpty else { updateSelectionOverlay(); return }
+        configureInteractionStrokeForCurrentZoom()
         let path = UIBezierPath()
         for (index, point) in lassoPoints.enumerated() {
             index == 0 ? path.move(to: point) : path.addLine(to: point)
@@ -734,8 +753,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
             interactionLayer.path = nil
             return
         }
+        configureInteractionStrokeForCurrentZoom()
         if case .movingSelection = interaction { union = union.offsetBy(dx: movePreviewDelta.x, dy: movePreviewDelta.y) }
-        let path = UIBezierPath(rect: union.insetBy(dx: -10, dy: -10))
+        let screenSpaceInset = 10 / max(worldTransform.scale, 0.001)
+        let path = UIBezierPath(rect: union.insetBy(dx: -screenSpaceInset,
+                                                    dy: -screenSpaceInset))
         if resizableTextSelection() != nil {
             let radius = max(5, 11 / max(worldTransform.scale, 0.001))
             path.append(UIBezierPath(ovalIn: CGRect(x: union.maxX - radius,
@@ -745,6 +767,17 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         interactionLayer.path = path.cgPath
         interactionLayer.isHidden = false
+    }
+
+    /// The overlay lives in world space with the board layers, but its chrome
+    /// should remain legible at every camera zoom. Compensating only the
+    /// stroke presentation keeps the canonical lasso/selection geometry in
+    /// world coordinates while maintaining a stable two-point outline.
+    private func configureInteractionStrokeForCurrentZoom() {
+        let inverseScale = 1 / max(worldTransform.scale, 0.001)
+        interactionLayer.lineWidth = 2 * inverseScale
+        interactionLayer.lineDashPattern = [NSNumber(value: 8 * inverseScale),
+                                            NSNumber(value: 5 * inverseScale)]
     }
 
     private func resizableTextSelection() -> (key: SelectionKey, bounds: CGRect)? {
@@ -768,7 +801,12 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         for (boardID, keys) in grouped {
             guard let item = workspace.items.first(where: { $0.boardID == boardID }),
                   let local = boardViews[boardID]?.selectionBounds(keys: Set(keys)) else { continue }
-            union = union.union(LectureCoordinateTransform.boardLocalToLectureWorld(local, board: item))
+            let world = LectureCoordinateTransform.boardLocalToLectureWorld(local, board: item)
+            #if DEBUG
+            let labels = keys.map { "\($0.kind.rawValue):\($0.objectID)" }.sorted()
+            print("[VBoard] LECTURE SELECTION BOUNDS board=\(boardID) keys=\(labels) local=\(local) placement=(\(item.canvasX),\(item.canvasY)) world=\(world)")
+            #endif
+            union = union.union(world)
         }
         return union.isNull ? nil : union
     }
@@ -948,15 +986,25 @@ private final class LectureBoardRenderView: UIView {
 
     func hitTestKeys(at point: CGPoint) -> Set<SelectionKey> {
         guard let item, let scene else { return [] }
-        var result = Set(scene.editor.objects.compactMap { object -> SelectionKey? in
-            objectBounds(object).insetBy(dx: -12, dy: -12).contains(point)
-                ? SelectionKey(boardID: item.boardID, objectID: object.id, kind: .editorObject)
-                : nil
-        })
-        if let id = professor.hitTest(point) {
-            result.insert(SelectionKey(boardID: item.boardID, objectID: id, kind: .professorPath))
+        // User-created objects are the topmost editable layer. Returning the
+        // professor path underneath a user stroke as well made a single click
+        // look as if the old professor selection chrome had remained active,
+        // and a subsequent move mutated two different logical objects.
+        if let objectID = BoardHitTestPolicy.topmostEditorObjectID(
+            at: point,
+            objects: scene.editor.objects,
+            tolerance: 12
+        ) {
+            return [SelectionKey(boardID: item.boardID,
+                                 objectID: objectID,
+                                 kind: .editorObject)]
         }
-        return result
+        if let id = professor.hitTest(point) {
+            return [SelectionKey(boardID: item.boardID,
+                                 objectID: id,
+                                 kind: .professorPath)]
+        }
+        return []
     }
 
     func selectionKeys(containedBy polygon: [CGPoint]) -> Set<SelectionKey> {
@@ -1072,16 +1120,12 @@ private final class LectureBoardRenderView: UIView {
         objectLayers.removeAll(keepingCapacity: true)
         for object in SceneComposition.canonicalEditorObjects(objects) {
             let layer: CALayer
-            if object.type == "text", let text = object.text ?? object.sourceMarkdown {
-                let textLayer = CATextLayer()
-                textLayer.string = text
-                textLayer.fontSize = object.fontSize ?? 28
-                textLayer.foregroundColor = UIColor(svgHex: object.color ?? "#183153").cgColor
-                textLayer.isWrapped = true
-                textLayer.alignmentMode = .left
-                textLayer.contentsScale = window?.screen.scale ?? UIScreen.main.scale
-                textLayer.frame = objectBounds(object)
-                layer = textLayer
+            if object.type == "text", object.text != nil || object.sourceMarkdown != nil {
+                layer = CompactStudyPresentation.layer(
+                    for: object,
+                    frame: objectBounds(object),
+                    contentsScale: window?.screen.scale ?? UIScreen.main.scale
+                )
             } else {
                 let shape = CAShapeLayer()
                 let path = UIBezierPath()
@@ -1105,18 +1149,7 @@ private final class LectureBoardRenderView: UIView {
     }
 
     private func objectBounds(_ object: CanvasObject) -> CGRect {
-        let translation = object.translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
-        if let x = object.x, let y = object.y {
-            return CGRect(x: x + translation.x, y: y + translation.y,
-                          width: object.width ?? 400, height: object.height ?? 100)
-        }
-        let points = object.points ?? []
-        guard let first = points.first else { return .null }
-        return points.dropFirst().reduce(
-            CGRect(x: first.x + translation.x, y: first.y + translation.y, width: 0, height: 0)
-        ) { partial, point in
-            partial.union(CGRect(x: point.x + translation.x, y: point.y + translation.y, width: 0, height: 0))
-        }
+        BoardHitTestPolicy.bounds(of: object)
     }
 
     private func objectSamples(_ object: CanvasObject) -> [CGPoint] {

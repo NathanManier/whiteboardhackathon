@@ -215,7 +215,10 @@
   }
 
   function normalizeChemistryText(value) {
-    const text = String(value ?? "");
+    const text = String(value ?? "").replace(
+      /(^|\n)([ \t]*(?:-{3,}|_{3,}|\*{3,}))(#{1,6}[ \t]+)/g,
+      "$1$2\n\n$3"
+    );
     let output = "";
     let cursor = 0;
     CHEMISTRY_CANDIDATE.lastIndex = 0;
@@ -237,6 +240,18 @@
       cursor = end;
     }
     return output + normalizeBareChemistryCommands(text.slice(cursor));
+  }
+
+  /*
+   * Some historical/model-generated answers wrapped mhchem commands in math
+   * delimiters but omitted only the leading backslash: `$ce{H2O}$`. Repair
+   * that narrow transport/presentation defect while building display markup.
+   * The canonical Markdown held by the caller is never mutated.
+   */
+  function normalizeDelimitedChemistryCommand(value) {
+    const source = String(value ?? "");
+    const match = source.match(/^(\s*)(ce|pu)(\{[\s\S]*\})(\s*)$/);
+    return match ? `${match[1]}\\${match[2]}${match[3]}${match[4]}` : source;
   }
 
   /*
@@ -305,7 +320,11 @@
         if (end >= 0) {
           flush();
           const closeLength = open === "$" ? 1 : 2;
-          output += text.slice(index, end + closeLength);
+          const bodyStart = index + 2;
+          const contentStart = open === "$" ? index + 1 : bodyStart;
+          const body = text.slice(contentStart, end);
+          output += open + normalizeDelimitedChemistryCommand(body) +
+            (open === "$" ? "$" : open === "$$" ? "$$" : open === "\\(" ? "\\)" : "\\]");
           index = end + closeLength;
           continue;
         }

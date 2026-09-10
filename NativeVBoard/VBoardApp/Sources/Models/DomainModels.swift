@@ -194,9 +194,17 @@ struct LectureResponse: Codable, Sendable {
 }
 
 struct StudyGuide: Codable, Sendable {
+    let id: String?
     let title: String?
     let content: String?
+    let version: Int?
     let stale: Bool?
+    let sourceBoardIDs: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, content, version, stale
+        case sourceBoardIDs = "source_board_ids"
+    }
 }
 
 struct StudyInteractionResponse: Codable, Sendable {

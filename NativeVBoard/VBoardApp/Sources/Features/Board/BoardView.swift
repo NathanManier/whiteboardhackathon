@@ -34,6 +34,15 @@ struct BoardView: View {
             let source = try await api.professorSVG(id: board.id)
             debug("BOARD OPEN SVG RESPONSE SUCCEEDED id=\(board.id) chars=\(source.utf8.count)")
             let document = try SVGDocument.parse(source)
+            let definitions = document.paths.map(\.d)
+            let warmup = Task.detached(priority: .userInitiated) {
+                await SVGPathParser.prewarm(definitions)
+            }
+            await withTaskCancellationHandler(operation: {
+                await warmup.value
+            }, onCancel: {
+                warmup.cancel()
+            })
             debug("BOARD OPEN SVG PARSE SUCCEEDED id=\(board.id) paths=\(document.paths.count)")
             let composition = SceneComposition.build(boardID: board.id, document: document, editor: editor)
             let uniqueIDs = Set(composition.nodes.map(\.logicalID)).count

@@ -137,6 +137,17 @@ assert(ctx.normalizeChemistryMarkdown("x2 + y2") === "x2 + y2",
   "ordinary undelimited math was mistaken for chemistry");
 assert(ctx.normalizeChemistryMarkdown("$H_2O$") === "$H_2O$",
   "explicit chemistry LaTeX was rewritten");
+assert(ctx.normalizeChemistryMarkdown("Fluorine ($ce{F}$) and water ($ce{H2O}$).") ===
+  "Fluorine ($\\ce{F}$) and water ($\\ce{H2O}$).",
+  "a delimited mhchem command missing only its backslash was not repaired for display");
+assert(render("Fluorine ($ce{F}$) and water ($ce{H2O}$).")
+  .match(/class="katex/g)?.length >= 2,
+  "repaired delimited mhchem commands did not render through KaTeX");
+const repairedBoundary = ctx.normalizeChemistryMarkdown("Overview\n---### Connection Across the Lecture");
+assert(repairedBoundary === "Overview\n---\n\n### Connection Across the Lecture",
+  "a horizontal rule joined to a heading was not repaired for display");
+assert(render("Overview\n---### Connection Across the Lecture").includes("<h3>Connection Across the Lecture</h3>"),
+  "a repaired Markdown heading did not render structurally");
 assert(ctx.normalizeChemistryMarkdown("`H2O`") === "`H2O`",
   "inline code was rewritten as chemistry");
 assert(ctx.normalizeChemistryMarkdown("```text\nH2O\n```") === "```text\nH2O\n```",

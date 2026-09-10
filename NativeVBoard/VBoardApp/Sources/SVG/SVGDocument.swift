@@ -51,14 +51,23 @@ extension UIColor {
 enum SVGPathParser {
     private static var cache: [String: CGPath] = [:]
     private static var cacheOrder: [String] = []
+    private static var nextEvictionIndex = 0
     private static let lock = NSLock()
-    private static let cacheLimit = 4096
+    // Large real boards can contain just under 5,000 conservative contours.
+    // Keep one such board plus its immediate lightweight neighbours warm while
+    // remaining explicitly bounded.
+    private static let cacheLimit = 8192
+
+    static func prewarm(_ definitions: [String]) async {
+        for definition in definitions {
+            guard !Task.isCancelled else { return }
+            _ = try? cachedPath(from: definition)
+        }
+    }
 
     static func cachedPath(from d: String, hits: () -> Void = {}, misses: () -> Void = {}) throws -> CGPath {
         lock.lock()
         if let cached = cache[d] {
-            cacheOrder.removeAll { $0 == d }
-            cacheOrder.append(d)
             lock.unlock()
             hits()
             return cached
@@ -67,14 +76,24 @@ enum SVGPathParser {
         let parsed = try path(from: d)
         lock.lock()
         // Another thread may have won the race; either instance is equivalent.
-        let value = cache[d] ?? parsed
-        cache[d] = value
-        cacheOrder.removeAll { $0 == d }
-        cacheOrder.append(d)
-        if cacheOrder.count > cacheLimit, let evicted = cacheOrder.first {
-            cacheOrder.removeFirst()
-            cache.removeValue(forKey: evicted)
+        if let existing = cache[d] {
+            lock.unlock()
+            hits()
+            return existing
         }
+        let value = parsed
+        // A fixed-size FIFO ring keeps lookups and insertions O(1). The old
+        // LRU bookkeeping scanned up to 4,096 long SVG strings on every hit,
+        // turning dense board promotion into an avoidable quadratic stall.
+        if cacheOrder.count < cacheLimit {
+            cacheOrder.append(d)
+        } else {
+            let evicted = cacheOrder[nextEvictionIndex]
+            cache.removeValue(forKey: evicted)
+            cacheOrder[nextEvictionIndex] = d
+            nextEvictionIndex = (nextEvictionIndex + 1) % cacheLimit
+        }
+        cache[d] = value
         lock.unlock()
         misses()
         return value
@@ -110,12 +129,13 @@ enum SVGPathParser {
 
 private enum SVGToken { case command(Character), number(CGFloat); var isNumber: Bool { if case .number = self { return true }; return false } }
 private struct Tokenizer {
+    private static let expression = try! NSRegularExpression(
+        pattern: "[MmLlHhVvCcQqZz]|[-+]?(?:[0-9]*\\.[0-9]+|[0-9]+\\.?)(?:[eE][-+]?[0-9]+)?"
+    )
     let tokens: [SVGToken]
     init(_ input: String) {
-        let pattern = "[MmLlHhVvCcQqZz]|[-+]?(?:[0-9]*\\.[0-9]+|[0-9]+\\.?)(?:[eE][-+]?[0-9]+)?"
         let range = NSRange(input.startIndex..., in: input)
-        let regex = try! NSRegularExpression(pattern: pattern)
-        tokens = regex.matches(in: input, range: range).compactMap { match in
+        tokens = Self.expression.matches(in: input, range: range).compactMap { match in
             let value = String(input[Range(match.range, in: input)!])
             if value.count == 1, let character = value.first, character.isLetter { return .command(character) }
             return Double(value).map { .number(CGFloat($0)) }

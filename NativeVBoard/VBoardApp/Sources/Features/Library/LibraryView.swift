@@ -170,9 +170,36 @@ struct StudyGuideView: View {
     @State private var error: String?
     var body: some View {
         NavigationStack {
-            Group { if let current { ScrollView { StudyContentView(source: current.content ?? "No guide content yet.").padding(24) } } else if loading { ProgressView("Preparing your study guide…") } else { ContentUnavailableView("No study guide yet", systemImage: "text.book.closed", description: Text("Generate a concise guide from this lecture’s whiteboards.")) } }
+            Group {
+                if let current {
+                    VStack(spacing: 0) {
+                        if let error {
+                            Label(error, systemImage: "exclamationmark.triangle.fill")
+                                .font(.subheadline)
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 10)
+                                .frame(maxWidth: .infinity)
+                                .background(.orange.opacity(0.10))
+                        }
+                        ScrollView { StudyContentView(source: current.content ?? "No guide content yet.").padding(24) }
+                    }
+                } else if loading {
+                    ProgressView("Preparing your study guide…")
+                } else if let error {
+                    ContentUnavailableView {
+                        Label("Couldn’t create study guide", systemImage: "text.book.closed.fill")
+                    } description: {
+                        Text(error)
+                    } actions: {
+                        Button("Try Again") { generate() }.buttonStyle(.borderedProminent)
+                    }
+                } else {
+                    ContentUnavailableView("No study guide yet", systemImage: "text.book.closed", description: Text("Generate a concise guide from this lecture’s whiteboards."))
+                }
+            }
                 .navigationTitle("Study Guide")
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }; ToolbarItem(placement: .primaryAction) { Button(guide == nil ? "Generate" : "Regenerate") { generate() }.disabled(loading) } }
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }; ToolbarItem(placement: .primaryAction) { Button(current == nil ? "Generate" : "Regenerate") { generate() }.disabled(loading) } }
         }.onAppear { current = guide }
     }
     private func generate() { loading = true; error = nil; Task { do { current = try await api.generateStudyGuide(folderID: folderID); loading = false } catch { loading = false; self.error = "Study Guide is temporarily unavailable." } } }

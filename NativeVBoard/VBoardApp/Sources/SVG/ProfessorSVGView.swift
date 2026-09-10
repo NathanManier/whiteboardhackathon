@@ -143,7 +143,13 @@ final class ProfessorSVGView: UIView {
         let start = CACurrentMediaTime()
         var cacheHits = 0
         var cacheMisses = 0
+        let provenanceBySourceID = Dictionary(uniqueKeysWithValues: (composition?.nodes ?? [])
+            .filter { $0.sourceKind == .professorSVG || $0.sourceKind == .importedTransform }
+            .map { ($0.sourceID, $0) })
         #endif
+        let displayScale = window?.screen.scale ?? UIScreen.main.scale
+        var shapeLayers: [CAShapeLayer] = []
+        shapeLayers.reserveCapacity(document.paths.count)
         for item in SceneComposition.canonicalProfessorPaths(document.paths) {
             guard let id = item.id, importedTransforms[id]?.deleted != true else { continue }
             do {
@@ -167,10 +173,12 @@ final class ProfessorSVGView: UIView {
                 shape.path = path
                 shape.fillColor = item.fill.cgColor
                 shape.fillRule = item.fillRule
-                shape.contentsScale = window?.screen.scale ?? UIScreen.main.scale
+                shape.contentsScale = displayScale
                 shape.isHidden = true
-                applyProvenance(id: id, to: shape)
-                contentLayer.addSublayer(shape)
+                #if DEBUG
+                applyProvenance(provenanceBySourceID[id], to: shape)
+                #endif
+                shapeLayers.append(shape)
                 entries[id] = Entry(bounds: path.boundingBoxOfPath, layer: shape)
                 index.insert(id: id, bounds: path.boundingBoxOfPath)
             } catch {
@@ -179,6 +187,11 @@ final class ProfessorSVGView: UIView {
                 #endif
             }
         }
+        // Commit the layer tree once. Repeated `addSublayer` calls make Core
+        // Animation perform thousands of incremental tree mutations on dense
+        // boards even though none of the layers can be visible until rebuild
+        // is complete.
+        contentLayer.sublayers = shapeLayers
         #if DEBUG
         var stats = RenderStats(state: "idle", indexedObjects: entries.count,
                                 newPathsCreated: entries.count, cacheHits: cacheHits,
@@ -212,9 +225,9 @@ final class ProfessorSVGView: UIView {
         #endif
     }
 
-    private func applyProvenance(id: String, to layer: CALayer) {
+    private func applyProvenance(_ node: SceneNode?, to layer: CALayer) {
         #if DEBUG
-        if let node = composition?.nodes.first(where: { $0.sourceID == id && ($0.sourceKind == .professorSVG || $0.sourceKind == .importedTransform) }) {
+        if let node {
             layer.name = node.debugLabel
             layer.setValue(node.logicalID, forKey: "vboard.logicalID")
             layer.setValue(node.sourceKind.rawValue, forKey: "vboard.sourceKind")

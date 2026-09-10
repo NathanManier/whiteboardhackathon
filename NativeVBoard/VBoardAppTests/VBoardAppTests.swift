@@ -15,7 +15,43 @@ private final class WebViewNavigationWaiter: NSObject, WKNavigationDelegate {
     }
 }
 
+private final class WorkspaceURLProtocolStub: URLProtocol, @unchecked Sendable {
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            guard let handler = Self.handler else {
+                throw URLError(.badServerResponse)
+            }
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
 final class WorldScreenTransformTests: XCTestCase {
+    func testWorldOverlayLayerIsPinnedToUntransformedCanvasOrigin() {
+        let layer = CALayer()
+        let bounds = CGRect(x: 0, y: 0, width: 1194, height: 742)
+
+        WorldOverlayLayerLayout.pin(layer, to: bounds)
+
+        XCTAssertEqual(layer.anchorPoint, .zero)
+        XCTAssertEqual(layer.position, .zero)
+        XCTAssertEqual(layer.bounds, bounds)
+        XCTAssertEqual(layer.frame.origin.x, 0, accuracy: 0.0001)
+        XCTAssertEqual(layer.frame.origin.y, 0, accuracy: 0.0001)
+    }
+
     func testCanvasCoordinateMapperConvertsFromOffsetSourceView() {
         let canvas = UIView(frame: CGRect(x: 40, y: 30, width: 800, height: 400))
         let source = UIView(frame: CGRect(x: 100, y: 80, width: 200, height: 100))
@@ -211,6 +247,15 @@ final class SVGDocumentTests: XCTestCase {
 }
 
 final class StrokeSerializationTests: XCTestCase {
+    private func stroke(id: String, x: Double, y: Double) -> CanvasObject {
+        CanvasObject(id: id, type: "stroke", color: "#183153", width: 4,
+                     opacity: 1,
+                     points: [WorldPoint(x: x, y: y, pressure: 1),
+                              WorldPoint(x: x + 20, y: y + 20, pressure: 1)],
+                     translation: nil, sourceMarkdown: nil, text: nil,
+                     x: nil, y: nil, height: nil, fontSize: nil)
+    }
+
     func testStrokeKeepsWorldCoordinatesAndPressure() throws {
         let stroke = UserStroke(id: "pencil-1", points: [StrokePoint(x: -4.5, y: 12.25, pressure: 0.6)])
         let data = try JSONEncoder().encode(stroke)
@@ -249,9 +294,73 @@ final class StrokeSerializationTests: XCTestCase {
         XCTAssertEqual(movedSecond.x - movedFirst.x, second.x - first.x, accuracy: 0.000001)
         XCTAssertEqual(movedSecond.y - movedFirst.y, second.y - first.y, accuracy: 0.000001)
     }
+
+    func testPointSelectionChoosesTopmostEditorObject() {
+        let lower = stroke(id: "lower", x: 10, y: 10)
+        let upper = stroke(id: "upper", x: 10, y: 10)
+        XCTAssertEqual(
+            BoardHitTestPolicy.topmostEditorObjectID(
+                at: CGPoint(x: 20, y: 20),
+                objects: [lower, upper],
+                tolerance: 2
+            ),
+            "upper"
+        )
+    }
+
+    @MainActor
+    func testDeletingEditorObjectDoesNotCreateProfessorSoftDelete() throws {
+        let boardID = "delete-ownership-\(UUID().uuidString)"
+        let object = stroke(id: "user-stroke", x: 10, y: 10)
+        let editor = EditorState(schemaVersion: 4, revision: 0, updatedAt: nil,
+                                 viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+                                 objects: [object], groups: [], importedTransforms: [:],
+                                 sourceBoards: [], mergedBoardIDs: [])
+        let store = BoardDocumentStore(boardID: boardID, editor: editor)
+        let api = APIClient(baseURL: URL(string: "https://ownership.test")!)
+
+        store.deleteObjects(editorObjectIDs: [object.id], professorPathIDs: [], api: api)
+
+        XCTAssertTrue(store.editor.objects.isEmpty)
+        XCTAssertNil(store.editor.importedTransforms[object.id])
+        store.undo(api: api)
+        XCTAssertEqual(store.editor.objects.map(\.id), [object.id])
+        XCTAssertNil(store.editor.importedTransforms[object.id])
+    }
+
+    @MainActor
+    func testCollidingEditorAndProfessorIDsRetainTypedMoveOwnership() throws {
+        let boardID = "move-ownership-\(UUID().uuidString)"
+        let object = stroke(id: "shared-id", x: 10, y: 10)
+        let editor = EditorState(schemaVersion: 4, revision: 0, updatedAt: nil,
+                                 viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+                                 objects: [object], groups: [], importedTransforms: [:],
+                                 sourceBoards: [], mergedBoardIDs: [])
+        let store = BoardDocumentStore(boardID: boardID, editor: editor)
+        let api = APIClient(baseURL: URL(string: "https://ownership.test")!)
+
+        store.moveObjects(editorObjectIDs: [object.id],
+                          professorPathIDs: [object.id],
+                          by: CGPoint(x: -7, y: 13), api: api)
+
+        XCTAssertEqual(store.editor.objects.first?.translation?.x, -7)
+        XCTAssertEqual(store.editor.objects.first?.translation?.y, 13)
+        XCTAssertEqual(store.editor.importedTransforms[object.id]?.x, -7)
+        XCTAssertEqual(store.editor.importedTransforms[object.id]?.y, 13)
+    }
 }
 
 final class ServerContractDecodingTests: XCTestCase {
+    func testCompactPresentationKeepsMathAndChemistryReadable() {
+        let source = #"Predict $\text{Pd}(0)$ for $\ce{SO4^{2-}}$, then use $\frac{a}{b} \rightarrow \alpha$."#
+        let rendered = CompactStudyPresentation.readableText(from: source)
+
+        XCTAssertEqual(rendered, "Predict Pd(0) for SO4^2-, then use (a)/(b) → α.")
+        XCTAssertFalse(rendered.contains("\\frac"))
+        XCTAssertFalse(rendered.contains("\\ce"))
+        XCTAssertFalse(rendered.contains("$"))
+    }
+
     func testStudyContentDocumentUsesBundledSanitizedRendererWithoutEmbeddingRawSource() {
         let source = #"## Reaction\n$\frac{1}{2}$ and $\ce{H2O}$ </script>"#
         let html = StudyContentDocument.html(source: source)
@@ -549,5 +658,195 @@ final class LectureWorkspaceModelTests: XCTestCase {
         XCTAssertEqual(workspace.items[1].canvasX, 3096)
         XCTAssertEqual(workspace.camera.width, 3128)
         XCTAssertEqual(workspace.items[1].createdAt, 200)
+    }
+}
+
+@MainActor
+final class LectureWorkspacePersistenceTests: XCTestCase {
+    override func tearDown() {
+        WorkspaceURLProtocolStub.handler = nil
+        super.tearDown()
+    }
+
+    func testLectureStudyRemainsAvailableForCrossBoardSelection() {
+        XCTAssertTrue(LectureStudyRouting.isAvailable(
+            selectedBoardIDs: ["board-a", "board-b"], activeBoardID: "board-b"
+        ))
+        XCTAssertTrue(LectureStudyRouting.isAvailable(
+            selectedBoardIDs: [], activeBoardID: "board-a"
+        ))
+        XCTAssertFalse(LectureStudyRouting.isAvailable(
+            selectedBoardIDs: [], activeBoardID: nil
+        ))
+    }
+
+    func testStudyGuideEnvelopeIgnoresSiblingStaleFlag() async throws {
+        let guideJSON = Data(#"""
+        {"study_guide":{"id":"guide-1","title":"Chemistry","content":"Use $\\ce{H2O}$.","version":1,"stale":false,"source_board_ids":["board-a"]},"study_guide_stale":false}
+        """#.utf8)
+        WorkspaceURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/api/folders/lecture/study-guide")
+            return (HTTPURLResponse(url: request.url!, statusCode: 200,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!, guideJSON)
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://guide.test")!,
+                            session: URLSession(configuration: configuration))
+
+        let guide = try await api.generateStudyGuide(folderID: "lecture")
+
+        XCTAssertEqual(guide?.id, "guide-1")
+        XCTAssertEqual(guide?.content, #"Use $\ce{H2O}$."#)
+    }
+
+    func testDebouncedSaveDoesNotCancelItsOwnWorkspacePUT() async throws {
+        let boardID = "board-a"
+        let folderID = "lecture-\(UUID().uuidString)"
+        let workspaceJSON = { (revision: Int, canvasX: Int) in
+            Data("""
+            {"workspace":{"schema_version":1,"revision":\(revision),"camera":{"x":0,"y":0,"width":1200,"height":800},"items":[{"id":"board:\(boardID)","kind":"board","board_id":"\(boardID)","canvas_x":\(canvasX),"canvas_y":0,"board_width":800,"board_height":600,"effective_content_bounds":{"x":\(canvasX),"y":0,"width":800,"height":600},"created_at":1,"unit_label":"No Unit","unit_confidence":0,"unit_source":"none","title":"Board A","z_index":0}],"active_board_id":"\(boardID)","last_viewed_at":1}}
+            """.utf8)
+        }
+        let lectureJSON = Data("""
+        {"folder":{"id":"\(folderID)","name":"Lecture","workspace_board_id":"\(boardID)","board_order":["\(boardID)"]},"boards":[{"id":"\(boardID)","name":"Board A","folder_id":"\(folderID)","status":"ready","width":800,"height":600,"created_at":1}],"study_guide":null,"study_guide_stale":false}
+        """.utf8)
+        let editorJSON = Data("""
+        {"editor":{"schema_version":4,"revision":0,"viewport":{"x":0,"y":0,"width":800,"height":600},"objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}}
+        """.utf8)
+        let putReachedServer = expectation(description: "workspace PUT reached server")
+
+        WorkspaceURLProtocolStub.handler = { request in
+            let path = request.url?.path ?? ""
+            let headers = ["Content-Type": path.hasSuffix(".svg") ? "image/svg+xml" : "application/json"]
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+                                           httpVersion: "HTTP/1.1", headerFields: headers)!
+            switch (request.httpMethod ?? "GET", path) {
+            case ("GET", "/api/folders/\(folderID)/lecture"):
+                return (response, lectureJSON)
+            case ("GET", "/api/folders/\(folderID)/workspace"):
+                return (response, workspaceJSON(7, 0))
+            case ("GET", "/api/boards/\(boardID)/editor"):
+                return (response, editorJSON)
+            case ("GET", "/boards/\(boardID)/board.svg"):
+                return (response, Data("<svg viewBox='0 0 800 600'></svg>".utf8))
+            case ("PUT", "/api/folders/\(folderID)/workspace"):
+                putReachedServer.fulfill()
+                return (response, workspaceJSON(8, 12))
+            default:
+                return (HTTPURLResponse(url: request.url!, statusCode: 404,
+                                        httpVersion: "HTTP/1.1",
+                                        headerFields: ["Content-Type": "application/json"])!,
+                        Data("{\"error\":\"not found\"}".utf8))
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://workspace.test")!,
+                            session: URLSession(configuration: configuration))
+        let store = LectureWorkspaceStore(folderID: folderID)
+        await store.load(api: api)
+        XCTAssertEqual(store.status, .clean)
+
+        store.moveBoard(boardID: boardID, by: CGPoint(x: 12, y: 0), api: api)
+        await fulfillment(of: [putReachedServer], timeout: 2)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(store.status, .clean)
+        XCTAssertEqual(store.workspace?.revision, 8)
+        XCTAssertEqual(store.workspace?.items.first?.canvasX, 12)
+    }
+
+    func testDebouncedBoardSaveDoesNotCancelItsOwnEditorPUT() async throws {
+        let boardID = "board-\(UUID().uuidString)"
+        let initial = try JSONDecoder().decode(EditorState.self, from: Data("""
+        {"schema_version":4,"revision":4,"viewport":{"x":0,"y":0,"width":800,"height":600},"objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}
+        """.utf8))
+        let saved = Data("""
+        {"editor":{"schema_version":4,"revision":5,"viewport":{"x":0,"y":0,"width":800,"height":600},"objects":[{"id":"stroke-a","type":"stroke","color":"#183153","width":4,"opacity":1,"points":[{"x":10,"y":12,"p":1}],"translation":{"x":0,"y":0}}],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}}
+        """.utf8)
+        let putReachedServer = expectation(description: "editor PUT reached server")
+
+        WorkspaceURLProtocolStub.handler = { request in
+            let path = request.url?.path ?? ""
+            let status = request.httpMethod == "PUT" && path == "/api/boards/\(boardID)/editor" ? 200 : 404
+            if status == 200 { putReachedServer.fulfill() }
+            return (HTTPURLResponse(url: request.url!, statusCode: status,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!,
+                    status == 200 ? saved : Data("{\"error\":\"not found\"}".utf8))
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://editor.test")!,
+                            session: URLSession(configuration: configuration))
+        let store = BoardDocumentStore(boardID: boardID, editor: initial)
+        store.applyStroke(UserStroke(id: "stroke-a",
+                                     points: [StrokePoint(x: 10, y: 12, pressure: 1)]), api: api)
+
+        await fulfillment(of: [putReachedServer], timeout: 2)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(store.status, .clean)
+        XCTAssertEqual(store.editor.revision, 5)
+        XCTAssertEqual(store.editor.objects.map(\.id), ["stroke-a"])
+    }
+
+    func testUndoAndRedoRebaseHistoryOntoAcceptedServerRevision() async throws {
+        let boardID = "history-rebase-\(UUID().uuidString)"
+        let initial = try JSONDecoder().decode(EditorState.self, from: Data("""
+        {"schema_version":4,"revision":4,"viewport":{"x":0,"y":0,"width":800,"height":600},"objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}
+        """.utf8))
+        let strokeJSON = """
+        {"id":"stroke-a","type":"stroke","color":"#183153","width":4,"opacity":1,"points":[{"x":10,"y":12,"p":1}],"translation":{"x":0,"y":0}}
+        """
+        var requestCount = 0
+        let requestsReachedServer = expectation(description: "save, undo, and redo reached server")
+        requestsReachedServer.expectedFulfillmentCount = 3
+
+        WorkspaceURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "PUT")
+            XCTAssertEqual(request.url?.path, "/api/boards/\(boardID)/editor")
+            requestCount += 1
+            requestsReachedServer.fulfill()
+            let revision = 4 + requestCount
+            let objects = requestCount == 2 ? "" : strokeJSON
+            let body = Data("""
+            {"editor":{"schema_version":4,"revision":\(revision),"viewport":{"x":0,"y":0,"width":800,"height":600},"objects":[\(objects)],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}}
+            """.utf8)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!, body)
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://history.test")!,
+                            session: URLSession(configuration: configuration))
+        let store = BoardDocumentStore(boardID: boardID, editor: initial)
+
+        store.applyStroke(UserStroke(id: "stroke-a",
+                                     points: [StrokePoint(x: 10, y: 12, pressure: 1)]), api: api)
+        while requestCount < 1 { try await Task.sleep(nanoseconds: 25_000_000) }
+        while store.status != .clean { try await Task.sleep(nanoseconds: 25_000_000) }
+        XCTAssertEqual(store.editor.revision, 5)
+
+        store.undo(api: api)
+        while requestCount < 2 { try await Task.sleep(nanoseconds: 25_000_000) }
+        while store.status != .clean { try await Task.sleep(nanoseconds: 25_000_000) }
+        XCTAssertEqual(store.editor.revision, 6)
+        XCTAssertTrue(store.editor.objects.isEmpty)
+        XCTAssertNil(store.conflictServerEditor)
+
+        store.redo(api: api)
+        await fulfillment(of: [requestsReachedServer], timeout: 2)
+        while store.status != .clean { try await Task.sleep(nanoseconds: 25_000_000) }
+        XCTAssertEqual(store.editor.revision, 7)
+        XCTAssertEqual(store.editor.objects.map(\.id), ["stroke-a"])
+        XCTAssertNil(store.conflictServerEditor)
     }
 }

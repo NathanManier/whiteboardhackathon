@@ -126,6 +126,38 @@ struct SelectionKey: Codable, Hashable, Sendable {
     let kind: WorkspaceSelectionKind
 }
 
+/// Defines deterministic layer ownership for point selection. Editor objects
+/// render above immutable professor ink, so a point that intersects both must
+/// select only the topmost editor object. Lasso selection intentionally remains
+/// multi-object and is not routed through this policy.
+enum BoardHitTestPolicy {
+    static func topmostEditorObjectID(at point: CGPoint,
+                                      objects: [CanvasObject],
+                                      tolerance: CGFloat) -> String? {
+        SceneComposition.canonicalEditorObjects(objects).reversed().first {
+            bounds(of: $0).insetBy(dx: -tolerance, dy: -tolerance).contains(point)
+        }?.id
+    }
+
+    static func bounds(of object: CanvasObject) -> CGRect {
+        let translation = object.translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
+        if let x = object.x, let y = object.y {
+            return CGRect(x: x + translation.x, y: y + translation.y,
+                          width: max(object.width ?? 400, 0),
+                          height: max(object.height ?? 100, 0))
+        }
+        guard let first = object.points?.first else { return .null }
+        return (object.points ?? []).dropFirst().reduce(
+            CGRect(x: first.x + translation.x, y: first.y + translation.y,
+                   width: 0, height: 0)
+        ) { partial, point in
+            partial.union(CGRect(x: point.x + translation.x,
+                                 y: point.y + translation.y,
+                                 width: 0, height: 0))
+        }
+    }
+}
+
 enum BoardRepresentation: Int, Comparable, Sendable {
     case unloaded
     case thumbnail
@@ -222,21 +254,7 @@ enum WorkspaceEffectiveBounds {
     }
 
     private static func objectBounds(_ object: CanvasObject) -> CGRect {
-        let translation = object.translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
-        if let x = object.x, let y = object.y {
-            return CGRect(x: x + translation.x, y: y + translation.y,
-                          width: max(object.width ?? 400, 0),
-                          height: max(object.height ?? 100, 0))
-        }
-        guard let first = object.points?.first else { return .null }
-        return (object.points ?? []).dropFirst().reduce(
-            CGRect(x: first.x + translation.x, y: first.y + translation.y,
-                   width: 0, height: 0)
-        ) { partial, point in
-            partial.union(CGRect(x: point.x + translation.x,
-                                 y: point.y + translation.y,
-                                 width: 0, height: 0))
-        }
+        BoardHitTestPolicy.bounds(of: object)
     }
 }
 

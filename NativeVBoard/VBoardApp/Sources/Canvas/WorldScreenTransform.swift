@@ -15,6 +15,18 @@ struct CanvasCoordinateMapper {
     }
 }
 
+/// Pins a world-space overlay to the same untransformed origin as the canvas
+/// render container. `CALayer` defaults to a centered anchor point; combining
+/// that default with `position = .zero` shifts an overlay by half its bounds,
+/// even though its path is expressed in the correct world coordinates.
+enum WorldOverlayLayerLayout {
+    static func pin(_ layer: CALayer, to bounds: CGRect) {
+        layer.anchorPoint = .zero
+        layer.bounds = bounds
+        layer.position = .zero
+    }
+}
+
 enum CameraMutationReason: String {
     case boardInitialFit
     case restorePersistedViewport

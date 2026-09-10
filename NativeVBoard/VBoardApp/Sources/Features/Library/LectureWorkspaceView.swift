@@ -157,7 +157,10 @@ struct LectureWorkspaceView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-                .disabled(studyBoardID == nil)
+                .disabled(!LectureStudyRouting.isAvailable(
+                    selectedBoardIDs: selectedBoardIDs,
+                    activeBoardID: store.activeBoardID
+                ))
                 Button { showImporter = true } label: { Image(systemName: "plus") }
                     .buttonStyle(.bordered)
                     .accessibilityLabel("Add Whiteboard")
@@ -197,6 +200,12 @@ struct LectureWorkspaceView: View {
     private var studyObjectIDs: [String] {
         guard let boardID = studyBoardID else { return [] }
         return store.selectedKeys.filter { $0.boardID == boardID }.map(\.objectID)
+    }
+}
+
+enum LectureStudyRouting {
+    static func isAvailable(selectedBoardIDs: Set<String>, activeBoardID: String?) -> Bool {
+        !selectedBoardIDs.isEmpty || activeBoardID != nil
     }
 }
 

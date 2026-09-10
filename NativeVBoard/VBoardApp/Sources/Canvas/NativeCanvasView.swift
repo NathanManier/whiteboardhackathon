@@ -121,8 +121,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         worldContainer.layer.position = .zero
         userLayer.anchorPoint = .zero
         userLayer.position = .zero
-        interactionLayer.anchorPoint = .zero
-        interactionLayer.position = .zero
+        WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
         paperLayer.anchorPoint = .zero
         paperLayer.position = .zero
         paperLayer.fillColor = UIColor(red: 0.985, green: 0.982, blue: 0.965, alpha: 1).cgColor
@@ -220,8 +219,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         userLayer.position = .zero
         paperLayer.bounds = worldContainer.bounds
         paperLayer.position = .zero
-        interactionLayer.bounds = worldContainer.bounds
-        interactionLayer.position = .zero
+        WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
         #if DEBUG
         perfLabel.frame = CGRect(x: 8, y: 8, width: 360, height: 112)
         #endif
@@ -851,13 +849,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func makeObjectLayer(_ object: CanvasObject) -> CALayer {
-        if object.type == "text", let text = object.text ?? object.sourceMarkdown,
-           let x = object.x, let y = object.y {
-            let layer = CATextLayer(); layer.string = text
-            layer.foregroundColor = UIColor(svgHex: object.color ?? "#183153").cgColor
-            layer.fontSize = object.fontSize ?? 32; layer.alignmentMode = .left
-            layer.contentsScale = window?.screen.scale ?? UIScreen.main.scale
-            layer.frame = CGRect(x: x + (object.translation?.x ?? 0), y: y + (object.translation?.y ?? 0), width: object.width ?? 400, height: object.height ?? 100)
+        if object.type == "text", object.text != nil || object.sourceMarkdown != nil,
+           object.x != nil, object.y != nil {
+            let layer = CompactStudyPresentation.layer(
+                for: object,
+                frame: BoardHitTestPolicy.bounds(of: object),
+                contentsScale: window?.screen.scale ?? UIScreen.main.scale
+            )
             applyProvenance(object.id, to: layer); return layer
         }
         let layer = CAShapeLayer(); let path = UIBezierPath()

@@ -252,7 +252,12 @@ final class LectureWorkspaceStore: ObservableObject {
             guard let store = boardStores[boardID],
                   let item = workspace?.items.first(where: { $0.boardID == boardID }) else { continue }
             let localDelta = LectureCoordinateTransform.lectureDeltaToBoardLocal(lectureDelta, board: item)
-            store.moveObjects(ids: Set(boardKeys.map(\.objectID)), by: localDelta, api: api)
+            store.moveObjects(
+                editorObjectIDs: Set(boardKeys.filter { $0.kind == .editorObject }.map(\.objectID)),
+                professorPathIDs: Set(boardKeys.filter { $0.kind == .professorPath }.map(\.objectID)),
+                by: localDelta,
+                api: api
+            )
             refreshSceneSnapshot(boardID, api: api)
         }
     }
@@ -271,7 +276,11 @@ final class LectureWorkspaceStore: ObservableObject {
         recordBoardUndo(affected)
         for (boardID, boardKeys) in grouped {
             guard let store = boardStores[boardID] else { continue }
-            store.deleteObjects(ids: Set(boardKeys.map(\.objectID)), api: api)
+            store.deleteObjects(
+                editorObjectIDs: Set(boardKeys.filter { $0.kind == .editorObject }.map(\.objectID)),
+                professorPathIDs: Set(boardKeys.filter { $0.kind == .professorPath }.map(\.objectID)),
+                api: api
+            )
             refreshSceneSnapshot(boardID, api: api)
         }
         selectedKeys.subtract(keys)
@@ -303,9 +312,10 @@ final class LectureWorkspaceStore: ObservableObject {
     func undo(api: APIClient) {
         if let entry = undoHistory.popLast() {
             switch entry {
-            case .workspace(let previous):
+            case .workspace(var previous):
                 guard let current = workspace else { return }
                 redoHistory.append(.workspace(current))
+                previous.revision = current.revision
                 workspace = previous
                 markDirty(api: api)
             case .boards(let boardIDs):
@@ -324,9 +334,10 @@ final class LectureWorkspaceStore: ObservableObject {
     func redo(api: APIClient) {
         if let entry = redoHistory.popLast() {
             switch entry {
-            case .workspace(let next):
+            case .workspace(var next):
                 guard let current = workspace else { return }
                 undoHistory.append(.workspace(current))
+                next.revision = current.revision
                 workspace = next
                 markDirty(api: api)
             case .boards(let boardIDs):
@@ -349,6 +360,15 @@ final class LectureWorkspaceStore: ObservableObject {
 
     func saveNow(api: APIClient) async {
         saveTask?.cancel()
+        saveTask = nil
+        await performSave(api: api)
+    }
+
+    /// Performs one authoritative workspace save without touching the
+    /// debounce task that invoked it. Calling `saveNow` from inside
+    /// `saveTask` used to cancel the current task, which in turn cancelled the
+    /// URLSession request before its PUT reached the server.
+    private func performSave(api: APIClient) async {
         guard let candidate = workspace,
               status == .dirty || status == .offlinePending else { return }
         let generation = mutationGeneration
@@ -361,6 +381,11 @@ final class LectureWorkspaceStore: ObservableObject {
                 status = .clean
                 removeOutbox()
             } else {
+                // A camera/placement mutation happened while this request was
+                // in flight. Its content remains local, but its next PUT must
+                // be based on the revision the server has just accepted.
+                workspace?.revision = saved.revision
+                baseRevision = saved.revision
                 status = .dirty
                 persistOutbox()
                 scheduleSave(api: api)
@@ -406,6 +431,15 @@ final class LectureWorkspaceStore: ObservableObject {
                 async let svgRequest = api.professorSVG(id: boardID)
                 let (editor, source) = try await (editorRequest, svgRequest)
                 let document = try SVGDocument.parse(source)
+                let definitions = document.paths.map(\.d)
+                let warmup = Task.detached(priority: .userInitiated) {
+                    await SVGPathParser.prewarm(definitions)
+                }
+                await withTaskCancellationHandler(operation: {
+                    await warmup.value
+                }, onCancel: {
+                    warmup.cancel()
+                })
                 guard let self, !Task.isCancelled,
                       self.sceneLoadTokens[boardID] == token,
                       self.desiredFullDetail.contains(boardID) else { return }
@@ -479,11 +513,15 @@ final class LectureWorkspaceStore: ObservableObject {
         guard scenes.count > sceneCacheLimit else { return }
         let candidates = scenes.keys.filter { !desiredFullDetail.contains($0) }
             .sorted { (lastSceneUse[$0] ?? 0) < (lastSceneUse[$1] ?? 0) }
-        for boardID in candidates.prefix(max(0, scenes.count - sceneCacheLimit)) {
+        let evicted = Array(candidates.prefix(max(0, scenes.count - sceneCacheLimit)))
+        for boardID in evicted {
             scenes.removeValue(forKey: boardID)
             boardStores.removeValue(forKey: boardID)
             lastSceneUse.removeValue(forKey: boardID)
         }
+        #if DEBUG
+        print("[VBoard] LECTURE SCENE CACHE cached=\(scenes.count) cacheBudget=\(sceneCacheLimit) fullDetail=\(desiredFullDetail.count) fullDetailBudget=\(BoardDetailPolicy.defaultFullDetailBudget) evicted=\(evicted.sorted())")
+        #endif
     }
 
     private func recordWorkspaceUndo(_ current: LectureWorkspace) {
@@ -515,7 +553,8 @@ final class LectureWorkspaceStore: ObservableObject {
         saveTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 750_000_000)
             guard !Task.isCancelled, let self else { return }
-            await self.saveNow(api: api)
+            self.saveTask = nil
+            await self.performSave(api: api)
         }
     }
 

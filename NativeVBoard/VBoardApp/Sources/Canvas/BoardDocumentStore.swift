@@ -67,13 +67,20 @@ final class BoardDocumentStore: ObservableObject {
     }
 
     func undo(api: APIClient) {
-        guard let previous = undoStack.popLast() else { return }
+        guard var previous = undoStack.popLast() else { return }
+        // History snapshots describe content, not a stale server precondition.
+        // Rebase the restored content onto the latest accepted revision so an
+        // undo performed after autosave does not immediately conflict.
+        previous.revision = editor.revision
+        previous.updatedAt = editor.updatedAt
         redoStack.append(editor); editor = previous; mutationGeneration += 1
         canUndo = !undoStack.isEmpty; canRedo = true; status = .dirty; persistOutbox(); scheduleSave(api: api)
     }
 
     func redo(api: APIClient) {
-        guard let next = redoStack.popLast() else { return }
+        guard var next = redoStack.popLast() else { return }
+        next.revision = editor.revision
+        next.updatedAt = editor.updatedAt
         undoStack.append(editor); editor = next; mutationGeneration += 1
         canUndo = true; canRedo = !redoStack.isEmpty; status = .dirty; persistOutbox(); scheduleSave(api: api)
     }
@@ -108,14 +115,16 @@ final class BoardDocumentStore: ObservableObject {
         var next = editor
         let originX = editor.viewport.x + editor.viewport.width * 0.08
         let originY = editor.viewport.y + editor.viewport.height * 0.12
+        let cardWidth = editor.viewport.width * 0.35
+        let presentationFontSize = min(82, max(58, cardWidth * 0.06))
         for (offset, problem) in fresh.enumerated() {
             next.objects.append(CanvasObject(id: problem.id, type: "text", color: "#183153",
-                                             width: editor.viewport.width * 0.35, opacity: 1,
+                                             width: cardWidth, opacity: 1,
                                              points: nil, translation: nil,
                                              sourceMarkdown: problem.text, text: problem.text,
                                              x: originX + Double(offset) * editor.viewport.width * 0.40,
                                              y: originY, height: editor.viewport.height * 0.28,
-                                             fontSize: 28, role: "ai_practice_problem",
+                                             fontSize: presentationFontSize, role: "ai_practice_problem",
                                              sourceStudyInteractionID: interactionID,
                                              createdAt: Date().timeIntervalSince1970,
                                              unitLabel: unitLabel,
@@ -147,12 +156,30 @@ final class BoardDocumentStore: ObservableObject {
     /// Applies one world-space delta to all selected objects as one document
     /// mutation, producing one undo entry and one outbox snapshot per drag.
     func moveObjects(ids: Set<String>, by delta: CGPoint, api: APIClient) {
-        guard !ids.isEmpty, (delta.x != 0 || delta.y != 0) else { return }
+        let editorIDs = Set(editor.objects.lazy.filter { ids.contains($0.id) }.map(\.id))
+        moveObjects(editorObjectIDs: editorIDs,
+                    professorPathIDs: ids.subtracting(editorIDs),
+                    by: delta,
+                    api: api)
+    }
+
+    /// Typed scene ownership prevents an editor object from also being
+    /// promoted into `imported_transforms` when IDs happen to collide across
+    /// the editor and professor layers.
+    func moveObjects(editorObjectIDs: Set<String>,
+                     professorPathIDs: Set<String>,
+                     by delta: CGPoint,
+                     api: APIClient) {
+        guard !editorObjectIDs.isEmpty || !professorPathIDs.isEmpty,
+              delta.x != 0 || delta.y != 0 else { return }
         var next = editor
-        for id in ids {
+        for id in editorObjectIDs {
             if let index = next.objects.firstIndex(where: { $0.id == id }) {
                 next.objects[index] = next.objects[index].translated(by: delta)
-            } else if let imported = next.importedTransforms[id] {
+            }
+        }
+        for id in professorPathIDs {
+            if let imported = next.importedTransforms[id] {
                 next.importedTransforms[id] = ObjectTransform(x: imported.x + delta.x, y: imported.y + delta.y,
                                                               scaleX: imported.scaleX, scaleY: imported.scaleY,
                                                               deleted: imported.deleted)
@@ -174,10 +201,22 @@ final class BoardDocumentStore: ObservableObject {
     }
 
     func deleteObjects(ids: Set<String>, api: APIClient) {
-        guard !ids.isEmpty else { return }
+        let editorIDs = Set(editor.objects.lazy.filter { ids.contains($0.id) }.map(\.id))
+        deleteObjects(editorObjectIDs: editorIDs,
+                      professorPathIDs: ids.subtracting(editorIDs),
+                      api: api)
+    }
+
+    /// Deletes user objects and soft-deletes professor paths as two distinct
+    /// canonical operations. A deleted user stroke must never create a bogus
+    /// imported-professor transform with the same ID.
+    func deleteObjects(editorObjectIDs: Set<String>,
+                       professorPathIDs: Set<String>,
+                       api: APIClient) {
+        guard !editorObjectIDs.isEmpty || !professorPathIDs.isEmpty else { return }
         var next = editor
-        next.objects.removeAll { ids.contains($0.id) }
-        for id in ids {
+        next.objects.removeAll { editorObjectIDs.contains($0.id) }
+        for id in professorPathIDs {
             if let imported = next.importedTransforms[id] {
                 next.importedTransforms[id] = ObjectTransform(x: imported.x, y: imported.y,
                                                                scaleX: imported.scaleX, scaleY: imported.scaleY, deleted: true)
@@ -214,6 +253,14 @@ final class BoardDocumentStore: ObservableObject {
 
     func saveNow(api: APIClient) async {
         saveTask?.cancel()
+        saveTask = nil
+        await performSave(api: api)
+    }
+
+    /// Saves the current editor snapshot without cancelling the debounce task
+    /// that called it. Cancelling that task also cancelled its URLSession PUT,
+    /// leaving otherwise healthy edits indefinitely in the local outbox.
+    private func performSave(api: APIClient) async {
         guard status == .dirty || status == .offlinePending else { return }
         status = .saving
         let candidate = editor
@@ -225,6 +272,12 @@ final class BoardDocumentStore: ObservableObject {
             if mutationGeneration == candidateGeneration {
                 editor = saved; baseRevision = saved.revision; status = .clean; removeOutbox()
             } else {
+                // The candidate reached the server even though newer local
+                // edits now exist. Keep those edits, but advance their
+                // revision precondition to the revision just accepted.
+                editor.revision = saved.revision
+                editor.updatedAt = saved.updatedAt
+                baseRevision = saved.revision
                 status = .dirty; persistOutbox(); scheduleSave(api: api)
             }
         } catch let error as APIError {
@@ -268,7 +321,8 @@ final class BoardDocumentStore: ObservableObject {
         saveTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 700_000_000)
             guard !Task.isCancelled, let self else { return }
-            await self.saveNow(api: api)
+            self.saveTask = nil
+            await self.performSave(api: api)
         }
     }
 

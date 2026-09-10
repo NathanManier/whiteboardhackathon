@@ -221,7 +221,12 @@ final class APIClient: ObservableObject {
         var request = try request(path: "/api/folders/\(folderID)/study-guide", method: "POST")
         request.httpBody = Data("{}".utf8)
         let (data, response) = try await data(for: request); try validate(response, data: data)
-        return try decoder.decode([String: StudyGuide].self, from: data)["study_guide"]
+        struct Envelope: Decodable {
+            let studyGuide: StudyGuide?
+            enum CodingKeys: String, CodingKey { case studyGuide = "study_guide" }
+        }
+        do { return try decoder.decode(Envelope.self, from: data).studyGuide }
+        catch { throw APIError.decoding("Could not decode the generated study guide.") }
     }
 
     private func get<T: Decodable>(_ path: String, label: String = "JSON") async throws -> T {
@@ -268,12 +273,9 @@ final class APIClient: ObservableObject {
         let http = response as? HTTPURLResponse
         let contentType = http?.value(forHTTPHeaderField: "Content-Type") ?? "(missing)"
         debugLog("BOARD RESPONSE endpoint=\(path) method=\(method) status=\(http?.statusCode ?? -1) contentType=\(contentType) bytes=\(data.count)")
-        guard !data.isEmpty else { return }
-        if let object = try? JSONSerialization.jsonObject(with: data), let pretty = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted]), let text = String(data: pretty, encoding: .utf8) {
-            debugLog("BOARD RESPONSE BODY endpoint=\(path)\n\(String(text.prefix(4096)))")
-        } else if let text = String(data: data, encoding: .utf8) {
-            debugLog("BOARD RESPONSE BODY endpoint=\(path)\n\(String(text.prefix(4096)))")
-        }
+        // Response bodies can contain handwritten work, study content, and
+        // lecture metadata. Status, MIME type, and byte count are sufficient
+        // for transport diagnostics; never echo user content into logs.
         #endif
     }
 
