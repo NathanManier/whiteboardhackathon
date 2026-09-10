@@ -184,6 +184,30 @@ class AccountAndOwnershipTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/auth/logout", headers=self.headers(rotated)).status_code, 200)
         self.assertEqual(self.client.get("/api/auth/me", headers=self.headers(rotated)).status_code, 401)
 
+    def test_expired_server_session_is_rejected(self):
+        expired_db = AuthDatabase(
+            f"sqlite:///{self.root / 'expired.sqlite3'}", access_ttl=-1, refresh_ttl=60
+        )
+        user = expired_db.upsert_apple_user(
+            apple_subject="expired-user", display_name="Expired", email=None
+        )
+        session = expired_db.create_session(user.id)
+        self.assertIsNone(expired_db.authenticate_access_token(session.access_token))
+
+    def test_resource_routes_require_auth_and_debug_login_is_not_public(self):
+        board_id = "d" * 32
+        self.create_board_files(board_id, "Private board")
+        for path in [
+            "/api/library",
+            f"/board/{board_id}",
+            f"/api/boards/{board_id}/editor",
+            f"/boards/{board_id}/board.svg",
+            f"/board/{board_id}/svg",
+        ]:
+            response = self.client.get(path, headers={"Accept": "application/json"})
+            self.assertEqual(response.status_code, 401, path)
+        self.assertEqual(self.client.post("/api/auth/debug", json={"testUser": "public"}).status_code, 404)
+
     def test_login_rate_limit_returns_retry_metadata_without_echoing_credentials(self):
         board_app.RATE_LIMIT_POLICIES["login"] = (2, 60)
         payload = {
@@ -240,6 +264,14 @@ class AccountAndOwnershipTests(unittest.TestCase):
             f"/api/folders/{folder_b}/workspace",
         ]:
             self.assertEqual(self.client.get(path, headers=headers_a).status_code, 404, path)
+        self.assertEqual(
+            self.client.put(
+                f"/api/folders/{folder_b}/workspace",
+                json={"revision": 0, "items": []},
+                headers=headers_a,
+            ).status_code,
+            404,
+        )
 
     def test_lecture_names_and_pdf_import_targets_are_tenant_scoped(self):
         account_a = self.login("apple-a")
