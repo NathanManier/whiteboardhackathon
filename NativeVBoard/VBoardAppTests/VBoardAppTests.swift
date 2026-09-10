@@ -1,5 +1,6 @@
 import XCTest
 @preconcurrency import WebKit
+import UIKit
 @testable import VBoardApp
 
 @MainActor
@@ -53,6 +54,242 @@ final class PDFBoardContractTests: XCTestCase {
         )
         XCTAssertEqual(selection?.canonicalObjectIDs, [PDFBoardSource.logicalID])
         XCTAssertEqual(selection?.localBBox.cgRect, region)
+    }
+}
+
+final class NativeImportCoordinateTests: XCTestCase {
+    func testAspectFitLargeLandscapePhotoUsesDisplayedImageRect() {
+        let mapper = AspectFitImageTransform(
+            sourcePixelSize: CGSize(width: 4032, height: 3024),
+            containerRect: CGRect(x: 0, y: 0, width: 1024, height: 1366)
+        )
+        XCTAssertEqual(mapper.imageRect.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(mapper.imageRect.minY, 299, accuracy: 0.001)
+        XCTAssertEqual(mapper.imageRect.width, 1024, accuracy: 0.001)
+        XCTAssertEqual(mapper.imageRect.height, 768, accuracy: 0.001)
+        XCTAssertEqual(mapper.viewToSourcePixel(CGPoint(x: 0, y: 299)), .zero)
+        XCTAssertEqual(mapper.viewToSourcePixel(CGPoint(x: 1024, y: 1067)),
+                       CGPoint(x: 4031, y: 3023))
+    }
+
+    func testAspectFitRoundTripIsSubpixelForRepresentativeSources() {
+        let sources = [CGSize(width: 4032, height: 3024),
+                       CGSize(width: 3024, height: 4032),
+                       CGSize(width: 1920, height: 1080),
+                       CGSize(width: 1080, height: 1920),
+                       CGSize(width: 2048, height: 2048),
+                       CGSize(width: 6000, height: 900),
+                       CGSize(width: 900, height: 6000)]
+        for source in sources {
+            let mapper = AspectFitImageTransform(
+                sourcePixelSize: source,
+                containerRect: CGRect(x: 17, y: 29, width: 1024, height: 1366)
+            )
+            let points = [CGPoint.zero,
+                          CGPoint(x: source.width - 1, y: 0),
+                          CGPoint(x: source.width - 1, y: source.height - 1),
+                          CGPoint(x: 0, y: source.height - 1),
+                          CGPoint(x: source.width * 0.37, y: source.height * 0.61)]
+            for point in points {
+                let roundTrip = mapper.viewToSourcePixel(mapper.sourcePixelToView(point))
+                XCTAssertEqual(roundTrip.x, point.x, accuracy: 0.5, "source=\(source)")
+                XCTAssertEqual(roundTrip.y, point.y, accuracy: 0.5, "source=\(source)")
+            }
+        }
+    }
+
+    func testCornerClampNeverProducesServerExclusiveWidthOrHeight() {
+        let mapper = AspectFitImageTransform(
+            sourcePixelSize: CGSize(width: 4032, height: 3024),
+            containerRect: CGRect(x: 0, y: 0, width: 1024, height: 1366)
+        )
+        XCTAssertEqual(mapper.viewToSourcePixel(CGPoint(x: 10_000, y: 10_000)),
+                       CGPoint(x: 4031, y: 3023))
+        XCTAssertEqual(mapper.viewToSourcePixel(CGPoint(x: -10_000, y: -10_000)),
+                       .zero)
+    }
+
+    @MainActor
+    func testImageOrientationIsBakedIntoUploadedPixels() throws {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 20), format: format)
+        let base = renderer.image { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        }
+        let rotated = UIImage(cgImage: try XCTUnwrap(base.cgImage), scale: 1, orientation: .right)
+        let normalized = try XCTUnwrap(NormalizedImageAsset.make(image: rotated))
+        XCTAssertEqual(normalized.image.imageOrientation, .up)
+        XCTAssertEqual(normalized.pixelSize, CGSize(width: 20, height: 40))
+        let encoded = try XCTUnwrap(UIImage(data: normalized.uploadData))
+        XCTAssertEqual(encoded.imageOrientation, .up)
+        XCTAssertEqual(encoded.cgImage?.width, 20)
+        XCTAssertEqual(encoded.cgImage?.height, 40)
+    }
+
+    func testInvalidCornerGeometryIsRejectedBeforeNetwork() {
+        let size = CGSize(width: 4032, height: 3024)
+        XCTAssertNil(CornerGeometry.validationMessage(
+            [CGPoint(x: 0, y: 0), CGPoint(x: 4031, y: 0),
+             CGPoint(x: 4031, y: 3023), CGPoint(x: 0, y: 3023)],
+            sourceSize: size
+        ))
+        XCTAssertNotNil(CornerGeometry.validationMessage(
+            [CGPoint(x: 0, y: 0), CGPoint(x: 4031, y: 3023),
+             CGPoint(x: 4031, y: 0), CGPoint(x: 0, y: 3023)],
+            sourceSize: size
+        ))
+    }
+}
+
+final class ImportFlowStateMachineTests: XCTestCase {
+    func testFailedCornersCanRetryAndCompletionResetsOnCancel() {
+        let upload = UUID(), firstSubmit = UUID(), retry = UUID()
+        var state = ImportFlowStateMachine()
+        state.sourceSelected()
+        XCTAssertTrue(state.beginImageUpload(upload))
+        XCTAssertFalse(state.beginImageUpload(UUID()), "a second tap must not submit again")
+        XCTAssertTrue(state.requireCorners(after: upload))
+        XCTAssertTrue(state.beginCornerSubmission(firstSubmit))
+        XCTAssertTrue(state.failToCorners(firstSubmit))
+        XCTAssertTrue(state.beginCornerSubmission(retry))
+        XCTAssertTrue(state.complete(retry))
+        state.cancel()
+        XCTAssertEqual(state.phase, .choosing)
+    }
+
+    func testPickerCancelAndPDFFailureReturnToReusableState() {
+        var state = ImportFlowStateMachine()
+        state.sourceSelected()
+        let pdf = UUID()
+        XCTAssertTrue(state.beginPDFUpload(pdf))
+        XCTAssertTrue(state.failToPreview(pdf))
+        state.cancel()
+        XCTAssertEqual(state.phase, .choosing)
+        state.sourceSelected()
+        XCTAssertTrue(state.beginImageUpload(UUID()))
+    }
+}
+
+final class PDFVisibleSourceTests: XCTestCase {
+    func testPDFTopLeftBoardTransformRoundTripsPageCorners() {
+        let transform = PDFPageBoardTransform(boardSize: CGSize(width: 612, height: 792))
+        let page = CGSize(width: 1224, height: 1584)
+        XCTAssertEqual(transform.pdfTopLeftToBoard(.zero, pdfDisplaySize: page), .zero)
+        XCTAssertEqual(transform.pdfTopLeftToBoard(CGPoint(x: 1224, y: 1584), pdfDisplaySize: page),
+                       CGPoint(x: 612, y: 792))
+        let sample = CGPoint(x: 183, y: 475)
+        let roundTrip = transform.boardToPDFTopLeft(
+            transform.pdfTopLeftToBoard(sample, pdfDisplaySize: page),
+            pdfDisplaySize: page
+        )
+        XCTAssertEqual(roundTrip.x, sample.x, accuracy: 0.001)
+        XCTAssertEqual(roundTrip.y, sample.y, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testPaperPDFProfessorAndUserLayersHaveCanonicalZOrder() throws {
+        let document = try SVGDocument.parse("<svg viewBox='0 0 612 792'/>")
+        let editor = try JSONDecoder().decode(EditorState.self, from: Data("""
+        {"schema_version":4,"revision":0,"viewport":{"x":0,"y":0,"width":612,"height":792},"objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}
+        """.utf8))
+        let canvas = InfiniteCanvasUIView(
+            boardID: "pdf-board", document: document, pdfData: Data("%PDF-invalid".utf8),
+            camera: editor.viewport, objects: [],
+            composition: SceneComposition.build(boardID: "pdf-board", document: document, editor: editor)
+        )
+        let order = canvas.sourceLayerOrderForTesting
+        XCTAssertLessThan(try XCTUnwrap(order.firstIndex(of: "VBoardPaper")),
+                          try XCTUnwrap(order.firstIndex(of: "VBoardPDFSource")))
+        XCTAssertLessThan(try XCTUnwrap(order.firstIndex(of: "VBoardPDFSource")),
+                          try XCTUnwrap(order.firstIndex(of: "VBoardProfessorSource")))
+        XCTAssertLessThan(try XCTUnwrap(order.firstIndex(of: "VBoardProfessorSource")),
+                          try XCTUnwrap(order.firstIndex(of: "VBoardUserContent")))
+    }
+
+    @MainActor
+    func testPDFPageRendererProducesVisiblePixels() throws {
+        let pageBounds = CGRect(x: 0, y: 0, width: 200, height: 300)
+        let pdf = UIGraphicsPDFRenderer(bounds: pageBounds).pdfData { context in
+            context.beginPage()
+            UIColor.white.setFill()
+            context.cgContext.fill(pageBounds)
+            UIColor.red.setFill()
+            context.cgContext.fill(CGRect(x: 40, y: 60, width: 120, height: 180))
+        }
+        let view = PDFPageRenderView(frame: CGRect(x: 0, y: 0, width: 200, height: 300))
+        view.display(data: pdf)
+        view.layoutIfNeeded()
+        let image = UIGraphicsImageRenderer(size: view.bounds.size).image { _ in
+            view.draw(view.bounds)
+        }
+        let cgImage = try XCTUnwrap(image.cgImage)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let context = try XCTUnwrap(CGContext(data: &pixel, width: 1, height: 1,
+                                              bitsPerComponent: 8, bytesPerRow: 4,
+                                              space: colorSpace,
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.draw(cgImage, in: CGRect(x: -100, y: -150, width: 200, height: 300))
+        XCTAssertGreaterThan(pixel[0], 180)
+        XCTAssertLessThan(pixel[1], 100)
+        XCTAssertLessThan(pixel[2], 100)
+        XCTAssertEqual(view.renderState, .ready)
+    }
+}
+
+final class SourceAssetCacheTests: XCTestCase {
+    func testCacheIsNamespacedByAccountAndBoard() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VBoardAssetCacheTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = SourceAssetCache(root: root)
+        let data = Data("private-pdf".utf8)
+        let keyA = SourceAssetCache.key(accountNamespace: "account-a", boardID: "board-a",
+                                        path: "/boards/board-a/source.pdf", version: "1")
+        try await cache.store(data, forKey: keyA, accountNamespace: "account-a", boardID: "board-a")
+        let accountA = try await cache.data(forKey: keyA, accountNamespace: "account-a", boardID: "board-a")
+        let accountB = try await cache.data(forKey: keyA, accountNamespace: "account-b", boardID: "board-a")
+        let boardB = try await cache.data(forKey: keyA, accountNamespace: "account-a", boardID: "board-b")
+        XCTAssertEqual(accountA, data)
+        XCTAssertNil(accountB)
+        XCTAssertNil(boardB)
+    }
+
+    @MainActor
+    func testProtectedPDFFetchUsesBearerAndThenLocalCache() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VBoardProtectedAssetTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        var requests = 0
+        WorkspaceURLProtocolStub.handler = { request in
+            requests += 1
+            XCTAssertEqual(request.url?.path, "/boards/board-pdf/source.pdf")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
+            return (HTTPURLResponse(url: request.url!, statusCode: 200,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/pdf"])!,
+                    Data("%PDF-protected".utf8))
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://assets.test")!,
+                            session: URLSession(configuration: configuration),
+                            sourceAssetCache: SourceAssetCache(root: root))
+        api.install(credentials: AuthCredentials(accessToken: "access-token",
+                                                  refreshToken: "refresh-token",
+                                                  accessExpiresAt: 100,
+                                                  refreshExpiresAt: 200,
+                                                  appleUserIdentifier: nil))
+        let first = try await api.cachedBoardAsset(boardID: "board-pdf",
+                                                   path: "/boards/board-pdf/source.pdf",
+                                                   version: "1")
+        let second = try await api.cachedBoardAsset(boardID: "board-pdf",
+                                                    path: "/boards/board-pdf/source.pdf",
+                                                    version: "1")
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(requests, 1)
     }
 }
 

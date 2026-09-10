@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 enum APIError: LocalizedError {
     case invalidBaseURL
@@ -27,13 +28,16 @@ final class APIClient: ObservableObject {
     private let encoder: JSONEncoder
     private let baseURL: URL
     private let diagnostics: ((String) -> Void)?
+    private let sourceAssetCache: SourceAssetCache
     private var credentials: AuthCredentials?
     private var refreshTask: Task<AuthCredentials?, Error>?
+    private var sourceAssetTasks: [String: Task<Data, Error>] = [:]
     @Published private(set) var authorizationHeader: String?
     var onCredentialsChanged: ((AuthCredentials?) -> Void)?
 
     init(baseURL: URL? = nil, session: URLSession = .shared,
-         diagnostics: ((String) -> Void)? = nil) {
+         diagnostics: ((String) -> Void)? = nil,
+         sourceAssetCache: SourceAssetCache = SourceAssetCache()) {
         // The bundled HTTPS endpoint is the production default. A Run-scheme
         // environment value remains available for a local Flask development server.
         let configured = ProcessInfo.processInfo.environment["VBoardAPIBaseURL"]
@@ -44,6 +48,7 @@ final class APIClient: ObservableObject {
         self.decoder = JSONDecoder()
         self.encoder = JSONEncoder()
         self.diagnostics = diagnostics
+        self.sourceAssetCache = sourceAssetCache
     }
 
     func install(credentials: AuthCredentials?) {
@@ -178,6 +183,35 @@ final class APIClient: ObservableObject {
         return data
     }
 
+    func cachedBoardAsset(boardID: String, path: String, version: String? = nil) async throws -> Data {
+        let namespace = LocalAccountNamespace.value
+        let key = SourceAssetCache.key(accountNamespace: namespace, boardID: boardID,
+                                       path: path, version: version)
+        if let cached = try await sourceAssetCache.data(forKey: key,
+                                                        accountNamespace: namespace,
+                                                        boardID: boardID) {
+            #if DEBUG
+            debugLog("SOURCE ASSET CACHE HIT board=\(boardID) path=\(path) bytes=\(cached.count)")
+            #endif
+            return cached
+        }
+        if let task = sourceAssetTasks[key] { return try await task.value }
+        let task = Task<Data, Error> { @MainActor [weak self] in
+            guard let self else { throw APIError.transport("The asset request was cancelled.") }
+            return try await self.authorizedAsset(path: path)
+        }
+        sourceAssetTasks[key] = task
+        defer { sourceAssetTasks.removeValue(forKey: key) }
+        let data = try await task.value
+        try await sourceAssetCache.store(data, forKey: key,
+                                         accountNamespace: namespace,
+                                         boardID: boardID)
+        #if DEBUG
+        debugLog("SOURCE ASSET CACHE STORE board=\(boardID) path=\(path) bytes=\(data.count)")
+        #endif
+        return data
+    }
+
     func exportSVG(boardID: String) async throws -> Data {
         let request = try request(path: "/board/\(boardID)/svg", accept: "image/svg+xml")
         let (data, response) = try await data(for: request)
@@ -241,10 +275,23 @@ final class APIClient: ObservableObject {
         catch { throw APIError.decoding("Could not decode the imported PDF response.") }
     }
 
-    func processCorners(boardID: String, corners: [[Double]]) async throws -> UploadResponse {
+    func processCorners(boardID: String, corners: [[Double]],
+                        normalizedCorners: [[String: Double]]? = nil) async throws -> UploadResponse {
         var request = try request(path: "/board/\(boardID)/corners", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["corners": corners])
+        var payload: [String: Any] = ["corners": corners]
+        if let normalizedCorners { payload["normalized_corners"] = normalizedCorners }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        #if DEBUG
+        debugLog("CORNER REQUEST START board=\(boardID) sourcePixels=\(corners) normalized=\(normalizedCorners ?? [])")
+        #endif
         let (data, response) = try await data(for: request)
+        #if DEBUG
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let body = String(data: data.prefix(8_192), encoding: .utf8)?
+                .replacingOccurrences(of: "\n", with: " ") ?? "<non-UTF8>"
+            debugLog("CORNER REQUEST FAILED board=\(boardID) status=\(http.statusCode) sourcePixels=\(corners) responseBody=\(body)")
+        }
+        #endif
         try validate(response, data: data)
         do { return try decoder.decode(UploadResponse.self, from: data) }
         catch { throw APIError.decoding("Could not decode the processed board response.") }
@@ -456,3 +503,54 @@ final class APIClient: ObservableObject {
 }
 
 private struct ServerError: Decodable { let error: String }
+
+actor SourceAssetCache {
+    private let root: URL
+
+    init(root: URL? = nil) {
+        self.root = root ?? FileManager.default.urls(for: .cachesDirectory,
+                                                     in: .userDomainMask)[0]
+            .appendingPathComponent("VBoardSourceAssets", isDirectory: true)
+    }
+
+    static func key(accountNamespace: String, boardID: String,
+                    path: String, version: String?) -> String {
+        let material = [accountNamespace, boardID, path, version ?? "immutable"]
+            .joined(separator: "|")
+        return SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
+    func data(forKey key: String, accountNamespace: String, boardID: String) throws -> Data? {
+        let url = try fileURL(forKey: key, accountNamespace: accountNamespace,
+                              boardID: boardID, create: false)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try Data(contentsOf: url, options: .mappedIfSafe)
+    }
+
+    func store(_ data: Data, forKey key: String,
+               accountNamespace: String, boardID: String) throws {
+        let url = try fileURL(forKey: key, accountNamespace: accountNamespace,
+                              boardID: boardID, create: true)
+        try data.write(to: url, options: .atomic)
+    }
+
+    private func fileURL(forKey key: String, accountNamespace: String,
+                         boardID: String, create: Bool) throws -> URL {
+        let safeNamespace = sanitized(accountNamespace)
+        let safeBoardID = sanitized(boardID)
+        let directory = root.appendingPathComponent(safeNamespace, isDirectory: true)
+            .appendingPathComponent(safeBoardID, isDirectory: true)
+        if create {
+            try FileManager.default.createDirectory(at: directory,
+                                                    withIntermediateDirectories: true)
+        }
+        return directory.appendingPathComponent("\(key).asset", isDirectory: false)
+    }
+
+    private func sanitized(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let result = value.unicodeScalars.map { allowed.contains($0) ? String($0) : "_" }
+        return String(result.joined().prefix(96))
+    }
+}

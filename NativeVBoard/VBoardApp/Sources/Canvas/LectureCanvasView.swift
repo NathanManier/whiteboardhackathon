@@ -18,7 +18,7 @@ struct LectureCanvasView: UIViewRepresentable {
     let selectedKeys: Set<SelectionKey>
     let tool: CanvasTool
     let thumbnailURLs: [String: URL]
-    let authorizationHeader: String?
+    var loadAsset: (String) async throws -> Data
     let focusRequest: WorkspaceFocusRequest?
     var onCameraChanged: (CameraRect) -> Void
     var onActiveBoardChanged: (String) -> Void
@@ -39,7 +39,7 @@ struct LectureCanvasView: UIViewRepresentable {
             selectedKeys: selectedKeys,
             tool: tool,
             thumbnailURLs: thumbnailURLs,
-            authorizationHeader: authorizationHeader,
+            loadAsset: loadAsset,
             callbacks: callbacks
         )
     }
@@ -47,7 +47,7 @@ struct LectureCanvasView: UIViewRepresentable {
     func updateUIView(_ view: LectureCanvasUIView, context: Context) {
         view.update(workspace: workspace, scenes: scenes, selectedKeys: selectedKeys,
                     tool: tool, thumbnailURLs: thumbnailURLs,
-                    authorizationHeader: authorizationHeader,
+                    loadAsset: loadAsset,
                     focusRequest: focusRequest, callbacks: callbacks)
     }
 
@@ -89,7 +89,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var selectedKeys: Set<SelectionKey>
     private var activeTool: CanvasTool
     private var thumbnailURLs: [String: URL]
-    private var authorizationHeader: String?
+    private var loadAsset: (String) async throws -> Data
     private var callbacks: LectureCanvasCallbacks
     private var controller: CameraController
     private var spatialIndex: WorkspaceSpatialIndex
@@ -116,14 +116,14 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
          selectedKeys: Set<SelectionKey>,
          tool: CanvasTool,
          thumbnailURLs: [String: URL],
-         authorizationHeader: String?,
+         loadAsset: @escaping (String) async throws -> Data,
          callbacks: LectureCanvasCallbacks) {
         self.workspace = workspace
         self.scenes = scenes
         self.selectedKeys = selectedKeys
         self.activeTool = tool
         self.thumbnailURLs = thumbnailURLs
-        self.authorizationHeader = authorizationHeader
+        self.loadAsset = loadAsset
         self.callbacks = callbacks
         controller = CameraController(camera: workspace.camera)
         spatialIndex = WorkspaceSpatialIndex(items: workspace.items)
@@ -190,7 +190,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 selectedKeys: Set<SelectionKey>,
                 tool: CanvasTool,
                 thumbnailURLs: [String: URL],
-                authorizationHeader: String?,
+                loadAsset: @escaping (String) async throws -> Data,
                 focusRequest: WorkspaceFocusRequest?,
                 callbacks: LectureCanvasCallbacks) {
         let placementsChanged = self.workspace.items != workspace.items
@@ -200,7 +200,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.selectedKeys = selectedKeys
         self.activeTool = tool
         self.thumbnailURLs = thumbnailURLs
-        self.authorizationHeader = authorizationHeader
+        self.loadAsset = loadAsset
         self.callbacks = callbacks
         if controller.camera != workspace.camera, !isInteracting {
             controller.setCamera(workspace.camera)
@@ -307,7 +307,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate {
                                 scene: representation == .fullVector ? scenes[item.boardID] : nil,
                                 representation: representation,
                                 thumbnailURL: thumbnailURLs[item.boardID],
-                                authorizationHeader: authorizationHeader)
+                                loadAsset: loadAsset)
         }
         if let activeBoardID = workspace.activeBoardID, let activeView = boardViews[activeBoardID] {
             worldContainer.bringSubviewToFront(activeView)
@@ -914,6 +914,7 @@ private final class LectureBoardRenderView: UIView {
     private var item: WorkspaceBoardItem?
     private var scene: WorkspaceBoardScene?
     private var representedThumbnailURL: URL?
+    private var thumbnailTask: Task<Void, Never>?
     private var liveStrokeLayer: CAShapeLayer?
 
     var hasFullScene: Bool { scene != nil }
@@ -965,7 +966,7 @@ private final class LectureBoardRenderView: UIView {
                    scene: WorkspaceBoardScene?,
                    representation: BoardRepresentation,
                    thumbnailURL: URL?,
-                   authorizationHeader: String?) {
+                   loadAsset: @escaping (String) async throws -> Data) {
         let sceneChanged = self.scene != scene
         self.item = item
         self.scene = scene
@@ -1000,7 +1001,7 @@ private final class LectureBoardRenderView: UIView {
             userLayer.isHidden = true
             thumbnail.isHidden = false
             if representation == .fullVector { loading.startAnimating() } else { loading.stopAnimating() }
-            loadThumbnail(thumbnailURL, authorizationHeader: authorizationHeader)
+            loadThumbnail(thumbnailURL, loadAsset: loadAsset)
         }
         if scene != nil { userLayer.isHidden = false }
         setNeedsLayout()
@@ -1216,8 +1217,10 @@ private final class LectureBoardRenderView: UIView {
         return inside
     }
 
-    private func loadThumbnail(_ url: URL?, authorizationHeader: String?) {
+    private func loadThumbnail(_ url: URL?,
+                               loadAsset: @escaping (String) async throws -> Data) {
         guard representedThumbnailURL != url else { return }
+        thumbnailTask?.cancel()
         representedThumbnailURL = url
         thumbnail.image = nil
         guard let url else { return }
@@ -1225,18 +1228,14 @@ private final class LectureBoardRenderView: UIView {
             thumbnail.image = cached
             return
         }
-        var request = URLRequest(url: url)
-        if let authorizationHeader {
-            request.setValue(authorizationHeader, forHTTPHeaderField: "Authorization")
-        }
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            guard let data, let image = UIImage(data: data) else { return }
+        thumbnailTask = Task { [weak self] in
+            guard let data = try? await loadAsset(url.absoluteString),
+                  !Task.isCancelled,
+                  let image = UIImage(data: data) else { return }
             Self.thumbnailCache.setObject(image, forKey: url as NSURL, cost: data.count)
-            DispatchQueue.main.async {
-                guard self?.representedThumbnailURL == url else { return }
-                self?.thumbnail.image = image
-            }
-        }.resume()
+            guard self?.representedThumbnailURL == url else { return }
+            self?.thumbnail.image = image
+        }
     }
 
     private func dateLabel(_ timestamp: Double) -> String {

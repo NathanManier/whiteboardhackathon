@@ -8,6 +8,7 @@ final class PDFPageRenderView: UIView {
     private var document: PDFDocument?
     private var pageIndex = 0
     private var representedDigest: Int?
+    private(set) var renderState: PDFRenderState = .unloaded
 
     override class var layerClass: AnyClass { CATiledLayer.self }
 
@@ -25,6 +26,7 @@ final class PDFPageRenderView: UIView {
             tiled.tileSize = CGSize(width: 768, height: 768)
             tiled.levelsOfDetail = 4
             tiled.levelsOfDetailBias = 4
+            tiled.needsDisplayOnBoundsChange = true
         }
     }
 
@@ -36,23 +38,71 @@ final class PDFPageRenderView: UIView {
         representedDigest = digest
         document = PDFDocument(data: data)
         self.pageIndex = pageIndex
+        renderState = document?.page(at: pageIndex) == nil ? .failed : .ready
+        #if DEBUG
+        let page = document?.page(at: pageIndex)
+        print("[VBoard] PDF BOARD LOAD bytes=\(data.count) pages=\(document?.pageCount ?? 0) pageIndex=\(pageIndex) pageBounds=\(String(describing: page?.bounds(for: .cropBox))) rotation=\(page?.rotation ?? 0) state=\(renderState.rawValue) viewFrame=\(frame) viewBounds=\(bounds) layerPosition=\(layer.position) anchor=\(layer.anchorPoint) hidden=\(isHidden) opacity=\(layer.opacity)")
+        #endif
         layer.setNeedsDisplay()
     }
 
     func clear() {
         representedDigest = nil
         document = nil
+        renderState = .unloaded
+        layer.setNeedsDisplay()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
         layer.setNeedsDisplay()
     }
 
     override func draw(_ rect: CGRect) {
-        guard let context = UIGraphicsGetCurrentContext(),
-              let page = document?.page(at: pageIndex) else { return }
+        guard bounds.width > 0, bounds.height > 0,
+              let context = UIGraphicsGetCurrentContext(),
+              let page = document?.page(at: pageIndex),
+              let pageRef = page.pageRef else { return }
         context.saveGState()
         context.setFillColor(UIColor.white.cgColor)
         context.fill(rect)
-        page.draw(with: .cropBox, to: context)
+        // UIView drawing begins in top-left/Y-down space while CGPDFPage is
+        // bottom-left/Y-up. Convert once, then ask Core Graphics for the exact
+        // crop-box/rotation transform into the board-local rectangle. The
+        // selection proxy uses this same entire board rectangle.
+        context.translateBy(x: 0, y: bounds.height)
+        context.scaleBy(x: 1, y: -1)
+        let pageTransform = pageRef.getDrawingTransform(
+            .cropBox,
+            rect: CGRect(origin: .zero, size: bounds.size),
+            rotate: 0,
+            preserveAspectRatio: false
+        )
+        context.concatenate(pageTransform)
+        context.drawPDFPage(pageRef)
         context.restoreGState()
+    }
+}
+
+enum PDFRenderState: String {
+    case unloaded
+    case ready
+    case failed
+}
+
+struct PDFPageBoardTransform: Equatable {
+    let boardSize: CGSize
+
+    func pdfTopLeftToBoard(_ point: CGPoint, pdfDisplaySize: CGSize) -> CGPoint {
+        guard pdfDisplaySize.width > 0, pdfDisplaySize.height > 0 else { return .zero }
+        return CGPoint(x: point.x / pdfDisplaySize.width * boardSize.width,
+                       y: point.y / pdfDisplaySize.height * boardSize.height)
+    }
+
+    func boardToPDFTopLeft(_ point: CGPoint, pdfDisplaySize: CGSize) -> CGPoint {
+        guard boardSize.width > 0, boardSize.height > 0 else { return .zero }
+        return CGPoint(x: point.x / boardSize.width * pdfDisplaySize.width,
+                       y: point.y / boardSize.height * pdfDisplaySize.height)
     }
 }
 

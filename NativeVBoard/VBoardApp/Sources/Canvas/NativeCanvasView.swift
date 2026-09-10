@@ -135,8 +135,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         paperLayer.strokeColor = UIColor.separator.withAlphaComponent(0.35).cgColor
         paperLayer.lineWidth = 2
         paperLayer.name = "VBoardPaper"
-        userLayer.addSublayer(paperLayer)
-        worldContainer.layer.addSublayer(userLayer)
+        pdfSource.layer.name = "VBoardPDFSource"
+        professor.layer.name = "VBoardProfessorSource"
+        userLayer.name = "VBoardUserContent"
         interactionLayer.fillColor = UIColor.systemBlue.withAlphaComponent(0.08).cgColor
         interactionLayer.strokeColor = UIColor.systemBlue.cgColor; interactionLayer.lineWidth = 2
         interactionLayer.lineDashPattern = [6, 4]; interactionLayer.isHidden = true
@@ -158,10 +159,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         #endif
         addSubview(worldContainer)
+        // The paper is the bottom-most board source. Keeping it inside the
+        // user layer placed an opaque rectangle above PDF/professor content,
+        // which explained why reopened imported boards showed annotations but
+        // not their source page.
+        worldContainer.layer.addSublayer(paperLayer)
         worldContainer.addSubview(pdfSource)
         worldContainer.addSubview(professor)
-        worldContainer.layer.insertSublayer(pdfSource.layer, at: 0)
-        worldContainer.layer.insertSublayer(professor.layer, above: pdfSource.layer)
         worldContainer.layer.addSublayer(userLayer)
         worldContainer.layer.addSublayer(interactionLayer)
         // ProfessorSVGView is a render-only subview. If it participates in
@@ -223,6 +227,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
+
+    var sourceLayerOrderForTesting: [String] {
+        worldContainer.layer.sublayers?.compactMap(\.name) ?? []
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()

@@ -456,7 +456,11 @@ final class LectureWorkspaceStore: ObservableObject {
                 let document = PDFBoardSource.selectableDocument(parsedDocument, sourceKind: sourceKind)
                 let pdfData: Data?
                 if sourceKind.isPDF, let path = board?.pdfURL {
-                    pdfData = try await api.authorizedAsset(path: path)
+                    pdfData = try await api.cachedBoardAsset(
+                        boardID: boardID,
+                        path: path,
+                        version: board?.updatedAt.map { String($0) }
+                    )
                 } else {
                     pdfData = nil
                 }

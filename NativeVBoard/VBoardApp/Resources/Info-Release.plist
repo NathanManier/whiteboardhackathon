@@ -24,6 +24,8 @@
     <true/>
     <key>NSCameraUsageDescription</key>
     <string>Take a photo of a physical whiteboard to make it editable.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Choose a whiteboard photo to turn it into an editable study canvas.</string>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
     <key>UISupportedInterfaceOrientations~ipad</key>

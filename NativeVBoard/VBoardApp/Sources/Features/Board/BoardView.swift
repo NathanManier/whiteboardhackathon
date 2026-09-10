@@ -38,7 +38,11 @@ struct BoardView: View {
             let document = PDFBoardSource.selectableDocument(parsedDocument, sourceKind: sourceKind)
             let pdfData: Data?
             if sourceKind.isPDF, let path = record.pdfURL ?? board.pdfURL {
-                pdfData = try await api.authorizedAsset(path: path)
+                pdfData = try await api.cachedBoardAsset(
+                    boardID: board.id,
+                    path: path,
+                    version: board.updatedAt.map { String($0) }
+                )
             } else {
                 pdfData = nil
             }
