@@ -65,7 +65,12 @@ struct LectureWorkspaceView: View {
             StudyGuideView(folderID: folder.id, guide: store.lecture?.studyGuide)
         }
         .sheet(isPresented: $showStudy) {
-            if let boardID = studyBoardID {
+            if selectedBoardIDs.count > 1 {
+                LectureSelectionStudyView(
+                    folderID: folder.id,
+                    selectedObjectIDsByBoard: selectedObjectIDsByBoard
+                )
+            } else if let boardID = studyBoardID {
                 StudyActionsView(boardID: boardID,
                                  selectedObjectIDs: studyObjectIDs) { problems, interactionID in
                     store.applyPracticeProblems(problems, interactionID: interactionID,
@@ -153,15 +158,85 @@ struct LectureWorkspaceView: View {
     }
 
     private var studyBoardID: String? {
-        let boardIDs = Set(store.selectedKeys.map(\.boardID))
-        if boardIDs.count == 1 { return boardIDs.first }
-        if boardIDs.isEmpty { return store.activeBoardID }
+        if selectedBoardIDs.count == 1 { return selectedBoardIDs.first }
+        if selectedBoardIDs.isEmpty { return store.activeBoardID }
         return nil
+    }
+
+    private var selectedBoardIDs: Set<String> { Set(store.selectedKeys.map(\.boardID)) }
+
+    private var selectedObjectIDsByBoard: [String: [String]] {
+        Dictionary(grouping: store.selectedKeys, by: \.boardID)
+            .mapValues { keys in Array(Set(keys.map(\.objectID))).sorted() }
     }
 
     private var studyObjectIDs: [String] {
         guard let boardID = studyBoardID else { return [] }
         return store.selectedKeys.filter { $0.boardID == boardID }.map(\.objectID)
+    }
+}
+
+private struct LectureSelectionStudyView: View {
+    @EnvironmentObject private var api: APIClient
+    @Environment(\.dismiss) private var dismiss
+    let folderID: String
+    let selectedObjectIDsByBoard: [String: [String]]
+    @State private var question = ""
+    @State private var loading = false
+    @State private var result: StudyInteractionResponse?
+    @State private var error: String?
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 18) {
+                if loading {
+                    ProgressView("Connecting the selected whiteboards…")
+                } else if let interaction = result?.interaction {
+                    Text(interaction.title ?? "Across this lecture").font(.title2.bold())
+                    ScrollView {
+                        Text(interaction.answer ?? "No explanation was returned.")
+                            .frame(maxWidth: 700, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                } else {
+                    Image(systemName: "rectangle.3.group.bubble.left")
+                        .font(.largeTitle).foregroundStyle(.tint)
+                    Text("Explain across whiteboards").font(.title2.bold())
+                    Text("The selected regions stay owned by their original whiteboards. V-Board will connect only this evidence across the lecture.")
+                        .multilineTextAlignment(.center).foregroundStyle(.secondary)
+                        .frame(maxWidth: 560)
+                    TextField("Optional question", text: $question)
+                        .textFieldStyle(.roundedBorder).frame(maxWidth: 560)
+                    Button("Explain Selection") { explain() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(selectedObjectIDsByBoard.count < 2 || selectedObjectIDsByBoard.count > 8)
+                }
+                if selectedObjectIDsByBoard.count > 8 {
+                    Text("Select content from up to eight whiteboards at a time.").foregroundStyle(.orange)
+                }
+                if let error { Text(error).foregroundStyle(.red) }
+            }
+            .padding(28)
+            .navigationTitle("Study Across Boards")
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+
+    private func explain() {
+        loading = true; error = nil
+        Task {
+            do {
+                result = try await api.explainLectureSelection(
+                    folderID: folderID,
+                    selectedObjectIDsByBoard: selectedObjectIDsByBoard,
+                    question: question
+                )
+                loading = false
+            } catch {
+                loading = false
+                self.error = "AI is temporarily unavailable. Your whiteboards are still saved."
+            }
+        }
     }
 }
 

@@ -146,6 +146,58 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertEqual(final["items"][0]["unit_source"], "manual")
         self.assertEqual(final["revision"], manual["revision"])
 
+    def test_cross_board_explain_keeps_selection_grouped_by_board(self):
+        folder = self.client.post("/api/folders", json={"name": "Connections"}).get_json()["folder"]
+        first_id, second_id = "7" * 32, "8" * 32
+        self._ready_board(first_id, "First concept", folder["id"])
+        self._ready_board(second_id, "Second concept", folder["id"])
+        library = board_app.read_library()
+        library["boards"].update({
+            first_id: {"name": "First concept", "folder_id": folder["id"], "created_at": 1},
+            second_id: {"name": "Second concept", "folder_id": folder["id"], "created_at": 2},
+        })
+        board_app.write_library(library)
+
+        def rendered(_metadata, board_dir, **_kwargs):
+            return {
+                "selected": f"data:image/png;base64,{board_dir.name[:4]}",
+                "context": f"data:image/png;base64,context{board_dir.name[:4]}",
+                "selection_bbox": {"x": 10, "y": 20, "width": 80, "height": 60},
+                "objects": [], "content_found": True,
+            }
+
+        with patch("study.service.render_views", side_effect=rendered), patch(
+            "study.service.explain_selection",
+            return_value={
+                "title": "Connection across boards",
+                "answer": "The second board applies the definition from the first.",
+                "confidence": "high",
+            },
+        ) as explain:
+            response = self.client.post(
+                f"/api/folders/{folder['id']}/study/explain-selection",
+                json={
+                    "question": "How do these connect?",
+                    "boards": [
+                        {"board_id": first_id, "selected_ids": [f"ink-{first_id[:8]}"]},
+                        {"board_id": second_id, "selected_ids": [f"ink-{second_id[:8]}"]},
+                    ],
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        payload = response.get_json()
+        self.assertEqual(payload["interaction"]["title"], "Connection across boards")
+        call = explain.call_args.kwargs
+        grouped = call["selection_context"]["boards"]
+        self.assertEqual([item["board_id"] for item in grouped], [first_id, second_id])
+        self.assertEqual(grouped[0]["selected_object_ids"], [f"ink-{first_id[:8]}"])
+        self.assertEqual(grouped[1]["selected_object_ids"], [f"ink-{second_id[:8]}"])
+        persisted = json.loads(
+            (board_app.BOARDS_DIR / ".workspaces" / f"{folder['id']}.study.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["interactions"][0]["source_board_ids"], [first_id, second_id])
+
     def test_new_lecture_board_reconciles_to_right_of_effective_content(self):
         folder = self.client.post("/api/folders", json={"name": "Chronology"}).get_json()["folder"]
         first_id, second_id = "4" * 32, "5" * 32

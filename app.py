@@ -3236,6 +3236,37 @@ def analyze_board_context_route(board_id: str) -> Response | tuple[Response, int
     return jsonify(status="ready" if public else "skipped", context=public)
 
 
+@app.post("/api/folders/<folder_id>/study/explain-selection")
+def explain_lecture_selection_route(folder_id: str) -> Response | tuple[Response, int]:
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    from study.ai import StudyAIError
+    from study.service import explain_lecture_selection
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    library = read_library()
+    if folder_by_id(library, folder_id) is None:
+        abort(404)
+    try:
+        interaction = explain_lecture_selection(
+            folder_id=folder_id,
+            library=library,
+            payload=payload,
+            combined_svg=combined_svg,
+            atomic_json=atomic_json,
+        )
+    except StudyAIError as exc:
+        return jsonify(error=str(exc)), exc.status
+    return jsonify(
+        interaction=interaction,
+        studyInteractionId=interaction.get("id"),
+        requestId=payload.get("requestId"),
+        followUpEnabled=False,
+    )
+
+
 @app.post("/api/boards/<board_id>/study/explain")
 def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
     from study.ai import StudyAIError

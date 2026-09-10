@@ -706,6 +706,157 @@ def persist_thumbnail(
                 pass
 
 
+def explain_lecture_selection(
+    *,
+    folder_id: str,
+    library: dict[str, Any],
+    payload: dict[str, Any],
+    combined_svg: CombinedSvg,
+    atomic_json: AtomicJson,
+) -> dict[str, Any]:
+    """Explain a bounded, board-grouped selection without merging documents.
+
+    Each board is validated and rasterized in its own local coordinate system
+    with the existing trusted renderer. Only the selected evidence is composed
+    into one Gemini request; no board editor state or SVG identity is flattened.
+    """
+    folder = folder_by_id(library, folder_id)
+    if folder is None:
+        raise StudyAIError("That lecture could not be found.", status=404)
+    requested = payload.get("boards")
+    if not isinstance(requested, list) or not 2 <= len(requested) <= 8:
+        raise StudyAIError("Select content from two to eight whiteboards.", status=400)
+    members = folder_board_ids(library, folder_id)
+    member_set = set(members)
+    from app import BOARDS_DIR, read_editor_state, read_metadata
+
+    materials: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in requested:
+        if not isinstance(raw, dict):
+            raise StudyAIError("Each selected whiteboard must be an object.", status=400)
+        board_id = str(raw.get("board_id") or "")
+        if board_id not in member_set or board_id in seen:
+            raise StudyAIError("Every selected whiteboard must belong to this lecture once.", status=400)
+        seen.add(board_id)
+        board_dir = BOARDS_DIR / board_id
+        if not board_dir.is_dir():
+            raise StudyAIError("A selected whiteboard is unavailable.", status=404)
+        metadata = read_metadata(board_dir)
+        editor = read_editor_state(board_dir, metadata)
+        selected_ids = expand_group_ids(
+            editor,
+            clean_selected_ids(
+                raw.get("selected_ids") or raw.get("selectedObjectIds"),
+                known_object_ids(editor, board_dir=board_dir, metadata=metadata),
+            ),
+        )
+        bbox = validate_bbox(raw.get("local_bbox") or raw.get("selectionBBox"))
+        if not selected_ids and bbox is None:
+            raise StudyAIError("Each whiteboard selection must contain visible content.", status=400)
+        try:
+            views = render_views(
+                metadata, board_dir, selected_ids=selected_ids, bbox=bbox,
+                combined_svg=combined_svg, include_overview=False,
+            )
+        except Exception as exc:
+            raise StudyAIError(
+                "Couldn't explain this selection right now. Your boards are still saved.",
+                status=503,
+            ) from exc
+        order = members.index(board_id) + 1
+        catalog = library.get("boards", {}).get(board_id)
+        catalog = catalog if isinstance(catalog, dict) else {}
+        selection_context = build_selection_context(
+            editor, selected_ids, study_state=read_study_state(board_dir), payload=raw,
+        )
+        materials.append({
+            "board_id": board_id,
+            "board_order": order,
+            "title": str(catalog.get("name") or metadata.get("name") or f"Whiteboard {order}"),
+            "selected_ids": selected_ids,
+            "local_bbox": views.get("selection_bbox") or bbox,
+            "selection_context": selection_context,
+            "objects": views.get("objects") or [],
+            "selected_image": views.get("selected"),
+            "context_image": views.get("context"),
+        })
+    if len(materials) < 2:
+        raise StudyAIError("Select content from at least two whiteboards.", status=400)
+
+    question = clamp_text(
+        payload.get("question") or "Explain how this selected content connects across the lecture.",
+        MAX_QUESTION_LENGTH,
+    )
+    lecture_context = public_lecture_context(stored_lecture_context(folder.get("lecture_context")))
+    grouped_context = {
+        "boards": [
+            {
+                "board_id": item["board_id"],
+                "board_order": item["board_order"],
+                "title": item["title"],
+                "selected_object_ids": item["selected_ids"],
+                "local_bbox": item["local_bbox"],
+                "selection": item["selection_context"],
+            }
+            for item in materials
+        ],
+        "selected_board_count": len(materials),
+    }
+    object_meta = [
+        {**obj, "board_id": item["board_id"], "board_order": item["board_order"]}
+        for item in materials for obj in item["objects"][:80] if isinstance(obj, dict)
+    ][:240]
+    images: dict[str, Any] = {"selected": materials[0]["selected_image"]}
+    if materials[0].get("context_image"):
+        images["context"] = materials[0]["context_image"]
+    additional = [
+        {"label": f"Whiteboard {item['board_order']} selected region", "image": item["selected_image"]}
+        for item in materials[1:] if item.get("selected_image")
+    ]
+    if additional:
+        images["lecture_boards"] = additional
+    result = explain_selection(
+        question=question,
+        board_title=f"{len(materials)} selected whiteboards",
+        folder_name=str(folder.get("name") or "Untitled lecture"),
+        object_meta=object_meta,
+        board_context=None,
+        lecture_context=lecture_context,
+        selection_context=grouped_context,
+        action="explain_across_boards",
+        images=images,
+    )
+    interaction_id = requested_interaction_id(payload.get("requestId")) or secrets.token_hex(8)
+    interaction = {
+        "id": interaction_id,
+        "board_id": materials[0]["board_id"],
+        "folder_id": folder_id,
+        "source_board_id": materials[0]["board_id"],
+        "source_board_ids": [item["board_id"] for item in materials],
+        "selected_by_board": grouped_context["boards"],
+        "selected_object_ids": [],
+        "question": question,
+        "title": result["title"],
+        "answer": result["answer"],
+        "confidence": result["confidence"],
+        "created_at": time.time(),
+        "follow_ups": [],
+        "action": "explain_across_boards",
+    }
+    study_path = BOARDS_DIR / ".workspaces" / f"{folder_id}.study.json"
+    study_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        state = json.loads(study_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        state = {"schema_version": 1, "interactions": []}
+    interactions = state.get("interactions") if isinstance(state, dict) else []
+    interactions = interactions if isinstance(interactions, list) else []
+    state = {"schema_version": 1, "interactions": [interaction, *interactions][:MAX_INTERACTIONS]}
+    atomic_json(study_path, state)
+    return public_interaction(interaction)
+
+
 def explain_board(
     *,
     board_id: str,
