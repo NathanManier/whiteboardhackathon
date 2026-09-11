@@ -675,6 +675,22 @@ def format_selection_context(selection_context: dict[str, Any] | None) -> str:
                         or item.get("sourceStudyInteractionId")
                     )
                 )
+    graphs = selection_context.get("graph_objects") or selection_context.get("graphObjects") or []
+    if graphs:
+        chunks.append(
+            "SELECTED GRAPH OBJECTS (authoritative app-known graph semantics; "
+            "use these exact expressions and viewport settings rather than re-reading them as OCR):"
+        )
+        for item in graphs[:24]:
+            if not isinstance(item, dict):
+                continue
+            safe_graph = {
+                "id": item.get("id"),
+                "expressions": (item.get("expressions") or [])[:8],
+                "viewport": item.get("viewport") if isinstance(item.get("viewport"), dict) else {},
+                "settings": item.get("settings") if isinstance(item.get("settings"), dict) else {},
+            }
+            chunks.append(json.dumps(safe_graph, ensure_ascii=True)[:12_000])
     relations = selection_context.get("relationships") or []
     if relations:
         chunks.append(

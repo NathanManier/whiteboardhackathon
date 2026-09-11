@@ -11,7 +11,7 @@ from unittest.mock import patch
 from PIL import Image
 
 import app as board_app
-from study.ai import StudyAIError
+from study.ai import StudyAIError, format_selection_context
 from study.graph_recognition import (
     GRAPH_RECOGNITION_RESPONSE_SCHEMA,
     MAX_GRAPH_DENSE_SELECTED_IDS,
@@ -593,6 +593,11 @@ class GraphRecognitionContractTests(unittest.TestCase):
         self.assertEqual(context["graph_objects"][0]["settings"]["angle_mode"], "degrees")
         self.assertNotIn("provider_metadata", context["graph_objects"][0])
         self.assertNotIn("do-not-send", json.dumps(context))
+        formatted = format_selection_context(context)
+        self.assertIn("SELECTED GRAPH OBJECTS", formatted)
+        self.assertIn(r"y=\\sin(x)", formatted)
+        self.assertIn('"angle_mode": "degrees"', formatted)
+        self.assertNotIn("do-not-send", formatted)
 
     def test_parser_accepts_multiple_supported_expressions_and_optional_confidence(self):
         result = parse_graph_recognition(json.dumps({
