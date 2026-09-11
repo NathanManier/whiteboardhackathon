@@ -218,6 +218,87 @@ class EditorApiTests(unittest.TestCase):
         self.assertEqual(reloaded["expressions"][0]["latex"], r"y=x^2-4")
         self.assertEqual(reloaded["viewport"]["y_max"], 12)
 
+    def test_graph_nested_extensions_survive_repeated_editor_round_trips(self):
+        state = self.editor_state()
+        graph = self.graph_object()
+        graph["expressions"][0]["future_expression"] = {"kind": "future"}
+        graph["expressions"][0]["display_style"]["future_style"] = {
+            "dash_phase": [1, 2, 3],
+        }
+        graph["viewport"]["future_viewport"] = {"axis_mode": "custom"}
+        graph["settings"]["future_setting"] = True
+        graph["source_selection"]["future_source"] = {"origin": "native"}
+        graph["provider_metadata"]["future_provider"] = {"revision": 2}
+        state["objects"].append(graph)
+
+        first_response = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=state
+        )
+        self.assertEqual(
+            first_response.status_code, 200, first_response.get_data(as_text=True)
+        )
+        first_editor = first_response.get_json()["editor"]
+        first_graph = first_editor["objects"][2]
+        self.assertEqual(
+            first_graph["expressions"][0]["future_expression"], {"kind": "future"}
+        )
+        self.assertEqual(
+            first_graph["expressions"][0]["display_style"]["future_style"],
+            {"dash_phase": [1, 2, 3]},
+        )
+        self.assertEqual(
+            first_graph["viewport"]["future_viewport"], {"axis_mode": "custom"}
+        )
+        self.assertTrue(first_graph["settings"]["future_setting"])
+        self.assertEqual(
+            first_graph["source_selection"]["future_source"], {"origin": "native"}
+        )
+        self.assertEqual(
+            first_graph["provider_metadata"]["future_provider"], {"revision": 2}
+        )
+
+        second_response = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=first_editor
+        )
+        self.assertEqual(
+            second_response.status_code, 200, second_response.get_data(as_text=True)
+        )
+        second_graph = second_response.get_json()["editor"]["objects"][2]
+        self.assertEqual(
+            second_graph["expressions"][0]["display_style"]["future_style"],
+            {"dash_phase": [1, 2, 3]},
+        )
+        self.assertEqual(
+            second_graph["viewport"]["future_viewport"], {"axis_mode": "custom"}
+        )
+
+    def test_graph_nested_extensions_remain_safely_bounded(self):
+        oversized_value = ["x" * 8_000, "y" * 8_000, "z" * 1_000]
+        mutations = [
+            lambda graph: graph["expressions"][0]["display_style"].update(
+                {"bad field": True}
+            ),
+            lambda graph: graph["viewport"].update({"bad field": True}),
+            lambda graph: graph["expressions"][0]["display_style"].update(
+                {"future_style": oversized_value}
+            ),
+            lambda graph: graph["viewport"].update(
+                {"future_viewport": oversized_value}
+            ),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                state = self.editor_state()
+                graph = self.graph_object()
+                mutate(graph)
+                state["objects"].append(graph)
+                response = self.client.put(
+                    f"/api/boards/{self.board_id}/editor", json=state
+                )
+                self.assertEqual(
+                    response.status_code, 400, response.get_data(as_text=True)
+                )
+
     def test_dense_graph_provenance_is_explicitly_summarized_and_round_trips(self):
         state = self.editor_state()
         graph = self.graph_object()

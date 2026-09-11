@@ -1167,6 +1167,10 @@ def _optional_graph_style(value: Any, label: str) -> dict[str, Any] | None:
         clean["opacity"] = finite_number(
             opacity, f"{label}.opacity", minimum=0, maximum=1,
         )
+    reserved = {"color", "line_width", "line_style", "point_style", "opacity"}
+    extensions = {key: item for key, item in value.items() if key not in reserved}
+    if extensions:
+        clean.update(_bounded_graph_json(extensions, f"{label} extensions", 16 * 1024))
     return clean
 
 
@@ -1263,6 +1267,16 @@ def validate_graph_object(item: dict[str, Any], index: int, board_id: str | None
     }
     if clean_viewport["x_min"] >= clean_viewport["x_max"] or clean_viewport["y_min"] >= clean_viewport["y_max"]:
         raise ValueError(f"{label}.viewport bounds are invalid.")
+    viewport_extensions = {
+        key: value for key, value in viewport.items()
+        if key not in {"x_min", "x_max", "y_min", "y_max"}
+    }
+    if viewport_extensions:
+        clean_viewport.update(
+            _bounded_graph_json(
+                viewport_extensions, f"{label}.viewport extensions", 16 * 1024,
+            )
+        )
 
     settings = item.get("settings")
     if settings is None:
