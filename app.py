@@ -712,7 +712,9 @@ def _workspace_board_item(
         unit_number = explicit[1]
     created_at = catalog.get("created_at") or metadata.get("created_at") or time.time()
     captured_at = metadata.get("captured_at") or source.get("captured_at")
-    bounds = {"x": x, "y": y, "width": width, "height": height}
+    # Source content remains W×H; the extra vertical apron is lecture layout
+    # metadata for student writing and never changes the canonical SVG/PDF.
+    bounds = {"x": x, "y": y, "width": width, "height": height * 1.5}
     return {
         "id": f"board:{board_id}",
         "kind": "board",
@@ -3631,6 +3633,94 @@ def create_folder() -> Response | tuple[Response, int]:
     write_library(library)
     claim_lecture_for_current_user(folder["id"], title=folder["name"])
     return jsonify(folder=folder), 201
+
+
+@app.post("/api/boards/blank")
+@require_authenticated
+def create_blank_board() -> Response | tuple[Response, int]:
+    """Create an editor-native writing board without invoking the CV pipeline."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+
+    library = read_library()
+    requested_folder = payload.get("folder_id")
+    if not isinstance(requested_folder, str) or requested_folder not in folder_ids(library):
+        return jsonify(error="Choose a lecture for this blank board."), 400
+    require_lecture_owner(requested_folder)
+    try:
+        requested_name = str(payload.get("name") or "").strip()
+        if requested_name:
+            board_name = validate_display_name(requested_name, "Board name")
+        else:
+            order = len(folder_board_ids(library, requested_folder)) + 1
+            board_name = unique_board_name(
+                owned_library(library), f"Blank Board {order}", requested_folder
+            )
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    width = 1600
+    height = 1000
+    now = time.time()
+    board_id = secrets.token_hex(16)
+    board_dir = board_directory(board_id, create=True)
+    empty_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{width}" height="{height}" viewBox="0 0 {width} {height}"></svg>'
+    ).encode("utf-8")
+    atomic_bytes(board_dir / "board.svg", empty_svg)
+    metadata: dict[str, Any] = {
+        "schema_version": 1,
+        "id": board_id,
+        "name": board_name,
+        "folder_id": requested_folder,
+        "source_kind": "blank_board",
+        "created_at": now,
+        "updated_at": now,
+        "source": {
+            "kind": "blank_board",
+            "width": width,
+            "height": height,
+        },
+        "dimensions": {"width": width, "height": height},
+        "assets": {"svg": "board.svg"},
+        "pipeline": {"status": "ready", "timings_ms": {}, "errors": []},
+    }
+    update_metadata(board_dir, metadata)
+    editor = default_editor_state(metadata)
+    editor["viewport"] = {
+        "x": 0,
+        "y": 0,
+        "width": width,
+        "height": 1500,
+    }
+    atomic_json(editor_path(board_dir), editor)
+
+    library["boards"][board_id] = {
+        "name": board_name,
+        "folder_id": requested_folder,
+        "created_at": now,
+        "updated_at": now,
+    }
+    folder = folder_by_id(library, requested_folder)
+    if folder:
+        sync_folder_board_order(library, requested_folder)
+        mark_study_guide_stale(folder)
+        folder["lecture_context"] = None
+    write_library(library)
+    claim_board_for_current_user(
+        board_id,
+        folder_id=requested_folder,
+        title=board_name,
+        source_kind="blank_board",
+    )
+    # Reconciliation appends the new board after existing meaningful content.
+    workspace = read_lecture_workspace(library, requested_folder)
+    return jsonify(
+        board=lecture_board_summary(board_id, metadata, library),
+        workspace=workspace,
+    ), 201
 
 
 @app.patch("/api/folders/<folder_id>")

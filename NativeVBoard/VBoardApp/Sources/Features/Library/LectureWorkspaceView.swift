@@ -66,8 +66,20 @@ struct LectureWorkspaceView: View {
                     .disabled(!store.canRedo)
                 Button { showNavigator = true } label: { Image(systemName: "sidebar.left") }
                     .accessibilityLabel("Lecture navigator")
-                Button { showImporter = true } label: { Image(systemName: "plus") }
-                    .accessibilityLabel("Add to lecture")
+                Menu {
+                    Button { createBlankBoard() } label: {
+                        Label("Blank Board", systemImage: "rectangle.and.pencil.and.ellipsis")
+                    }
+                    Button { showImporter = true } label: {
+                        Label("Import Whiteboard", systemImage: "camera.viewfinder")
+                    }
+                    if store.activeBoardStore != nil {
+                        Button { showNote = true } label: {
+                            Label("Note", systemImage: "note.text.badge.plus")
+                        }
+                    }
+                } label: { Image(systemName: "plus") }
+                .accessibilityLabel("Add to lecture")
                 Button { showGuide = true } label: { Image(systemName: "text.book.closed") }
                     .accessibilityLabel("Study Guide")
                 Menu {
@@ -259,7 +271,10 @@ struct LectureWorkspaceView: View {
                 }
 
                 if workspace.items.isEmpty {
-                    EmptyWorkspaceAction(addWhiteboard: { showImporter = true })
+                    EmptyWorkspaceAction(
+                        createBlankBoard: { createBlankBoard() },
+                        importWhiteboard: { showImporter = true }
+                    )
                 }
 
                 if let point = pencilQuickPalettePoint {
@@ -376,6 +391,17 @@ struct LectureWorkspaceView: View {
                 try await api.deleteBoard(id: board.id)
                 await store.load(api: api)
             } catch { actionError = "The whiteboard could not be deleted." }
+        }
+    }
+
+    private func createBlankBoard() {
+        Task {
+            do {
+                let board = try await api.createBlankBoard(folderID: folder.id)
+                await store.refreshAfterImport(boardID: board.id, api: api)
+            } catch {
+                actionError = "The blank board could not be created."
+            }
         }
     }
 
@@ -611,16 +637,20 @@ struct StudyDock<Content: View>: View {
 }
 
 private struct EmptyWorkspaceAction: View {
-    let addWhiteboard: () -> Void
+    let createBlankBoard: () -> Void
+    let importWhiteboard: () -> Void
     var body: some View {
         VStack(spacing: 10) {
-            Text("Add your first whiteboard").font(.title3.weight(.semibold))
-            Text("Photograph a board or import a Freeform PDF.")
+            Text("Start this lecture").font(.title3.weight(.semibold))
+            Text("Write on a blank board or bring in existing material.")
                 .font(.subheadline).foregroundStyle(.secondary)
-            Button("Add Whiteboard", action: addWhiteboard).buttonStyle(.borderedProminent)
+            HStack {
+                Button("Blank Board", action: createBlankBoard).buttonStyle(.borderedProminent)
+                Button("Import Whiteboard", action: importWhiteboard).buttonStyle(.bordered)
+            }
         }
-        .padding(20)
-        .background(Color(uiColor: .systemBackground).opacity(0.92), in: RoundedRectangle(cornerRadius: 12))
+        .padding(16)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 

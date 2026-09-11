@@ -220,6 +220,25 @@ final class APIClient: ObservableObject {
         struct Envelope: Decodable { let board: LibraryBoard }
         return try decoder.decode(Envelope.self, from: data).board
     }
+    func moveBoard(id: String, toFolderID folderID: String?) async throws -> LibraryBoard {
+        var request = try request(path: "/api/boards/\(id)", method: "PATCH")
+        let destination: Any = folderID ?? NSNull()
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["folder_id": destination])
+        let (data, response) = try await data(for: request); try validate(response, data: data)
+        struct Envelope: Decodable { let board: LibraryBoard }
+        return try decoder.decode(Envelope.self, from: data).board
+    }
+    func createBlankBoard(folderID: String, name: String? = nil) async throws -> LibraryBoard {
+        var request = try request(path: "/api/boards/blank", method: "POST")
+        var payload: [String: Any] = ["folder_id": folderID]
+        if let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payload["name"] = name
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let (data, response) = try await data(for: request); try validate(response, data: data)
+        struct Envelope: Decodable { let board: LibraryBoard }
+        return try decoder.decode(Envelope.self, from: data).board
+    }
     func board(id: String) async throws -> BoardRecord { try await get("/board/\(id)") }
     func editor(id: String) async throws -> EditorState {
         // Flask deliberately wraps this response as {"editor": {...}}.

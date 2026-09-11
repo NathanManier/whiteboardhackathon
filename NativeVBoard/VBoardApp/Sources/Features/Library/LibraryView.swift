@@ -17,6 +17,7 @@ struct LibraryView: View {
     @State private var section: LibrarySection = .lectures
     @State private var renameTarget: LibraryRenameTarget?
     @State private var deleteTarget: LibraryDeleteTarget?
+    @State private var moveTarget: LibraryBoard?
     @AppStorage("vboard.library.layout") private var layoutRaw = LibraryLayout.grid.rawValue
 
     var body: some View {
@@ -57,6 +58,13 @@ struct LibraryView: View {
             .sheet(isPresented: $showAccount) { AccountView(user: account) }
             .sheet(item: $renameTarget) { target in
                 RenamePrompt(title: target.title, value: target.name) { newName in rename(target, to: newName) }
+            }
+            .sheet(item: $moveTarget) { board in
+                if let library {
+                    MoveBoardToLectureSheet(board: board, lectures: library.folders) { folderID in
+                        move(board, to: folderID)
+                    }
+                }
             }
             .sheet(item: $pendingImport) { item in
                 ImportFlowView(pendingImport: item) { board in
@@ -145,6 +153,7 @@ struct LibraryView: View {
             .buttonStyle(.plain)
             .contextMenu {
                 Button("Rename") { renameTarget = .board(board) }
+                Button("Move to Lecture") { moveTarget = board }
                 Button("Delete", role: .destructive) { deleteTarget = .board(board) }
             }
     }
@@ -172,6 +181,18 @@ struct LibraryView: View {
                 }
                 load()
             } catch { self.error = "That item could not be deleted." }
+        }
+    }
+
+    private func move(_ board: LibraryBoard, to folderID: String?) {
+        moveTarget = nil
+        Task {
+            do {
+                _ = try await api.moveBoard(id: board.id, toFolderID: folderID)
+                load()
+            } catch {
+                self.error = "That whiteboard could not be moved."
+            }
         }
     }
 
@@ -391,6 +412,8 @@ private struct RemoteBoardThumbnail: View {
             Color(uiColor: .tertiarySystemFill)
             if let thumbnail {
                 Image(uiImage: thumbnail).resizable().scaledToFill()
+            } else if board.sourceKind == .blankBoard {
+                BlankBoardThumbnail()
             } else {
                 Image(systemName: board.status == "ready" ? "scribble.variable" : "clock")
                     .font(.title3).foregroundStyle(.secondary)
@@ -400,6 +423,72 @@ private struct RemoteBoardThumbnail: View {
         .task(id: board.thumbnailURL) {
             guard let path = board.thumbnailURL else { return }
             thumbnail = (try? await api.authorizedAsset(path: path)).flatMap(UIImage.init(data:))
+        }
+    }
+}
+
+private struct BlankBoardThumbnail: View {
+    var body: some View {
+        Canvas { context, size in
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(uiColor: .systemBackground)))
+            let spacing: CGFloat = 22
+            var dots = Path()
+            var x = spacing / 2
+            while x < size.width {
+                var y = spacing / 2
+                while y < size.height {
+                    dots.addEllipse(in: CGRect(x: x - 0.8, y: y - 0.8, width: 1.6, height: 1.6))
+                    y += spacing
+                }
+                x += spacing
+            }
+            context.fill(dots, with: .color(.secondary.opacity(0.42)))
+        }
+        .overlay(alignment: .bottomTrailing) {
+            Image(systemName: "pencil.line").foregroundStyle(.secondary).padding(9)
+        }
+    }
+}
+
+private struct MoveBoardToLectureSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let board: LibraryBoard
+    let lectures: [LectureFolder]
+    let onMove: (String?) -> Void
+    @State private var destination: String
+
+    init(board: LibraryBoard, lectures: [LectureFolder], onMove: @escaping (String?) -> Void) {
+        self.board = board
+        self.lectures = lectures
+        self.onMove = onMove
+        _destination = State(initialValue: board.folderID ?? "unfiled")
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Picker("Lecture", selection: $destination) {
+                    Text("Unfiled / Library").tag("unfiled")
+                    ForEach(lectures) { lecture in
+                        Text(lecture.name).tag(lecture.id)
+                    }
+                }
+                Text("A whiteboard belongs to one lecture. Moving it preserves its ink, edits, and study history.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .navigationTitle("Move to Lecture")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Move") {
+                        onMove(destination == "unfiled" ? nil : destination)
+                        dismiss()
+                    }
+                    .disabled(destination == (board.folderID ?? "unfiled"))
+                }
+            }
         }
     }
 }

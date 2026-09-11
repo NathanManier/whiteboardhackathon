@@ -9,14 +9,14 @@ final class WorkspaceAppearanceTests: XCTestCase {
             let world = WorkspaceDotFieldPolicy.worldSpacing(forScale: scale)
             XCTAssertTrue(WorkspaceDotFieldPolicy.worldIntervals.contains(world))
             let screen = world * scale
-            XCTAssertGreaterThanOrEqual(screen, 39)
-            XCTAssertLessThanOrEqual(screen, 125)
+            XCTAssertGreaterThanOrEqual(screen, 48)
+            XCTAssertLessThanOrEqual(screen, 72)
         }
     }
 
     func testDotFieldFadesAndThenHidesAtExtremeCloseZoom() {
-        XCTAssertEqual(WorkspaceDotFieldPolicy.opacity(forScale: 1), 0.14, accuracy: 0.0001)
-        XCTAssertLessThan(WorkspaceDotFieldPolicy.opacity(forScale: 8), 0.14)
+        XCTAssertEqual(WorkspaceDotFieldPolicy.opacity(forScale: 1), 0.23, accuracy: 0.0001)
+        XCTAssertLessThan(WorkspaceDotFieldPolicy.opacity(forScale: 8), 0.23)
         XCTAssertEqual(WorkspaceDotFieldPolicy.opacity(forScale: 12), 0)
     }
 
@@ -58,6 +58,49 @@ final class WorkspaceAppearanceTests: XCTestCase {
         XCTAssertTrue(BoardVectorLoadState.vectorPartial.isWorking)
         XCTAssertFalse(BoardVectorLoadState.vectorReady.isWorking)
         XCTAssertEqual(BoardVectorLoadState.vectorPartial.userLabel, "Refining editable ink…")
+    }
+
+    func testVectorPreviewNeverExposesPartialConstruction() {
+        XCTAssertEqual(VectorProgressivePresentationPolicy.previewOpacity(
+            progress: 0, hasStableVectorPresentation: false), 1)
+        XCTAssertEqual(VectorProgressivePresentationPolicy.previewOpacity(
+            progress: 0.75, hasStableVectorPresentation: false), 1)
+        XCTAssertEqual(VectorProgressivePresentationPolicy.previewOpacity(
+            progress: 0.01, hasStableVectorPresentation: true), 0)
+        XCTAssertEqual(VectorProgressivePresentationPolicy.previewOpacity(
+            progress: 1, hasStableVectorPresentation: false), 0)
+    }
+
+    func testSourceContentRectIsDistinctFromWritingWorkspace() {
+        let source = BoardSurfaceGeometry.sourceContentRect(
+            size: CGSize(width: 3024, height: 4032)
+        )
+        let workspace = BoardSurfaceGeometry.workspaceRegion(
+            sourceSize: CGSize(width: 3024, height: 4032)
+        )
+        XCTAssertEqual(source, CGRect(x: 0, y: 0, width: 3024, height: 4032))
+        XCTAssertEqual(workspace.width, source.width)
+        XCTAssertEqual(workspace.height, source.height * 1.5)
+    }
+
+    func testThumbnailAspectFillCropsPortraitLandscapeSquareAndTallSources() {
+        let frame = CGRect(x: 0, y: 0, width: 300, height: 160)
+        for source in [CGSize(width: 4032, height: 3024),
+                       CGSize(width: 3024, height: 4032),
+                       CGSize(width: 1000, height: 1000),
+                       CGSize(width: 600, height: 4000)] {
+            let result = ThumbnailCropPolicy.aspectFillRect(sourceSize: source, destination: frame)
+            XCTAssertGreaterThanOrEqual(result.width, frame.width - 0.001)
+            XCTAssertGreaterThanOrEqual(result.height, frame.height - 0.001)
+            XCTAssertEqual(result.midX, frame.midX, accuracy: 0.001)
+            XCTAssertEqual(result.midY, frame.midY, accuracy: 0.001)
+            XCTAssertFalse(result.width > frame.width && result.height > frame.height)
+        }
+    }
+
+    func testBlankBoardSourceKindRoundTrips() throws {
+        let data = try JSONEncoder().encode(BoardSourceKind.blankBoard)
+        XCTAssertEqual(try JSONDecoder().decode(BoardSourceKind.self, from: data), .blankBoard)
     }
 
     #if DEBUG
@@ -789,7 +832,7 @@ private func requestBodyData(_ request: URLRequest) throws -> Data {
     let bufferSize = 16_384
     let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
     defer { buffer.deallocate() }
-    while stream.hasBytesAvailable {
+    while true {
         let count = stream.read(buffer, maxLength: bufferSize)
         if count < 0 { throw stream.streamError ?? URLError(.cannotDecodeContentData) }
         if count == 0 { break }
@@ -799,6 +842,90 @@ private func requestBodyData(_ request: URLRequest) throws -> Data {
 }
 
 final class WorldScreenTransformTests: XCTestCase {
+    @MainActor
+    func testProgressiveVectorBatchesStayHiddenUntilAtomicPromotion() async throws {
+        let initial = try SVGDocument.parse("""
+        <svg viewBox="0 0 1000 1000">
+          <path id="old" d="M 0 0 L 20 0 L 20 20 L 0 20 Z" fill="#000000"/>
+        </svg>
+        """)
+        let densePaths = (0..<260).map { index in
+            let x = (index % 20) * 25
+            let y = (index / 20) * 25
+            return "<path id=\"p-\(index)\" d=\"M \(x) \(y) L \(x + 10) \(y) L \(x + 10) \(y + 10) L \(x) \(y + 10) Z\" fill=\"#000000\"/>"
+        }.joined()
+        let dense = try SVGDocument.parse("<svg viewBox=\"0 0 1000 1000\">\(densePaths)</svg>")
+        let camera = WorldScreenTransform(
+            camera: CameraRect(x: 0, y: 0, width: 1000, height: 1000),
+            viewport: CGSize(width: 1000, height: 1000)
+        )
+        let view = ProfessorSVGView(frame: CGRect(x: 0, y: 0, width: 1000, height: 1000))
+        let initialReady = expectation(description: "initial vector ready")
+        view.onProgress = { progress in
+            if progress >= 0.999 { initialReady.fulfill() }
+        }
+        view.display(initial, transform: camera)
+        await fulfillment(of: [initialReady], timeout: 2)
+        XCTAssertEqual(view.visiblePathIDsForTesting, ["old"])
+
+        let firstHiddenBatch = expectation(description: "first hidden batch prepared")
+        let denseReady = expectation(description: "dense vector atomically promoted")
+        var observedIncompleteProgress = false
+        view.onProgress = { progress in
+            if progress > 0, progress < 0.999 {
+                XCTAssertEqual(view.visiblePathIDsForTesting, ["old"],
+                               "Computational contour batches must not enter the visible scene")
+                if !observedIncompleteProgress {
+                    observedIncompleteProgress = true
+                    firstHiddenBatch.fulfill()
+                }
+            } else if progress >= 0.999 {
+                denseReady.fulfill()
+            }
+        }
+        view.display(dense, transform: camera)
+        await fulfillment(of: [firstHiddenBatch, denseReady], timeout: 3)
+        XCTAssertTrue(observedIncompleteProgress)
+        XCTAssertEqual(view.visiblePathIDsForTesting.count, 260)
+        XCTAssertFalse(view.visiblePathIDsForTesting.contains("old"))
+    }
+
+    @MainActor
+    func testTransformProxyRemainsUntilExactReplacementIsReady() async throws {
+        let document = try SVGDocument.parse("""
+        <svg viewBox="0 0 100 100">
+          <path id="prof-1" d="M 5 5 L 25 5 L 25 25 L 5 25 Z" fill="#000000"/>
+        </svg>
+        """)
+        let camera = WorldScreenTransform(
+            camera: CameraRect(x: 0, y: 0, width: 100, height: 100),
+            viewport: CGSize(width: 100, height: 100)
+        )
+        let view = ProfessorSVGView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let initialReady = expectation(description: "initial exact vector ready")
+        view.onProgress = { if $0 >= 0.999 { initialReady.fulfill() } }
+        view.display(document, transform: camera)
+        await fulfillment(of: [initialReady], timeout: 2)
+
+        view.retainPreviewScale(ids: ["prof-1"], anchor: .zero, scale: 4)
+        XCTAssertEqual(view.layerTransformForTesting(id: "prof-1")?.a ?? -1, 4, accuracy: 0.001)
+        let replacementReady = expectation(description: "replacement exact vector ready")
+        view.onProgress = { progress in
+            if progress > 0, progress < 0.999 {
+                XCTAssertEqual(view.layerTransformForTesting(id: "prof-1")?.a ?? -1, 4, accuracy: 0.001)
+            } else if progress >= 0.999 {
+                replacementReady.fulfill()
+            }
+        }
+        view.display(document, transform: camera,
+                     importedTransforms: [
+                        "prof-1": ObjectTransform(x: 0, y: 0, scaleX: 4, scaleY: 4, deleted: false)
+                     ])
+        await fulfillment(of: [replacementReady], timeout: 2)
+        XCTAssertEqual(view.layerTransformForTesting(id: "prof-1"), .identity)
+        XCTAssertEqual(view.bounds(for: "prof-1").width, 80, accuracy: 0.001)
+    }
+
     @MainActor
     func testEndingLectureNavigationRefinesAgainstLatestCamera() async throws {
         let document = try SVGDocument.parse("""
@@ -1765,6 +1892,54 @@ final class LectureWorkspacePersistenceTests: XCTestCase {
         XCTAssertFalse(LectureStudyRouting.isAvailable(
             selectedBoardIDs: []
         ))
+    }
+
+    func testCreateBlankBoardUsesLectureDestinationAndNoUploadRoute() async throws {
+        WorkspaceURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/api/boards/blank")
+            let body = try requestBodyData(request)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            XCTAssertEqual(json["folder_id"] as? String, "lecture-a")
+            XCTAssertEqual(json["name"] as? String, "Scratch Work")
+            let response = Data(#"{"board":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"Scratch Work","folder_id":"lecture-a","status":"ready","source_kind":"blank_board"}}"#.utf8)
+            return (HTTPURLResponse(url: request.url!, statusCode: 201,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!, response)
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://blank.test")!,
+                            session: URLSession(configuration: configuration))
+
+        let board = try await api.createBlankBoard(folderID: "lecture-a", name: "Scratch Work")
+
+        XCTAssertEqual(board.sourceKind, .blankBoard)
+        XCTAssertEqual(board.folderID, "lecture-a")
+    }
+
+    func testMoveBoardSendsExplicitDestinationIncludingUnfiled() async throws {
+        var bodies: [[String: Any]] = []
+        WorkspaceURLProtocolStub.handler = { request in
+            bodies.append(try XCTUnwrap(JSONSerialization.jsonObject(
+                with: try requestBodyData(request)
+            ) as? [String: Any]))
+            let folder = bodies.count == 1 ? #""lecture-b""# : "null"
+            let response = Data("{\"board\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"name\":\"Board\",\"folder_id\":\(folder),\"status\":\"ready\",\"source_kind\":\"physical_whiteboard\"}}".utf8)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!, response)
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://move.test")!,
+                            session: URLSession(configuration: configuration))
+
+        _ = try await api.moveBoard(id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", toFolderID: "lecture-b")
+        _ = try await api.moveBoard(id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", toFolderID: nil)
+
+        XCTAssertEqual(bodies.first?["folder_id"] as? String, "lecture-b")
+        XCTAssertTrue(bodies.last?["folder_id"] is NSNull)
     }
 
     func testStudyGuideEnvelopeIgnoresSiblingStaleFlag() async throws {

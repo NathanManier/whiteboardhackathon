@@ -79,6 +79,52 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertFalse((board_app.BOARDS_DIR / first_id / "editor.json").exists())
         self.assertFalse((board_app.BOARDS_DIR / second_id / "editor.json").exists())
 
+    def test_blank_board_is_editor_native_and_skips_cv_assets(self):
+        folder = self.client.post("/api/folders", json={"name": "Writing"}).get_json()["folder"]
+        existing_id = "a" * 32
+        self._ready_board(existing_id, "Imported", folder["id"], 800, 600)
+        library = board_app.read_library()
+        library["boards"][existing_id] = {
+            "name": "Imported", "folder_id": folder["id"], "created_at": 1,
+        }
+        board_app.write_library(library)
+        original_workspace = self.client.get(
+            f"/api/folders/{folder['id']}/workspace"
+        ).get_json()["workspace"]
+
+        response = self.client.post(
+            "/api/boards/blank",
+            json={"folder_id": folder["id"]},
+        )
+
+        self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
+        payload = response.get_json()
+        board = payload["board"]
+        self.assertEqual(board["source_kind"], "blank_board")
+        self.assertEqual(board["status"], "ready")
+        board_dir = board_app.BOARDS_DIR / board["id"]
+        metadata = board_app.read_metadata(board_dir)
+        self.assertEqual(metadata["source"]["kind"], "blank_board")
+        self.assertEqual(metadata["assets"], {"svg": "board.svg"})
+        self.assertFalse((board_dir / "original.jpg").exists())
+        self.assertFalse((board_dir / "master.png").exists())
+        self.assertFalse((board_dir / "thumbnail.png").exists())
+        self.assertEqual((board_dir / "board.svg").read_text(encoding="utf-8").count("<path"), 0)
+        editor = json.loads((board_dir / "editor.json").read_text(encoding="utf-8"))
+        self.assertEqual(editor["objects"], [])
+        self.assertEqual(editor["viewport"]["height"], 1500)
+        workspace = payload["workspace"]
+        self.assertEqual([item["board_id"] for item in workspace["items"]],
+                         [existing_id, board["id"]])
+        self.assertGreater(workspace["items"][1]["canvas_x"],
+                           workspace["items"][0]["effective_content_bounds"]["x"]
+                           + workspace["items"][0]["effective_content_bounds"]["width"])
+        self.assertGreater(workspace["revision"], original_workspace["revision"])
+
+    def test_blank_board_requires_existing_lecture(self):
+        response = self.client.post("/api/boards/blank", json={"folder_id": "f" * 16})
+        self.assertEqual(response.status_code, 400)
+
     def test_hundred_board_lecture_endpoint_is_a_linear_summary_manifest(self):
         folder = self.client.post("/api/folders", json={"name": "Large Lecture"}).get_json()["folder"]
         library = board_app.read_library()
