@@ -271,7 +271,61 @@ class AccountAndOwnershipTests(unittest.TestCase):
             },
         )
         self.assertEqual(graph_response.status_code, 401)
+        grouped_graph_response = self.client.post(
+            f"/api/folders/{'d' * 16}/study/graph-recognition",
+            json={
+                "requestId": "b" * 16,
+                "action": "graph_recognition",
+                "contextScope": "local",
+                "primaryBoardId": board_id,
+                "boards": [
+                    {
+                        "boardId": board_id,
+                        "selectedObjectIds": ["one"],
+                        "bbox": {"x": 0, "y": 0, "width": 10, "height": 10},
+                    },
+                    {
+                        "boardId": "e" * 32,
+                        "selectedObjectIds": ["two"],
+                        "bbox": {"x": 0, "y": 0, "width": 10, "height": 10},
+                    },
+                ],
+            },
+        )
+        self.assertEqual(grouped_graph_response.status_code, 401)
         self.assertEqual(self.client.post("/api/auth/debug", json={"testUser": "public"}).status_code, 404)
+
+    def test_graph_recognition_authentication_precedes_file_lock_creation(self):
+        board_id = "f" * 32
+        folder_id = "f" * 16
+        payload = {
+            "requestId": "f" * 16,
+            "action": "graph_recognition",
+            "contextScope": "local",
+            "selection": {
+                "selectedObjectIds": [],
+                "bbox": {"x": 0, "y": 0, "width": 10, "height": 10},
+            },
+        }
+        self.assertEqual(
+            self.client.post(
+                f"/api/boards/{board_id}/study/graph-recognition", json=payload
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/folders/{folder_id}/study/graph-recognition", json={
+                    "requestId": "f" * 16,
+                    "action": "graph_recognition",
+                    "contextScope": "local",
+                    "primaryBoardId": board_id,
+                    "boards": [],
+                }
+            ).status_code,
+            401,
+        )
+        self.assertFalse((board_app.BOARDS_DIR / ".locks").exists())
 
     def test_login_rate_limit_returns_retry_metadata_without_echoing_credentials(self):
         board_app.RATE_LIMIT_POLICIES["login"] = (2, 60)
@@ -340,6 +394,52 @@ class AccountAndOwnershipTests(unittest.TestCase):
             headers=headers_a,
         )
         self.assertEqual(graph_probe.status_code, 404)
+        grouped_graph_probe = self.client.post(
+            f"/api/folders/{folder_b}/study/graph-recognition",
+            json={
+                "requestId": "b" * 16,
+                "action": "graph_recognition",
+                "contextScope": "local",
+                "primaryBoardId": board_b,
+                "boards": [
+                    {
+                        "boardId": board_b,
+                        "selectedObjectIds": ["one"],
+                        "bbox": {"x": 0, "y": 0, "width": 10, "height": 10},
+                    },
+                    {
+                        "boardId": "c" * 32,
+                        "selectedObjectIds": ["two"],
+                        "bbox": {"x": 0, "y": 0, "width": 10, "height": 10},
+                    },
+                ],
+            },
+            headers=headers_a,
+        )
+        self.assertEqual(grouped_graph_probe.status_code, 404)
+        foreign_board_probe = self.client.post(
+            f"/api/folders/{folder_a}/study/graph-recognition",
+            json={
+                "requestId": "c" * 16,
+                "action": "graph_recognition",
+                "contextScope": "local",
+                "primaryBoardId": board_a,
+                "boards": [
+                    {
+                        "boardId": board_a,
+                        "selectedObjectIds": ["one"],
+                        "bbox": {"x": 0, "y": 0, "width": 10, "height": 10},
+                    },
+                    {
+                        "boardId": board_b,
+                        "selectedObjectIds": ["two"],
+                        "bbox": {"x": 0, "y": 0, "width": 10, "height": 10},
+                    },
+                ],
+            },
+            headers=headers_a,
+        )
+        self.assertEqual(foreign_board_probe.status_code, 404)
         self.assertEqual(
             self.client.put(
                 f"/api/folders/{folder_b}/workspace",

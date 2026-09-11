@@ -948,6 +948,258 @@ def recognize_board_graph(
     }
 
 
+def recognize_lecture_graph(
+    *,
+    folder_id: str,
+    library: dict[str, Any],
+    payload: dict[str, Any],
+    combined_svg: CombinedSvg,
+    atomic_json: AtomicJson,
+) -> dict[str, Any]:
+    """Recognize one graph from two to eight isolated board-local selections."""
+    from app import BOARDS_DIR, read_editor_state, read_metadata
+    from .graph_recognition import (
+        cached_graph_entry_for_fingerprint,
+        compose_grouped_selection_raster,
+        graph_cache_key,
+        graph_recognition_model,
+        grouped_graph_input_fingerprint,
+        grouped_graph_requested_board_ids,
+        idempotent_cached_result,
+        parse_grouped_graph_recognition_request,
+        public_graph_result,
+        read_graph_cache,
+        recognize_graph_math,
+        record_graph_cache_hit,
+        remember_graph_request,
+        store_graph_cache_result,
+        validate_cached_graph_result,
+        validate_selection_raster,
+        write_graph_cache,
+    )
+
+    started = time.perf_counter()
+    folder = folder_by_id(library, folder_id)
+    if folder is None:
+        raise StudyAIError("That lecture could not be found.", status=404)
+    _request_id, _primary_board_id, requested_board_ids = grouped_graph_requested_board_ids(payload)
+    lecture_members = set(folder_board_ids(library, folder_id))
+    board_sources: dict[str, tuple[Path, dict[str, Any], dict[str, Any]]] = {}
+    allowed_ids_by_board: dict[str, set[str]] = {}
+    for board_id in requested_board_ids:
+        if board_id not in lecture_members:
+            raise StudyAIError("Every selected board must belong to this lecture.", status=400)
+        board_dir = BOARDS_DIR / board_id
+        if not board_dir.is_dir():
+            raise StudyAIError("A selected board is unavailable.", status=404)
+        metadata = read_metadata(board_dir)
+        editor = read_editor_state(board_dir, metadata)
+        board_sources[board_id] = (board_dir, metadata, editor)
+        allowed_ids_by_board[board_id] = known_object_ids(
+            editor,
+            board_dir=board_dir,
+            metadata=metadata,
+        )
+
+    selection = parse_grouped_graph_recognition_request(
+        payload,
+        lecture_board_ids=lecture_members,
+        allowed_ids_by_board=allowed_ids_by_board,
+    )
+    materials: list[dict[str, Any]] = []
+    fingerprint_selections: list[dict[str, Any]] = []
+    for board_selection in selection.boards:
+        board_dir, metadata, editor = board_sources[board_selection.board_id]
+        selected_ids = expand_group_ids(editor, board_selection.selected_ids)
+        material = {
+            "board_id": board_selection.board_id,
+            "board_dir": board_dir,
+            "metadata": metadata,
+            "editor": editor,
+            "selected_ids": selected_ids,
+            "bbox": board_selection.bbox,
+        }
+        materials.append(material)
+        fingerprint_selections.append({
+            "board_id": board_selection.board_id,
+            "visual_revision": graph_selection_visual_revision(
+                board_dir,
+                metadata,
+                editor,
+                selected_ids,
+            ),
+            "selected_ids": sorted(selected_ids),
+            "bbox": board_selection.bbox,
+        })
+
+    model = graph_recognition_model()
+    input_fingerprint = grouped_graph_input_fingerprint(
+        folder_id=folder_id,
+        primary_board_id=selection.primary_board_id,
+        selections=fingerprint_selections,
+        model=model,
+    )
+    cache_dir = BOARDS_DIR / ".workspaces"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_filename = f"{folder_id}.graph-recognition.json"
+    cache = read_graph_cache(cache_dir, cache_filename)
+    replay = idempotent_cached_result(
+        cache,
+        request_id=selection.request_id,
+        input_fingerprint=input_fingerprint,
+    )
+    if replay is not None:
+        try:
+            result = validate_cached_graph_result(replay)
+        except StudyAIError:
+            cache["requests"] = [
+                item for item in cache.get("requests") or []
+                if not isinstance(item, dict) or item.get("request_id") != selection.request_id
+            ]
+        else:
+            record_graph_cache_hit(
+                image_dimensions=None,
+                latency_ms=(time.perf_counter() - started) * 1000,
+            )
+            LOGGER.info(
+                "GROUPED GRAPH RECOGNITION request=%s lecture=%s boards=%d objects=%d "
+                "cache_hit=true replay=true success=true",
+                selection.request_id,
+                folder_id,
+                len(materials),
+                sum(len(item["selected_ids"]) for item in materials),
+            )
+            return {
+                "result": public_graph_result(result, selection.request_id),
+                "cache_hit": True,
+                "idempotent_replay": True,
+            }
+
+    existing = cached_graph_entry_for_fingerprint(cache, input_fingerprint)
+    if existing is not None:
+        try:
+            result = validate_cached_graph_result(existing.get("result"))
+        except StudyAIError:
+            result = None
+        if result is not None:
+            remember_graph_request(
+                cache,
+                request_id=selection.request_id,
+                input_fingerprint=input_fingerprint,
+                cache_key=str(existing.get("key") or ""),
+            )
+            write_graph_cache(cache_dir, cache, atomic_json, cache_filename)
+            dimensions = existing.get("image_dimensions")
+            dimensions = dimensions if isinstance(dimensions, dict) else None
+            record_graph_cache_hit(
+                image_dimensions=dimensions,
+                latency_ms=(time.perf_counter() - started) * 1000,
+            )
+            LOGGER.info(
+                "GROUPED GRAPH RECOGNITION request=%s lecture=%s boards=%d objects=%d "
+                "cache_hit=true replay=false success=true",
+                selection.request_id,
+                folder_id,
+                len(materials),
+                sum(len(item["selected_ids"]) for item in materials),
+            )
+            return {
+                "result": public_graph_result(result, selection.request_id),
+                "cache_hit": True,
+                "idempotent_replay": False,
+            }
+
+    selected_images: list[str] = []
+    selected_text_objects: list[dict[str, Any]] = []
+    for material in materials:
+        try:
+            views = render_views(
+                material["metadata"],
+                material["board_dir"],
+                selected_ids=material["selected_ids"],
+                bbox=material["bbox"],
+                combined_svg=combined_svg,
+                include_overview=False,
+                include_context=False,
+            )
+        except Exception as exc:
+            raise StudyAIError(
+                "Couldn't read these selections for graphing. Your boards are still saved.",
+                status=503,
+            ) from exc
+        selected_image = views.get("selected")
+        validate_selection_raster(selected_image)
+        selected_images.append(selected_image)
+        selection_context = build_selection_context(
+            material["editor"],
+            material["selected_ids"],
+        )
+        selected_text_objects.extend(selection_context.get("text_objects") or [])
+
+    composed_image, image_dimensions = compose_grouped_selection_raster(selected_images)
+    raster_hash, _ = validate_selection_raster(composed_image)
+    key = graph_cache_key(input_fingerprint, raster_hash)
+    exact = next(
+        (
+            item for item in cache.get("entries") or []
+            if isinstance(item, dict) and item.get("key") == key
+        ),
+        None,
+    )
+    if exact is not None:
+        try:
+            result = validate_cached_graph_result(exact.get("result"))
+        except StudyAIError:
+            result = None
+    else:
+        result = None
+    cache_hit = result is not None
+    if result is None:
+        result = recognize_graph_math(
+            selected_image=composed_image,
+            selected_text_objects=selected_text_objects,
+            selection_count=len(materials),
+        )
+        store_graph_cache_result(
+            cache,
+            request_id=selection.request_id,
+            input_fingerprint=input_fingerprint,
+            cache_key=key,
+            result=result,
+            image_dimensions=image_dimensions,
+        )
+    else:
+        remember_graph_request(
+            cache,
+            request_id=selection.request_id,
+            input_fingerprint=input_fingerprint,
+            cache_key=key,
+        )
+        record_graph_cache_hit(
+            image_dimensions=image_dimensions,
+            latency_ms=(time.perf_counter() - started) * 1000,
+        )
+    write_graph_cache(cache_dir, cache, atomic_json, cache_filename)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    LOGGER.info(
+        "GROUPED GRAPH RECOGNITION request=%s lecture=%s boards=%d objects=%d image=%dx%d "
+        "cache_hit=%s replay=false success=true latency_ms=%.2f",
+        selection.request_id,
+        folder_id,
+        len(materials),
+        sum(len(item["selected_ids"]) for item in materials),
+        image_dimensions["width"],
+        image_dimensions["height"],
+        str(cache_hit).lower(),
+        elapsed_ms,
+    )
+    return {
+        "result": public_graph_result(result, selection.request_id),
+        "cache_hit": cache_hit,
+        "idempotent_replay": False,
+    }
+
+
 def persist_thumbnail(
     metadata: dict[str, Any],
     board_dir: Path,

@@ -4305,6 +4305,9 @@ def delete_folder(folder_id: str) -> Response | tuple[Response, int]:
     ]
     write_library(library)
     lecture_workspace_path(folder_id).unlink(missing_ok=True)
+    (BOARDS_DIR / ".workspaces" / f"{folder_id}.graph-recognition.json").unlink(
+        missing_ok=True
+    )
     user = current_user()
     if not user.is_test_user:
         AUTH_DB.delete_lecture_record(user.id, folder_id)
@@ -4744,6 +4747,78 @@ def explain_lecture_selection_route(folder_id: str) -> Response | tuple[Response
     )
 
 
+@app.post("/api/folders/<folder_id>/study/graph-recognition")
+@require_authenticated
+@locked_workspace_operation
+def grouped_graph_recognition_route(folder_id: str) -> Response | tuple[Response, int]:
+    if not FOLDER_ID_RE.fullmatch(folder_id):
+        abort(404)
+    require_lecture_owner(folder_id)
+    from study.ai import StudyAIError
+    from study.graph_recognition import grouped_graph_requested_board_ids
+    from study.service import recognize_lecture_graph
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    library = read_library()
+    if folder_by_id(library, folder_id) is None:
+        abort(404)
+    try:
+        request_id, primary_board_id, selected_board_ids = grouped_graph_requested_board_ids(payload)
+    except StudyAIError as exc:
+        return jsonify(error=str(exc)), exc.status
+    # The lecture record and every selected board must belong to the same
+    # authenticated account before membership details are evaluated.
+    for selected_board_id in selected_board_ids:
+        require_board_owner(selected_board_id)
+    if limited := enforce_rate_limit("graph_recognition"):
+        return limited
+    selected_ids: list[str] = []
+    for raw in payload.get("boards") or []:
+        if not isinstance(raw, dict):
+            continue
+        raw_ids = raw.get("selectedObjectIds") or raw.get("selected_ids")
+        if isinstance(raw_ids, list):
+            selected_ids.extend(item for item in raw_ids if isinstance(item, str))
+    try:
+        route_context = ai_context(
+            action="graph_recognition",
+            question="Identify graphable math in these selected regions",
+            request_id=request_id,
+            board_id=primary_board_id,
+            folder_id=folder_id,
+            selected_ids=selected_ids,
+            selected_board_count=len(selected_board_ids),
+            has_selected_visual=True,
+        )
+        with routed_study(route_context):
+            outcome = recognize_lecture_graph(
+                folder_id=folder_id,
+                library=library,
+                payload=payload,
+                combined_svg=combined_svg,
+                atomic_json=atomic_json,
+            )
+    except StudyAIError as exc:
+        LOGGER.warning(
+            "GROUPED GRAPH RECOGNITION request=%s lecture=%s boards=%d success=false status=%d",
+            request_id,
+            folder_id,
+            len(selected_board_ids),
+            exc.status,
+        )
+        return jsonify(error=str(exc), requestId=request_id), exc.status
+    response = jsonify(
+        result=outcome["result"],
+        requestId=request_id,
+        cacheHit=bool(outcome.get("cache_hit")),
+        idempotentReplay=bool(outcome.get("idempotent_replay")),
+    )
+    response.headers["X-Graph-Recognition-Request-Id"] = request_id
+    return response
+
+
 @app.post("/api/boards/<board_id>/study/explain")
 @locked_board_operation
 @require_authenticated
@@ -4805,8 +4880,8 @@ def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
 
 
 @app.post("/api/boards/<board_id>/study/graph-recognition")
-@locked_board_operation
 @require_authenticated
+@locked_board_operation
 def graph_recognition_route(board_id: str) -> Response | tuple[Response, int]:
     from study.ai import StudyAIError
     from study.service import recognize_board_graph

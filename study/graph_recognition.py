@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, UnidentifiedImageError
 
 from .ai import StudyAIError, call_study_model
 from .routing import AIModelPolicy, current_ai_request, mark_ai_cache_hit
@@ -30,6 +30,8 @@ MAX_GRAPH_SELECTION_PIXELS = MAX_GRAPH_SELECTION_EDGE * MAX_GRAPH_SELECTION_EDGE
 MAX_GRAPH_SELECTION_BYTES = 8 * 1024 * 1024
 MAX_GRAPH_CACHE_ENTRIES = 64
 MAX_GRAPH_REQUEST_RECORDS = 128
+MIN_GROUPED_GRAPH_BOARDS = 2
+MAX_GROUPED_GRAPH_BOARDS = 8
 
 GRAPH_EXPRESSION_TYPES = {
     "explicitFunction",
@@ -45,6 +47,7 @@ GRAPH_EXPRESSION_TYPES = {
 }
 
 _EXPRESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_BOARD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _DATA_URL_RE = re.compile(r"^data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$")
 _UNSAFE_LATEX_RE = re.compile(
     r"(?:<|>|javascript:|\\(?:begin\s*\{document\}|end\s*\{document\}|input|include|write|openout|read|usepackage|href|url|htmlClass|htmlStyle|class|style))",
@@ -111,6 +114,20 @@ class GraphRecognitionSelection:
     request_id: str
     selected_ids: list[str]
     bbox: dict[str, float] | None
+
+
+@dataclass(frozen=True)
+class GroupedGraphBoardSelection:
+    board_id: str
+    selected_ids: list[str]
+    bbox: dict[str, float]
+
+
+@dataclass(frozen=True)
+class GroupedGraphRecognitionSelection:
+    request_id: str
+    primary_board_id: str
+    boards: list[GroupedGraphBoardSelection]
 
 
 def _finite_confidence(value: Any, label: str) -> float:
@@ -224,11 +241,18 @@ def recognize_graph_math(
     *,
     selected_image: str,
     selected_text_objects: list[dict[str, Any]] | None = None,
+    selection_count: int = 1,
 ) -> dict[str, Any]:
     lines = [
         "Recognize graphable math in this focused local selection.",
         "The selected image is the only visual evidence.",
     ]
+    if selection_count > 1:
+        lines = [
+            f"Recognize graphable math in these {selection_count} focused local selections.",
+            "The selected image is one contact sheet whose labeled panels are all primary visual evidence.",
+            "Do not infer content between panels that is not visibly supported.",
+        ]
     known_text = []
     for item in (selected_text_objects or [])[:8]:
         if not isinstance(item, dict):
@@ -300,6 +324,105 @@ def parse_graph_recognition_request(
     return GraphRecognitionSelection(request_id=request_id, selected_ids=selected_ids, bbox=bbox)
 
 
+def grouped_graph_requested_board_ids(
+    payload: dict[str, Any],
+) -> tuple[str, str, list[str]]:
+    """Validate the stable grouped envelope before any board asset is opened."""
+    request_id = requested_interaction_id(payload.get("requestId"))
+    if request_id is None:
+        raise StudyAIError("requestId must be a 16-character lowercase hexadecimal id.", status=400)
+    if payload.get("action") != "graph_recognition":
+        raise StudyAIError("action must be graph_recognition.", status=400)
+    if payload.get("contextScope") != "local":
+        raise StudyAIError("contextScope must be local.", status=400)
+    primary_board_id = payload.get("primaryBoardId", payload.get("primary_board_id"))
+    if not isinstance(primary_board_id, str) or not _BOARD_ID_RE.fullmatch(primary_board_id):
+        raise StudyAIError("primaryBoardId must be a valid board id.", status=400)
+    raw_boards = payload.get("boards")
+    if (
+        not isinstance(raw_boards, list)
+        or not MIN_GROUPED_GRAPH_BOARDS <= len(raw_boards) <= MAX_GROUPED_GRAPH_BOARDS
+    ):
+        raise StudyAIError(
+            f"boards must contain {MIN_GROUPED_GRAPH_BOARDS} to {MAX_GROUPED_GRAPH_BOARDS} selections.",
+            status=400,
+        )
+    board_ids: list[str] = []
+    for index, raw in enumerate(raw_boards):
+        if not isinstance(raw, dict):
+            raise StudyAIError(f"boards[{index}] must be an object.", status=400)
+        board_id = raw.get("boardId", raw.get("board_id"))
+        if (
+            not isinstance(board_id, str)
+            or not _BOARD_ID_RE.fullmatch(board_id)
+            or board_id in board_ids
+        ):
+            raise StudyAIError("Each grouped board selection must have one distinct valid boardId.", status=400)
+        board_ids.append(board_id)
+    if primary_board_id not in board_ids:
+        raise StudyAIError("primaryBoardId must be included in boards.", status=400)
+    return request_id, primary_board_id, board_ids
+
+
+def parse_grouped_graph_recognition_request(
+    payload: dict[str, Any],
+    *,
+    lecture_board_ids: set[str],
+    allowed_ids_by_board: dict[str, set[str]],
+) -> GroupedGraphRecognitionSelection:
+    request_id, primary_board_id, board_ids = grouped_graph_requested_board_ids(payload)
+    raw_boards = payload["boards"]
+    boards: list[GroupedGraphBoardSelection] = []
+    for index, (board_id, raw) in enumerate(zip(board_ids, raw_boards)):
+        if board_id not in lecture_board_ids:
+            raise StudyAIError("Every selected board must belong to this lecture.", status=400)
+        raw_ids = raw.get("selectedObjectIds", raw.get("selected_ids"))
+        if (
+            not isinstance(raw_ids, list)
+            or not 1 <= len(raw_ids) <= MAX_GRAPH_SELECTED_IDS
+        ):
+            raise StudyAIError(
+                f"boards[{index}].selectedObjectIds must contain 1 to {MAX_GRAPH_SELECTED_IDS} ids.",
+                status=400,
+            )
+        allowed_ids = allowed_ids_by_board.get(board_id, set())
+        selected_ids: list[str] = []
+        seen: set[str] = set()
+        for object_id in raw_ids:
+            if not isinstance(object_id, str) or object_id in seen:
+                raise StudyAIError(
+                    f"boards[{index}].selectedObjectIds contains an invalid or duplicate id.",
+                    status=400,
+                )
+            if object_id not in allowed_ids:
+                raise StudyAIError(
+                    f"boards[{index}].selectedObjectIds contains an unknown board object id.",
+                    status=400,
+                )
+            seen.add(object_id)
+            selected_ids.append(object_id)
+        raw_bbox = raw.get(
+            "bbox",
+            raw.get("local_bbox", raw.get("selectionBBox", raw.get("selection_bbox"))),
+        )
+        bbox = validate_bbox(raw_bbox)
+        if bbox is None:
+            raise StudyAIError(
+                f"boards[{index}].bbox must be finite and have positive dimensions.",
+                status=400,
+            )
+        boards.append(GroupedGraphBoardSelection(
+            board_id=board_id,
+            selected_ids=selected_ids,
+            bbox=bbox,
+        ))
+    return GroupedGraphRecognitionSelection(
+        request_id=request_id,
+        primary_board_id=primary_board_id,
+        boards=boards,
+    )
+
+
 def validate_selection_raster(data_url: Any) -> tuple[str, dict[str, int]]:
     if not isinstance(data_url, str):
         raise StudyAIError("The selected region could not be prepared for graph recognition.", status=503)
@@ -329,6 +452,80 @@ def validate_selection_raster(data_url: Any) -> tuple[str, dict[str, int]]:
     return hashlib.sha256(raw).hexdigest(), {"width": int(width), "height": int(height)}
 
 
+def compose_grouped_selection_raster(data_urls: list[str]) -> tuple[str, dict[str, int]]:
+    """Compose two to eight focused selection rasters into one bounded image."""
+    if not MIN_GROUPED_GRAPH_BOARDS <= len(data_urls) <= MAX_GROUPED_GRAPH_BOARDS:
+        raise StudyAIError("Grouped graph recognition requires two to eight selections.", status=400)
+    images: list[Image.Image] = []
+    try:
+        for data_url in data_urls:
+            validate_selection_raster(data_url)
+            match = _DATA_URL_RE.fullmatch(data_url)
+            if match is None:
+                raise StudyAIError(
+                    "The selected regions could not be prepared for graph recognition.",
+                    status=503,
+                )
+            raw = base64.b64decode(match.group(2), validate=True)
+            with Image.open(io.BytesIO(raw)) as image:
+                images.append(image.convert("RGB"))
+        columns = 1 if len(images) == 2 else 2
+        rows = math.ceil(len(images) / columns)
+        canvas_width = MAX_GRAPH_SELECTION_EDGE
+        canvas_height = MAX_GRAPH_SELECTION_EDGE
+        gutter = 12
+        label_height = 24
+        cell_width = (canvas_width - gutter * (columns + 1)) // columns
+        cell_height = (canvas_height - gutter * (rows + 1)) // rows
+        canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+        draw = ImageDraw.Draw(canvas)
+        for index, image in enumerate(images):
+            column = index % columns
+            row = index // columns
+            cell_x = gutter + column * (cell_width + gutter)
+            cell_y = gutter + row * (cell_height + gutter)
+            draw.rounded_rectangle(
+                (cell_x, cell_y, cell_x + cell_width, cell_y + cell_height),
+                radius=6,
+                outline=(205, 211, 220),
+                width=2,
+                fill=(250, 250, 248),
+            )
+            draw.text(
+                (cell_x + 8, cell_y + 5),
+                f"Selection {index + 1}",
+                fill=(65, 72, 84),
+            )
+            available_width = max(1, cell_width - 16)
+            available_height = max(1, cell_height - label_height - 12)
+            scale = min(available_width / image.width, available_height / image.height)
+            target = (
+                max(1, int(round(image.width * scale))),
+                max(1, int(round(image.height * scale))),
+            )
+            resized = (
+                image.resize(target, Image.Resampling.LANCZOS)
+                if image.size != target
+                else image
+            )
+            paste_x = cell_x + (cell_width - resized.width) // 2
+            paste_y = cell_y + label_height + (available_height - resized.height) // 2
+            canvas.paste(resized, (paste_x, paste_y))
+        output = io.BytesIO()
+        canvas.save(output, format="PNG", optimize=True)
+    except StudyAIError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise StudyAIError(
+            "The selected regions could not be prepared for graph recognition.",
+            status=503,
+        ) from exc
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    data_url = "data:image/png;base64," + encoded
+    _hash, dimensions = validate_selection_raster(data_url)
+    return data_url, dimensions
+
+
 def graph_input_fingerprint(
     *,
     board_id: str,
@@ -342,6 +539,25 @@ def graph_input_fingerprint(
         "visual_revision": visual_revision,
         "selected_ids": sorted(selected_ids),
         "bbox": bbox,
+        "model": model,
+        "recognition_version": GRAPH_RECOGNITION_VERSION,
+    }
+    return hashlib.sha256(
+        json.dumps(source, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def grouped_graph_input_fingerprint(
+    *,
+    folder_id: str,
+    primary_board_id: str,
+    selections: list[dict[str, Any]],
+    model: str,
+) -> str:
+    source = {
+        "folder_id": folder_id,
+        "primary_board_id": primary_board_id,
+        "selections": selections,
         "model": model,
         "recognition_version": GRAPH_RECOGNITION_VERSION,
     }
@@ -364,9 +580,12 @@ def empty_graph_cache() -> dict[str, Any]:
     }
 
 
-def read_graph_cache(board_dir: Path) -> dict[str, Any]:
+def read_graph_cache(
+    cache_dir: Path,
+    filename: str = "graph-recognition.json",
+) -> dict[str, Any]:
     try:
-        value = json.loads((board_dir / "graph-recognition.json").read_text(encoding="utf-8"))
+        value = json.loads((cache_dir / filename).read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return empty_graph_cache()
     if not isinstance(value, dict):
@@ -381,12 +600,13 @@ def read_graph_cache(board_dir: Path) -> dict[str, Any]:
 
 
 def write_graph_cache(
-    board_dir: Path,
+    cache_dir: Path,
     cache: dict[str, Any],
     atomic_json: Callable[[Path, Any], None],
+    filename: str = "graph-recognition.json",
 ) -> None:
     atomic_json(
-        board_dir / "graph-recognition.json",
+        cache_dir / filename,
         {
             "schema_version": GRAPH_RECOGNITION_CACHE_SCHEMA_VERSION,
             "entries": list(cache.get("entries") or [])[:MAX_GRAPH_CACHE_ENTRIES],

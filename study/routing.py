@@ -125,7 +125,12 @@ def classify_request(context: AIRequestContext) -> AIRoute:
         or bool(_PREVIOUS.search(question))
         or bool(_LECTURE.search(question))
     )
-    if course_reference:
+    if context.action == "graph_recognition":
+        # Even a grouped graph request contains only explicitly selected,
+        # board-local rasters. It must not trigger lecture retrieval merely
+        # because those selections happen to come from multiple boards.
+        scope = ContextScope.LOCAL
+    elif course_reference:
         scope = ContextScope.COURSE
     elif context.selected_board_count > 1 or lecture_reference:
         scope = ContextScope.LECTURE
