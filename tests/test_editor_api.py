@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import app as board_app
@@ -214,6 +215,12 @@ class EditorApiTests(unittest.TestCase):
     def test_combined_svg_exports_safe_static_graph_without_provider_state(self):
         state = self.editor_state()
         state["objects"].append(self.graph_object())
+        source_before = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">'
+            b'<path id="professor-one" d="M 1 1 L 8 8" fill="#111111"/>'
+            b'</svg>'
+        )
+        (self.board_dir / "board.svg").write_bytes(source_before)
         self.assertEqual(
             self.client.put(f"/api/boards/{self.board_id}/editor", json=state).status_code,
             200,
@@ -226,6 +233,16 @@ class EditorApiTests(unittest.TestCase):
         self.assertIn("y=x^2-4", markup)
         self.assertIn("graph-clip-graph-one", markup)
         self.assertNotIn("PRIVATE_PROVIDER_STATE", markup)
+        root = ET.fromstring(response.data)
+        curve = next(
+            item for item in root.iter()
+            if item.get("data-expression-id") == "expression-1"
+        )
+        self.assertTrue(curve.tag.endswith("path"))
+        self.assertEqual(curve.get("data-static-plot"), "true")
+        self.assertEqual(curve.get("stroke"), "#2d70b3")
+        self.assertGreater(str(curve.get("d") or "").count("L "), 100)
+        self.assertEqual((self.board_dir / "board.svg").read_bytes(), source_before)
 
     def test_graph_object_rejects_cross_board_owner_unsafe_latex_and_invalid_viewport(self):
         mutations = [

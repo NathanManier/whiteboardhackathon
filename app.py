@@ -2935,6 +2935,8 @@ def append_static_graph_svg(
     namespace: str,
 ) -> None:
     """Export a safe provider-independent graph card without embedding provider HTML/state."""
+    from study.graph_export import static_graph_primitives
+
     frame = item.get("frame") if isinstance(item.get("frame"), dict) else {}
     try:
         x = float(frame.get("x"))
@@ -3017,6 +3019,18 @@ def append_static_graph_svg(
             plot, f"{{{namespace}}}path",
             {"d": f"M {plot_x:.4f} {axis_y:.4f} H {plot_x + plot_width:.4f}",
              "stroke": "#667085", "stroke-width": "1.5"},
+        )
+    for primitive in static_graph_primitives(
+        item,
+        plot_x=plot_x,
+        plot_y=plot_y,
+        plot_width=plot_width,
+        plot_height=plot_height,
+    ):
+        ET.SubElement(
+            plot,
+            f"{{{namespace}}}{primitive.tag}",
+            primitive.attributes,
         )
     expressions = [
         expression for expression in item.get("expressions") or []
