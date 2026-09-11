@@ -14,12 +14,16 @@ import app as board_app
 from study.ai import StudyAIError
 from study.graph_recognition import (
     GRAPH_RECOGNITION_RESPONSE_SCHEMA,
+    MAX_GRAPH_DENSE_SELECTED_IDS,
     MAX_GRAPH_EXPRESSIONS,
+    MAX_GRAPH_SELECTED_IDS,
+    parse_graph_recognition_request,
     parse_graph_recognition,
     recognize_graph_math,
     validate_selection_raster,
 )
 from study.routing import AIRequestContext, ContextScope, ReasoningDifficulty, classify_request
+from study.service import build_selection_context
 
 
 def image_data_url(width: int = 320, height: int = 120) -> str:
@@ -125,8 +129,12 @@ class GraphRecognitionApiTests(unittest.TestCase):
         self.assertEqual(response.headers["X-Graph-Recognition-Request-Id"], "a" * 16)
         self.assertFalse(render.call_args.kwargs["include_overview"])
         self.assertFalse(render.call_args.kwargs["include_context"])
-        self.assertEqual(set(recognize.call_args.kwargs), {"selected_image", "selected_text_objects"})
+        self.assertEqual(
+            set(recognize.call_args.kwargs),
+            {"selected_image", "selected_text_objects", "selected_graph_objects"},
+        )
         self.assertEqual(recognize.call_args.kwargs["selected_text_objects"], [])
+        self.assertEqual(recognize.call_args.kwargs["selected_graph_objects"], [])
         saved = json.loads((self.board_dir / "graph-recognition.json").read_text(encoding="utf-8"))
         self.assertEqual(len(saved["entries"]), 1)
         self.assertNotIn("selected_image", json.dumps(saved))
@@ -219,6 +227,28 @@ class GraphRecognitionApiTests(unittest.TestCase):
         self.assertEqual(changed.status_code, 409, changed.get_data(as_text=True))
         self.assertEqual(render.call_count, 1)
         self.assertEqual(recognize.call_count, 1)
+
+    def test_verified_cache_and_replay_do_not_consume_model_rate_limit(self):
+        with patch("study.service.render_views", return_value=self.views()), patch(
+            "study.graph_recognition.recognize_graph_math", return_value=recognized_result()
+        ) as recognize, patch("app.enforce_rate_limit", return_value=None) as rate_limit:
+            first = self.client.post(
+                f"/api/boards/{self.board_id}/study/graph-recognition",
+                json=self.request("8" * 16),
+            )
+            replay = self.client.post(
+                f"/api/boards/{self.board_id}/study/graph-recognition",
+                json=self.request("8" * 16),
+            )
+            cached = self.client.post(
+                f"/api/boards/{self.board_id}/study/graph-recognition",
+                json=self.request("9" * 16),
+            )
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(replay.get_json()["idempotentReplay"])
+        self.assertTrue(cached.get_json()["cacheHit"])
+        self.assertEqual(rate_limit.call_count, 1)
+        recognize.assert_called_once()
 
     def test_camera_only_save_keeps_cache_but_selected_transform_invalidates_it(self):
         with patch("study.service.render_views", return_value=self.views()) as render, patch(
@@ -509,6 +539,61 @@ class GroupedGraphRecognitionApiTests(unittest.TestCase):
 
 
 class GraphRecognitionContractTests(unittest.TestCase):
+    def test_dense_single_board_selection_requires_bbox_and_remains_bounded(self):
+        selected_ids = [f"object-{index}" for index in range(MAX_GRAPH_SELECTED_IDS + 1)]
+        payload = {
+            "requestId": "d" * 16,
+            "action": "graph_recognition",
+            "contextScope": "local",
+            "selection": {
+                "selectedObjectIds": selected_ids,
+                "bbox": {"x": -120, "y": 40, "width": 900, "height": 600},
+            },
+        }
+
+        selection = parse_graph_recognition_request(payload, allowed_ids=set(selected_ids))
+        self.assertEqual(selection.selected_ids, selected_ids)
+        self.assertEqual(selection.bbox["x"], -120)
+
+        payload["selection"].pop("bbox")
+        with self.assertRaisesRegex(StudyAIError, "require a finite bbox"):
+            parse_graph_recognition_request(payload, allowed_ids=set(selected_ids))
+
+        oversized_ids = [f"dense-{index}" for index in range(MAX_GRAPH_DENSE_SELECTED_IDS + 1)]
+        payload["selection"] = {
+            "selectedObjectIds": oversized_ids,
+            "bbox": {"x": 0, "y": 0, "width": 100, "height": 100},
+        }
+        with self.assertRaisesRegex(StudyAIError, "at most"):
+            parse_graph_recognition_request(payload, allowed_ids=set(oversized_ids))
+
+    def test_server_owned_graph_semantics_are_in_selection_context(self):
+        graph = {
+            "id": "graph-one",
+            "type": "graph",
+            "frame": {"x": -20, "y": 30, "width": 400, "height": 300},
+            "expressions": [{
+                "id": "expression-one",
+                "latex": r"y=\sin(x)",
+                "type": "explicitFunction",
+                "visible": True,
+                "restrictions": [],
+            }],
+            "viewport": {"x_min": -10, "x_max": 10, "y_min": -5, "y_max": 5},
+            "settings": {"angle_mode": "degrees", "show_grid": False},
+            "source_selection": {
+                "source_board_ids": ["a" * 32],
+                "original_recognition_request_id": "b" * 16,
+            },
+            "provider_metadata": {"state": {"private": "do-not-send"}},
+        }
+        context = build_selection_context({"objects": [graph]}, ["graph-one"])
+        self.assertEqual(context["graph_objects"][0]["expressions"][0]["latex"], r"y=\sin(x)")
+        self.assertEqual(context["graph_objects"][0]["viewport"]["x_min"], -10)
+        self.assertEqual(context["graph_objects"][0]["settings"]["angle_mode"], "degrees")
+        self.assertNotIn("provider_metadata", context["graph_objects"][0])
+        self.assertNotIn("do-not-send", json.dumps(context))
+
     def test_parser_accepts_multiple_supported_expressions_and_optional_confidence(self):
         result = parse_graph_recognition(json.dumps({
             "graphable": True,

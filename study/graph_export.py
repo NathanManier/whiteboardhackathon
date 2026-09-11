@@ -256,7 +256,14 @@ def _variables(node: _Node) -> set[str]:
     return set()
 
 
-def _evaluate(node: _Node, *, x: float = 0, y: float = 0, depth: int = 0) -> float:
+def _evaluate(
+    node: _Node,
+    *,
+    x: float = 0,
+    y: float = 0,
+    angle_mode: str = "radians",
+    depth: int = 0,
+) -> float:
     if depth > MAX_STATIC_GRAPH_PARSE_DEPTH:
         raise ArithmeticError("Expression is nested too deeply.")
     kind = node[0]
@@ -265,11 +272,17 @@ def _evaluate(node: _Node, *, x: float = 0, y: float = 0, depth: int = 0) -> flo
     elif kind == "identifier":
         result = {"x": x, "y": y, "pi": math.pi, "e": math.e}[node[1]]
     elif kind == "unary":
-        operand = _evaluate(node[2], x=x, y=y, depth=depth + 1)
+        operand = _evaluate(
+            node[2], x=x, y=y, angle_mode=angle_mode, depth=depth + 1
+        )
         result = operand if node[1] == "+" else -operand
     elif kind == "binary":
-        left = _evaluate(node[2], x=x, y=y, depth=depth + 1)
-        right = _evaluate(node[3], x=x, y=y, depth=depth + 1)
+        left = _evaluate(
+            node[2], x=x, y=y, angle_mode=angle_mode, depth=depth + 1
+        )
+        right = _evaluate(
+            node[3], x=x, y=y, angle_mode=angle_mode, depth=depth + 1
+        )
         if node[1] == "+":
             result = left + right
         elif node[1] == "-":
@@ -285,13 +298,16 @@ def _evaluate(node: _Node, *, x: float = 0, y: float = 0, depth: int = 0) -> flo
                 raise ArithmeticError("Unsafe exponent.")
             result = math.pow(left, right)
     elif kind == "function":
-        argument = _evaluate(node[2], x=x, y=y, depth=depth + 1)
+        argument = _evaluate(
+            node[2], x=x, y=y, angle_mode=angle_mode, depth=depth + 1
+        )
+        trig_argument = math.radians(argument) if angle_mode == "degrees" else argument
         if node[1] == "sin":
-            result = math.sin(argument)
+            result = math.sin(trig_argument)
         elif node[1] == "cos":
-            result = math.cos(argument)
+            result = math.cos(trig_argument)
         elif node[1] == "tan":
-            result = math.tan(argument)
+            result = math.tan(trig_argument)
         elif node[1] == "sqrt":
             if argument < 0:
                 raise ArithmeticError("Square root domain error.")
@@ -334,11 +350,11 @@ def _split_relation(value: str) -> tuple[str, str] | None:
     return value[:split_at], value[split_at + 1:]
 
 
-def _constant(node: _Node) -> float:
+def _constant(node: _Node, *, angle_mode: str = "radians") -> float:
     if _variables(node):
         raise StaticGraphParseError("Expected a constant.")
     try:
-        return _evaluate(node)
+        return _evaluate(node, angle_mode=angle_mode)
     except (ArithmeticError, OverflowError, ValueError) as exc:
         raise StaticGraphParseError("Invalid constant.") from exc
 
@@ -362,19 +378,19 @@ def _explicit_node(value: str) -> _Node:
     return node
 
 
-def _line_value(value: str, variable: str) -> float:
+def _line_value(value: str, variable: str, *, angle_mode: str = "radians") -> float:
     relation = _split_relation(value)
     if relation is None:
-        return _constant(_parse(value))
+        return _constant(_parse(value), angle_mode=angle_mode)
     left, right = relation
     if left.replace(" ", "") == variable:
-        return _constant(_parse(right))
+        return _constant(_parse(right), angle_mode=angle_mode)
     if right.replace(" ", "") == variable:
-        return _constant(_parse(left))
+        return _constant(_parse(left), angle_mode=angle_mode)
     raise StaticGraphParseError("Not a supported line.")
 
 
-def _point_value(value: str) -> tuple[float, float]:
+def _point_value(value: str, *, angle_mode: str = "radians") -> tuple[float, float]:
     raw = value.strip()
     if raw.startswith("(") and raw.endswith(")"):
         raw = raw[1:-1]
@@ -391,7 +407,10 @@ def _point_value(value: str) -> tuple[float, float]:
             split_at = index
     if split_at is None or depth != 0:
         raise StaticGraphParseError("Invalid point.")
-    return _constant(_parse(raw[:split_at])), _constant(_parse(raw[split_at + 1:]))
+    return (
+        _constant(_parse(raw[:split_at]), angle_mode=angle_mode),
+        _constant(_parse(raw[split_at + 1:]), angle_mode=angle_mode),
+    )
 
 
 def _squared_variable(node: _Node, variable: str) -> bool:
@@ -404,7 +423,7 @@ def _squared_variable(node: _Node, variable: str) -> bool:
     )
 
 
-def _origin_circle_radius(value: str) -> float:
+def _origin_circle_radius(value: str, *, angle_mode: str = "radians") -> float:
     relation = _split_relation(value)
     if relation is None:
         raise StaticGraphParseError("Not a circle relation.")
@@ -422,9 +441,9 @@ def _origin_circle_radius(value: str) -> float:
         )
 
     if is_circle(left):
-        radius_squared = _constant(right)
+        radius_squared = _constant(right, angle_mode=angle_mode)
     elif is_circle(right):
-        radius_squared = _constant(left)
+        radius_squared = _constant(left, angle_mode=angle_mode)
     else:
         raise StaticGraphParseError("Not a supported origin circle.")
     if not 0 < radius_squared <= 1e12:
@@ -512,6 +531,7 @@ def _explicit_path(
     *,
     plot: tuple[float, float, float, float],
     viewport: tuple[float, float, float, float],
+    angle_mode: str,
 ) -> str:
     x_min, x_max, y_min, y_max = viewport
     y_span = y_max - y_min
@@ -523,7 +543,7 @@ def _explicit_path(
     for index in range(sample_count):
         x_value = x_min + (x_max - x_min) * index / (sample_count - 1)
         try:
-            y_value = _evaluate(node, x=x_value)
+            y_value = _evaluate(node, x=x_value, angle_mode=angle_mode)
         except (ArithmeticError, OverflowError, ValueError):
             y_value = math.nan
         if (
@@ -545,7 +565,7 @@ def _explicit_path(
             continue
         midpoint_x = (left[0] + right[0]) * 0.5
         try:
-            midpoint_y = _evaluate(node, x=midpoint_x)
+            midpoint_y = _evaluate(node, x=midpoint_x, angle_mode=angle_mode)
         except (ArithmeticError, OverflowError, ValueError):
             midpoint_y = math.nan
         midpoint_valid = (
@@ -591,6 +611,7 @@ def static_graph_primitives(
     plot_y: float,
     plot_width: float,
     plot_height: float,
+    max_expressions: int | None = None,
 ) -> list[StaticGraphPrimitive]:
     """Return bounded SVG geometry for the deliberately small P0 expression subset.
 
@@ -607,10 +628,18 @@ def static_graph_primitives(
     except StaticGraphParseError:
         return []
     plot = (plot_x, plot_y, plot_width, plot_height)
+    settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+    angle_mode = str(settings.get("angle_mode") or "radians")
+    if angle_mode not in {"radians", "degrees"}:
+        angle_mode = "radians"
     primitives: list[StaticGraphPrimitive] = []
+    considered = 0
     for expression in item.get("expressions") or []:
         if not isinstance(expression, dict) or not expression.get("visible", True):
             continue
+        if max_expressions is not None and considered >= max(0, max_expressions):
+            break
+        considered += 1
         restrictions = expression.get("restrictions", [])
         if restrictions:
             # Exporting an unrestricted approximation would misrepresent the
@@ -627,27 +656,32 @@ def static_graph_primitives(
             latex = _plain_math(raw_latex)
             style = _style(expression)
             if expression_type == "explicitFunction":
-                path_data = _explicit_path(_explicit_node(latex), plot=plot, viewport=viewport)
+                path_data = _explicit_path(
+                    _explicit_node(latex),
+                    plot=plot,
+                    viewport=viewport,
+                    angle_mode=angle_mode,
+                )
                 if not path_data:
                     continue
                 attributes = {"d": path_data, **style}
                 primitive = StaticGraphPrimitive("path", attributes)
             elif expression_type == "horizontalLine":
-                y_value = _line_value(latex, "y")
+                y_value = _line_value(latex, "y", angle_mode=angle_mode)
                 start = _screen_point(viewport[0], y_value, plot=plot, viewport=viewport)
                 end = _screen_point(viewport[1], y_value, plot=plot, viewport=viewport)
                 primitive = StaticGraphPrimitive(
                     "path", {"d": _format_path([[start, end]]), **style}
                 )
             elif expression_type == "verticalLine":
-                x_value = _line_value(latex, "x")
+                x_value = _line_value(latex, "x", angle_mode=angle_mode)
                 start = _screen_point(x_value, viewport[2], plot=plot, viewport=viewport)
                 end = _screen_point(x_value, viewport[3], plot=plot, viewport=viewport)
                 primitive = StaticGraphPrimitive(
                     "path", {"d": _format_path([[start, end]]), **style}
                 )
             elif expression_type == "point":
-                point = _point_value(latex)
+                point = _point_value(latex, angle_mode=angle_mode)
                 screen = _screen_point(*point, plot=plot, viewport=viewport)
                 attributes = {
                     "cx": f"{screen[0]:.3f}",
@@ -658,7 +692,7 @@ def static_graph_primitives(
                 }
                 primitive = StaticGraphPrimitive("circle", attributes)
             elif expression_type == "implicitEquation":
-                radius = _origin_circle_radius(latex)
+                radius = _origin_circle_radius(latex, angle_mode=angle_mode)
                 points = [
                     _screen_point(
                         math.cos(index * math.tau / 128) * radius,

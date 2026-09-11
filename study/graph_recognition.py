@@ -25,6 +25,7 @@ MAX_GRAPH_EXPRESSIONS = 8
 MAX_GRAPH_WARNINGS = 8
 MAX_GRAPH_LATEX_LENGTH = 1_000
 MAX_GRAPH_SELECTED_IDS = 400
+MAX_GRAPH_DENSE_SELECTED_IDS = 10_000
 MAX_GRAPH_SELECTION_EDGE = 1_280
 MAX_GRAPH_SELECTION_PIXELS = MAX_GRAPH_SELECTION_EDGE * MAX_GRAPH_SELECTION_EDGE
 MAX_GRAPH_SELECTION_BYTES = 8 * 1024 * 1024
@@ -241,6 +242,7 @@ def recognize_graph_math(
     *,
     selected_image: str,
     selected_text_objects: list[dict[str, Any]] | None = None,
+    selected_graph_objects: list[dict[str, Any]] | None = None,
     selection_count: int = 1,
 ) -> dict[str, Any]:
     lines = [
@@ -264,6 +266,31 @@ def recognize_graph_math(
         lines.append(
             "Exact selected app text, if any (supporting evidence only): "
             + json.dumps(known_text, ensure_ascii=True, separators=(",", ":"))
+        )
+    known_graphs: list[dict[str, Any]] = []
+    for item in (selected_graph_objects or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        expressions = []
+        for expression in (item.get("expressions") or [])[:MAX_GRAPH_EXPRESSIONS]:
+            if not isinstance(expression, dict):
+                continue
+            latex = str(expression.get("latex") or "").strip()
+            if latex:
+                expressions.append({
+                    "latex": latex[:MAX_GRAPH_LATEX_LENGTH],
+                    "type": str(expression.get("type") or "unknown")[:40],
+                    "visible": bool(expression.get("visible", True)),
+                })
+        if expressions:
+            known_graphs.append({
+                "expressions": expressions,
+                "viewport": item.get("viewport") if isinstance(item.get("viewport"), dict) else {},
+            })
+    if known_graphs:
+        lines.append(
+            "Exact selected canonical graph objects (supporting evidence only): "
+            + json.dumps(known_graphs, ensure_ascii=True, separators=(",", ":"))
         )
     return call_study_model(
         system=GRAPH_RECOGNITION_SYSTEM,
@@ -301,9 +328,18 @@ def parse_graph_recognition_request(
     raw_ids = raw_selection.get("selectedObjectIds", raw_selection.get("selected_object_ids", []))
     if raw_ids is None:
         raw_ids = []
-    if not isinstance(raw_ids, list) or len(raw_ids) > MAX_GRAPH_SELECTED_IDS:
+    raw_bbox = raw_selection.get("bbox", raw_selection.get("selectionBBox"))
+    bbox = validate_bbox(raw_bbox)
+    if raw_bbox is not None and bbox is None:
+        raise StudyAIError("selection.bbox must be finite and have positive dimensions.", status=400)
+    if not isinstance(raw_ids, list) or len(raw_ids) > MAX_GRAPH_DENSE_SELECTED_IDS:
         raise StudyAIError(
-            f"selection.selectedObjectIds must contain at most {MAX_GRAPH_SELECTED_IDS} ids.",
+            f"selection.selectedObjectIds must contain at most {MAX_GRAPH_DENSE_SELECTED_IDS} ids.",
+            status=400,
+        )
+    if len(raw_ids) > MAX_GRAPH_SELECTED_IDS and bbox is None:
+        raise StudyAIError(
+            f"Selections above {MAX_GRAPH_SELECTED_IDS} ids require a finite bbox.",
             status=400,
         )
     selected_ids: list[str] = []
@@ -315,10 +351,6 @@ def parse_graph_recognition_request(
             raise StudyAIError("selection.selectedObjectIds contains an unknown board object id.", status=400)
         seen.add(item)
         selected_ids.append(item)
-    raw_bbox = raw_selection.get("bbox", raw_selection.get("selectionBBox"))
-    bbox = validate_bbox(raw_bbox)
-    if raw_bbox is not None and bbox is None:
-        raise StudyAIError("selection.bbox must be finite and have positive dimensions.", status=400)
     if not selected_ids and bbox is None:
         raise StudyAIError("Select something on the board first.", status=400)
     return GraphRecognitionSelection(request_id=request_id, selected_ids=selected_ids, bbox=bbox)
@@ -377,12 +409,22 @@ def parse_grouped_graph_recognition_request(
         if board_id not in lecture_board_ids:
             raise StudyAIError("Every selected board must belong to this lecture.", status=400)
         raw_ids = raw.get("selectedObjectIds", raw.get("selected_ids"))
+        raw_bbox = raw.get(
+            "bbox",
+            raw.get("local_bbox", raw.get("selectionBBox", raw.get("selection_bbox"))),
+        )
+        bbox = validate_bbox(raw_bbox)
+        if bbox is None:
+            raise StudyAIError(
+                f"boards[{index}].bbox must be finite and have positive dimensions.",
+                status=400,
+            )
         if (
             not isinstance(raw_ids, list)
-            or not 1 <= len(raw_ids) <= MAX_GRAPH_SELECTED_IDS
+            or not 1 <= len(raw_ids) <= MAX_GRAPH_DENSE_SELECTED_IDS
         ):
             raise StudyAIError(
-                f"boards[{index}].selectedObjectIds must contain 1 to {MAX_GRAPH_SELECTED_IDS} ids.",
+                f"boards[{index}].selectedObjectIds must contain 1 to {MAX_GRAPH_DENSE_SELECTED_IDS} ids.",
                 status=400,
             )
         allowed_ids = allowed_ids_by_board.get(board_id, set())
@@ -401,21 +443,16 @@ def parse_grouped_graph_recognition_request(
                 )
             seen.add(object_id)
             selected_ids.append(object_id)
-        raw_bbox = raw.get(
-            "bbox",
-            raw.get("local_bbox", raw.get("selectionBBox", raw.get("selection_bbox"))),
-        )
-        bbox = validate_bbox(raw_bbox)
-        if bbox is None:
-            raise StudyAIError(
-                f"boards[{index}].bbox must be finite and have positive dimensions.",
-                status=400,
-            )
         boards.append(GroupedGraphBoardSelection(
             board_id=board_id,
             selected_ids=selected_ids,
             bbox=bbox,
         ))
+    if sum(len(board.selected_ids) for board in boards) > MAX_GRAPH_DENSE_SELECTED_IDS:
+        raise StudyAIError(
+            f"Grouped selections may contain at most {MAX_GRAPH_DENSE_SELECTED_IDS} ids in total.",
+            status=400,
+        )
     return GroupedGraphRecognitionSelection(
         request_id=request_id,
         primary_board_id=primary_board_id,

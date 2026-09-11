@@ -101,6 +101,44 @@ class StaticGraphExportTests(unittest.TestCase):
         self.assertEqual(primitive.attributes["stroke-opacity"], "0.6500")
         self.assertEqual(primitive.attributes["stroke-dasharray"], "8 6")
 
+    def test_degree_angle_mode_changes_trigonometric_geometry(self):
+        expression = [{
+            "id": "sine",
+            "latex": r"y=\sin(x)",
+            "type": "explicitFunction",
+        }]
+        radians_graph = self.graph(expression)
+        radians_graph["viewport"] = {"x_min": 0, "x_max": 180, "y_min": -2, "y_max": 2}
+        radians_graph["settings"] = {"angle_mode": "radians"}
+        degrees_graph = self.graph(expression)
+        degrees_graph["viewport"] = dict(radians_graph["viewport"])
+        degrees_graph["settings"] = {"angle_mode": "degrees"}
+        radians = static_graph_primitives(
+            radians_graph, plot_x=0, plot_y=0, plot_width=400, plot_height=300
+        )[0]
+        degrees = static_graph_primitives(
+            degrees_graph, plot_x=0, plot_y=0, plot_width=400, plot_height=300
+        )[0]
+        self.assertNotEqual(radians.attributes["d"], degrees.attributes["d"])
+
+    def test_expression_budget_bounds_static_sampling(self):
+        expressions = [
+            {"id": f"curve-{index}", "latex": f"y=x^{index + 1}", "type": "explicitFunction"}
+            for index in range(8)
+        ]
+        primitives = static_graph_primitives(
+            self.graph(expressions),
+            plot_x=20,
+            plot_y=30,
+            plot_width=400,
+            plot_height=300,
+            max_expressions=2,
+        )
+        self.assertEqual(
+            [item.attributes["data-expression-id"] for item in primitives],
+            ["curve-0", "curve-1"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

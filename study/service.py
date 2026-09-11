@@ -596,6 +596,62 @@ def compact_text_object(item: dict[str, Any]) -> dict[str, Any] | None:
     return payload
 
 
+def compact_graph_object(item: dict[str, Any]) -> dict[str, Any] | None:
+    if item.get("type") != "graph":
+        return None
+    expressions: list[dict[str, Any]] = []
+    for raw in (item.get("expressions") or [])[:12]:
+        if not isinstance(raw, dict):
+            continue
+        latex = str(raw.get("latex") or "").strip()
+        if not latex:
+            continue
+        expressions.append({
+            "id": str(raw.get("id") or "")[:64],
+            "latex": latex[:1_000],
+            "type": str(raw.get("type") or "unknown")[:40],
+            "visible": bool(raw.get("visible", True)),
+            "restrictions": [
+                str(value)[:500] for value in (raw.get("restrictions") or [])[:16]
+                if isinstance(value, str)
+            ],
+        })
+    if not expressions:
+        return None
+    viewport = item.get("viewport") if isinstance(item.get("viewport"), dict) else {}
+    settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+    source = item.get("source_selection") if isinstance(item.get("source_selection"), dict) else {}
+    return {
+        "id": item.get("id"),
+        "role": "graph",
+        "text": "Graph expressions: " + "; ".join(
+            expression["latex"] for expression in expressions if expression["visible"]
+        )[:8_000],
+        "expressions": expressions,
+        "viewport": {
+            key: viewport.get(key) for key in ("x_min", "x_max", "y_min", "y_max")
+        },
+        "settings": {
+            key: settings.get(key)
+            for key in (
+                "show_x_axis", "show_y_axis", "show_grid",
+                "show_expressions_panel", "angle_mode",
+            )
+            if key in settings
+        },
+        "bbox": editor_object_box(item),
+        "source": {
+            "source_board_ids": [
+                str(value) for value in (source.get("source_board_ids") or [])[:8]
+                if isinstance(value, str)
+            ],
+            "original_recognition_request_id": source.get(
+                "original_recognition_request_id"
+            ),
+        },
+    }
+
+
 def build_selection_context(
     editor: dict[str, Any],
     selected_ids: list[str],
@@ -614,15 +670,19 @@ def build_selection_context(
         if isinstance(extra, list):
             from_payload = [item for item in extra if isinstance(item, dict)]
     text_objects = []
+    graph_objects = []
     seen_ids: set[str] = set()
     for item in selected:
-        if item.get("type") != "text":
-            continue
-        compact = compact_text_object(item)
-        if compact:
-            text_objects.append(compact)
-            if compact.get("id"):
-                seen_ids.add(str(compact["id"]))
+        if item.get("type") == "text":
+            compact = compact_text_object(item)
+            if compact:
+                text_objects.append(compact)
+                if compact.get("id"):
+                    seen_ids.add(str(compact["id"]))
+        elif item.get("type") == "graph":
+            compact_graph = compact_graph_object(item)
+            if compact_graph:
+                graph_objects.append(compact_graph)
     for item in from_payload:
         compact = compact_text_object(item)
         if not compact:
@@ -701,6 +761,7 @@ def build_selection_context(
                 break
     return {
         "text_objects": text_objects,
+        "graph_objects": graph_objects,
         "relationships": relationships,
         "selected_object_ids": selected_ids,
         "selected_count": len(selected_ids),
@@ -772,6 +833,7 @@ def recognize_board_graph(
     payload: dict[str, Any],
     combined_svg: CombinedSvg,
     atomic_json: AtomicJson,
+    before_model: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Recognize graphable math from one board-local, focused selection."""
     from .graph_recognition import (
@@ -906,9 +968,12 @@ def recognize_board_graph(
         # objects named by the selection.  Do not accept client-supplied text
         # as extra evidence for this focused visual action.
         selection_context = build_selection_context(editor, selected_ids)
+        if before_model is not None:
+            before_model()
         result = recognize_graph_math(
             selected_image=views["selected"],
             selected_text_objects=selection_context.get("text_objects") or [],
+            selected_graph_objects=selection_context.get("graph_objects") or [],
         )
         store_graph_cache_result(
             cache,
@@ -955,6 +1020,7 @@ def recognize_lecture_graph(
     payload: dict[str, Any],
     combined_svg: CombinedSvg,
     atomic_json: AtomicJson,
+    before_model: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Recognize one graph from two to eight isolated board-local selections."""
     from app import BOARDS_DIR, read_editor_state, read_metadata
@@ -1111,6 +1177,7 @@ def recognize_lecture_graph(
 
     selected_images: list[str] = []
     selected_text_objects: list[dict[str, Any]] = []
+    selected_graph_objects: list[dict[str, Any]] = []
     for material in materials:
         try:
             views = render_views(
@@ -1135,6 +1202,7 @@ def recognize_lecture_graph(
             material["selected_ids"],
         )
         selected_text_objects.extend(selection_context.get("text_objects") or [])
+        selected_graph_objects.extend(selection_context.get("graph_objects") or [])
 
     composed_image, image_dimensions = compose_grouped_selection_raster(selected_images)
     raster_hash, _ = validate_selection_raster(composed_image)
@@ -1155,9 +1223,12 @@ def recognize_lecture_graph(
         result = None
     cache_hit = result is not None
     if result is None:
+        if before_model is not None:
+            before_model()
         result = recognize_graph_math(
             selected_image=composed_image,
             selected_text_objects=selected_text_objects,
+            selected_graph_objects=selected_graph_objects,
             selection_count=len(materials),
         )
         store_graph_cache_result(

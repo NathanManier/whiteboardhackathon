@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+import hashlib
 import io
 import importlib
 import inspect
 import json
 import logging
+import math
 import os
 
 import re
@@ -95,6 +97,12 @@ MAX_TEXT_LENGTH = 20_000
 MAX_WORLD_COORDINATE = 10_000_000.0
 MAX_GRAPH_EXTENSION_BYTES = 64 * 1024
 MAX_GRAPH_PROVIDER_STATE_BYTES = 256 * 1024
+MAX_GRAPH_PROVENANCE_INPUT_KEYS = 10_000
+MAX_STATIC_GRAPH_FULL_CARDS = 96
+MAX_STATIC_GRAPH_EXACT_EXPRESSIONS = 256
+MAX_STATIC_GRAPH_PATH_CHARS = 2 * 1024 * 1024
+MAX_STATIC_GRAPH_LABEL_CHARS = 256 * 1024
+MAX_STATIC_GRAPH_MARKUP_CHARS = 6 * 1024 * 1024
 MAX_DEBUG_RASTER_DIMENSION = 1600
 MAX_DEBUG_SVG_BYTES = 16 * 1024 * 1024
 MAX_DEBUG_SVG_PATHS = 2_500
@@ -296,6 +304,19 @@ def enforce_rate_limit(action: str, *, unauthenticated_hint: str | None = None) 
     return response
 
 
+class _DeferredRateLimit(Exception):
+    def __init__(self, response: Response):
+        super().__init__("Study request rate limited.")
+        self.response = response
+
+
+def enforce_graph_model_rate_limit() -> None:
+    """Charge graph-recognition quota only when a provider call is required."""
+    limited = enforce_rate_limit("graph_recognition")
+    if limited is not None:
+        raise _DeferredRateLimit(limited)
+
+
 def study_rate_limit_action(action: str) -> str:
     normalized = action.strip().lower().replace("-", "_").replace(" ", "_")
     if normalized in {"practice", "practice_problem", "practice_problems", "problems"}:
@@ -318,6 +339,34 @@ def require_lecture_owner(folder_id: str) -> None:
     if user.is_test_user:
         return
     if not AUTH_DB.user_owns_lecture(user.id, folder_id):
+        abort(404)
+
+
+def require_graph_provenance_owners(editor: dict[str, Any]) -> None:
+    """Authorize every board reference before accepting GraphObject provenance."""
+    referenced: set[str] = set()
+    for item in editor.get("objects") or []:
+        if not isinstance(item, dict) or item.get("type") != "graph":
+            continue
+        source = item.get("source_selection")
+        if not isinstance(source, dict):
+            continue
+        for board_id in source.get("source_board_ids") or []:
+            if isinstance(board_id, str):
+                referenced.add(board_id)
+        # Lecture provenance keys are encoded as
+        # `<board-id>:<kind>:<canonical-id>`. Authorize that embedded board as
+        # well, even if a malformed client omitted it from source_board_ids.
+        for key in source.get("selected_object_keys") or []:
+            if not isinstance(key, str):
+                continue
+            board_prefix, separator, _suffix = key.partition(":")
+            if separator and BOARD_ID_RE.fullmatch(board_prefix):
+                referenced.add(board_prefix)
+    user = current_user()
+    if user.is_test_user or not referenced:
+        return
+    if not referenced.issubset(AUTH_DB.owned_board_ids(user.id)):
         abort(404)
 
 
@@ -1276,7 +1325,7 @@ def validate_graph_object(item: dict[str, Any], index: int, board_id: str | None
                 raise ValueError(f"{label}.source_selection.source_board_ids is invalid.")
             clean_source_boards.append(source_board)
         keys = source.get("selected_object_keys", [])
-        if not isinstance(keys, list) or len(keys) > MAX_GRAPH_SELECTED_IDS:
+        if not isinstance(keys, list) or len(keys) > MAX_GRAPH_PROVENANCE_INPUT_KEYS:
             raise ValueError(f"{label}.source_selection.selected_object_keys is invalid.")
         clean_keys: list[str] = []
         for key in keys:
@@ -1290,8 +1339,33 @@ def validate_graph_object(item: dict[str, Any], index: int, board_id: str | None
             clean_keys.append(key)
         clean_source: dict[str, Any] = {
             "source_board_ids": clean_source_boards,
-            "selected_object_keys": clean_keys,
+            "selected_object_keys": clean_keys[:MAX_GRAPH_SELECTED_IDS],
         }
+        if len(clean_keys) > MAX_GRAPH_SELECTED_IDS:
+            serialized_keys = json.dumps(
+                clean_keys, ensure_ascii=True, separators=(",", ":")
+            ).encode("utf-8")
+            clean_source.update({
+                "selected_object_keys_truncated": True,
+                "selected_object_key_count": len(clean_keys),
+                "selected_object_keys_sha256": hashlib.sha256(serialized_keys).hexdigest(),
+            })
+        elif source.get("selected_object_keys_truncated") is True:
+            original_count = source.get("selected_object_key_count")
+            original_digest = source.get("selected_object_keys_sha256")
+            if (
+                isinstance(original_count, bool)
+                or not isinstance(original_count, int)
+                or not len(clean_keys) <= original_count <= MAX_GRAPH_PROVENANCE_INPUT_KEYS
+                or not isinstance(original_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", original_digest)
+            ):
+                raise ValueError(f"{label}.source_selection key summary is invalid.")
+            clean_source.update({
+                "selected_object_keys_truncated": True,
+                "selected_object_key_count": original_count,
+                "selected_object_keys_sha256": original_digest,
+            })
         interaction_id = source.get("interaction_id")
         if interaction_id is not None:
             if not isinstance(interaction_id, str) or not STROKE_ID_RE.fullmatch(interaction_id):
@@ -1313,6 +1387,8 @@ def validate_graph_object(item: dict[str, Any], index: int, board_id: str | None
             key: value for key, value in source.items()
             if key not in {
                 "interaction_id", "source_board_ids", "selected_object_keys",
+                "selected_object_keys_truncated", "selected_object_key_count",
+                "selected_object_keys_sha256",
                 "original_recognition_request_id", "original_selection_bbox",
             }
         }
@@ -2861,6 +2937,64 @@ def validate_user_strokes(value: Any, width: int, height: int) -> list[dict[str,
     return validated
 
 
+def _editor_group_structure(
+    editor: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Return deterministic single-parent group ownership for scene rendering.
+
+    The web editor renders only top-level objects/groups and recursively emits
+    their children. Corrupt legacy data can name a child from more than one
+    group; first ownership wins here so export never duplicates canonical ink.
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    parent_by_child: dict[str, str] = {}
+    for raw in editor.get("groups") or []:
+        if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
+            continue
+        group_id = raw["id"]
+        if group_id in groups:
+            continue
+        groups[group_id] = raw
+        for child in raw.get("children") or []:
+            if isinstance(child, str) and child != group_id:
+                parent_by_child.setdefault(child, group_id)
+    return groups, parent_by_child
+
+
+def _group_transform_value(group: dict[str, Any]) -> str:
+    transform = group.get("transform") if isinstance(group.get("transform"), dict) else {}
+    x = float(transform.get("x", 0) or 0)
+    y = float(transform.get("y", 0) or 0)
+    scale_x = float(transform.get("scaleX", 1) or 1)
+    scale_y = float(transform.get("scaleY", 1) or 1)
+    rotation = float(transform.get("rotation", 0) or 0)
+    return (
+        f"translate({x:.4f} {y:.4f}) "
+        f"scale({scale_x:.4f} {scale_y:.4f}) rotate({rotation:.4f})"
+    )
+
+
+def _group_transform_chain(
+    object_id: str,
+    groups: dict[str, dict[str, Any]],
+    parent_by_child: dict[str, str],
+) -> list[str]:
+    chain: list[str] = []
+    seen: set[str] = {object_id}
+    current = object_id
+    while current in parent_by_child and len(chain) < 32:
+        parent_id = parent_by_child[current]
+        if parent_id in seen:
+            break
+        seen.add(parent_id)
+        group = groups.get(parent_id)
+        if group is None:
+            break
+        chain.insert(0, _group_transform_value(group))
+        current = parent_id
+    return chain
+
+
 def append_professor_svg(
     professor: ET.Element,
     *,
@@ -2871,6 +3005,8 @@ def append_professor_svg(
     origin_y: float = 0.0,
     id_prefix: str = "",
     namespace: str = "http://www.w3.org/2000/svg",
+    groups: dict[str, dict[str, Any]] | None = None,
+    parent_by_child: dict[str, str] | None = None,
 ) -> None:
     svg_name = metadata.get("assets", {}).get("svg")
     if not isinstance(svg_name, str) or Path(svg_name).name != svg_name:
@@ -2914,10 +3050,14 @@ def append_professor_svg(
             y_value = float(transform.get("y", 0) or 0)
             scale_x = float(transform.get("scaleX", 1) or 1)
             scale_y = float(transform.get("scaleY", 1) or 1)
+        parts = _group_transform_chain(
+            str(object_id or original_id or ""), groups or {}, parent_by_child or {}
+        )
         if x_value or y_value or scale_x != 1 or scale_y != 1:
-            parts = [f"translate({x_value:.4f} {y_value:.4f})"]
+            parts.append(f"translate({x_value:.4f} {y_value:.4f})")
             if scale_x != 1 or scale_y != 1:
                 parts.append(f"scale({scale_x:.4f} {scale_y:.4f})")
+        if parts:
             wrapper = ET.SubElement(
                 board_wrap,
                 f"{{{namespace}}}g",
@@ -2928,11 +3068,83 @@ def append_professor_svg(
             board_wrap.append(copied)
 
 
+def _new_static_graph_budget() -> dict[str, int]:
+    return {
+        "full_cards": MAX_STATIC_GRAPH_FULL_CARDS,
+        "exact_expressions": MAX_STATIC_GRAPH_EXACT_EXPRESSIONS,
+        "path_chars": MAX_STATIC_GRAPH_PATH_CHARS,
+        "label_chars": MAX_STATIC_GRAPH_LABEL_CHARS,
+        "markup_chars": MAX_STATIC_GRAPH_MARKUP_CHARS,
+    }
+
+
+def _bounded_graph_label(
+    expressions: list[dict[str, Any]], budget: dict[str, int] | None
+) -> str:
+    first = next(
+        (
+            str(item.get("latex") or "").strip()
+            for item in expressions
+            if isinstance(item, dict) and str(item.get("latex") or "").strip()
+        ),
+        "",
+    )
+    candidate = f"Graph: {first[:180]}" if first else "Graph"
+    if budget is None:
+        return candidate
+    remaining = max(0, budget.get("label_chars", 0))
+    if remaining < len(candidate):
+        return "Graph"
+    budget["label_chars"] = remaining - len(candidate)
+    return candidate
+
+
+def _append_graph_fallback(
+    group: ET.Element,
+    *,
+    namespace: str,
+    frame: tuple[float, float, float, float],
+    expressions: list[dict[str, Any]],
+    budget: dict[str, int] | None,
+    reason: str,
+) -> None:
+    x, y, width, height = frame
+    group.set("data-static-fallback", reason)
+    ET.SubElement(
+        group,
+        f"{{{namespace}}}rect",
+        {
+            "x": f"{x:.4f}", "y": f"{y:.4f}",
+            "width": f"{width:.4f}", "height": f"{height:.4f}",
+            "rx": f"{min(16.0, width * 0.04, height * 0.04):.4f}",
+            "fill": "#ffffff", "stroke": "#c8ced8", "stroke-width": "1.5",
+        },
+    )
+    label = ET.SubElement(
+        group,
+        f"{{{namespace}}}text",
+        {
+            "x": f"{x + min(24.0, max(10.0, width * 0.05)):.4f}",
+            "y": f"{y + min(height * 0.55, 44.0):.4f}",
+            "fill": "#243247",
+            "font-size": f"{max(10.0, min(18.0, height * 0.052)):.4f}",
+            "font-family": "Arial, sans-serif",
+        },
+    )
+    label.text = _bounded_graph_label(expressions, budget)
+    if budget is not None:
+        budget["markup_chars"] = max(
+            0, budget.get("markup_chars", 0) - 420 - len(label.text or "")
+        )
+
+
 def append_static_graph_svg(
     parent: ET.Element,
     definitions: ET.Element,
     item: dict[str, Any],
     namespace: str,
+    *,
+    budget: dict[str, int] | None = None,
 ) -> None:
     """Export a safe provider-independent graph card without embedding provider HTML/state."""
     from study.graph_export import static_graph_primitives
@@ -2957,6 +3169,25 @@ def append_static_graph_svg(
             "data-provider-independent": "true",
         },
     )
+    expressions = [
+        expression for expression in item.get("expressions") or []
+        if isinstance(expression, dict) and expression.get("visible", True)
+    ]
+    if budget is not None and (
+        budget.get("full_cards", 0) <= 0 or budget.get("markup_chars", 0) < 3_000
+    ):
+        _append_graph_fallback(
+            group,
+            namespace=namespace,
+            frame=(x, y, width, height),
+            expressions=expressions,
+            budget=budget,
+            reason="document-complexity-budget",
+        )
+        return
+    if budget is not None:
+        budget["full_cards"] -= 1
+        budget["markup_chars"] = max(0, budget["markup_chars"] - 3_000)
     ET.SubElement(
         group,
         f"{{{namespace}}}rect",
@@ -3020,22 +3251,57 @@ def append_static_graph_svg(
             {"d": f"M {plot_x:.4f} {axis_y:.4f} H {plot_x + plot_width:.4f}",
              "stroke": "#667085", "stroke-width": "1.5"},
         )
-    for primitive in static_graph_primitives(
+    expression_limit = None
+    if budget is not None:
+        expression_limit = min(len(expressions), max(0, budget.get("exact_expressions", 0)))
+        budget["exact_expressions"] -= expression_limit
+    primitives = static_graph_primitives(
         item,
         plot_x=plot_x,
         plot_y=plot_y,
         plot_width=plot_width,
         plot_height=plot_height,
-    ):
+        max_expressions=expression_limit,
+    )
+    primitive_chars = sum(
+        len(primitive.tag) + sum(len(key) + len(value) for key, value in primitive.attributes.items())
+        for primitive in primitives
+    )
+    if budget is not None and primitive_chars > budget.get("path_chars", 0):
+        primitives = []
+        group.set("data-static-fallback", "path-output-budget")
+    elif budget is not None:
+        budget["path_chars"] -= primitive_chars
+        budget["markup_chars"] = max(0, budget["markup_chars"] - primitive_chars)
+    for primitive in primitives:
         ET.SubElement(
             plot,
             f"{{{namespace}}}{primitive.tag}",
             primitive.attributes,
         )
-    expressions = [
-        expression for expression in item.get("expressions") or []
-        if isinstance(expression, dict) and expression.get("visible", True)
+    represented = {
+        primitive.attributes.get("data-expression-id") for primitive in primitives
+    }
+    missing_expressions = [
+        expression for expression in expressions
+        if expression.get("id") not in represented
     ]
+    if not settings.get("show_expressions_panel", False):
+        if missing_expressions:
+            fallback = ET.SubElement(
+                group,
+                f"{{{namespace}}}text",
+                {
+                    "x": f"{plot_x + 7:.4f}",
+                    "y": f"{plot_y + plot_height - 8:.4f}",
+                    "fill": "#243247",
+                    "font-size": f"{max(9.0, min(15.0, height * 0.045)):.4f}",
+                    "font-family": "Arial, sans-serif",
+                    "data-static-fallback": "unplotted-expression",
+                },
+            )
+            fallback.text = _bounded_graph_label(missing_expressions, budget)
+        return
     font_size = max(9.0, min(18.0, height * 0.052))
     label_background_height = min(
         plot_height,
@@ -3079,7 +3345,232 @@ def append_static_graph_svg(
         label.text = str(expression.get("latex") or "")
 
 
+def _editor_object_transform(item: dict[str, Any]) -> str:
+    translation = item.get("translation") if isinstance(item.get("translation"), dict) else {}
+    scale_x = float(item.get("scaleX", 1) or 1)
+    scale_y = float(item.get("scaleY", 1) or 1)
+    transform = (
+        f'translate({float(translation.get("x", 0)):.4f} '
+        f'{float(translation.get("y", 0)):.4f})'
+    )
+    if scale_x != 1 or scale_y != 1:
+        transform = f"{transform} scale({scale_x:.4f} {scale_y:.4f})"
+    return transform
+
+
+def _append_editor_object_svg(
+    parent: ET.Element,
+    definitions: ET.Element,
+    item: dict[str, Any],
+    namespace: str,
+    graph_budget: dict[str, int],
+) -> None:
+    transform = _editor_object_transform(item)
+    if item.get("type") == "graph":
+        append_static_graph_svg(
+            parent, definitions, item, namespace, budget=graph_budget
+        )
+        return
+    if item.get("type") == "text":
+        text = ET.SubElement(
+            parent,
+            f"{{{namespace}}}text",
+            {
+                "id": str(item.get("id", "")),
+                "x": str(item.get("x", 0)),
+                "y": str(float(item.get("y", 0)) + float(item.get("font_size", 32))),
+                "fill": str(item.get("color", "#183153")),
+                "font-size": str(item.get("font_size", 32)),
+                "font-family": "Arial, sans-serif",
+                "transform": transform,
+            },
+        )
+        lines = str(item.get("text", "")).splitlines() or [""]
+        for line_index, line in enumerate(lines):
+            span = ET.SubElement(
+                text,
+                f"{{{namespace}}}tspan",
+                {
+                    "x": str(item.get("x", 0)),
+                    "dy": "0" if line_index == 0 else "1.2em",
+                },
+            )
+            span.text = line
+        return
+    if item.get("type") == "path" and isinstance(item.get("d"), str) and item.get("d"):
+        ET.SubElement(
+            parent,
+            f"{{{namespace}}}path",
+            {
+                "id": str(item.get("id", "")),
+                "d": str(item.get("d")),
+                "fill": str(item.get("fill") or item.get("color") or "#183153"),
+                "fill-opacity": str(item.get("opacity", 1)),
+                "transform": transform,
+            },
+        )
+        return
+    points = item.get("points")
+    if not isinstance(points, list) or not points:
+        return
+    path_data = "M " + " L ".join(
+        f'{point["x"]:.4f} {point["y"]:.4f}' for point in points
+    )
+    attributes = {
+        "id": str(item.get("id", "")),
+        "d": path_data,
+        "fill": "none",
+        "stroke": str(item.get("color", "#183153")),
+        "stroke-width": str(item.get("width", item.get("size", 4))),
+        "stroke-opacity": str(item.get("opacity", 1)),
+        "stroke-linecap": "round",
+        "stroke-linejoin": "round",
+        "transform": transform,
+    }
+    erasures = item.get("erasures", [])
+    if isinstance(erasures, list) and erasures:
+        mask_id = f'erase-{item.get("id", secrets.token_hex(4))}'
+        mask = ET.SubElement(
+            definitions,
+            f"{{{namespace}}}mask",
+            {"id": mask_id, "maskUnits": "userSpaceOnUse"},
+        )
+        ET.SubElement(
+            mask,
+            f"{{{namespace}}}rect",
+            {
+                "x": str(-MAX_WORLD_COORDINATE),
+                "y": str(-MAX_WORLD_COORDINATE),
+                "width": str(MAX_WORLD_COORDINATE * 2),
+                "height": str(MAX_WORLD_COORDINATE * 2),
+                "fill": "white",
+            },
+        )
+        for erasure in erasures:
+            erase_points = erasure.get("points", [])
+            if not erase_points:
+                continue
+            erase_path = "M " + " L ".join(
+                f'{point["x"]:.4f} {point["y"]:.4f}' for point in erase_points
+            )
+            ET.SubElement(
+                mask,
+                f"{{{namespace}}}path",
+                {
+                    "d": erase_path,
+                    "fill": "none",
+                    "stroke": "black",
+                    "stroke-width": str(erasure.get("width", 24)),
+                    "stroke-linecap": "round",
+                    "stroke-linejoin": "round",
+                },
+            )
+        attributes["mask"] = f"url(#{mask_id})"
+    ET.SubElement(parent, f"{{{namespace}}}path", attributes)
+
+
+def _affine_multiply(
+    parent: tuple[float, float, float, float, float, float],
+    child: tuple[float, float, float, float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    pa, pb, pc, pd, pe, pf = parent
+    ca, cb, cc, cd, ce, cf = child
+    return (
+        pa * ca + pc * cb,
+        pb * ca + pd * cb,
+        pa * cc + pc * cd,
+        pb * cc + pd * cd,
+        pa * ce + pc * cf + pe,
+        pb * ce + pd * cf + pf,
+    )
+
+
+def _group_affine(group: dict[str, Any]) -> tuple[float, float, float, float, float, float]:
+    transform = group.get("transform") if isinstance(group.get("transform"), dict) else {}
+    x = float(transform.get("x", 0) or 0)
+    y = float(transform.get("y", 0) or 0)
+    scale_x = float(transform.get("scaleX", 1) or 1)
+    scale_y = float(transform.get("scaleY", 1) or 1)
+    radians = math.radians(float(transform.get("rotation", 0) or 0))
+    cosine, sine = math.cos(radians), math.sin(radians)
+    # Equivalent to SVG `translate(...) scale(...) rotate(...)`.
+    return (
+        scale_x * cosine,
+        scale_y * sine,
+        -scale_x * sine,
+        scale_y * cosine,
+        x,
+        y,
+    )
+
+
+def _object_group_affine(
+    object_id: str,
+    groups: dict[str, dict[str, Any]],
+    parent_by_child: dict[str, str],
+) -> tuple[float, float, float, float, float, float]:
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = {object_id}
+    current = object_id
+    while current in parent_by_child and len(chain) < 32:
+        parent_id = parent_by_child[current]
+        if parent_id in seen or parent_id not in groups:
+            break
+        seen.add(parent_id)
+        chain.insert(0, groups[parent_id])
+        current = parent_id
+    matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    for group in chain:
+        matrix = _affine_multiply(matrix, _group_affine(group))
+    return matrix
+
+
+def _transform_rect(
+    rect: dict[str, float],
+    matrix: tuple[float, float, float, float, float, float],
+) -> dict[str, float]:
+    a, b, c, d, e, f = matrix
+    corners = [
+        (rect["x"], rect["y"]),
+        (rect["x"] + rect["width"], rect["y"]),
+        (rect["x"] + rect["width"], rect["y"] + rect["height"]),
+        (rect["x"], rect["y"] + rect["height"]),
+    ]
+    points = [(a * x + c * y + e, b * x + d * y + f) for x, y in corners]
+    xs, ys = [point[0] for point in points], [point[1] for point in points]
+    return {
+        "x": min(xs), "y": min(ys),
+        "width": max(1.0, max(xs) - min(xs)),
+        "height": max(1.0, max(ys) - min(ys)),
+    }
+
+
+def _graph_frame_bounds(
+    objects: list[dict[str, Any]],
+    groups: dict[str, dict[str, Any]],
+    parent_by_child: dict[str, str],
+) -> list[dict[str, float]]:
+    result: list[dict[str, float]] = []
+    for item in objects:
+        if item.get("type") != "graph" or not isinstance(item.get("frame"), dict):
+            continue
+        frame = item["frame"]
+        try:
+            rect = {key: float(frame[key]) for key in ("x", "y", "width", "height")}
+        except (KeyError, TypeError, ValueError):
+            continue
+        if rect["width"] <= 0 or rect["height"] <= 0:
+            continue
+        result.append(_transform_rect(
+            rect,
+            _object_group_affine(str(item.get("id") or ""), groups, parent_by_child),
+        ))
+    return result
+
+
 def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
+    from study.rendering import content_bounds, union_boxes
+
     dimensions = metadata.get("dimensions", {})
     width = int(dimensions.get("width") or metadata.get("source", {}).get("width") or 1)
     height = int(dimensions.get("height") or metadata.get("source", {}).get("height") or 1)
@@ -3094,20 +3585,23 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
             "overflow": "visible",
         },
     )
-    professor = ET.SubElement(root, f"{{{namespace}}}g", {"id": "professor-ink"})
     editor = read_editor_state(board_dir, metadata)
+    groups, parent_by_child = _editor_group_structure(editor)
     imported_transforms = editor.get("imported_transforms", {})
     if not isinstance(imported_transforms, dict):
         imported_transforms = {}
+    professor = ET.SubElement(root, f"{{{namespace}}}g", {"id": "professor-ink"})
     append_professor_svg(
         professor,
         board_dir=board_dir,
         metadata=metadata,
         imported_transforms=imported_transforms,
         namespace=namespace,
+        groups=groups,
+        parent_by_child=parent_by_child,
     )
     user = ET.SubElement(root, f"{{{namespace}}}g", {"id": "user-ink"})
-    objects = editor.get("objects", [])
+    objects = [item for item in editor.get("objects", []) if isinstance(item, dict)]
     if not objects:
         objects = [
             {
@@ -3121,120 +3615,94 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
             for stroke in metadata.get("user_strokes", [])
             if isinstance(stroke, dict)
         ]
+    object_by_id = {
+        str(item.get("id")): item for item in objects if isinstance(item.get("id"), str)
+    }
     definitions = ET.SubElement(root, f"{{{namespace}}}defs")
+    graph_budget = _new_static_graph_budget()
+    rendered_objects: set[str] = set()
+    active_groups: set[str] = set()
+
+    def group_has_user_content(group_id: str, seen: set[str] | None = None) -> bool:
+        if group_id not in groups:
+            return False
+        visited = set(seen or ())
+        if group_id in visited:
+            return False
+        visited.add(group_id)
+        for child_id in groups[group_id].get("children") or []:
+            if not isinstance(child_id, str) or parent_by_child.get(child_id) != group_id:
+                continue
+            if child_id in object_by_id or group_has_user_content(child_id, visited):
+                return True
+        return False
+
+    def append_object(parent: ET.Element, object_id: str) -> None:
+        if object_id in rendered_objects:
+            return
+        item = object_by_id.get(object_id)
+        if item is None:
+            return
+        rendered_objects.add(object_id)
+        _append_editor_object_svg(parent, definitions, item, namespace, graph_budget)
+
+    def append_group(parent: ET.Element, group_id: str) -> None:
+        if group_id in active_groups or not group_has_user_content(group_id):
+            return
+        group = groups.get(group_id)
+        if group is None:
+            return
+        active_groups.add(group_id)
+        node = ET.SubElement(
+            parent,
+            f"{{{namespace}}}g",
+            {
+                "id": group_id,
+                "data-vboard-object": "group",
+                "transform": _group_transform_value(group),
+            },
+        )
+        for child_id in group.get("children") or []:
+            if not isinstance(child_id, str) or parent_by_child.get(child_id) != group_id:
+                continue
+            if child_id in groups:
+                append_group(node, child_id)
+            else:
+                append_object(node, child_id)
+        active_groups.remove(group_id)
+
     for item in objects:
-        if not isinstance(item, dict):
-            continue
-        translation = item.get("translation", {})
-        scale_x = float(item.get("scaleX", 1) or 1)
-        scale_y = float(item.get("scaleY", 1) or 1)
-        transform = (
-            f'translate({float(translation.get("x", 0)):.4f} '
-            f'{float(translation.get("y", 0)):.4f})'
-        )
-        if scale_x != 1 or scale_y != 1:
-            transform = f"{transform} scale({scale_x:.4f} {scale_y:.4f})"
-        if item.get("type") == "graph":
-            append_static_graph_svg(user, definitions, item, namespace)
-            continue
-        if item.get("type") == "text":
-            text = ET.SubElement(
-                user,
-                f"{{{namespace}}}text",
-                {
-                    "id": str(item.get("id", "")),
-                    "x": str(item.get("x", 0)),
-                    "y": str(float(item.get("y", 0)) + float(item.get("font_size", 32))),
-                    "fill": str(item.get("color", "#183153")),
-                    "font-size": str(item.get("font_size", 32)),
-                    "font-family": "Arial, sans-serif",
-                    "transform": transform,
-                },
-            )
-            lines = str(item.get("text", "")).splitlines() or [""]
-            for line_index, line in enumerate(lines):
-                span = ET.SubElement(
-                    text,
-                    f"{{{namespace}}}tspan",
-                    {
-                        "x": str(item.get("x", 0)),
-                        "dy": "0" if line_index == 0 else "1.2em",
-                    },
-                )
-                span.text = line
-            continue
-        if item.get("type") == "path" and isinstance(item.get("d"), str) and item.get("d"):
-            ET.SubElement(
-                user,
-                f"{{{namespace}}}path",
-                {
-                    "id": str(item.get("id", "")),
-                    "d": str(item.get("d")),
-                    "fill": str(item.get("fill") or item.get("color") or "#183153"),
-                    "fill-opacity": str(item.get("opacity", 1)),
-                    "transform": transform,
-                },
-            )
-            continue
-        points = item.get("points")
-        if not isinstance(points, list) or not points:
-            continue
-        path_data = "M " + " L ".join(f'{point["x"]:.4f} {point["y"]:.4f}' for point in points)
-        attributes = {
-            "id": str(item.get("id", "")),
-            "d": path_data,
-            "fill": "none",
-            "stroke": str(item.get("color", "#183153")),
-            "stroke-width": str(item.get("width", item.get("size", 4))),
-            "stroke-opacity": str(item.get("opacity", 1)),
-            "stroke-linecap": "round",
-            "stroke-linejoin": "round",
-            "transform": transform,
-        }
-        erasures = item.get("erasures", [])
-        if isinstance(erasures, list) and erasures:
-            mask_id = f'erase-{item.get("id", secrets.token_hex(4))}'
-            mask = ET.SubElement(
-                definitions,
-                f"{{{namespace}}}mask",
-                {"id": mask_id, "maskUnits": "userSpaceOnUse"},
-            )
-            ET.SubElement(
-                mask,
-                f"{{{namespace}}}rect",
-                {
-                    "x": str(-MAX_WORLD_COORDINATE),
-                    "y": str(-MAX_WORLD_COORDINATE),
-                    "width": str(MAX_WORLD_COORDINATE * 2),
-                    "height": str(MAX_WORLD_COORDINATE * 2),
-                    "fill": "white",
-                },
-            )
-            for erasure in erasures:
-                erase_points = erasure.get("points", [])
-                if not erase_points:
-                    continue
-                erase_path = "M " + " L ".join(
-                    f'{point["x"]:.4f} {point["y"]:.4f}' for point in erase_points
-                )
-                ET.SubElement(
-                    mask,
-                    f"{{{namespace}}}path",
-                    {
-                        "d": erase_path,
-                        "fill": "none",
-                        "stroke": "black",
-                        "stroke-width": str(erasure.get("width", 24)),
-                        "stroke-linecap": "round",
-                        "stroke-linejoin": "round",
-                    },
-                )
-            attributes["mask"] = f"url(#{mask_id})"
-        ET.SubElement(
-            user,
-            f"{{{namespace}}}path",
-            attributes,
-        )
+        object_id = str(item.get("id") or "")
+        if object_id and object_id not in parent_by_child:
+            append_object(user, object_id)
+    for group_id in groups:
+        if group_id not in parent_by_child:
+            append_group(user, group_id)
+    # Preserve corrupt legacy content without ever rendering one logical object twice.
+    for object_id in object_by_id:
+        append_object(user, object_id)
+
+    board_bounds = {"x": 0.0, "y": 0.0, "width": float(width), "height": float(height)}
+    bounds_scene = deepcopy(root)
+    for parent in list(bounds_scene.iter()):
+        for child in list(parent):
+            if child.get("data-vboard-object") == "graph":
+                parent.remove(child)
+    rendered_bounds = content_bounds(bounds_scene, board_bounds)
+    scene_bounds = union_boxes([
+        board_bounds,
+        rendered_bounds,
+        *_graph_frame_bounds(objects, groups, parent_by_child),
+    ]) or board_bounds
+    left = math.floor(scene_bounds["x"])
+    top = math.floor(scene_bounds["y"])
+    right = math.ceil(scene_bounds["x"] + scene_bounds["width"])
+    bottom = math.ceil(scene_bounds["y"] + scene_bounds["height"])
+    export_width = max(1, right - left)
+    export_height = max(1, bottom - top)
+    root.set("width", str(export_width))
+    root.set("height", str(export_height))
+    root.set("viewBox", f"{left} {top} {export_width} {export_height}")
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
@@ -3967,8 +4435,8 @@ def save_board(board_id: str) -> Response | tuple[Response, int]:
 
 
 @app.route("/api/boards/<board_id>/editor", methods=["GET", "PUT", "POST"])
-@locked_board_operation
 @require_authenticated
+@locked_board_operation
 def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
     require_board_owner(board_id)
     board_dir = require_board_id(board_id)
@@ -3994,6 +4462,7 @@ def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
                 editor=current,
             ), 409
         clean = validate_editor_state(raw_state, board_id=board_id)
+        require_graph_provenance_owners(clean)
     except (TypeError, ValueError) as exc:
         return jsonify(error=str(exc)), 400
     clean["source_boards"] = [default_source_board(board_id, metadata)]
@@ -4001,7 +4470,7 @@ def board_editor_state(board_id: str) -> Response | tuple[Response, int]:
     clean["revision"] = current_revision + 1
     clean["updated_at"] = time.time()
     atomic_json(editor_path(board_dir), clean)
-    metadata["editor_schema_version"] = 2
+    metadata["editor_schema_version"] = clean["schema_version"]
     metadata["editor_updated_at"] = clean["updated_at"]
     update_metadata(board_dir, metadata)
     LOGGER.info(
@@ -4772,8 +5241,6 @@ def grouped_graph_recognition_route(folder_id: str) -> Response | tuple[Response
     # authenticated account before membership details are evaluated.
     for selected_board_id in selected_board_ids:
         require_board_owner(selected_board_id)
-    if limited := enforce_rate_limit("graph_recognition"):
-        return limited
     selected_ids: list[str] = []
     for raw in payload.get("boards") or []:
         if not isinstance(raw, dict):
@@ -4799,7 +5266,10 @@ def grouped_graph_recognition_route(folder_id: str) -> Response | tuple[Response
                 payload=payload,
                 combined_svg=combined_svg,
                 atomic_json=atomic_json,
+                before_model=enforce_graph_model_rate_limit,
             )
+    except _DeferredRateLimit as exc:
+        return exc.response
     except StudyAIError as exc:
         LOGGER.warning(
             "GROUPED GRAPH RECOGNITION request=%s lecture=%s boards=%d success=false status=%d",
@@ -4894,8 +5364,6 @@ def graph_recognition_route(board_id: str) -> Response | tuple[Response, int]:
     request_id = requested_interaction_id(payload.get("requestId"))
     if request_id is None:
         return jsonify(error="requestId must be a 16-character lowercase hexadecimal id."), 400
-    if limited := enforce_rate_limit("graph_recognition"):
-        return limited
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     editor = read_editor_state(board_dir, metadata)
@@ -4923,7 +5391,10 @@ def graph_recognition_route(board_id: str) -> Response | tuple[Response, int]:
                 payload=payload,
                 combined_svg=combined_svg,
                 atomic_json=atomic_json,
+                before_model=enforce_graph_model_rate_limit,
             )
+    except _DeferredRateLimit as exc:
+        return exc.response
     except StudyAIError as exc:
         LOGGER.warning(
             "GRAPH RECOGNITION request=%s board=%s success=false status=%d",

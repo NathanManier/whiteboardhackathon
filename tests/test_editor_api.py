@@ -1,10 +1,14 @@
 import json
+import io
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from PIL import Image
+
 import app as board_app
+from study.rendering import rasterize_svg_bytes
 
 
 class EditorApiTests(unittest.TestCase):
@@ -137,6 +141,8 @@ class EditorApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         saved = response.get_json()["editor"]
         self.assertEqual(saved["revision"], 1)
+        metadata = json.loads((self.board_dir / "board.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["editor_schema_version"], saved["schema_version"])
         self.assertEqual(saved["objects"][1]["text"], "Editable text")
         self.assertEqual(saved["objects"][1]["source_markdown"], "Editable text")
         self.assertEqual(saved["objects"][1]["role"], "ai_practice_problem")
@@ -212,6 +218,35 @@ class EditorApiTests(unittest.TestCase):
         self.assertEqual(reloaded["expressions"][0]["latex"], r"y=x^2-4")
         self.assertEqual(reloaded["viewport"]["y_max"], 12)
 
+    def test_dense_graph_provenance_is_explicitly_summarized_and_round_trips(self):
+        state = self.editor_state()
+        graph = self.graph_object()
+        keys = [f"{self.board_id}:professor-{index}" for index in range(405)]
+        graph["source_selection"]["selected_object_keys"] = keys
+        state["objects"].append(graph)
+        saved_response = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=state
+        )
+        self.assertEqual(saved_response.status_code, 200, saved_response.get_data(as_text=True))
+        saved = saved_response.get_json()["editor"]
+        source = saved["objects"][2]["source_selection"]
+        self.assertEqual(source["selected_object_keys"], keys[:400])
+        self.assertTrue(source["selected_object_keys_truncated"])
+        self.assertEqual(source["selected_object_key_count"], 405)
+        self.assertRegex(source["selected_object_keys_sha256"], r"^[0-9a-f]{64}$")
+
+        saved["revision"] = 1
+        round_trip = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=saved
+        )
+        self.assertEqual(round_trip.status_code, 200, round_trip.get_data(as_text=True))
+        source_again = round_trip.get_json()["editor"]["objects"][2]["source_selection"]
+        self.assertEqual(source_again["selected_object_key_count"], 405)
+        self.assertEqual(
+            source_again["selected_object_keys_sha256"],
+            source["selected_object_keys_sha256"],
+        )
+
     def test_combined_svg_exports_safe_static_graph_without_provider_state(self):
         state = self.editor_state()
         state["objects"].append(self.graph_object())
@@ -230,10 +265,13 @@ class EditorApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('id="graph-one"', markup)
         self.assertIn('data-vboard-object="graph"', markup)
-        self.assertIn("y=x^2-4", markup)
+        self.assertNotIn("y=x^2-4", markup)
         self.assertIn("graph-clip-graph-one", markup)
         self.assertNotIn("PRIVATE_PROVIDER_STATE", markup)
         root = ET.fromstring(response.data)
+        view_box = [float(value) for value in root.get("viewBox", "").split()]
+        self.assertLessEqual(view_box[0], -240)
+        self.assertGreaterEqual(view_box[1] + view_box[3], 1320)
         curve = next(
             item for item in root.iter()
             if item.get("data-expression-id") == "expression-1"
@@ -242,7 +280,107 @@ class EditorApiTests(unittest.TestCase):
         self.assertEqual(curve.get("data-static-plot"), "true")
         self.assertEqual(curve.get("stroke"), "#2d70b3")
         self.assertGreater(str(curve.get("d") or "").count("L "), 100)
+        rendered = Image.open(io.BytesIO(rasterize_svg_bytes(response.data, 640)))
+        self.assertGreater(rendered.width, 0)
+        self.assertGreater(rendered.height, 0)
         self.assertEqual((self.board_dir / "board.svg").read_bytes(), source_before)
+
+    def test_graph_expression_panel_is_only_exported_when_enabled(self):
+        state = self.editor_state()
+        graph = self.graph_object()
+        graph["settings"]["show_expressions_panel"] = True
+        state["objects"].append(graph)
+        self.assertEqual(
+            self.client.put(f"/api/boards/{self.board_id}/editor", json=state).status_code,
+            200,
+        )
+        markup = self.client.get(f"/board/{self.board_id}/svg").get_data(as_text=True)
+        self.assertIn("y=x^2-4", markup)
+
+    def test_groups_render_children_once_and_apply_nested_transform(self):
+        state = self.editor_state()
+        state["objects"].append(self.graph_object())
+        state["groups"] = [{
+            "id": "group-one",
+            "type": "group",
+            "children": ["stroke-one", "graph-one"],
+            "transform": {
+                "x": 100, "y": 50, "scaleX": 2, "scaleY": 2, "rotation": 0,
+            },
+        }]
+        saved = self.client.put(f"/api/boards/{self.board_id}/editor", json=state)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        response = self.client.get(f"/board/{self.board_id}/svg")
+        root = ET.fromstring(response.data)
+        group = next(element for element in root.iter() if element.get("id") == "group-one")
+        self.assertEqual(
+            group.get("transform"),
+            "translate(100.0000 50.0000) scale(2.0000 2.0000) rotate(0.0000)",
+        )
+        self.assertEqual(sum(element.get("id") == "stroke-one" for element in root.iter()), 1)
+        self.assertEqual(sum(element.get("id") == "graph-one" for element in root.iter()), 1)
+        view_box = [float(value) for value in root.get("viewBox", "").split()]
+        self.assertLessEqual(view_box[0], -380)
+        self.assertGreaterEqual(view_box[1] + view_box[3], 2690)
+
+    def test_professor_path_in_group_is_transformed_once_without_user_duplicate(self):
+        source_id = "black-abc123def456"
+        (self.board_dir / "board.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">'
+            f'<path id="{source_id}" d="M 10 10 L 40 10" fill="#111111"/>'
+            "</svg>",
+            encoding="utf-8",
+        )
+        metadata = json.loads((self.board_dir / "board.json").read_text(encoding="utf-8"))
+        metadata["assets"]["svg"] = "board.svg"
+        board_app.atomic_json(self.board_dir / "board.json", metadata)
+        state = self.editor_state()
+        state["imported_transforms"] = {
+            source_id: {"x": 5, "y": 7, "scaleX": 1.5, "scaleY": 1.5}
+        }
+        state["groups"] = [{
+            "id": "professor-group",
+            "children": [source_id],
+            "transform": {"x": 100, "y": 50, "scaleX": 2, "scaleY": 2, "rotation": 0},
+        }]
+        saved = self.client.put(f"/api/boards/{self.board_id}/editor", json=state)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        root = ET.fromstring(self.client.get(f"/board/{self.board_id}/svg").data)
+        self.assertEqual(sum(element.get("id") == source_id for element in root.iter()), 1)
+        professor_path = next(element for element in root.iter() if element.get("id") == source_id)
+        parent = next(
+            element for element in root.iter() if professor_path in list(element)
+        )
+        self.assertIn("translate(100.0000 50.0000)", parent.get("transform", ""))
+        self.assertIn("translate(5.0000 7.0000)", parent.get("transform", ""))
+        self.assertFalse(any(
+            element.get("id") == "professor-group"
+            for element in root.iter()
+        ))
+
+    def test_document_graph_budget_uses_readable_fallback_cards(self):
+        state = self.editor_state()
+        state["objects"] = []
+        for index in range(board_app.MAX_STATIC_GRAPH_FULL_CARDS + 5):
+            graph = self.graph_object()
+            graph["id"] = f"graph-{index}"
+            graph["expressions"][0]["id"] = f"expression-{index}"
+            graph["frame"] = {
+                "x": index * 660, "y": 0, "width": 640, "height": 420,
+            }
+            state["objects"].append(graph)
+        saved = self.client.put(f"/api/boards/{self.board_id}/editor", json=state)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        root = ET.fromstring(self.client.get(f"/board/{self.board_id}/svg").data)
+        exact = [element for element in root.iter() if element.get("data-static-plot") == "true"]
+        fallbacks = [
+            element for element in root.iter()
+            if element.get("data-static-fallback") == "document-complexity-budget"
+        ]
+        self.assertLessEqual(len(exact), board_app.MAX_STATIC_GRAPH_EXACT_EXPRESSIONS)
+        self.assertEqual(len(fallbacks), 5)
+        fallback_text = " ".join("".join(element.itertext()) for element in fallbacks)
+        self.assertIn("Graph:", fallback_text)
 
     def test_graph_object_rejects_cross_board_owner_unsafe_latex_and_invalid_viewport(self):
         mutations = [

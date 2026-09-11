@@ -449,6 +449,61 @@ class AccountAndOwnershipTests(unittest.TestCase):
             404,
         )
 
+    def test_graph_provenance_cannot_reference_another_users_board(self):
+        account_a = self.login("graph-owner-a")
+        account_b = self.login("graph-owner-b")
+        board_a, board_b = "6" * 32, "7" * 32
+        self.create_board_files(board_a, "Owned graph board")
+        self.create_board_files(board_b, "Foreign source board")
+        board_app.AUTH_DB.own_board(
+            account_a["user"]["id"], board_a, lecture_id=None, title="Owned graph board"
+        )
+        board_app.AUTH_DB.own_board(
+            account_b["user"]["id"], board_b, lecture_id=None, title="Foreign source board"
+        )
+
+        headers_a = self.headers(account_a["session"])
+        loaded = self.client.get(
+            f"/api/boards/{board_a}/editor", headers=headers_a
+        )
+        self.assertEqual(loaded.status_code, 200, loaded.get_data(as_text=True))
+        editor = loaded.get_json()["editor"]
+        editor["objects"].append({
+            "id": "graph-private-provenance",
+            "type": "graph",
+            "owning_board_id": board_a,
+            "frame": {"x": 0, "y": 0, "width": 320, "height": 240},
+            "expressions": [{
+                "id": "expression-one",
+                "latex": "y=x",
+                "type": "explicitFunction",
+            }],
+            "viewport": {"x_min": -10, "x_max": 10, "y_min": -10, "y_max": 10},
+            "settings": {},
+            "created_at": 1,
+            "updated_at": 1,
+            "version": 1,
+            "source_selection": {
+                # The explicit source list and composite keys are both
+                # security boundaries. A malicious client cannot hide the
+                # foreign board by omitting it from source_board_ids.
+                "source_board_ids": [board_a],
+                "selected_object_keys": [f"{board_b}:professorPath:path-one"],
+            },
+        })
+
+        rejected = self.client.put(
+            f"/api/boards/{board_a}/editor", json={"editor": editor}, headers=headers_a
+        )
+        self.assertEqual(rejected.status_code, 404, rejected.get_data(as_text=True))
+        reloaded = self.client.get(
+            f"/api/boards/{board_a}/editor", headers=headers_a
+        ).get_json()["editor"]
+        self.assertNotIn(
+            "graph-private-provenance",
+            {item["id"] for item in reloaded["objects"]},
+        )
+
     def test_graph_recognition_has_an_account_rate_limit(self):
         account = self.login("graph-rate-limit")
         board_id = "e" * 32
@@ -478,7 +533,13 @@ class AccountAndOwnershipTests(unittest.TestCase):
             "cache_hit": False,
             "idempotent_replay": False,
         }
-        with patch("study.service.recognize_board_graph", return_value=outcome) as recognize:
+        def recognize_once_per_request(**kwargs):
+            kwargs["before_model"]()
+            return outcome
+
+        with patch(
+            "study.service.recognize_board_graph", side_effect=recognize_once_per_request
+        ) as recognize:
             first = self.client.post(
                 f"/api/boards/{board_id}/study/graph-recognition",
                 json=payload,
@@ -493,7 +554,7 @@ class AccountAndOwnershipTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
         self.assertEqual(second.status_code, 429, second.get_data(as_text=True))
         self.assertGreater(int(second.headers["Retry-After"]), 0)
-        self.assertEqual(recognize.call_count, 1)
+        self.assertEqual(recognize.call_count, 2)
 
     def test_lecture_names_and_pdf_import_targets_are_tenant_scoped(self):
         account_a = self.login("apple-a")
