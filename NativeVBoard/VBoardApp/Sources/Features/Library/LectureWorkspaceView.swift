@@ -6,6 +6,7 @@ struct LectureWorkspaceView: View {
     let folder: LectureFolder
     let initialFocusBoardID: String?
     @StateObject private var store: LectureWorkspaceStore
+    @StateObject private var graphRecognition = GraphRecognitionController()
     @State private var activeTool: CanvasTool = .navigation
     @State private var showImporter = false
     @State private var showNavigator = false
@@ -24,6 +25,10 @@ struct LectureWorkspaceView: View {
     @State private var studyInitialAction: String?
     @State private var previousPencilTool: CanvasTool = .pen
     @State private var pencilQuickPalettePoint: CGPoint?
+    @State private var graphCreationRequest: GraphCreationRequest?
+    @State private var editingGraph: GraphObject?
+    @State private var interactiveGraph: GraphObject?
+    @State private var canvasSize = CGSize.zero
     @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.dots.rawValue
     @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
     @AppStorage("vboard.study.inspectorWidth") private var studyPanelWidth = 0.0
@@ -111,6 +116,26 @@ struct LectureWorkspaceView: View {
         .sheet(isPresented: $showGuide) {
             StudyGuideView(folderID: folder.id, guide: store.lecture?.studyGuide)
         }
+        .sheet(item: $graphCreationRequest) { request in
+            GraphCreationSheet(
+                target: request.target,
+                recognition: graphRecognition,
+                prepareSelection: { await prepareGraphRecognition(request.target) },
+                onCreate: { expressions, requestID in
+                    createGraph(expressions: expressions, requestID: requestID,
+                                selection: request.selection,
+                                sourceBoardIDs: request.sourceBoardIDs,
+                                selectedObjectKeys: request.selectedObjectKeys)
+                }
+            )
+            .environmentObject(api)
+        }
+        .sheet(item: $editingGraph) { graph in
+            GraphExpressionEditor(graph: graph) { expressions in
+                store.replaceGraph(graph.replacing(expressions: expressions),
+                                   boardID: graph.owningBoardID, api: api)
+            }
+        }
         .sheet(isPresented: $showNote) {
             LectureNoteSheet(unitLabel: activeUnitLabel) { markdown in
                 store.addNote(markdown, api: api)
@@ -161,6 +186,16 @@ struct LectureWorkspaceView: View {
         .onChange(of: activeTool) { oldValue, newValue in
             if newValue != .objectEraser && oldValue != newValue {
                 previousPencilTool = newValue
+            }
+        }
+        .onChange(of: store.selectedKeys) { _, _ in
+            let target = graphRecognitionTarget
+            graphRecognition.selectionChanged(
+                target, api: api,
+                prepareSelection: { if let target { await prepareGraphRecognition(target) } }
+            )
+            if target?.primarySelection.canonicalObjectIDs != interactiveGraph.map({ [$0.id] }) {
+                interactiveGraph = nil
             }
         }
         .task { await store.load(api: api, focusBoardID: initialFocusBoardID) }
@@ -252,18 +287,56 @@ struct LectureWorkspaceView: View {
                 )
                 .ignoresSafeArea(edges: .bottom)
 
+                if let graph = interactiveGraph,
+                   let rect = graphScreenRect(graph, workspace: workspace,
+                                              viewport: proxy.size),
+                   rect.intersects(CGRect(origin: .zero, size: proxy.size)) {
+                    GraphInteractiveSurface(
+                        graph: graph,
+                        onCommitViewport: { viewport in
+                            let updated = graph.replacing(viewport: viewport)
+                            store.replaceGraph(updated, boardID: graph.owningBoardID, api: api)
+                            if interactiveGraph?.id == graph.id { interactiveGraph = updated }
+                        },
+                        onEdit: {
+                            editingGraph = store.scenes[graph.owningBoardID]?.editor.objects
+                                .first(where: { $0.id == graph.id })?.graph ?? graph
+                            interactiveGraph = nil
+                        },
+                        onDone: { interactiveGraph = nil }
+                    )
+                    .frame(width: max(rect.width, 1), height: max(rect.height, 1))
+                    .position(x: rect.midX, y: rect.midY)
+                    .shadow(color: .black.opacity(0.16), radius: 10, y: 4)
+                    .zIndex(20)
+                }
+
                 WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
                                      penColor: $penColor, penWidth: $penWidth,
                                      markerColor: $markerColor, markerWidth: $markerWidth,
                                      markerOpacity: $markerOpacity)
                     .padding(.bottom, 12)
 
-                if !store.selectedKeys.isEmpty, let selectionScreenBounds {
+                if interactiveGraph == nil, !store.selectedKeys.isEmpty, let selectionScreenBounds {
                     SelectionActionBar(
                         canCheckWork: selectionCanCheckWork,
+                        graphPrimaryTitle: graphPrimaryTitle,
+                        graphIsLoading: selectedGraph == nil && graphRecognition.isClassifying,
                         explain: { openStudy(action: "explain") },
                         practice: { openStudy(action: "practice_problems") },
                         check: { openStudy(action: "check_my_work") },
+                        graphPrimary: { performPrimaryGraphAction() },
+                        graphSelection: { openGraphCreation() },
+                        editGraph: selectedGraph.map { graph in { editingGraph = graph } },
+                        resetGraph: selectedGraph.map { graph in
+                            {
+                                store.replaceGraph(graph.replacing(viewport: .conventional),
+                                                   boardID: graph.owningBoardID, api: api)
+                            }
+                        },
+                        duplicateGraph: selectedGraphKey.map { key in
+                            { _ = store.duplicateGraph(key, api: api) }
+                        },
                         delete: { store.deleteSelection(store.selectedKeys, api: api) }
                     )
                     .position(SelectionToolbarLayout.position(for: selectionScreenBounds, viewport: proxy.size))
@@ -293,7 +366,14 @@ struct LectureWorkspaceView: View {
                 Button("") { store.redo(api: api) }
                     .keyboardShortcut("z", modifiers: [.command, .shift])
                     .frame(width: 0, height: 0).opacity(0.001)
+                if interactiveGraph != nil {
+                    Button("") { interactiveGraph = nil }
+                        .keyboardShortcut(.cancelAction)
+                        .frame(width: 0, height: 0).opacity(0.001)
+                }
             }
+            .onAppear { canvasSize = proxy.size }
+            .onChange(of: proxy.size) { _, value in canvasSize = value }
         }
     }
 
@@ -344,6 +424,99 @@ struct LectureWorkspaceView: View {
     private var studyBoardID: String? {
         if selectedBoardIDs.count == 1 { return selectedBoardIDs.first }
         return nil
+    }
+
+    private var graphRecognitionTarget: GraphRecognitionTarget? {
+        let boardIDs = selectedBoardIDs.sorted()
+        guard !boardIDs.isEmpty else { return nil }
+        let selections = boardIDs.compactMap(store.studySelection(for:))
+        guard selections.count == boardIDs.count else { return nil }
+        return GraphRecognitionTarget.makeLecture(
+            folderID: folder.id,
+            selections: selections,
+            preferredPrimaryBoardID: store.activeBoardID
+        )
+    }
+
+    private var selectedGraphKey: SelectionKey? {
+        guard store.selectedKeys.count == 1, let key = store.selectedKeys.first,
+              key.kind == .editorObject,
+              store.scenes[key.boardID]?.editor.objects
+                .first(where: { $0.id == key.objectID })?.graph != nil else { return nil }
+        return key
+    }
+
+    private var selectedGraph: GraphObject? {
+        guard let key = selectedGraphKey else { return nil }
+        return store.scenes[key.boardID]?.editor.objects
+            .first(where: { $0.id == key.objectID })?.graph
+    }
+
+    private var graphPrimaryTitle: String? {
+        if selectedGraph != nil { return "Interact" }
+        return GraphabilityPolicy.showsPrimaryAction(result: graphRecognition.result)
+            ? "Graph" : nil
+    }
+
+    private func performPrimaryGraphAction() {
+        if let graph = selectedGraph {
+            interactiveGraph = graph
+        } else {
+            openGraphCreation()
+        }
+    }
+
+    private func openGraphCreation() {
+        guard selectedGraph == nil, let target = graphRecognitionTarget else { return }
+        let canonicalIDsByBoard = Dictionary(uniqueKeysWithValues:
+            target.selections.map { ($0.boardID, Set($0.canonicalObjectIDs)) })
+        let keys = store.selectedKeys.filter { key in
+            canonicalIDsByBoard[key.boardID]?.contains(key.objectID) == true
+        }.sorted {
+            if $0.boardID == $1.boardID { return $0.objectID < $1.objectID }
+            return $0.boardID < $1.boardID
+        }.map { "\($0.boardID):\($0.kind.rawValue):\($0.objectID)" }
+        graphCreationRequest = GraphCreationRequest(target: target, selectedObjectKeys: keys)
+    }
+
+    private func prepareGraphRecognition(_ target: GraphRecognitionTarget) async {
+        // The server rasterizes canonical board state. Flush every participating
+        // board before the single grouped request so no secondary selection is
+        // recognized against stale editor JSON.
+        for boardID in target.sourceBoardIDs {
+            await store.saveBoardNow(boardID, api: api)
+        }
+    }
+
+    private func createGraph(expressions: [GraphExpression], requestID: String?,
+                             selection: BoardStudySelection,
+                             sourceBoardIDs: [String], selectedObjectKeys: [String]) {
+        guard let workspace = store.workspace,
+              let item = workspace.items.first(where: { $0.boardID == selection.boardID }),
+              let scene = store.scenes[selection.boardID] else { return }
+        let scale = canvasSize.width > 0 && canvasSize.height > 0
+            ? WorldScreenTransform(camera: workspace.camera, viewport: canvasSize).scale : 1
+        let occupied = scene.editor.objects.map { BoardHitTestPolicy.bounds(of: $0) }
+        let graph = GraphObjectFactory.make(
+            boardID: item.boardID, selection: selection, expressions: expressions,
+            recognitionRequestID: requestID, cameraScale: scale, occupied: occupied,
+            sourceBoardIDs: sourceBoardIDs, selectedObjectKeys: selectedObjectKeys
+        )
+        store.addGraph(graph, boardID: item.boardID, api: api)
+    }
+
+    private func graphScreenRect(_ graph: GraphObject, workspace: LectureWorkspace,
+                                 viewport: CGSize) -> CGRect? {
+        guard let item = workspace.items.first(where: { $0.boardID == graph.owningBoardID })
+        else { return nil }
+        let lectureRect = LectureCoordinateTransform.boardLocalToLectureWorld(
+            graph.frame.cgRect, board: item
+        )
+        let transform = WorldScreenTransform(camera: workspace.camera, viewport: viewport)
+        let a = transform.screenPoint(for: lectureRect.origin)
+        let b = transform.screenPoint(for: CGPoint(x: lectureRect.maxX, y: lectureRect.maxY))
+        return CGRect(x: min(a.x, b.x), y: min(a.y, b.y),
+                      width: abs(b.x - a.x), height: abs(b.y - a.y))
     }
 
     private var selectedBoardIDs: Set<String> { Set(store.selectedKeys.map(\.boardID)) }
@@ -508,9 +681,16 @@ private struct CanvasToolOptions: View {
 
 struct SelectionActionBar: View {
     let canCheckWork: Bool
+    let graphPrimaryTitle: String?
+    let graphIsLoading: Bool
     let explain: () -> Void
     let practice: () -> Void
     let check: () -> Void
+    let graphPrimary: () -> Void
+    let graphSelection: () -> Void
+    let editGraph: (() -> Void)?
+    let resetGraph: (() -> Void)?
+    let duplicateGraph: (() -> Void)?
     let delete: () -> Void
 
     var body: some View {
@@ -518,7 +698,36 @@ struct SelectionActionBar: View {
             action("Explain", "text.magnifyingglass", explain)
             action("Practice", "list.bullet.clipboard", practice)
             if canCheckWork { action("Check", "checkmark.circle", check) }
+            Group {
+                if graphIsLoading {
+                    ProgressView().controlSize(.small)
+                } else if let graphPrimaryTitle {
+                    action(graphPrimaryTitle,
+                           graphPrimaryTitle == "Interact" ? "hand.tap" : "function",
+                           graphPrimary)
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(width: 70, height: 30)
             Menu {
+                if editGraph != nil {
+                    Button(action: { editGraph?() }) {
+                        Label("Edit Equations", systemImage: "function")
+                    }
+                    Button(action: { resetGraph?() }) {
+                        Label("Reset View", systemImage: "arrow.counterclockwise")
+                    }
+                    Button(action: { duplicateGraph?() }) {
+                        Label("Duplicate Graph", systemImage: "plus.square.on.square")
+                    }
+                    Divider()
+                } else {
+                    Button(action: graphSelection) {
+                        Label("Graph Selection", systemImage: "function")
+                    }
+                    Divider()
+                }
                 Button(role: .destructive, action: delete) { Label("Erase Selection", systemImage: "trash") }
             } label: {
                 Image(systemName: "ellipsis")
@@ -543,7 +752,7 @@ struct SelectionActionBar: View {
 }
 
 enum SelectionToolbarLayout {
-    static let size = CGSize(width: 310, height: 42)
+    static let size = CGSize(width: 390, height: 42)
 
     static func position(for rect: CGRect, viewport: CGSize) -> CGPoint {
         let x = min(max(rect.midX, size.width / 2 + 12), viewport.width - size.width / 2 - 12)

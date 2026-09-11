@@ -410,6 +410,86 @@ final class APIClient: ObservableObject {
         catch { throw APIError.decoding("Could not decode the study response.") }
     }
 
+    func recognizeGraph(request payload: GraphRecognitionRequest) async throws
+        -> GraphRecognitionEnvelope {
+        let path = "/api/boards/\(payload.boardID)/study/graph-recognition"
+        return try await performGraphRecognition(
+            path: path,
+            payload: payload,
+            requestID: payload.requestId,
+            sanitizedJSON: payload.sanitizedJSON,
+            sourceDescription: "board=\(payload.boardID) canonicalIDs=\(payload.selection.selectedObjectIds) localBBox=\(payload.selection.bbox)"
+        )
+    }
+
+    func recognizeGraph(request payload: LectureGraphRecognitionRequest) async throws
+        -> GraphRecognitionEnvelope {
+        let path = "/api/folders/\(payload.folderID)/study/graph-recognition"
+        let sources = payload.boards.map {
+            "\($0.boardId):ids=\($0.selectedObjectIds):bbox=\($0.bbox)"
+        }.joined(separator: ";")
+        return try await performGraphRecognition(
+            path: path,
+            payload: payload,
+            requestID: payload.requestId,
+            sanitizedJSON: payload.sanitizedJSON,
+            sourceDescription: "lecture=\(payload.folderID) primary=\(payload.primaryBoardId) boards=[\(sources)]"
+        )
+    }
+
+    func recognizeGraph(target: GraphRecognitionTarget,
+                        requestID: String = BoardStudyExplainRequest.makeRequestID()) async throws
+        -> GraphRecognitionEnvelope {
+        switch target {
+        case .board(let selection):
+            return try await recognizeGraph(request: GraphRecognitionRequest.make(
+                selection: selection, requestID: requestID
+            ))
+        case .lecture(let lecture):
+            return try await recognizeGraph(request: LectureGraphRecognitionRequest(
+                target: lecture, requestID: requestID
+            ))
+        }
+    }
+
+    private func performGraphRecognition<Payload: Encodable>(
+        path: String,
+        payload: Payload,
+        requestID: String,
+        sanitizedJSON: String,
+        sourceDescription: String
+    ) async throws -> GraphRecognitionEnvelope {
+        var request = try request(path: path, method: "POST")
+        request.httpBody = try encoder.encode(payload)
+        let started = Date().timeIntervalSinceReferenceDate
+        debugLog("GRAPH RECOGNITION START url=\(request.url?.absoluteString ?? path) requestID=\(requestID) \(sourceDescription)")
+        let (data, response) = try await data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        debugLog("GRAPH RECOGNITION RESPONSE request=\(requestID) status=\(status) bytes=\(data.count) milliseconds=\((Date().timeIntervalSinceReferenceDate - started) * 1_000)")
+        #if DEBUG
+        if !(200..<300).contains(status) {
+            let responseBody = String(data: data.prefix(8_192), encoding: .utf8)?
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\r", with: " ") ?? "<non-UTF8 response>"
+            debugLog("GRAPH RECOGNITION FAILED url=\(request.url?.absoluteString ?? path) status=\(status) outgoingJSON=\(sanitizedJSON) responseBody=\(responseBody) \(sourceDescription) requestID=\(requestID)")
+        }
+        #endif
+        try validate(response, data: data)
+        do {
+            let envelope = try decoder.decode(GraphRecognitionEnvelope.self, from: data)
+            guard envelope.requestId == requestID,
+                  envelope.result.requestID == requestID else {
+                throw APIError.decoding("The graph recognition response did not match this request.")
+            }
+            _ = try envelope.result.validated()
+            return envelope
+        } catch let error as APIError {
+            throw error
+        } catch {
+            throw APIError.decoding("Could not decode the graph recognition response.")
+        }
+    }
+
     func followUp(boardID: String, interactionID: String,
                   action: String = "followup", question: String = "") async throws -> StudyInteractionResponse {
         var request = try request(path: "/api/boards/\(boardID)/study/\(interactionID)/followup", method: "POST")

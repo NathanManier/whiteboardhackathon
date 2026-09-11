@@ -95,6 +95,7 @@ private struct BoardEditorSurface: View {
     let pdfData: Data?
     let composition: SceneComposition
     @StateObject private var store: BoardDocumentStore
+    @StateObject private var graphRecognition = GraphRecognitionController()
     @State private var showImport = false
     @State private var showStudy = false
     @State private var showShare = false
@@ -106,6 +107,10 @@ private struct BoardEditorSurface: View {
     @State private var selectedPDFRegion: CGRect?
     @State private var liveCamera: CameraRect?
     @State private var studyInitialAction: String?
+    @State private var graphCreationRequest: GraphCreationRequest?
+    @State private var editingGraph: GraphObject?
+    @State private var interactiveGraph: GraphObject?
+    @State private var canvasSize = CGSize.zero
     @AppStorage("vboard.study.inspectorWidth") private var studyPanelWidth = 0.0
     @AppStorage("vboard.study.panelCollapsed") private var studyPanelCollapsed = false
     @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
@@ -169,6 +174,25 @@ private struct BoardEditorSurface: View {
             }
         }
         .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
+        .sheet(item: $graphCreationRequest) { request in
+            GraphCreationSheet(
+                target: request.target,
+                recognition: graphRecognition,
+                prepareSelection: { await store.saveNow(api: api) },
+                onCreate: { expressions, requestID in
+                    createGraph(expressions: expressions, requestID: requestID,
+                                selection: request.selection,
+                                sourceBoardIDs: request.sourceBoardIDs,
+                                selectedObjectKeys: request.selectedObjectKeys)
+                }
+            )
+            .environmentObject(api)
+        }
+        .sheet(item: $editingGraph) { graph in
+            GraphExpressionEditor(graph: graph) { expressions in
+                store.replaceGraph(graph.replacing(expressions: expressions), api: api)
+            }
+        }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
         .alert("Couldn’t export board", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) { Button("OK", role: .cancel) {} } message: { Text(exportError ?? "") }
         .alert("Board changed on the server", isPresented: $showConflict) {
@@ -176,6 +200,16 @@ private struct BoardEditorSurface: View {
             Button("Reload Server Version", role: .destructive) { store.reloadServerVersion() }
         } message: { Text("Your local edits are preserved locally. Choose which version should remain.") }
         .onChange(of: store.status) { _, status in if status == .conflict { showConflict = true } }
+        .onChange(of: studySelection) { _, selection in
+            graphRecognition.selectionChanged(
+                selection.map(GraphRecognitionTarget.board),
+                api: api,
+                prepareSelection: { await store.saveNow(api: api) }
+            )
+            if selection?.canonicalObjectIDs != interactiveGraph.map({ [$0.id] }) {
+                interactiveGraph = nil
+            }
+        }
         .task { store.restoreLocalIfPresent(server: store.editor) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
     }
@@ -188,17 +222,55 @@ private struct BoardEditorSurface: View {
             // and the live camera cannot be reset by SwiftUI identity churn.
             NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), showsPaper: pdfData != nil || physicalBoardShowsPaper, backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots, penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1), markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity), showsDeveloperDiagnostics: developerDiagnosticsIfAvailable, onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onResize: { ids, anchor, factor in selectedPDFRegion = nil; store.scaleObjects(ids: ids, around: anchor, by: factor, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
                 .ignoresSafeArea(edges: .bottom)
+            if let graph = interactiveGraph {
+                let rect = graphScreenRect(graph, viewport: proxy.size)
+                if rect.intersects(CGRect(origin: .zero, size: proxy.size)) {
+                GraphInteractiveSurface(
+                    graph: graph,
+                    onCommitViewport: { viewport in
+                        let updated = graph.replacing(viewport: viewport)
+                        store.replaceGraph(updated, api: api)
+                        if interactiveGraph?.id == graph.id { interactiveGraph = updated }
+                    },
+                    onEdit: {
+                        editingGraph = store.editor.objects
+                            .first(where: { $0.id == graph.id })?.graph ?? graph
+                        interactiveGraph = nil
+                    },
+                    onDone: { interactiveGraph = nil }
+                )
+                .frame(width: max(rect.width, 1), height: max(rect.height, 1))
+                .position(x: rect.midX, y: rect.midY)
+                .shadow(color: .black.opacity(0.16), radius: 10, y: 4)
+                .zIndex(20)
+                }
+            }
             WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
                                  penColor: $penColor, penWidth: $penWidth,
                                  markerColor: $markerColor, markerWidth: $markerWidth,
                                  markerOpacity: $markerOpacity)
             .padding(.bottom, 12)
 
-            if let rect = selectionScreenRect(viewport: proxy.size) {
+            if interactiveGraph == nil, let rect = selectionScreenRect(viewport: proxy.size) {
                 SelectionActionBar(canCheckWork: selectionCanCheckWork,
+                                   graphPrimaryTitle: graphPrimaryTitle,
+                                   graphIsLoading: selectedGraph == nil && graphRecognition.isClassifying,
                                    explain: { openStudy("explain") },
                                    practice: { openStudy("practice_problems") },
                                    check: { openStudy("check_my_work") },
+                                   graphPrimary: { performPrimaryGraphAction() },
+                                   graphSelection: { openGraphCreation() },
+                                   editGraph: selectedGraph.map { graph in { editingGraph = graph } },
+                                   resetGraph: selectedGraph.map { graph in
+                                       { store.replaceGraph(graph.replacing(viewport: .conventional), api: api) }
+                                   },
+                                   duplicateGraph: selectedGraph.map { graph in
+                                       {
+                                           if let id = store.duplicateGraph(id: graph.id, api: api) {
+                                               selectedIDs = [id]
+                                           }
+                                       }
+                                   },
                                    delete: { store.deleteObjects(ids: selectedIDs, api: api) })
                     .position(SelectionToolbarLayout.position(for: rect, viewport: proxy.size))
             }
@@ -207,7 +279,14 @@ private struct BoardEditorSurface: View {
             // the same commands through UIKeyCommand for device input.
             Button("") { store.undo(api: api) }.keyboardShortcut("z", modifiers: .command).frame(width: 0, height: 0).opacity(0.001)
             Button("") { store.redo(api: api) }.keyboardShortcut("z", modifiers: [.command, .shift]).frame(width: 0, height: 0).opacity(0.001)
+            if interactiveGraph != nil {
+                Button("") { interactiveGraph = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .frame(width: 0, height: 0).opacity(0.001)
             }
+            }
+            .onAppear { canvasSize = proxy.size }
+            .onChange(of: proxy.size) { _, value in canvasSize = value }
         }
     }
 
@@ -248,10 +327,58 @@ private struct BoardEditorSurface: View {
         return CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
     }
 
+    private func graphScreenRect(_ graph: GraphObject, viewport: CGSize) -> CGRect {
+        let transform = WorldScreenTransform(camera: liveCamera ?? store.editor.viewport,
+                                             viewport: viewport)
+        let a = transform.screenPoint(for: graph.frame.cgRect.origin)
+        let b = transform.screenPoint(for: CGPoint(x: graph.frame.cgRect.maxX,
+                                                    y: graph.frame.cgRect.maxY))
+        return CGRect(x: min(a.x, b.x), y: min(a.y, b.y),
+                      width: abs(b.x - a.x), height: abs(b.y - a.y))
+    }
+
     private var studySelection: BoardStudySelection? {
         BoardStudySelection.isolated(boardID: board.id, selectedIDs: selectedIDs,
                                      document: document, editor: store.editor,
                                      preferredLocalBBox: selectedPDFRegion)
+    }
+    private var selectedGraph: GraphObject? {
+        guard selectedIDs.count == 1, let id = selectedIDs.first else { return nil }
+        return store.editor.objects.first(where: { $0.id == id })?.graph
+    }
+    private var graphPrimaryTitle: String? {
+        if selectedGraph != nil { return "Interact" }
+        return GraphabilityPolicy.showsPrimaryAction(result: graphRecognition.result)
+            ? "Graph" : nil
+    }
+
+    private func performPrimaryGraphAction() {
+        if let graph = selectedGraph {
+            interactiveGraph = graph
+        } else {
+            openGraphCreation()
+        }
+    }
+
+    private func openGraphCreation() {
+        guard let selection = studySelection, selectedGraph == nil else { return }
+        graphCreationRequest = GraphCreationRequest(selection: selection)
+    }
+
+    private func createGraph(expressions: [GraphExpression], requestID: String?,
+                             selection: BoardStudySelection,
+                             sourceBoardIDs: [String], selectedObjectKeys: [String]) {
+        let scale = canvasSize.width > 0 && canvasSize.height > 0
+            ? WorldScreenTransform(camera: liveCamera ?? store.editor.viewport,
+                                   viewport: canvasSize).scale : 1
+        let occupied = store.editor.objects.map { BoardHitTestPolicy.bounds(of: $0) }
+        let graph = GraphObjectFactory.make(
+            boardID: board.id, selection: selection, expressions: expressions,
+            recognitionRequestID: requestID, cameraScale: scale, occupied: occupied,
+            sourceBoardIDs: sourceBoardIDs, selectedObjectKeys: selectedObjectKeys
+        )
+        store.addGraph(graph, api: api)
+        selectedIDs = [graph.id]
     }
     private var selectionCanCheckWork: Bool {
         let selectedObjects = store.editor.objects.filter { selectedIDs.contains($0.id) }

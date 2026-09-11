@@ -443,6 +443,49 @@ final class LectureWorkspaceStore: ObservableObject {
         refreshSceneSnapshot(boardID, api: api)
     }
 
+    func addGraph(_ graph: GraphObject, boardID: String, api: APIClient) {
+        guard graph.owningBoardID == boardID,
+              let store = boardStores[boardID] else { return }
+        let before = store.editor.objects.count
+        recordBoardUndo([boardID])
+        store.addGraph(graph, api: api)
+        guard store.editor.objects.count != before else {
+            _ = undoHistory.popLast()
+            return
+        }
+        refreshSceneSnapshot(boardID, api: api)
+        selectedKeys = [SelectionKey(boardID: boardID, objectID: graph.id,
+                                     kind: .editorObject, objectType: "graph")]
+        selectedPDFRegions.removeAll()
+    }
+
+    func replaceGraph(_ graph: GraphObject, boardID: String, api: APIClient) {
+        guard graph.owningBoardID == boardID,
+              let store = boardStores[boardID],
+              store.editor.objects.contains(where: { $0.id == graph.id && $0.graph != graph })
+        else { return }
+        recordBoardUndo([boardID])
+        store.replaceGraph(graph, api: api)
+        refreshSceneSnapshot(boardID, api: api)
+    }
+
+    @discardableResult
+    func duplicateGraph(_ key: SelectionKey, api: APIClient) -> SelectionKey? {
+        guard key.kind == .editorObject,
+              let store = boardStores[key.boardID] else { return nil }
+        recordBoardUndo([key.boardID])
+        guard let id = store.duplicateGraph(id: key.objectID, api: api) else {
+            _ = undoHistory.popLast()
+            return nil
+        }
+        refreshSceneSnapshot(key.boardID, api: api)
+        let duplicate = SelectionKey(boardID: key.boardID, objectID: id,
+                                     kind: .editorObject, objectType: "graph")
+        selectedKeys = [duplicate]
+        selectedPDFRegions.removeAll()
+        return duplicate
+    }
+
     func addNote(_ markdown: String, api: APIClient) {
         guard let boardID = activeBoardID,
               let store = boardStores[boardID],
