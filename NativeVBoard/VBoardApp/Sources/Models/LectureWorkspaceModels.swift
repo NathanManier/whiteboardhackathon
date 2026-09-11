@@ -235,6 +235,11 @@ enum BoardHitTestPolicy {
     }
 
     static func bounds(of object: CanvasObject) -> CGRect {
+        if let graph = object.graph {
+            return CGRect(x: graph.frame.x, y: graph.frame.y,
+                          width: max(graph.frame.width, 0),
+                          height: max(graph.frame.height, 0))
+        }
         let translation = object.translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
         if let x = object.x, let y = object.y {
             return CGRect(x: x + translation.x, y: y + translation.y,

@@ -136,6 +136,20 @@ enum EditorThreeWayMerger {
         case (_, nil, nil):
             return nil
         case (let base?, let local?, let server?):
+            if base.type == "graph", local.type == "graph", server.type == "graph" {
+                guard let baseGraph = base.graph,
+                      let localGraph = local.graph,
+                      let serverGraph = server.graph else {
+                    unresolved.insert(id)
+                    return local
+                }
+                var graphConflict = false
+                let graph = mergeGraphObject(base: baseGraph, local: localGraph,
+                                             server: serverGraph,
+                                             conflict: &graphConflict)
+                if graphConflict { unresolved.insert(id) }
+                return CanvasObject(graph: graph)
+            }
             var conflict = false
             let merged = CanvasObject(
                 id: id,
@@ -166,11 +180,160 @@ enum EditorThreeWayMerger {
                                    conflict: &conflict),
                 unitLabel: resolve(base.unitLabel, local.unitLabel, server.unitLabel,
                                    conflict: &conflict),
-                origin: resolve(base.origin, local.origin, server.origin, conflict: &conflict)
+                origin: resolve(base.origin, local.origin, server.origin, conflict: &conflict),
+                graph: resolve(base.graph, local.graph, server.graph, conflict: &conflict)
             )
             if conflict { unresolved.insert(id) }
             return merged
         }
+    }
+
+    /// Graphs are first-class stable-ID editor objects. Their semantic fields
+    /// merge independently, so a frame change on one device and an expression
+    /// edit on another do not trigger a routine conflict.
+    private static func mergeGraphObject(base: GraphObject,
+                                         local: GraphObject,
+                                         server: GraphObject,
+                                         conflict: inout Bool) -> GraphObject {
+        GraphObject(
+            id: resolve(base.id, local.id, server.id, conflict: &conflict),
+            owningBoardID: resolve(base.owningBoardID, local.owningBoardID,
+                                   server.owningBoardID, conflict: &conflict),
+            frame: mergeGraphFrame(base: base.frame, local: local.frame,
+                                   server: server.frame, conflict: &conflict),
+            expressions: mergeGraphExpressions(base: base.expressions,
+                                                local: local.expressions,
+                                                server: server.expressions,
+                                                conflict: &conflict),
+            viewport: mergeGraphViewport(base: base.viewport, local: local.viewport,
+                                         server: server.viewport, conflict: &conflict),
+            settings: mergeGraphSettings(base: base.settings, local: local.settings,
+                                         server: server.settings, conflict: &conflict),
+            sourceSelection: resolve(base.sourceSelection, local.sourceSelection,
+                                     server.sourceSelection, conflict: &conflict),
+            providerMetadata: resolve(base.providerMetadata, local.providerMetadata,
+                                      server.providerMetadata, conflict: &conflict),
+            createdAt: resolve(base.createdAt, local.createdAt, server.createdAt,
+                               conflict: &conflict),
+            // Timestamp/version bookkeeping follows the newest compatible
+            // value and must not turn independent semantic edits into conflict.
+            updatedAt: max(base.updatedAt, max(local.updatedAt, server.updatedAt)),
+            version: max(base.version, max(local.version, server.version)),
+            additionalFields: mergeJSONFields(base: base.additionalFields,
+                                              local: local.additionalFields,
+                                              server: server.additionalFields,
+                                              conflict: &conflict)
+        )
+    }
+
+    private static func mergeGraphFrame(base: GraphFrame, local: GraphFrame,
+                                        server: GraphFrame,
+                                        conflict: inout Bool) -> GraphFrame {
+        GraphFrame(
+            x: resolve(base.x, local.x, server.x, conflict: &conflict),
+            y: resolve(base.y, local.y, server.y, conflict: &conflict),
+            width: resolve(base.width, local.width, server.width, conflict: &conflict),
+            height: resolve(base.height, local.height, server.height, conflict: &conflict)
+        )
+    }
+
+    private static func mergeGraphViewport(base: GraphViewport, local: GraphViewport,
+                                           server: GraphViewport,
+                                           conflict: inout Bool) -> GraphViewport {
+        GraphViewport(
+            xMin: resolve(base.xMin, local.xMin, server.xMin, conflict: &conflict),
+            xMax: resolve(base.xMax, local.xMax, server.xMax, conflict: &conflict),
+            yMin: resolve(base.yMin, local.yMin, server.yMin, conflict: &conflict),
+            yMax: resolve(base.yMax, local.yMax, server.yMax, conflict: &conflict)
+        )
+    }
+
+    private static func mergeGraphSettings(base: GraphSettings, local: GraphSettings,
+                                           server: GraphSettings,
+                                           conflict: inout Bool) -> GraphSettings {
+        GraphSettings(
+            showXAxis: resolve(base.showXAxis, local.showXAxis, server.showXAxis,
+                               conflict: &conflict),
+            showYAxis: resolve(base.showYAxis, local.showYAxis, server.showYAxis,
+                               conflict: &conflict),
+            showGrid: resolve(base.showGrid, local.showGrid, server.showGrid,
+                              conflict: &conflict),
+            showExpressionsPanel: resolve(base.showExpressionsPanel,
+                                          local.showExpressionsPanel,
+                                          server.showExpressionsPanel,
+                                          conflict: &conflict),
+            lockViewport: resolve(base.lockViewport, local.lockViewport,
+                                  server.lockViewport, conflict: &conflict),
+            angleMode: resolve(base.angleMode, local.angleMode, server.angleMode,
+                               conflict: &conflict)
+        )
+    }
+
+    private static func mergeGraphExpressions(base: [GraphExpression],
+                                              local: [GraphExpression],
+                                              server: [GraphExpression],
+                                              conflict: inout Bool) -> [GraphExpression] {
+        let baseByID = Dictionary(uniqueKeysWithValues: base.map { ($0.id, $0) })
+        let localByID = Dictionary(uniqueKeysWithValues: local.map { ($0.id, $0) })
+        let serverByID = Dictionary(uniqueKeysWithValues: server.map { ($0.id, $0) })
+        let ids = Set(baseByID.keys).union(localByID.keys).union(serverByID.keys)
+        var mergedByID: [String: GraphExpression] = [:]
+
+        for id in ids {
+            switch (baseByID[id], localByID[id], serverByID[id]) {
+            case (nil, nil, nil):
+                break
+            case (nil, let local?, nil):
+                mergedByID[id] = local
+            case (nil, nil, let server?):
+                mergedByID[id] = server
+            case (nil, let local?, let server?):
+                if local != server { conflict = true }
+                mergedByID[id] = local
+            case (let base?, nil, let server?):
+                if server != base { conflict = true; mergedByID[id] = server }
+            case (let base?, let local?, nil):
+                if local != base { conflict = true; mergedByID[id] = local }
+            case (_, nil, nil):
+                break
+            case (let base?, let local?, let server?):
+                mergedByID[id] = GraphExpression(
+                    id: id,
+                    latex: resolve(base.latex, local.latex, server.latex,
+                                   conflict: &conflict),
+                    type: resolve(base.type, local.type, server.type, conflict: &conflict),
+                    visible: resolve(base.visible, local.visible, server.visible,
+                                     conflict: &conflict),
+                    displayStyle: resolve(base.displayStyle, local.displayStyle,
+                                          server.displayStyle, conflict: &conflict),
+                    restrictions: resolve(base.restrictions, local.restrictions,
+                                          server.restrictions, conflict: &conflict),
+                    additionalFields: mergeJSONFields(base: base.additionalFields,
+                                                      local: local.additionalFields,
+                                                      server: server.additionalFields,
+                                                      conflict: &conflict)
+                )
+            }
+        }
+
+        var emitted = Set<String>()
+        return (server + local).compactMap { expression in
+            guard emitted.insert(expression.id).inserted else { return nil }
+            return mergedByID[expression.id]
+        }
+    }
+
+    private static func mergeJSONFields(base: [String: JSONValue],
+                                        local: [String: JSONValue],
+                                        server: [String: JSONValue],
+                                        conflict: inout Bool) -> [String: JSONValue] {
+        let keys = Set(base.keys).union(local.keys).union(server.keys)
+        var result: [String: JSONValue] = [:]
+        for key in keys {
+            let value = resolve(base[key], local[key], server[key], conflict: &conflict)
+            if let value { result[key] = value }
+        }
+        return result
     }
 
     private static func mergeGroups(base: [EditorGroup],
@@ -343,6 +506,71 @@ final class BoardDocumentStore: ObservableObject {
             unitLabel: unitLabel, origin: "study"
         ))
         apply(next, api: api)
+    }
+
+    /// Inserts one provider-independent graph through the same history,
+    /// outbox, autosave, and revision path as every other editor object.
+    func addGraph(_ graph: GraphObject, api: APIClient) {
+        guard graph.owningBoardID == boardID,
+              graph.frame.hasFinitePositiveSize,
+              graph.viewport.isValid,
+              !graph.expressions.isEmpty,
+              !editor.objects.contains(where: { $0.id == graph.id }) else { return }
+        var next = editor
+        next.objects.append(CanvasObject(graph: graph))
+        apply(next, api: api)
+    }
+
+    /// Replaces a graph with the same stable ID/owner as one canonical undo
+    /// item. Callers use this for expression, viewport, settings, or frame
+    /// commits after an interaction session settles.
+    func replaceGraph(_ graph: GraphObject, api: APIClient) {
+        guard graph.owningBoardID == boardID,
+              graph.frame.hasFinitePositiveSize,
+              graph.viewport.isValid,
+              !graph.expressions.isEmpty,
+              let index = editor.objects.firstIndex(where: {
+                  $0.id == graph.id && $0.type == "graph"
+              }), editor.objects[index].graph != graph else { return }
+        var next = editor
+        next.objects[index] = CanvasObject(graph: graph)
+        apply(next, api: api)
+    }
+
+    /// Closure form keeps mutation logic provider-independent while ensuring
+    /// one interaction produces one document/history/outbox mutation.
+    func updateGraph(id: String, api: APIClient,
+                     transform: (GraphObject) -> GraphObject) {
+        guard let current = editor.objects.first(where: { $0.id == id })?.graph else { return }
+        let updated = transform(current)
+        guard updated.id == current.id,
+              updated.owningBoardID == current.owningBoardID else { return }
+        replaceGraph(updated, api: api)
+    }
+
+    /// Duplicates semantic content with a distinct stable ID and a small
+    /// board-local offset. Source provenance is retained intentionally; the
+    /// new graph remains a derived view of the same original selection.
+    @discardableResult
+    func duplicateGraph(id: String, newID: String = "graph-" + UUID().uuidString.lowercased(),
+                        offset: CGPoint = CGPoint(x: 32, y: 32),
+                        api: APIClient) -> String? {
+        guard let source = editor.objects.first(where: { $0.id == id })?.graph,
+              !editor.objects.contains(where: { $0.id == newID }) else { return nil }
+        let duplicate = GraphObject(
+            id: newID, owningBoardID: source.owningBoardID,
+            frame: GraphFrame(x: source.frame.x + Double(offset.x),
+                              y: source.frame.y + Double(offset.y),
+                              width: source.frame.width, height: source.frame.height),
+            expressions: source.expressions, viewport: source.viewport,
+            settings: source.settings, sourceSelection: source.sourceSelection,
+            providerMetadata: source.providerMetadata,
+            createdAt: Date().timeIntervalSince1970,
+            updatedAt: Date().timeIntervalSince1970,
+            version: source.version, additionalFields: source.additionalFields
+        )
+        addGraph(duplicate, api: api)
+        return editor.objects.contains(where: { $0.id == newID }) ? newID : nil
     }
 
     func moveObject(id: String, by delta: CGPoint, api: APIClient) {

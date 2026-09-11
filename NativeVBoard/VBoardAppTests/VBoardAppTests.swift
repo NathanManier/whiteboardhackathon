@@ -2237,3 +2237,259 @@ final class LectureWorkspacePersistenceTests: XCTestCase {
         XCTAssertNil(store.conflictServerEditor)
     }
 }
+
+@MainActor
+final class GraphDomainModelTests: XCTestCase {
+    private let boardID = "603f5213ab0a249716833214c5ab88da"
+
+    private func graph(owningBoardID: String? = nil,
+                       frame: GraphFrame = GraphFrame(x: -240, y: 80,
+                                                       width: 560, height: 340),
+                       expressions: [GraphExpression]? = nil,
+                       updatedAt: Double = 20) -> GraphObject {
+        GraphObject(
+            id: "graph-opaque-A9_z",
+            owningBoardID: owningBoardID ?? boardID,
+            frame: frame,
+            expressions: expressions ?? [
+                GraphExpression(id: "expression-1", latex: "y=x^2-4",
+                                type: .explicitFunction),
+                GraphExpression(id: "expression-2", latex: "x^2+y^2=9",
+                                type: .implicitEquation, visible: false)
+            ],
+            viewport: GraphViewport(xMin: -12.5, xMax: 18.25,
+                                    yMin: -7.75, yMax: 23.5),
+            settings: GraphSettings(showXAxis: true, showYAxis: false,
+                                    showGrid: true, showExpressionsPanel: false,
+                                    lockViewport: false, angleMode: "radians"),
+            sourceSelection: GraphSourceSelection(
+                interactionID: "0123456789abcdef",
+                sourceBoardIDs: [boardID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                selectedObjectKeys: ["professor:path-red-7", "editor:stroke-user-2"],
+                originalRecognitionRequestID: "0123456789abcdef",
+                originalSelectionBBox: GraphFrame(x: -80, y: 15, width: 310, height: 95)
+            ),
+            providerMetadata: GraphProviderMetadata(
+                preference: "desmos",
+                state: .object(["opaque": .array([.integer(7), .bool(true)])]),
+                semanticContentHash: String(repeating: "a", count: 64), renderVersion: 3
+            ),
+            createdAt: 10, updatedAt: updatedAt, version: 1,
+            additionalFields: ["future_semantics": .object(["mode": .string("phase-c")])]
+        )
+    }
+
+    private func editor(revision: Int, object: GraphObject) -> EditorState {
+        EditorState(schemaVersion: 4, revision: revision, updatedAt: nil,
+                    viewport: CameraRect(x: -500, y: 100, width: 1_200, height: 800),
+                    objects: [CanvasObject(graph: object)], groups: [],
+                    importedTransforms: [:], sourceBoards: [], mergedBoardIDs: [])
+    }
+
+    func testGraphObjectFlatEditorJSONRoundTripsAllCanonicalSemantics() throws {
+        let source = graph()
+        let encoded = try JSONEncoder().encode(EditorEnvelope(editor: editor(revision: 8,
+                                                                              object: source)))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let editorJSON = try XCTUnwrap(root["editor"] as? [String: Any])
+        let objects = try XCTUnwrap(editorJSON["objects"] as? [[String: Any]])
+        let objectJSON = try XCTUnwrap(objects.first)
+
+        XCTAssertEqual(objectJSON["type"] as? String, "graph")
+        XCTAssertEqual(objectJSON["id"] as? String, source.id)
+        XCTAssertEqual(objectJSON["owning_board_id"] as? String, boardID)
+        XCTAssertNotNil(objectJSON["frame"])
+        XCTAssertNotNil(objectJSON["expressions"])
+        XCTAssertNotNil(objectJSON["viewport"])
+        XCTAssertNotNil(objectJSON["settings"])
+        XCTAssertNotNil(objectJSON["source_selection"])
+        XCTAssertNotNil(objectJSON["provider_metadata"])
+        XCTAssertNil(objectJSON["graph"], "Graph semantics stay flat in objects[]")
+
+        let decoded = try JSONDecoder().decode(EditorEnvelope.self, from: encoded).editor
+        XCTAssertEqual(decoded.objects.count, 1)
+        XCTAssertEqual(decoded.objects[0].graph, source)
+        XCTAssertEqual(decoded.objects[0].graph?.expressions.count, 2)
+        XCTAssertEqual(decoded.objects[0].graph?.frame.x, -240)
+        XCTAssertEqual(decoded.objects[0].graph?.sourceSelection?.selectedObjectKeys,
+                       ["professor:path-red-7", "editor:stroke-user-2"])
+        XCTAssertEqual(decoded.objects[0].graph?.providerMetadata?.state,
+                       .object(["opaque": .array([.integer(7), .bool(true)])]))
+    }
+
+    func testUnknownGraphAndExpressionFieldsSurviveRoundTrip() throws {
+        let payload = Data(#"""
+        {"editor":{"schema_version":4,"revision":2,
+          "viewport":{"x":0,"y":0,"width":800,"height":600},
+          "objects":[{
+            "id":"graph-future","type":"graph","owning_board_id":"603f5213ab0a249716833214c5ab88da",
+            "frame":{"x":-10.5,"y":20.25,"width":420.5,"height":260.75},
+            "expressions":[{"id":"future-expression","latex":"r=2\\sin(3\\theta)",
+              "type":"futureCurveKind","future_expression":{"quality":9}}],
+            "future_graph":{"label":"preserve me","flags":[true,null,3]}
+          }],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}}
+        """#.utf8)
+        let decoded = try JSONDecoder().decode(EditorEnvelope.self, from: payload)
+        let graph = try XCTUnwrap(decoded.editor.objects.first?.graph)
+
+        XCTAssertEqual(graph.viewport, .conventional)
+        XCTAssertEqual(graph.settings, GraphSettings())
+        XCTAssertEqual(graph.version, 1)
+        XCTAssertEqual(graph.expressions.first?.visible, true)
+        XCTAssertEqual(graph.expressions.first?.type.rawValue, "futureCurveKind")
+        XCTAssertEqual(graph.additionalFields["future_graph"],
+                       .object(["label": .string("preserve me"),
+                                "flags": .array([.bool(true), .null, .integer(3)])]))
+        XCTAssertEqual(graph.expressions.first?.additionalFields["future_expression"],
+                       .object(["quality": .integer(9)]))
+
+        let reencoded = try JSONEncoder().encode(decoded)
+        let roundTrip = try JSONDecoder().decode(EditorEnvelope.self, from: reencoded)
+        XCTAssertEqual(roundTrip.editor.objects.first?.graph, graph)
+    }
+
+    func testExistingEditorDocumentWithoutGraphsDecodesUnchanged() throws {
+        let payload = Data(#"""
+        {"editor":{"schema_version":4,"revision":7,
+          "viewport":{"x":-20,"y":-10,"width":800,"height":600},
+          "objects":[{"id":"stroke-1","type":"stroke","color":"#183153",
+            "width":4,"opacity":1,"points":[{"x":1.5,"y":-2.25,"p":0.8}],
+            "translation":{"x":0,"y":0}}],
+          "groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}}
+        """#.utf8)
+        let decoded = try JSONDecoder().decode(EditorEnvelope.self, from: payload).editor
+        XCTAssertEqual(decoded.revision, 7)
+        XCTAssertEqual(decoded.objects.first?.type, "stroke")
+        XCTAssertNil(decoded.objects.first?.graph)
+        XCTAssertEqual(decoded.objects.first?.points?.first?.x, 1.5)
+
+        let roundTrip = try JSONDecoder().decode(
+            EditorEnvelope.self,
+            from: JSONEncoder().encode(EditorEnvelope(editor: decoded))
+        ).editor
+        XCTAssertEqual(roundTrip, decoded)
+    }
+
+    func testGraphGeometryOperationsRetainSemanticsAndOpaqueIDs() {
+        let source = graph()
+        let moved = CanvasObject(graph: source).translated(by: CGPoint(x: 35.5, y: -120.25))
+        XCTAssertEqual(moved.graph?.id, source.id)
+        XCTAssertEqual(moved.graph?.frame.x, source.frame.x + 35.5)
+        XCTAssertEqual(moved.graph?.frame.y, source.frame.y - 120.25)
+        XCTAssertEqual(moved.graph?.expressions, source.expressions)
+        XCTAssertEqual(moved.graph?.sourceSelection, source.sourceSelection)
+
+        let scaled = moved.scaled(around: CGPoint(x: -50, y: 20), by: 2)
+        XCTAssertEqual(scaled.graph?.frame.width, source.frame.width * 2)
+        XCTAssertEqual(scaled.graph?.frame.height, source.frame.height * 2)
+        XCTAssertEqual(scaled.graph?.viewport, source.viewport)
+        XCTAssertEqual(scaled.graph?.settings, source.settings)
+    }
+
+    func testAddGraphUsesCanonicalEditorSavePath() async throws {
+        let storeBoardID = "graph-save-" + UUID().uuidString.lowercased()
+        let source = graph(owningBoardID: storeBoardID)
+        let initial = EditorState(
+            schemaVersion: 4, revision: 11, updatedAt: nil,
+            viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+            objects: [], groups: [], importedTransforms: [:],
+            sourceBoards: [], mergedBoardIDs: []
+        )
+        var requestCount = 0
+        WorkspaceURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "PUT")
+            XCTAssertEqual(request.url?.path, "/api/boards/\(storeBoardID)/editor")
+            var candidate = try JSONDecoder().decode(EditorState.self,
+                                                     from: requestBodyData(request))
+            XCTAssertEqual(candidate.objects.first?.graph, source)
+            requestCount += 1
+            candidate.revision = 12
+            return (HTTPURLResponse(url: request.url!, statusCode: 200,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "application/json"])!,
+                    try JSONEncoder().encode(EditorEnvelope(editor: candidate)))
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://graph-save.test")!,
+                            session: URLSession(configuration: configuration))
+        let store = BoardDocumentStore(boardID: storeBoardID, editor: initial)
+
+        store.addGraph(source, api: api)
+        XCTAssertEqual(store.editor.objects.map(\.id), [source.id])
+        XCTAssertTrue(store.canUndo)
+        await store.saveNow(api: api)
+
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(store.status, .clean)
+        XCTAssertEqual(store.editor.revision, 12)
+        XCTAssertEqual(store.editor.objects.first?.graph, source)
+    }
+
+    func testGraphMergeCombinesLocalFrameAndServerExpressionEdit() {
+        let base = graph(updatedAt: 20)
+        let local = GraphObject(
+            id: base.id, owningBoardID: base.owningBoardID,
+            frame: GraphFrame(x: 125, y: -90, width: 700, height: 420),
+            expressions: base.expressions, viewport: base.viewport, settings: base.settings,
+            sourceSelection: base.sourceSelection, providerMetadata: base.providerMetadata,
+            createdAt: base.createdAt, updatedAt: 30, version: base.version,
+            additionalFields: base.additionalFields
+        )
+        var serverExpressions = base.expressions
+        serverExpressions[0] = GraphExpression(id: "expression-1", latex: "y=x^2-9",
+                                               type: .explicitFunction)
+        let server = GraphObject(
+            id: base.id, owningBoardID: base.owningBoardID, frame: base.frame,
+            expressions: serverExpressions, viewport: base.viewport, settings: base.settings,
+            sourceSelection: base.sourceSelection, providerMetadata: base.providerMetadata,
+            createdAt: base.createdAt, updatedAt: 40, version: base.version,
+            additionalFields: base.additionalFields
+        )
+
+        let result = EditorThreeWayMerger.merge(base: editor(revision: 4, object: base),
+                                                local: editor(revision: 4, object: local),
+                                                server: editor(revision: 5, object: server))
+        let merged = result.editor.objects.first?.graph
+        XCTAssertTrue(result.isAutomatic)
+        XCTAssertEqual(merged?.frame, local.frame)
+        XCTAssertEqual(merged?.expressions[0].latex, "y=x^2-9")
+        XCTAssertEqual(merged?.expressions[1], base.expressions[1])
+        XCTAssertEqual(merged?.updatedAt, 40)
+    }
+
+    func testGraphMergeFlagsSameExpressionSourceCollision() {
+        let base = graph()
+        let localExpressions = [
+            GraphExpression(id: "expression-1", latex: "y=x^2-16", type: .explicitFunction),
+            base.expressions[1]
+        ]
+        let serverExpressions = [
+            GraphExpression(id: "expression-1", latex: "y=x^2-25", type: .explicitFunction),
+            base.expressions[1]
+        ]
+        let local = GraphObject(id: base.id, owningBoardID: base.owningBoardID,
+                                frame: base.frame, expressions: localExpressions,
+                                viewport: base.viewport, settings: base.settings,
+                                sourceSelection: base.sourceSelection,
+                                providerMetadata: base.providerMetadata,
+                                createdAt: base.createdAt, updatedAt: 30,
+                                version: base.version,
+                                additionalFields: base.additionalFields)
+        let server = GraphObject(id: base.id, owningBoardID: base.owningBoardID,
+                                 frame: base.frame, expressions: serverExpressions,
+                                 viewport: base.viewport, settings: base.settings,
+                                 sourceSelection: base.sourceSelection,
+                                 providerMetadata: base.providerMetadata,
+                                 createdAt: base.createdAt, updatedAt: 40,
+                                 version: base.version,
+                                 additionalFields: base.additionalFields)
+
+        let result = EditorThreeWayMerger.merge(base: editor(revision: 4, object: base),
+                                                local: editor(revision: 4, object: local),
+                                                server: editor(revision: 5, object: server))
+        XCTAssertEqual(result.unresolvedObjectIDs, [base.id])
+        XCTAssertEqual(result.editor.objects.first?.graph?.expressions[0].latex,
+                       "y=x^2-16", "Current conflict policy retains local value")
+    }
+}
