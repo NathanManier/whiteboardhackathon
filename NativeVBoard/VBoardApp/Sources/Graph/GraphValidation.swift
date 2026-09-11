@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// A field-addressable error suitable for both user-safe save failures and
@@ -27,8 +28,14 @@ enum GraphPersistenceValidator {
     static let maximumRestrictionScalars = 500
     static let maximumSourceBoards = 8
     static let maximumSelectedObjectKeys = 400
+    static let maximumSelectedObjectKeyInputs = 10_000
     static let maximumSelectedObjectKeyScalars = 160
     static let maximumExpressionExtensionBytes = 16 * 1_024
+    static let maximumStyleExtensionBytes = 16 * 1_024
+    static let maximumViewportExtensionBytes = 16 * 1_024
+    static let maximumSettingsExtensionBytes = 16 * 1_024
+    static let maximumSourceExtensionBytes = 16 * 1_024
+    static let maximumProviderExtensionBytes = 32 * 1_024
     static let maximumGraphExtensionBytes = 64 * 1_024
     static let maximumProviderStateBytes = 256 * 1_024
 
@@ -114,6 +121,14 @@ enum GraphPersistenceValidator {
     static func sanitized(_ graphs: [GraphObject],
                           expectedBoardID: String? = nil) throws -> [GraphObject] {
         try graphs.map { try sanitized($0, expectedBoardID: expectedBoardID) }
+    }
+
+    /// Shared correction/manual-entry validation before the creation sheet is
+    /// dismissed. This prevents a locally accepted expression from becoming
+    /// an editor mutation that the authoritative server would reject.
+    static func sanitized(_ expression: GraphExpression) throws -> GraphExpression {
+        var seen = Set<String>()
+        return try sanitizedExpression(expression, index: 0, seenIDs: &seen)
     }
 
     private static func sanitizedExpression(
@@ -233,7 +248,12 @@ enum GraphPersistenceValidator {
             lineWidth: lineWidth,
             lineStyle: style.lineStyle,
             opacity: opacity,
-            pointStyle: style.pointStyle
+            pointStyle: style.pointStyle,
+            additionalFields: try sanitizedFieldMap(
+                style.additionalFields,
+                path: "\(path).extensions",
+                maximumBytes: maximumStyleExtensionBytes
+            )
         )
     }
 
@@ -253,7 +273,14 @@ enum GraphPersistenceValidator {
         guard xMin < xMax, yMin < yMax else {
             throw failure("graph.viewport", "bounds are invalid")
         }
-        return GraphViewport(xMin: xMin, xMax: xMax, yMin: yMin, yMax: yMax)
+        return GraphViewport(
+            xMin: xMin, xMax: xMax, yMin: yMin, yMax: yMax,
+            additionalFields: try sanitizedFieldMap(
+                viewport.additionalFields,
+                path: "graph.viewport.extensions",
+                maximumBytes: maximumViewportExtensionBytes
+            )
+        )
     }
 
     private static func sanitizedSettings(_ settings: GraphSettings) throws -> GraphSettings {
@@ -267,7 +294,12 @@ enum GraphPersistenceValidator {
             showGrid: settings.showGrid,
             showExpressionsPanel: settings.showExpressionsPanel,
             lockViewport: settings.lockViewport,
-            angleMode: angleMode
+            angleMode: angleMode,
+            additionalFields: try sanitizedFieldMap(
+                settings.additionalFields,
+                path: "graph.settings.extensions",
+                maximumBytes: maximumSettingsExtensionBytes
+            )
         )
     }
 
@@ -287,9 +319,9 @@ enum GraphPersistenceValidator {
             }
         }
 
-        guard source.selectedObjectKeys.count <= maximumSelectedObjectKeys else {
+        guard source.selectedObjectKeys.count <= maximumSelectedObjectKeyInputs else {
             throw failure("graph.source_selection.selected_object_keys",
-                          "must contain at most \(maximumSelectedObjectKeys) items")
+                          "must contain at most \(maximumSelectedObjectKeyInputs) items")
         }
         var objectKeys = Set<String>()
         for (index, key) in source.selectedObjectKeys.enumerated() {
@@ -321,12 +353,47 @@ enum GraphPersistenceValidator {
                                minimumSize: 1)
         }
 
+        var selectedObjectKeys = source.selectedObjectKeys
+        var sourceExtensions = source.additionalFields
+        let summaryKeys = [
+            "selected_object_keys_truncated",
+            "selected_object_key_count",
+            "selected_object_keys_sha256"
+        ]
+        if selectedObjectKeys.count > maximumSelectedObjectKeys {
+            let fullKeys = selectedObjectKeys
+            selectedObjectKeys = Array(fullKeys.prefix(maximumSelectedObjectKeys))
+            let encoded = (try? JSONEncoder().encode(fullKeys)) ?? Data()
+            let digest = SHA256.hash(data: encoded)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            sourceExtensions[summaryKeys[0]] = .bool(true)
+            sourceExtensions[summaryKeys[1]] = .integer(Int64(fullKeys.count))
+            sourceExtensions[summaryKeys[2]] = .string(digest)
+        } else if sourceExtensions[summaryKeys[0]] == .bool(true) {
+            guard case .integer(let originalCount)? = sourceExtensions[summaryKeys[1]],
+                  Int64(selectedObjectKeys.count) <= originalCount,
+                  originalCount <= Int64(maximumSelectedObjectKeyInputs),
+                  case .string(let digest)? = sourceExtensions[summaryKeys[2]],
+                  digest.unicodeScalars.count == 64,
+                  digest.unicodeScalars.allSatisfy(isASCIILowerHexDigit) else {
+                throw failure("graph.source_selection", "key summary is invalid")
+            }
+        } else {
+            summaryKeys.forEach { sourceExtensions.removeValue(forKey: $0) }
+        }
+
         return GraphSourceSelection(
             interactionID: source.interactionID,
             sourceBoardIDs: source.sourceBoardIDs,
-            selectedObjectKeys: source.selectedObjectKeys,
+            selectedObjectKeys: selectedObjectKeys,
             originalRecognitionRequestID: source.originalRecognitionRequestID,
-            originalSelectionBBox: originalBBox
+            originalSelectionBBox: originalBBox,
+            additionalFields: try sanitizedFieldMap(
+                sourceExtensions,
+                path: "graph.source_selection.extensions",
+                maximumBytes: maximumSourceExtensionBytes
+            )
         )
     }
 
@@ -356,7 +423,12 @@ enum GraphPersistenceValidator {
             preference: provider.preference,
             state: state,
             semanticContentHash: provider.semanticContentHash,
-            renderVersion: provider.renderVersion
+            renderVersion: provider.renderVersion,
+            additionalFields: try sanitizedFieldMap(
+                provider.additionalFields,
+                path: "graph.provider_metadata.extensions",
+                maximumBytes: maximumProviderExtensionBytes
+            )
         )
     }
 

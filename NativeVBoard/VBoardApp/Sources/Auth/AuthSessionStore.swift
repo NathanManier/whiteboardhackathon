@@ -85,11 +85,15 @@ enum LocalAccountNamespace {
     private(set) static var value = "signed-out"
 
     static func activate(_ userID: String) {
+        GraphProxyCache.shared.removeAll()
         value = SHA256.hash(data: Data(userID.utf8)).prefix(16)
             .map { String(format: "%02x", $0) }.joined()
     }
 
-    static func clear() { value = "signed-out" }
+    static func clear() {
+        GraphProxyCache.shared.removeAll()
+        value = "signed-out"
+    }
 }
 
 final class AuthKeychain {
@@ -112,18 +116,24 @@ final class AuthKeychain {
 
     func save(_ credentials: AuthCredentials) throws {
         let data = try JSONEncoder().encode(credentials)
-        let attributes = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        ] as [String: Any]
-        let status = SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
+        // Accessibility is immutable for an existing generic-password item on
+        // some simulator/device Keychain implementations. Updating only the
+        // value preserves the insertion access class while atomically rotating
+        // the access/refresh pair encoded in this one value.
+        let updateAttributes = [kSecValueData as String: data] as [String: Any]
+        let status = SecItemUpdate(baseQuery as CFDictionary,
+                                   updateAttributes as CFDictionary)
         if status == errSecItemNotFound {
             var insertion = baseQuery
-            attributes.forEach { insertion[$0.key] = $0.value }
+            insertion[kSecValueData as String] = data
+            insertion[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             guard SecItemAdd(insertion as CFDictionary, nil) == errSecSuccess else {
                 throw APIError.transport("V-Board could not securely save the session.")
             }
         } else if status != errSecSuccess {
+            #if DEBUG
+            print("[VBoard] KEYCHAIN UPDATE FAILED status=\(status)")
+            #endif
             throw APIError.transport("V-Board could not securely update the session.")
         }
     }

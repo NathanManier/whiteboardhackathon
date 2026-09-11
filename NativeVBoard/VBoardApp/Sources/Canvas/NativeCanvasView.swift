@@ -78,6 +78,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private let userLayer = CALayer()
     private let paperLayer = CAShapeLayer()
     private var userObjectLayers: [String: CALayer] = [:]
+    private var renderedObjects: [String: CanvasObject] = [:]
     private var strokeLayers: [String: CALayer] = [:]
     private var activeStrokeLayer: CAShapeLayer?
     private(set) var userStrokes: [UserStroke] = []
@@ -125,6 +126,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var panStart = CGPoint.zero
     private var panStartCamera = CameraRect(x: 0, y: 0, width: 1, height: 1)
     private var panGesture: UIPanGestureRecognizer!
+    private var pinchGesture: UIPinchGestureRecognizer!
     private var isSpacePressed = false
     private var interactionState: InteractionState = .idle
     private var activeInputSource: InputSource = .touch
@@ -249,7 +251,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         panGesture.isEnabled = false
         #endif
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(didPinch(_:)))
-        pinch.delegate = self; addGestureRecognizer(pinch)
+        // Camera gestures must never compete with a Pencil stroke. Finger and
+        // trackpad pinch share the same authoritative CameraController path.
+        pinch.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue),
+                                   NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        pinch.cancelsTouchesInView = false
+        pinch.delegate = self; pinchGesture = pinch; addGestureRecognizer(pinch)
         registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (view: InfiniteCanvasUIView, _) in
             view.updateWorkspaceBackground()
         }
@@ -610,7 +617,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
     }
 
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        let pair = Set([ObjectIdentifier(gestureRecognizer),
+                        ObjectIdentifier(otherGestureRecognizer)])
+        return pair == Set([ObjectIdentifier(panGesture),
+                            ObjectIdentifier(pinchGesture)])
+    }
 
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === panGesture else { return true }
@@ -694,7 +707,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
          UIKeyCommand(input: "-", modifierFlags: [.command], action: #selector(zoomOutKey)),
          UIKeyCommand(input: "0", modifierFlags: [.command], action: #selector(resetZoomKey)),
          UIKeyCommand(input: "z", modifierFlags: [.command], action: #selector(undoKey)),
-         UIKeyCommand(input: "z", modifierFlags: [.command, .shift], action: #selector(redoKey))]
+         UIKeyCommand(input: "z", modifierFlags: [.command, .shift], action: #selector(redoKey)),
+         UIKeyCommand(input: "\u{8}", modifierFlags: [], action: #selector(deleteSelectionKey))]
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -751,6 +765,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
     @objc private func undoKey() { onUndo() }
     @objc private func redoKey() { onRedo() }
+    @objc private func deleteSelectionKey() {
+        guard interactionState == .idle, !selectedIDs.isEmpty else { return }
+        let deleted = selectedIDs
+        selectedIDs.removeAll()
+        onSelectionRegionChanged(nil)
+        onSelectionChanged([])
+        updateSelectionOverlay()
+        onDelete(deleted)
+    }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
@@ -777,7 +800,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         activeID = UUID().uuidString; activePoints = samples(for: touch, event: event)
         let layer = CAShapeLayer(); layer.fillColor = UIColor.clear.cgColor
         layer.strokeColor = strokeColor.cgColor; layer.lineWidth = strokeWidth
-        layer.lineCap = .round; layer.lineJoin = .round; activeStrokeLayer = layer
+        layer.lineCap = .round; layer.lineJoin = .round
+        // Canonical object layers retain document order. The transient trace
+        // is presentation-only and must remain visible above opaque graph
+        // proxies until the finalized canonical stroke replaces it.
+        layer.zPosition = 1_000_000
+        activeStrokeLayer = layer
         updateActiveStroke()
     }
 
@@ -889,7 +917,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             return
         }
         if interactionState == .resizingSelection, let session = resizeSession {
-            let scale = SelectionResizeGeometry.scale(session: session, currentPointer: point)
+            let requested = SelectionResizeGeometry.scale(session: session, currentPointer: point)
+            let scale = boundedResizeScale(anchor: session.anchor, requested: requested) ?? 1
             resizePreviewBounds = SelectionResizeGeometry.bounds(session: session, scale: scale)
             previewResize(anchor: session.anchor, scale: scale)
             updateSelectionOverlay()
@@ -917,10 +946,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     private func finishEditing(at endpoint: CGPoint?) {
         if interactionState == .resizingSelection, let session = resizeSession {
-            let scale = endpoint.map {
+            let requested = endpoint.map {
                 SelectionResizeGeometry.scale(session: session, currentPointer: $0)
             } ?? 1
-            if endpoint != nil, abs(scale - 1) > 0.001 {
+            if endpoint != nil,
+               let scale = boundedResizeScale(anchor: session.anchor, requested: requested) {
                 retainResizePreview(anchor: session.anchor, scale: scale)
                 onResize(selectedIDs, session.anchor, scale)
                 debugInputOperation("RESIZE COMMIT")
@@ -1033,6 +1063,20 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     private func retainResizePreview(anchor: CGPoint, scale: CGFloat) {
         professor.retainPreviewScale(ids: selectedIDs, anchor: anchor, scale: scale)
+    }
+
+    /// The visual proxy must use the same factor as the document mutation.
+    /// Otherwise a graph already at its minimum/maximum can leave a retained
+    /// transform behind even though the canonical store correctly no-ops.
+    private func boundedResizeScale(anchor: CGPoint, requested: CGFloat) -> CGFloat? {
+        let editorIDs = Set(objects.lazy.filter { self.selectedIDs.contains($0.id) }.map(\.id))
+        return SelectionScaleBounds.selection(
+            objects: objects,
+            importedTransforms: importedTransforms,
+            editorObjectIDs: editorIDs,
+            professorPathIDs: selectedIDs.subtracting(editorIDs),
+            anchor: anchor
+        )?.clampedFactor(requested)
     }
 
     private func eraseSegment(from start: CGPoint, to end: CGPoint) {
@@ -1180,16 +1224,37 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var strokeOpacity: Double { activeStrokeStyle.opacity }
 
     private func rebuildUserLayers() {
-        userObjectLayers.values.forEach { $0.removeFromSuperlayer() }
-        userObjectLayers.removeAll(keepingCapacity: true)
-        for object in SceneComposition.canonicalEditorObjects(objects) {
-            let layer = makeObjectLayer(object)
-            userObjectLayers[object.id] = layer; userLayer.addSublayer(layer)
+        let canonical = SceneComposition.canonicalEditorObjects(objects)
+        let nextIDs = Set(canonical.map(\.id))
+        for id in Array(userObjectLayers.keys) where !nextIDs.contains(id) {
+            userObjectLayers.removeValue(forKey: id)?.removeFromSuperlayer()
+            renderedObjects.removeValue(forKey: id)
+        }
+        for (index, object) in canonical.enumerated() {
+            let layer: CALayer
+            if renderedObjects[object.id] == object, let existing = userObjectLayers[object.id] {
+                layer = existing
+            } else {
+                userObjectLayers.removeValue(forKey: object.id)?.removeFromSuperlayer()
+                layer = makeObjectLayer(object)
+                userObjectLayers[object.id] = layer
+                userLayer.addSublayer(layer)
+            }
+            layer.zPosition = CGFloat(index)
+            renderedObjects[object.id] = object
         }
         for stroke in userStrokes where strokeLayers[stroke.id] == nil { addStrokeLayer(stroke) }
     }
 
     private func makeObjectLayer(_ object: CanvasObject) -> CALayer {
+        if object.type == "graph", let graph = object.graph {
+            let layer = GraphFallbackRenderer.cachedProxyLayer(
+                for: graph, contentsScale: window?.screen.scale ?? UIScreen.main.scale,
+                appearance: traitCollection.userInterfaceStyle
+            )
+            applyProvenance(object.id, to: layer)
+            return layer
+        }
         if object.type == "text", object.text != nil || object.sourceMarkdown != nil,
            object.x != nil, object.y != nil {
             let layer = CompactStudyPresentation.layer(

@@ -393,25 +393,58 @@ final class LectureWorkspaceStore: ObservableObject {
 
     /// Resizes a mixed or cross-board selection as one workspace history
     /// gesture while keeping each board's editor.json isolated.
+    @discardableResult
     func resizeSelection(_ keys: Set<SelectionKey>,
                          around lectureAnchor: CGPoint,
                          by factor: CGFloat,
-                         api: APIClient) {
+                         api: APIClient) -> CGFloat? {
         let grouped = Dictionary(grouping: keys, by: \.boardID)
-        let affected = grouped.keys.filter { boardStores[$0] != nil }.sorted()
-        guard !affected.isEmpty, factor.isFinite, factor > 0 else { return }
-        recordBoardUndo(affected)
+        var prepared: [(boardID: String, store: BoardDocumentStore,
+                        editorIDs: Set<String>, professorIDs: Set<String>,
+                        localAnchor: CGPoint, bounds: SelectionScaleBounds)] = []
         for (boardID, boardKeys) in grouped {
             guard let store = boardStores[boardID],
-                  let item = workspace?.items.first(where: { $0.boardID == boardID }) else { continue }
+                  let item = workspace?.items.first(where: { $0.boardID == boardID }) else {
+                return nil
+            }
             let localAnchor = LectureCoordinateTransform.lectureWorldToBoardLocal(lectureAnchor, board: item)
-            store.scaleObjects(
-                editorObjectIDs: Set(boardKeys.filter { $0.kind == .editorObject }.map(\.objectID)),
-                professorPathIDs: Set(boardKeys.filter { $0.kind == .professorPath }.map(\.objectID)),
-                around: localAnchor, by: factor, api: api
-            )
-            refreshSceneSnapshot(boardID, api: api)
+            let editorIDs = Set(boardKeys.filter { $0.kind == .editorObject }.map(\.objectID))
+            let professorIDs = Set(boardKeys.filter { $0.kind == .professorPath }.map(\.objectID))
+            guard let bounds = store.selectionScaleBounds(
+                editorObjectIDs: editorIDs,
+                professorPathIDs: professorIDs,
+                around: localAnchor
+            ) else { return nil }
+            prepared.append((boardID, store, editorIDs, professorIDs, localAnchor, bounds))
         }
+        guard !prepared.isEmpty else { return nil }
+
+        // Lecture selections may span isolated board documents, but the
+        // visual gesture is still one rigid selection. Intersect every
+        // board-local constraint first, then commit exactly one factor to all
+        // owners so a graph reaching its limit cannot distort other members.
+        var sharedBounds = prepared[0].bounds
+        for context in prepared.dropFirst() { sharedBounds.formIntersection(context.bounds) }
+        guard let boundedFactor = sharedBounds.clampedFactor(factor) else { return nil }
+
+        var mutatedBoardIDs: [String] = []
+        for context in prepared.sorted(by: { $0.boardID < $1.boardID }) {
+            guard context.store.scaleObjects(
+                editorObjectIDs: context.editorIDs,
+                professorPathIDs: context.professorIDs,
+                around: context.localAnchor,
+                by: boundedFactor,
+                api: api
+            ) != nil else { continue }
+            mutatedBoardIDs.append(context.boardID)
+            refreshSceneSnapshot(context.boardID, api: api)
+        }
+        guard !mutatedBoardIDs.isEmpty else { return nil }
+        // History ownership is installed only after a canonical mutation.
+        // A graph already at its bound must not create a workspace undo entry
+        // that later pops an unrelated board-level edit.
+        recordBoardUndo(mutatedBoardIDs)
+        return boundedFactor
     }
 
     func deleteSelection(_ keys: Set<SelectionKey>, api: APIClient) {

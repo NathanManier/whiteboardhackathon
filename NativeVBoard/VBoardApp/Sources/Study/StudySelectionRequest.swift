@@ -1,5 +1,6 @@
 import CoreGraphics
 import Combine
+import CryptoKit
 import Foundation
 
 struct StudySelectionBBox: Codable, Equatable, Sendable {
@@ -52,6 +53,24 @@ struct BoardStudySelection: Equatable, Sendable {
     let selectedTextObjects: [StudySelectedTextObject]
     /// Diagnostic provenance only. Never encoded in the single-board API.
     let lectureWorldBBox: CGRect?
+    /// Hash of only the selected canonical visual content. Camera movement is
+    /// deliberately absent, while stroke edits and imported-path transforms
+    /// invalidate native recognition reuse before the server rasterizes again.
+    let visualRevision: String
+
+    init(boardID: String,
+         canonicalObjectIDs: [String],
+         localBBox: StudySelectionBBox,
+         selectedTextObjects: [StudySelectedTextObject],
+         lectureWorldBBox: CGRect?,
+         visualRevision: String = "") {
+        self.boardID = boardID
+        self.canonicalObjectIDs = canonicalObjectIDs
+        self.localBBox = localBBox
+        self.selectedTextObjects = selectedTextObjects
+        self.lectureWorldBBox = lectureWorldBBox
+        self.visualRevision = visualRevision
+    }
 
     static func isolated(boardID: String,
                          selectedIDs: Set<String>,
@@ -102,6 +121,8 @@ struct BoardStudySelection: Equatable, Sendable {
         var canonicalIDs = Set<String>()
         var localBounds = CGRect.null
         var selectedTextObjects: [StudySelectedTextObject] = []
+        var selectedEditorObjects: [CanvasObject] = []
+        var selectedProfessorStates: [ProfessorVisualState] = []
 
         for key in keys {
             switch key.kind {
@@ -110,6 +131,7 @@ struct BoardStudySelection: Equatable, Sendable {
                 let bounds = BoardHitTestPolicy.bounds(of: object)
                 guard let validBounds = finiteBounds(bounds) else { continue }
                 canonicalIDs.insert(object.id)
+                selectedEditorObjects.append(object)
                 localBounds = localBounds.union(validBounds)
                 if object.type == "text", let text = object.text ?? object.sourceMarkdown,
                    !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -160,6 +182,10 @@ struct BoardStudySelection: Equatable, Sendable {
                     : transformed.boundingBoxOfPath
                 guard let validBounds = finiteBounds(candidate) else { continue }
                 canonicalIDs.insert(key.objectID)
+                selectedProfessorStates.append(ProfessorVisualState(
+                    id: key.objectID,
+                    transform: editor.importedTransforms[key.objectID]
+                ))
                 localBounds = localBounds.union(validBounds)
             }
         }
@@ -198,8 +224,45 @@ struct BoardStudySelection: Equatable, Sendable {
             canonicalObjectIDs: canonicalIDs.sorted(),
             localBBox: canonicalLocalBBox,
             selectedTextObjects: selectedTextObjects.sorted { $0.id < $1.id },
-            lectureWorldBBox: lectureWorldBBox
+            lectureWorldBBox: lectureWorldBBox,
+            visualRevision: recognitionVisualRevision(
+                boardID: boardID,
+                objects: selectedEditorObjects,
+                professorStates: selectedProfessorStates
+            )
         )
+    }
+
+    private struct ProfessorVisualState: Codable {
+        let id: String
+        let transform: ObjectTransform?
+    }
+
+    private struct RecognitionVisualFingerprint: Encodable {
+        let boardID: String
+        let objects: [CanvasObject]
+        let professorStates: [ProfessorVisualState]
+    }
+
+    private static func recognitionVisualRevision(
+        boardID: String,
+        objects: [CanvasObject],
+        professorStates: [ProfessorVisualState]
+    ) -> String {
+        let fingerprint = RecognitionVisualFingerprint(
+            boardID: boardID,
+            objects: objects.sorted { $0.id < $1.id },
+            professorStates: professorStates.sorted { $0.id < $1.id }
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(fingerprint) else {
+            return (objects.map(\.id) + professorStates.map(\.id)).sorted()
+                .joined(separator: "|")
+        }
+        return SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private static func finiteBounds(_ rect: CGRect) -> CGRect? {
@@ -396,7 +459,7 @@ enum GraphRecognitionTarget: Equatable, Sendable {
         )
         return "\(selection.boardID)|"
             + selection.canonicalObjectIDs.sorted().joined(separator: ",")
-            + "|\(coordinates)|\(semantic)"
+            + "|\(coordinates)|\(semantic)|visual=\(selection.visualRevision)"
     }
 }
 

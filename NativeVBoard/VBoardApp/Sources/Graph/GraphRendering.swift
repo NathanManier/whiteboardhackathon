@@ -44,44 +44,277 @@ protocol GraphRendererProvider: AnyObject {
     func unmount()
 }
 
+/// Third-party provider calls are never allowed to own V-Board lifecycle
+/// progress indefinitely. The operation itself is unstructured deliberately:
+/// cancellation or the deadline resumes the caller immediately even if a web
+/// provider ignores Task cancellation. A late completion is discarded by the
+/// single-resolution gate.
+@MainActor
+enum GraphProviderOperationDeadline {
+    static func run(
+        before timeoutNanoseconds: UInt64,
+        operation: @escaping @MainActor () async throws -> Void
+    ) async throws {
+        let outcome: Result<Void, Error>? = await value(
+            before: timeoutNanoseconds
+        ) {
+            do {
+                try await operation()
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        guard let outcome else {
+            if Task.isCancelled { throw CancellationError() }
+            throw GraphRendererError.provider("provider_timeout")
+        }
+        try outcome.get()
+    }
+
+    static func value<Value>(
+        before timeoutNanoseconds: UInt64,
+        operation: @escaping @MainActor () async -> Value
+    ) async -> Value? {
+        let race = GraphProviderDeadlineRace<Value>()
+        return await withTaskCancellationHandler {
+            await race.run(before: timeoutNanoseconds, operation: operation)
+        } onCancel: {
+            Task { @MainActor in race.cancel() }
+        }
+    }
+}
+
+@MainActor
+private final class GraphProviderDeadlineRace<Value> {
+    private var continuation: CheckedContinuation<Value?, Never>?
+    private var operationTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+
+    func run(
+        before timeoutNanoseconds: UInt64,
+        operation: @escaping @MainActor () async -> Value
+    ) async -> Value? {
+        guard !Task.isCancelled else { return nil }
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            operationTask = Task { @MainActor [weak self] in
+                let value = await operation()
+                self?.resolve(value)
+            }
+            timeoutTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: max(timeoutNanoseconds, 1))
+                guard !Task.isCancelled else { return }
+                self?.resolve(nil)
+            }
+        }
+    }
+
+    func cancel() { resolve(nil) }
+
+    private func resolve(_ value: Value?) {
+        guard let continuation else { return }
+        self.continuation = nil
+        if value == nil {
+            operationTask?.cancel()
+        } else {
+            timeoutTask?.cancel()
+        }
+        operationTask = nil
+        timeoutTask = nil
+        continuation.resume(returning: value)
+    }
+}
+
 /// Owns the deliberately tiny expensive-provider budget. Activating a second
 /// graph first demotes and releases the previous provider.
 @MainActor
 final class GraphProviderCoordinator {
+    typealias PreemptionHandler = @MainActor () async -> Void
+
     private(set) var activeGraphID: String?
     private(set) var activeProvider: GraphRendererProvider?
+    private var activePreemptionHandler: PreemptionHandler?
+    private var transitionIsOwned = false
+    private var transitionWaiters: [CheckedContinuation<Void, Never>] = []
 
     var activeProviderCount: Int { activeProvider == nil ? 0 : 1 }
 
     func promote(graph: GraphObject, provider: GraphRendererProvider,
-                 frame: CGRect) async throws {
+                 frame: CGRect,
+                 onPreempt: PreemptionHandler? = nil) async throws {
+        await acquireTransition()
+        defer { releaseTransition() }
+        try Task.checkCancellation()
         if activeGraphID != graph.id || activeProvider !== provider {
-            activeProvider?.unmount()
+            let previousProvider = activeProvider
+            let previousPreemptionHandler = activePreemptionHandler
             activeProvider = nil
             activeGraphID = nil
+            activePreemptionHandler = nil
+            if let previousPreemptionHandler {
+                await previousPreemptionHandler()
+            } else {
+                previousProvider?.unmount()
+            }
         }
+        try Task.checkCancellation()
         guard provider.isAvailable else { throw GraphRendererError.unavailable }
-        try await provider.mount(graph: graph, in: frame)
-        try await provider.setInteractive(true)
+        // Reserve the single expensive-provider slot before entering any
+        // third-party async mount/activation call. If that call ignores
+        // cancellation, the session's preemption handler still represents the
+        // physical provider until bounded demotion has unmounted it; another
+        // graph cannot slip into the budget during that handoff.
         activeProvider = provider
         activeGraphID = graph.id
+        activePreemptionHandler = onPreempt
+        try await GraphProviderOperationDeadline.run(
+            before: 15_000_000_000
+        ) {
+            try await provider.mount(graph: graph, in: frame)
+        }
+        try Task.checkCancellation()
+        try await GraphProviderOperationDeadline.run(
+            before: 3_000_000_000
+        ) {
+            try await provider.setInteractive(true)
+        }
+        try Task.checkCancellation()
     }
 
-    func demote() async -> GraphViewport? {
+    func demote(fallbackViewport: GraphViewport? = nil,
+                timeoutNanoseconds: UInt64 = 750_000_000) async -> GraphViewport? {
+        await acquireTransition()
+        defer { releaseTransition() }
         guard let provider = activeProvider else { return nil }
-        let viewport = await provider.readViewport()
-        try? await provider.setInteractive(false)
-        provider.unmount()
         activeProvider = nil
         activeGraphID = nil
-        return viewport
+        activePreemptionHandler = nil
+        return await GraphProviderFinalizer.finish(
+            provider, fallbackViewport: fallbackViewport,
+            timeoutNanoseconds: timeoutNanoseconds
+        )
+    }
+
+    /// A session keeps coordinator ownership while it captures its proxy and
+    /// finalizes the provider. New promotions therefore invoke and await that
+    /// session's preemption handler instead of mounting concurrently. Once the
+    /// provider is physically unmounted, release the slot synchronously.
+    func completeExternalDemotion(of provider: GraphRendererProvider) {
+        guard activeProvider === provider else { return }
+        activeProvider = nil
+        activeGraphID = nil
+        activePreemptionHandler = nil
+    }
+
+    private func acquireTransition() async {
+        if !transitionIsOwned {
+            transitionIsOwned = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            transitionWaiters.append(continuation)
+        }
+    }
+
+    private func releaseTransition() {
+        if transitionWaiters.isEmpty {
+            transitionIsOwned = false
+        } else {
+            transitionWaiters.removeFirst().resume()
+        }
     }
 
     func handleMemoryWarning() {
         activeProvider?.unmount()
         activeProvider = nil
         activeGraphID = nil
+        activePreemptionHandler = nil
         GraphProxyCache.shared.removeAll()
+    }
+}
+
+/// Third-party providers are allowed to fail, but never to hold Done/Edit or
+/// the global one-provider budget indefinitely. A timeout falls back to the
+/// last canonical viewport and unmounts immediately; any late callback is
+/// ignored by the single-resolution race.
+@MainActor
+enum GraphProviderFinalizer {
+    struct Result: Equatable {
+        /// The valid provider viewport, or the caller's canonical fallback when
+        /// readback did not complete successfully.
+        let viewport: GraphViewport?
+        /// Non-nil only when the provider itself returned a valid viewport.
+        /// Callers use this provenance to avoid keying a live snapshot with a
+        /// fallback viewport that the snapshot does not actually depict.
+        let providerViewport: GraphViewport?
+    }
+
+    private struct ViewportReadback {
+        let viewport: GraphViewport?
+    }
+
+    static func finish(_ provider: GraphRendererProvider,
+                       fallbackViewport: GraphViewport?,
+                       timeoutNanoseconds: UInt64 = 750_000_000) async -> GraphViewport? {
+        await finishWithProvenance(
+            provider, fallbackViewport: fallbackViewport,
+            timeoutNanoseconds: timeoutNanoseconds
+        ).viewport
+    }
+
+    static func finishWithProvenance(
+        _ provider: GraphRendererProvider,
+        fallbackViewport: GraphViewport?,
+        providerAlreadyNonInteractive: Bool = false,
+        timeoutNanoseconds: UInt64 = 750_000_000
+    ) async -> Result {
+        let readBudget = max(timeoutNanoseconds * 2 / 3, 1)
+        let disableBudget = max(timeoutNanoseconds - readBudget, 1)
+        let readback: ViewportReadback? = await value(
+            before: readBudget,
+            operation: { ViewportReadback(viewport: await provider.readViewport()) }
+        )
+        guard let readback else {
+            provider.unmount()
+            return Result(viewport: fallbackViewport, providerViewport: nil)
+        }
+        if !providerAlreadyNonInteractive {
+            let _: Bool? = await value(before: disableBudget) {
+                try? await provider.setInteractive(false)
+                return true
+            }
+        }
+        provider.unmount()
+        if let viewport = readback.viewport, viewport.isValid {
+            return Result(viewport: viewport, providerViewport: viewport)
+        }
+        return Result(viewport: fallbackViewport, providerViewport: nil)
+    }
+
+    /// Stops provider-owned gestures before a proxy image and viewport are
+    /// captured. Without this barrier, the user can pan between the snapshot
+    /// and readback, producing an image whose pixels do not match its cache key.
+    static func freezeInteraction(
+        _ provider: GraphRendererProvider,
+        timeoutNanoseconds: UInt64 = 250_000_000
+    ) async -> Bool {
+        let completed: Bool? = await value(before: timeoutNanoseconds) {
+            do {
+                try await provider.setInteractive(false)
+                return true
+            } catch {
+                return false
+            }
+        }
+        return completed == true
+    }
+
+    private static func value<Value>(before timeoutNanoseconds: UInt64,
+                                     operation: @escaping @MainActor () async -> Value) async -> Value? {
+        await GraphProviderOperationDeadline.value(
+            before: timeoutNanoseconds, operation: operation
+        )
     }
 }
 
@@ -99,8 +332,6 @@ enum GraphFallbackPalette {
 /// Cheap provider-independent graph presentation used for passive canvas
 /// objects, offline display, far zoom, provider failure, and export snapshots.
 enum GraphFallbackRenderer {
-    static let minimumSize = CGSize(width: 180, height: 140)
-
     /// Reusable raster proxy for high-frequency canvas scene refreshes. The
     /// canonical graph remains vector/semantic data; this is derived display
     /// state keyed by account, board, graph semantics, viewport, and size.
@@ -144,8 +375,14 @@ enum GraphFallbackRenderer {
     }
 
     static func image(for graph: GraphObject, scale: CGFloat = UIScreen.main.scale) -> UIImage {
-        let size = CGSize(width: max(graph.frame.width, minimumSize.width),
-                          height: max(graph.frame.height, minimumSize.height))
+        // Render in the graph's real logical aspect. Independently enlarging
+        // width and height to different minimums distorts valid narrow/tall or
+        // short/wide graph frames when the resulting bitmap is stretched back
+        // into the canonical canvas frame.
+        let size = CGSize(
+            width: max(graph.frame.width, GraphFrame.minimumDimension),
+            height: max(graph.frame.height, GraphFrame.minimumDimension)
+        )
         let proxyGraph = graph.replacing(
             frame: GraphFrame(x: 0, y: 0,
                               width: Double(size.width), height: Double(size.height))
@@ -298,7 +535,12 @@ enum GraphFallbackSampler {
     static func path(for expression: GraphExpression, viewport: GraphViewport,
                      frame: CGRect, angleMode: String? = "radians") -> UIBezierPath {
         let path = UIBezierPath()
-        guard viewport.isValid, frame.width > 0, frame.height > 0 else { return path }
+        // The provider understands arbitrary Desmos restriction syntax. The
+        // safe native parser intentionally does not; rendering an unrestricted
+        // curve would be confidently wrong, so use the existing readable
+        // unsupported-equation fallback instead.
+        guard expression.restrictions.isEmpty,
+              viewport.isValid, frame.width > 0, frame.height > 0 else { return path }
 
         switch expression.type.rawValue {
         case GraphExpressionType.verticalLine.rawValue:
@@ -337,6 +579,7 @@ enum GraphFallbackSampler {
                                    viewport: GraphViewport, frame: CGRect,
                                    angleMode: String? = "radians") -> UIBezierPath? {
         guard expression.type == .inequality,
+              expression.restrictions.isEmpty,
               let relation = GraphEquationClassifier.relation(in: expression.latex) else {
             return nil
         }

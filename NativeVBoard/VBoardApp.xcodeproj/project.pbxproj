@@ -37,6 +37,16 @@
 		A030 /* ShareViewController.swift */ = {isa = PBXBuildFile; fileRef = A130; };
 		A031 /* VBoardShareExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B003; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A010 /* Tests */ = {isa = PBXBuildFile; fileRef = A110; };
+		J001 /* GraphRendering.swift */ = {isa = PBXBuildFile; fileRef = J101; };
+		J002 /* DesmosGraphRenderer.swift */ = {isa = PBXBuildFile; fileRef = J102; };
+		J003 /* GraphCreationFlow.swift */ = {isa = PBXBuildFile; fileRef = J103; };
+		K001 /* GraphInteractiveSurface.swift */ = {isa = PBXBuildFile; fileRef = K101; };
+		K002 /* GraphInteractiveSurfaceTests.swift */ = {isa = PBXBuildFile; fileRef = K102; };
+		L001 /* GraphStageBTests.swift */ = {isa = PBXBuildFile; fileRef = L101; };
+		M001 /* GraphProxyCache.swift */ = {isa = PBXBuildFile; fileRef = M101; };
+		N001 /* GraphValidation.swift */ = {isa = PBXBuildFile; fileRef = N101; };
+		N002 /* GraphValidationTests.swift */ = {isa = PBXBuildFile; fileRef = N102; };
+		O001 /* GraphStageBHardeningTests.swift */ = {isa = PBXBuildFile; fileRef = O101; };
 /* End PBXBuildFile section */
 /* Begin PBXFileReference section */
 		A101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/App/VBoardApp.swift; sourceTree = "<group>"; };
@@ -74,14 +84,24 @@
 		B001 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B003 = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; path = VBoardShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		J101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphRendering.swift; sourceTree = "<group>"; };
+		J102 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/DesmosGraphRenderer.swift; sourceTree = "<group>"; };
+		J103 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphCreationFlow.swift; sourceTree = "<group>"; };
+		K101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphInteractiveSurface.swift; sourceTree = "<group>"; };
+		K102 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphInteractiveSurfaceTests.swift; sourceTree = "<group>"; };
+		L101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphStageBTests.swift; sourceTree = "<group>"; };
+		M101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphProxyCache.swift; sourceTree = "<group>"; };
+		N101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphValidation.swift; sourceTree = "<group>"; };
+		N102 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphValidationTests.swift; sourceTree = "<group>"; };
+		O101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphStageBHardeningTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 /* Begin PBXCopyFilesBuildPhase section */
 		F010 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 13; files = (A031, ); name = "Embed App Extensions"; runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXCopyFilesBuildPhase section */
 /* Begin PBXGroup section */
 		C001 = {isa = PBXGroup; children = (C002, C003, C004, C005, B001, B002, B003); sourceTree = "<group>"; };
-		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A126, A127, A128, A129, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113, A118, A125, A124); };
-		C003 = {isa = PBXGroup; path = VBoardAppTests; sourceTree = "<group>"; children = (A110); };
+		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A126, A127, A128, A129, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113, A118, A125, J101, J102, J103, K101, M101, N101, A124); };
+		C003 = {isa = PBXGroup; path = VBoardAppTests; sourceTree = "<group>"; children = (A110, K102, L101, N102, O101); };
 		C004 = {isa = PBXGroup; name = "Study Renderer Resources"; sourceTree = "<group>"; children = (A119, A120, A121, A122, A123); };
 		C005 = {isa = PBXGroup; path = VBoardShareExtension; sourceTree = "<group>"; children = (A130, A131, A132); };
 /* End PBXGroup section */
@@ -99,8 +119,8 @@
 		F008 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A026, A027, A028, A029, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013, A018, A025); runOnlyForDeploymentPostprocessing = 0; };
-		F004 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A010); runOnlyForDeploymentPostprocessing = 0; };
+		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A026, A027, A028, A029, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013, A018, A025, J001, J002, J003, K001, M001, N001); runOnlyForDeploymentPostprocessing = 0; };
+		F004 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A010, K002, L001, N002, O001); runOnlyForDeploymentPostprocessing = 0; };
 		F007 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A030); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXFrameworksBuildPhase section */

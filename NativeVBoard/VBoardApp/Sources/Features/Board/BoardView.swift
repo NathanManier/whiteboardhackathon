@@ -200,6 +200,11 @@ private struct BoardEditorSurface: View {
             Button("Reload Server Version", role: .destructive) { store.reloadServerVersion() }
         } message: { Text("Your local edits are preserved locally. Choose which version should remain.") }
         .onChange(of: store.status) { _, status in if status == .conflict { showConflict = true } }
+        .onChange(of: activeTool) { _, tool in
+            if !GraphPencilInteractionPolicy.allowsAnnotation(for: tool) {
+                interactiveGraph = nil
+            }
+        }
         .onChange(of: studySelection) { _, selection in
             graphRecognition.selectionChanged(
                 selection.map(GraphRecognitionTarget.board),
@@ -222,15 +227,53 @@ private struct BoardEditorSurface: View {
             // and the live camera cannot be reset by SwiftUI identity churn.
             NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), showsPaper: pdfData != nil || physicalBoardShowsPaper, backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots, penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1), markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity), showsDeveloperDiagnostics: developerDiagnosticsIfAvailable, onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onResize: { ids, anchor, factor in selectedPDFRegion = nil; store.scaleObjects(ids: ids, around: anchor, by: factor, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
                 .ignoresSafeArea(edges: .bottom)
+            ForEach(store.editor.objects.compactMap(\.graph).filter {
+                $0.id != interactiveGraph?.id
+            }) { graph in
+                let rect = graphScreenRect(graph, viewport: proxy.size)
+                if rect.intersects(CGRect(origin: .zero, size: proxy.size)) {
+                    GraphAccessibilityProxy(
+                        graph: graph,
+                        onInteract: { interactiveGraph = graph },
+                        onEdit: { editingGraph = graph },
+                        onDelete: {
+                            selectedIDs.remove(graph.id)
+                            store.deleteObjects(ids: Set([graph.id]), api: api)
+                        }
+                    )
+                    .frame(width: max(rect.width, 1), height: max(rect.height, 1))
+                    .position(x: rect.midX, y: rect.midY)
+                    .zIndex(10)
+                }
+            }
+            if interactiveGraph != nil {
+                GraphOutsideInteractionShield { interactiveGraph = nil }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .zIndex(5)
+            }
             if let graph = interactiveGraph {
                 let rect = graphScreenRect(graph, viewport: proxy.size)
                 if rect.intersects(CGRect(origin: .zero, size: proxy.size)) {
                 GraphInteractiveSurface(
                     graph: graph,
-                    onCommitViewport: { viewport in
-                        let updated = graph.replacing(viewport: viewport)
+                    canonicalStrokeObjects: GraphAnnotationOverlayPolicy.strokeObjectsAbove(
+                        graphID: graph.id, in: store.editor.objects
+                    ),
+                    pencilAnnotationEnabled:
+                        GraphPencilInteractionPolicy.allowsAnnotation(for: activeTool),
+                    pencilStyle: activeTool == .highlighter
+                        ? CanvasStrokeStyle(colorHex: markerColor, width: markerWidth,
+                                            opacity: markerOpacity)
+                        : CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),
+                    onPencilStroke: { store.applyStroke($0, api: api) },
+                    onPencilRequestsPassiveMode: { interactiveGraph = nil },
+                    onCommitViewport: { owningBoardID, graphID, viewport in
+                        guard owningBoardID == board.id,
+                              let current = store.editor.objects
+                                .first(where: { $0.id == graphID })?.graph else { return }
+                        let updated = current.replacing(viewport: viewport)
                         store.replaceGraph(updated, api: api)
-                        if interactiveGraph?.id == graph.id { interactiveGraph = updated }
+                        if interactiveGraph?.id == graphID { interactiveGraph = updated }
                     },
                     onEdit: {
                         editingGraph = store.editor.objects
@@ -250,6 +293,7 @@ private struct BoardEditorSurface: View {
                                  markerColor: $markerColor, markerWidth: $markerWidth,
                                  markerOpacity: $markerOpacity)
             .padding(.bottom, 12)
+            .zIndex(30)
 
             if interactiveGraph == nil, let rect = selectionScreenRect(viewport: proxy.size) {
                 SelectionActionBar(canCheckWork: selectionCanCheckWork,

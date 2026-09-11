@@ -225,7 +225,7 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
     func captureSnapshot() async throws -> UIImage {
         guard isMounted else { throw GraphRendererError.provider("not mounted") }
         let value = try await webView.callAsyncJavaScript(
-            "return await window.vboardGraphAdapter.snapshot('png');",
+            "return await window.vboardGraphAdapter.snapshot('png', 2048, 1200);",
             arguments: [:], in: nil, contentWorld: .page
         )
         guard let dataURI = value as? String,
@@ -242,7 +242,7 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
     func captureSVG() async throws -> String {
         guard isMounted else { throw GraphRendererError.provider("not mounted") }
         let value = try await webView.callAsyncJavaScript(
-            "return await window.vboardGraphAdapter.snapshot('svg');",
+            "return await window.vboardGraphAdapter.snapshot('svg', 2048, 2500);",
             arguments: [:], in: nil, contentWorld: .page
         )
         guard let svg = value as? String, svg.count <= 8_000_000,
@@ -291,10 +291,24 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
     private static func payload(for graph: GraphObject) -> [String: Any] {
         [
             "id": graph.id,
-            "expressions": graph.expressions.prefix(12).map { expression in
-                ["id": expression.id,
-                 "latex": String(expression.latex.prefix(2_000)),
-                 "visible": expression.visible] as [String: Any]
+            "expressions": graph.expressions.prefix(GraphRecognitionController.maximumExpressions).map { expression in
+                var payload: [String: Any] = [
+                    "id": expression.id,
+                    "latex": String(expression.latex.prefix(GraphRecognitionController.maximumLatexLength)),
+                    "visible": expression.visible,
+                    "type": expression.type.rawValue,
+                    "restrictions": expression.restrictions
+                ]
+                if let style = expression.displayStyle {
+                    var stylePayload: [String: Any] = [:]
+                    if let color = style.color { stylePayload["color"] = color }
+                    if let lineWidth = style.lineWidth { stylePayload["lineWidth"] = lineWidth }
+                    if let lineStyle = style.lineStyle { stylePayload["lineStyle"] = lineStyle }
+                    if let opacity = style.opacity { stylePayload["opacity"] = opacity }
+                    if let pointStyle = style.pointStyle { stylePayload["pointStyle"] = pointStyle }
+                    if !stylePayload.isEmpty { payload["style"] = stylePayload }
+                }
+                return payload
             },
             "viewport": [
                 "xMin": graph.viewport.xMin, "xMax": graph.viewport.xMax,
@@ -303,7 +317,10 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
             "settings": [
                 "showXAxis": graph.settings.showXAxis,
                 "showYAxis": graph.settings.showYAxis,
-                "showGrid": graph.settings.showGrid
+                "showGrid": graph.settings.showGrid,
+                "showExpressionsPanel": graph.settings.showExpressionsPanel,
+                "lockViewport": graph.settings.lockViewport,
+                "angleMode": graph.settings.angleMode ?? "radians"
             ]
         ]
     }
@@ -360,13 +377,22 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
             });
             window.vboardGraphAdapter = {
               setGraph(graph) {
-                if (!graph || graph.id !== graphID || !Array.isArray(graph.expressions) || graph.expressions.length > 12) return false;
+                if (!graph || graph.id !== graphID || !Array.isArray(graph.expressions) || graph.expressions.length > 8) return false;
                 const next = new Set();
                 const expressions = [];
                 for (const value of graph.expressions) {
-                  if (!value || typeof value.id !== 'string' || value.id.length > 128 || typeof value.latex !== 'string' || value.latex.length > 2000) continue;
+                  if (!value || typeof value.id !== 'string' || value.id.length > 128 || typeof value.latex !== 'string' || value.latex.length > 1000) continue;
                   next.add(value.id);
-                  expressions.push({id:value.id, latex:value.latex, hidden:value.visible === false});
+                  const restrictions = Array.isArray(value.restrictions)
+                    ? value.restrictions.filter(item => typeof item === 'string' && item.length <= 500).slice(0, 16)
+                    : [];
+                  const restrictedLatex = value.latex + restrictions.map(item => `{${item}}`).join('');
+                  const expression = {id:value.id, latex:restrictedLatex, hidden:value.visible === false};
+                  const style = value.style || {};
+                  if (typeof style.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(style.color)) expression.color = style.color;
+                  if (Number.isFinite(style.lineWidth)) expression.lineWidth = Math.max(0.5, Math.min(style.lineWidth, 20));
+                  if (Number.isFinite(style.opacity)) expression.fillOpacity = expression.lineOpacity = Math.max(0, Math.min(style.opacity, 1));
+                  expressions.push(expression);
                 }
                 const removed = [...knownIDs].filter(id => !next.has(id)).map(id => ({id}));
                 if (removed.length) calculator.removeExpressions(removed);
@@ -377,7 +403,14 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
                   calculator.setMathBounds({left:v.xMin,right:v.xMax,bottom:v.yMin,top:v.yMax});
                 }
                 const s = graph.settings || {};
-                calculator.updateSettings({xAxisNumbers:!!s.showXAxis,yAxisNumbers:!!s.showYAxis,showGrid:!!s.showGrid});
+                calculator.updateSettings({
+                  xAxisNumbers:!!s.showXAxis,
+                  yAxisNumbers:!!s.showYAxis,
+                  showGrid:!!s.showGrid,
+                  expressions:!!s.showExpressionsPanel,
+                  lockViewport:!!s.lockViewport,
+                  degreeMode:s.angleMode === 'degrees'
+                });
                 calculator.resize();
                 return true;
               },
@@ -388,10 +421,35 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
               },
               getViewport() { return bounds(); },
               resize() { if (calculator) calculator.resize(); return true; },
-              snapshot(format) {
+              snapshot(format, requestedMaxEdge, requestedTimeoutMs) {
                 return new Promise((resolve, reject) => {
                   if (!calculator) { reject(new Error('not_ready')); return; }
-                  calculator.asyncScreenshot({format:format === 'svg' ? 'svg' : 'png', targetPixelRatio:2}, value => value ? resolve(value) : reject(new Error('snapshot_failed')));
+                  const node = document.getElementById('calculator');
+                  const sourceWidth = Math.max(1, node.clientWidth || 640);
+                  const sourceHeight = Math.max(1, node.clientHeight || 480);
+                  const maxEdge = Math.max(256, Math.min(Number(requestedMaxEdge) || 2048, 2048));
+                  const reduction = Math.min(1, maxEdge / Math.max(sourceWidth, sourceHeight));
+                  const width = Math.max(1, Math.round(sourceWidth * reduction));
+                  const height = Math.max(1, Math.round(sourceHeight * reduction));
+                  const timeoutMs = Math.max(250, Math.min(Number(requestedTimeoutMs) || 1200, 3000));
+                  let settled = false;
+                  const finish = (value, error) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    if (error) reject(error); else resolve(value);
+                  };
+                  const timer = setTimeout(() => finish(null, new Error('snapshot_timeout')), timeoutMs);
+                  try {
+                    calculator.asyncScreenshot({
+                      format:format === 'svg' ? 'svg' : 'png',
+                      targetPixelRatio:1, width, height
+                    }, value => value
+                      ? finish(value, null)
+                      : finish(null, new Error('snapshot_failed')));
+                  } catch (_) {
+                    finish(null, new Error('snapshot_failed'));
+                  }
                 });
               },
               destroy() {

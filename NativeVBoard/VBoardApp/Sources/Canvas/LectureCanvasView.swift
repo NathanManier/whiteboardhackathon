@@ -790,7 +790,6 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             }
             region.path = nextPath
             let isActive = item.boardID == workspace.activeBoardID
-            let isPDF = item.sourceKind.isPDF
             region.fillColor = UIColor.clear.cgColor
             region.strokeColor = boardRegionBoundaryColor(active: isActive).cgColor
             region.lineWidth = (isActive ? 1.5 : 1.2) / max(worldTransform.scale, 0.001)
@@ -1067,7 +1066,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             movePreviewDelta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
             previewSelectionMove(movePreviewDelta)
         case .resizingSelection(let session):
-            let scale = SelectionResizeGeometry.scale(session: session, currentPointer: world)
+            let requested = SelectionResizeGeometry.scale(session: session, currentPointer: world)
+            let scale = boundedSelectionResizeScale(session: session, requested: requested) ?? 1
             resizePreviewBounds = SelectionResizeGeometry.bounds(session: session, scale: scale)
             previewSelectionResize(session: session, scale: scale)
             updateSelectionOverlay()
@@ -1146,8 +1146,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                 clearSelectionMovePreview()
             }
         case .resizingSelection(let session):
-            let scale = SelectionResizeGeometry.scale(session: session, currentPointer: world)
-            if abs(scale - 1) > 0.001 {
+            let requested = SelectionResizeGeometry.scale(session: session, currentPointer: world)
+            if let scale = boundedSelectionResizeScale(session: session, requested: requested) {
                 retainSelectionResizePreview(session: session, scale: scale)
                 callbacks.onResizeSelection(session.keys, session.anchor, scale)
             } else {
@@ -1311,6 +1311,39 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         }
     }
 
+    /// A lecture gesture can span several isolated board documents. Resolve
+    /// their board-local graph/object constraints into one lecture-wide
+    /// factor before displaying or committing any transform.
+    private func boundedSelectionResizeScale(session: SelectionResizeSession,
+                                             requested: CGFloat) -> CGFloat? {
+        let grouped = Dictionary(grouping: session.keys, by: \.boardID)
+        var sharedBounds: SelectionScaleBounds?
+        for (boardID, keys) in grouped {
+            guard let scene = scenes[boardID],
+                  let item = workspace.items.first(where: { $0.boardID == boardID }) else {
+                return nil
+            }
+            let localAnchor = LectureCoordinateTransform.lectureWorldToBoardLocal(
+                session.anchor, board: item
+            )
+            let editorIDs = Set(keys.filter { $0.kind == .editorObject }.map(\.objectID))
+            let professorIDs = Set(keys.filter { $0.kind == .professorPath }.map(\.objectID))
+            guard let localBounds = SelectionScaleBounds.selection(
+                objects: scene.editor.objects,
+                importedTransforms: scene.editor.importedTransforms,
+                editorObjectIDs: editorIDs,
+                professorPathIDs: professorIDs,
+                anchor: localAnchor
+            ) else { return nil }
+            if sharedBounds == nil {
+                sharedBounds = localBounds
+            } else {
+                sharedBounds?.formIntersection(localBounds)
+            }
+        }
+        return sharedBounds?.clampedFactor(requested)
+    }
+
     private func updateInteractionOverlay() {
         guard !lassoPoints.isEmpty else { updateSelectionOverlay(); return }
         configureInteractionStrokeForCurrentZoom()
@@ -1428,7 +1461,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             UIKeyCommand(input: "-", modifierFlags: .command, action: #selector(zoomOut)),
             UIKeyCommand(input: "0", modifierFlags: .command, action: #selector(fitActiveBoard)),
             UIKeyCommand(input: "z", modifierFlags: .command, action: #selector(undoCommand)),
-            UIKeyCommand(input: "z", modifierFlags: [.command, .shift], action: #selector(redoCommand))
+            UIKeyCommand(input: "z", modifierFlags: [.command, .shift], action: #selector(redoCommand)),
+            UIKeyCommand(input: "\u{8}", modifierFlags: [], action: #selector(deleteSelectionCommand))
         ]
     }
 
@@ -1451,6 +1485,14 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     @objc private func fitActiveBoard() { if let boardID = workspace.activeBoardID { focus(boardID: boardID) } }
     @objc private func undoCommand() { callbacks.onUndo() }
     @objc private func redoCommand() { callbacks.onRedo() }
+    @objc private func deleteSelectionCommand() {
+        guard case .idle = interaction, !selectedKeys.isEmpty else { return }
+        let deleted = selectedKeys
+        selectedKeys.removeAll()
+        callbacks.onSelectionChanged([], [:])
+        updateSelectionOverlay()
+        callbacks.onDelete(deleted)
+    }
 
     private func zoom(by magnification: CGFloat) {
         controller.zoom(by: magnification,
@@ -1478,6 +1520,7 @@ private final class LectureBoardRenderView: UIView {
     private let vectorIndicator = BoardVectorLoadingIndicator()
     private let userLayer = CALayer()
     private var objectLayers: [String: CALayer] = [:]
+    private var renderedObjects: [String: CanvasObject] = [:]
     private var resizePreviewPositions: [String: CGPoint] = [:]
     private var item: WorkspaceBoardItem?
     private var scene: WorkspaceBoardScene?
@@ -1776,6 +1819,9 @@ private final class LectureBoardRenderView: UIView {
             layer.fillColor = UIColor.clear.cgColor
             layer.lineCap = .round
             layer.lineJoin = .round
+            // This is a transient preview, not canonical document ordering.
+            // Keep it above graph proxy layers until lift commits the stroke.
+            layer.zPosition = 1_000_000
             userLayer.addSublayer(layer)
             liveStrokeLayer = layer
             return layer
@@ -1796,12 +1842,30 @@ private final class LectureBoardRenderView: UIView {
     }
 
     private func rebuildUserLayers(_ objects: [CanvasObject]) {
-        resizePreviewPositions.removeAll(keepingCapacity: true)
-        objectLayers.values.forEach { $0.removeFromSuperlayer() }
-        objectLayers.removeAll(keepingCapacity: true)
-        for object in SceneComposition.canonicalEditorObjects(objects) {
+        let canonical = SceneComposition.canonicalEditorObjects(objects)
+        let nextIDs = Set(canonical.map(\.id))
+        for id in Array(objectLayers.keys) where !nextIDs.contains(id) {
+            objectLayers.removeValue(forKey: id)?.removeFromSuperlayer()
+            renderedObjects.removeValue(forKey: id)
+            resizePreviewPositions.removeValue(forKey: id)
+        }
+        for (index, object) in canonical.enumerated() {
+            if renderedObjects[object.id] == object, let existing = objectLayers[object.id] {
+                existing.zPosition = CGFloat(index)
+                continue
+            }
+            objectLayers.removeValue(forKey: object.id)?.removeFromSuperlayer()
+            // A canonical replacement supersedes this object's transient
+            // resize baseline. Unchanged layers retain their baseline so an
+            // unrelated scene refresh cannot make gesture cancellation jump.
+            resizePreviewPositions.removeValue(forKey: object.id)
             let layer: CALayer
-            if object.type == "text", object.text != nil || object.sourceMarkdown != nil {
+            if object.type == "graph", let graph = object.graph {
+                layer = GraphFallbackRenderer.cachedProxyLayer(
+                    for: graph, contentsScale: window?.screen.scale ?? UIScreen.main.scale,
+                    appearance: traitCollection.userInterfaceStyle
+                )
+            } else if object.type == "text", object.text != nil || object.sourceMarkdown != nil {
                 layer = CompactStudyPresentation.layer(
                     for: object,
                     frame: objectBounds(object),
@@ -1840,7 +1904,9 @@ private final class LectureBoardRenderView: UIView {
                 shape.lineJoin = .round
                 layer = shape
             }
+            layer.zPosition = CGFloat(index)
             objectLayers[object.id] = layer
+            renderedObjects[object.id] = object
             userLayer.addSublayer(layer)
         }
     }

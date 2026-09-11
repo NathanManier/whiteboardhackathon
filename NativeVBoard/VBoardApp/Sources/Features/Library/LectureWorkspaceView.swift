@@ -187,6 +187,9 @@ struct LectureWorkspaceView: View {
             if newValue != .objectEraser && oldValue != newValue {
                 previousPencilTool = newValue
             }
+            if !GraphPencilInteractionPolicy.allowsAnnotation(for: newValue) {
+                interactiveGraph = nil
+            }
         }
         .onChange(of: store.selectedKeys) { _, _ in
             let target = graphRecognitionTarget
@@ -287,16 +290,40 @@ struct LectureWorkspaceView: View {
                 )
                 .ignoresSafeArea(edges: .bottom)
 
+                graphAccessibilityOverlays(workspace, viewport: proxy.size)
+
+                if interactiveGraph != nil {
+                    GraphOutsideInteractionShield { interactiveGraph = nil }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .zIndex(5)
+                }
+
                 if let graph = interactiveGraph,
                    let rect = graphScreenRect(graph, workspace: workspace,
                                               viewport: proxy.size),
                    rect.intersects(CGRect(origin: .zero, size: proxy.size)) {
                     GraphInteractiveSurface(
                         graph: graph,
-                        onCommitViewport: { viewport in
-                            let updated = graph.replacing(viewport: viewport)
-                            store.replaceGraph(updated, boardID: graph.owningBoardID, api: api)
-                            if interactiveGraph?.id == graph.id { interactiveGraph = updated }
+                        canonicalStrokeObjects: GraphAnnotationOverlayPolicy.strokeObjectsAbove(
+                            graphID: graph.id,
+                            in: store.scenes[graph.owningBoardID]?.editor.objects ?? []
+                        ),
+                        pencilAnnotationEnabled:
+                            GraphPencilInteractionPolicy.allowsAnnotation(for: activeTool),
+                        pencilStyle: activeTool == .highlighter
+                            ? CanvasStrokeStyle(colorHex: markerColor, width: markerWidth,
+                                                opacity: markerOpacity)
+                            : CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),
+                        onPencilStroke: {
+                            store.applyStroke($0, boardID: graph.owningBoardID, api: api)
+                        },
+                        onPencilRequestsPassiveMode: { interactiveGraph = nil },
+                        onCommitViewport: { owningBoardID, graphID, viewport in
+                            guard let current = store.scenes[owningBoardID]?.editor.objects
+                                .first(where: { $0.id == graphID })?.graph else { return }
+                            let updated = current.replacing(viewport: viewport)
+                            store.replaceGraph(updated, boardID: owningBoardID, api: api)
+                            if interactiveGraph?.id == graphID { interactiveGraph = updated }
                         },
                         onEdit: {
                             editingGraph = store.scenes[graph.owningBoardID]?.editor.objects
@@ -316,6 +343,7 @@ struct LectureWorkspaceView: View {
                                      markerColor: $markerColor, markerWidth: $markerWidth,
                                      markerOpacity: $markerOpacity)
                     .padding(.bottom, 12)
+                    .zIndex(30)
 
                 if interactiveGraph == nil, !store.selectedKeys.isEmpty, let selectionScreenBounds {
                     SelectionActionBar(
@@ -358,6 +386,7 @@ struct LectureWorkspaceView: View {
                     .position(x: min(max(point.x, 150), proxy.size.width - 150),
                               y: min(max(point.y - 58, 42), proxy.size.height - 88))
                     .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                    .zIndex(31)
                 }
 
                 Button("") { store.undo(api: api) }
@@ -375,6 +404,37 @@ struct LectureWorkspaceView: View {
             .onAppear { canvasSize = proxy.size }
             .onChange(of: proxy.size) { _, value in canvasSize = value }
         }
+    }
+
+    @ViewBuilder
+    private func graphAccessibilityOverlays(_ workspace: LectureWorkspace,
+                                            viewport: CGSize) -> some View {
+        let visibleRect = CGRect(origin: .zero, size: viewport)
+        ForEach(workspace.items, id: \.boardID) { item in
+            let graphs = (store.scenes[item.boardID]?.editor.objects ?? [])
+                .compactMap(\.graph)
+                .filter { $0.id != interactiveGraph?.id }
+            ForEach(graphs) { graph in
+                if let rect = graphScreenRect(graph, workspace: workspace, viewport: viewport),
+                   rect.intersects(visibleRect) {
+                    GraphAccessibilityProxy(
+                        graph: graph,
+                        onInteract: { interactiveGraph = graph },
+                        onEdit: { editingGraph = graph },
+                        onDelete: { deleteGraphFromAccessibility(graph) }
+                    )
+                    .frame(width: max(rect.width, 1), height: max(rect.height, 1))
+                    .position(x: rect.midX, y: rect.midY)
+                    .zIndex(10)
+                }
+            }
+        }
+    }
+
+    private func deleteGraphFromAccessibility(_ graph: GraphObject) {
+        let key = SelectionKey(boardID: graph.owningBoardID, objectID: graph.id,
+                               kind: .editorObject, objectType: "graph")
+        store.deleteSelection(Set([key]), api: api)
     }
 
     private func togglePencilEraser() {
@@ -493,14 +553,37 @@ struct LectureWorkspaceView: View {
                              sourceBoardIDs: [String], selectedObjectKeys: [String]) {
         guard let workspace = store.workspace,
               let item = workspace.items.first(where: { $0.boardID == selection.boardID }),
-              let scene = store.scenes[selection.boardID] else { return }
+              store.scenes[selection.boardID] != nil else { return }
         let scale = canvasSize.width > 0 && canvasSize.height > 0
             ? WorldScreenTransform(camera: workspace.camera, viewport: canvasSize).scale : 1
-        let occupied = scene.editor.objects.map { BoardHitTestPolicy.bounds(of: $0) }
+        let sourceInLecture = selection.lectureWorldBBox
+            ?? LectureCoordinateTransform.boardLocalToLectureWorld(
+                selection.localBBox.cgRect, board: item
+            )
+        let sourceInOwner = LectureCoordinateTransform.lectureWorldToBoardLocal(
+            sourceInLecture, board: item
+        )
+        // Score placement against lecture-world content from every board, then
+        // translate those bounds into the owner document. Translation-only
+        // board placement makes the score identical while keeping the created
+        // GraphObject correctly board-local and board-owned.
+        var occupiedInLecture = workspace.items.map(\.effectiveFrame)
+        for candidate in workspace.items {
+            guard let candidateScene = store.scenes[candidate.boardID] else { continue }
+            occupiedInLecture.append(contentsOf: candidateScene.editor.objects.map {
+                LectureCoordinateTransform.boardLocalToLectureWorld(
+                    BoardHitTestPolicy.bounds(of: $0), board: candidate
+                )
+            })
+        }
+        let occupiedInOwner = occupiedInLecture.map {
+            LectureCoordinateTransform.lectureWorldToBoardLocal($0, board: item)
+        }
         let graph = GraphObjectFactory.make(
             boardID: item.boardID, selection: selection, expressions: expressions,
-            recognitionRequestID: requestID, cameraScale: scale, occupied: occupied,
-            sourceBoardIDs: sourceBoardIDs, selectedObjectKeys: selectedObjectKeys
+            recognitionRequestID: requestID, cameraScale: scale, occupied: occupiedInOwner,
+            sourceBoardIDs: sourceBoardIDs, selectedObjectKeys: selectedObjectKeys,
+            placementSource: sourceInOwner
         )
         store.addGraph(graph, boardID: item.boardID, api: api)
     }

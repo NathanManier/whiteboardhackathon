@@ -233,6 +233,7 @@ struct GraphCreationSheet: View {
                     create()
                 }
                 .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
                 .disabled(isCreating || drafts.allSatisfy { !$0.enabled })
             }
         }
@@ -268,6 +269,7 @@ struct GraphCreationSheet: View {
                     .disabled(drafts.isEmpty)
                 Spacer()
                 Button("Graph") { create() }.buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
                     .disabled(isCreating || drafts.isEmpty)
             }
         }
@@ -445,8 +447,12 @@ enum GraphObjectFactory {
                      expressions: [GraphExpression], recognitionRequestID: String?,
                      cameraScale: CGFloat, occupied: [CGRect],
                      sourceBoardIDs: [String]? = nil,
-                     selectedObjectKeys: [String]? = nil) -> GraphObject {
-        let source = selection.localBBox.cgRect
+                     selectedObjectKeys: [String]? = nil,
+                     placementSource: CGRect? = nil) -> GraphObject {
+        // Board screens use the canonical board-local selection directly.
+        // Lecture callers may supply the same lecture-world source converted
+        // into the owning board's coordinates after scoring all nearby boards.
+        let source = placementSource ?? selection.localBBox.cgRect
         let now = Date().timeIntervalSince1970
         let stableID = recognitionRequestID.map { "graph-recognition-" + $0 }
             ?? "graph-" + UUID().uuidString.lowercased()
@@ -514,8 +520,14 @@ struct GraphExpressionEditor: View {
             }
             .navigationTitle("Edit Graph")
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Save") { save() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save() }
+                        .keyboardShortcut(.defaultAction)
+                }
             }
         }
         .presentationDetents([.medium, .large])

@@ -2387,7 +2387,9 @@ final class GraphDomainModelTests: XCTestCase {
     }
 
     func testAddGraphUsesCanonicalEditorSavePath() async throws {
-        let storeBoardID = "graph-save-" + UUID().uuidString.lowercased()
+        let storeBoardID = UUID().uuidString
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
         let source = graph(owningBoardID: storeBoardID)
         let initial = EditorState(
             schemaVersion: 4, revision: 11, updatedAt: nil,

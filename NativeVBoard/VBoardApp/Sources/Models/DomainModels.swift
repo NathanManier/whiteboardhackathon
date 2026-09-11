@@ -411,14 +411,19 @@ private func encodeAdditionalFields(_ fields: [String: JSONValue],
 }
 
 struct GraphFrame: Codable, Equatable, Sendable {
+    static let minimumDimension = 32.0
+
     let x: Double
     let y: Double
     let width: Double
     let height: Double
 
     var hasFinitePositiveSize: Bool {
-        x.isFinite && y.isFinite && width.isFinite && height.isFinite && width > 0 && height > 0
+        x.isFinite && y.isFinite && width.isFinite && height.isFinite
+            && width >= Self.minimumDimension && height >= Self.minimumDimension
     }
+
+    var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
 }
 
 /// Open raw-value model: known cases have constants while future server values
@@ -455,8 +460,9 @@ struct GraphExpressionDisplayStyle: Codable, Equatable, Sendable {
     let lineStyle: String?
     let opacity: Double?
     let pointStyle: String?
+    let additionalFields: [String: JSONValue]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case color
         case lineWidth = "line_width"
         case lineStyle = "line_style"
@@ -465,12 +471,37 @@ struct GraphExpressionDisplayStyle: Codable, Equatable, Sendable {
     }
 
     init(color: String? = nil, lineWidth: Double? = nil, lineStyle: String? = nil,
-         opacity: Double? = nil, pointStyle: String? = nil) {
+         opacity: Double? = nil, pointStyle: String? = nil,
+         additionalFields: [String: JSONValue] = [:]) {
         self.color = color
         self.lineWidth = lineWidth
         self.lineStyle = lineStyle
         self.opacity = opacity
         self.pointStyle = pointStyle
+        self.additionalFields = additionalFields
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        color = try container.decodeIfPresent(String.self, forKey: .color)
+        lineWidth = try container.decodeIfPresent(Double.self, forKey: .lineWidth)
+        lineStyle = try container.decodeIfPresent(String.self, forKey: .lineStyle)
+        opacity = try container.decodeIfPresent(Double.self, forKey: .opacity)
+        pointStyle = try container.decodeIfPresent(String.self, forKey: .pointStyle)
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let knownKeys = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: knownKeys, to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(color, forKey: .color)
+        try container.encodeIfPresent(lineWidth, forKey: .lineWidth)
+        try container.encodeIfPresent(lineStyle, forKey: .lineStyle)
+        try container.encodeIfPresent(opacity, forKey: .opacity)
+        try container.encodeIfPresent(pointStyle, forKey: .pointStyle)
     }
 }
 
@@ -534,15 +565,56 @@ struct GraphViewport: Codable, Equatable, Sendable {
     let xMax: Double
     let yMin: Double
     let yMax: Double
+    let additionalFields: [String: JSONValue]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case xMin = "x_min"
         case xMax = "x_max"
         case yMin = "y_min"
         case yMax = "y_max"
     }
 
+    init(xMin: Double, xMax: Double, yMin: Double, yMax: Double,
+         additionalFields: [String: JSONValue] = [:]) {
+        self.xMin = xMin; self.xMax = xMax; self.yMin = yMin; self.yMax = yMax
+        self.additionalFields = additionalFields
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        xMin = try container.decode(Double.self, forKey: .xMin)
+        xMax = try container.decode(Double.self, forKey: .xMax)
+        yMin = try container.decode(Double.self, forKey: .yMin)
+        yMax = try container.decode(Double.self, forKey: .yMax)
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let knownKeys = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: knownKeys, to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(xMin, forKey: .xMin); try container.encode(xMax, forKey: .xMax)
+        try container.encode(yMin, forKey: .yMin); try container.encode(yMax, forKey: .yMax)
+    }
+
     static let conventional = GraphViewport(xMin: -10, xMax: 10, yMin: -10, yMax: 10)
+
+    /// Provider bridges own only the four visible bounds. Future canonical
+    /// viewport fields belong to V-Board and must survive provider readback,
+    /// Reset View, and save/reopen unchanged.
+    func replacingBounds(with bounds: GraphViewport) -> GraphViewport {
+        GraphViewport(
+            xMin: bounds.xMin, xMax: bounds.xMax,
+            yMin: bounds.yMin, yMax: bounds.yMax,
+            additionalFields: additionalFields
+        )
+    }
+
+    func resettingToConventionalBounds() -> GraphViewport {
+        replacingBounds(with: .conventional)
+    }
 
     var isValid: Bool {
         xMin.isFinite && xMax.isFinite && yMin.isFinite && yMax.isFinite
@@ -557,8 +629,9 @@ struct GraphSettings: Codable, Equatable, Sendable {
     let showExpressionsPanel: Bool
     let lockViewport: Bool
     let angleMode: String?
+    let additionalFields: [String: JSONValue]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case showXAxis = "show_x_axis"
         case showYAxis = "show_y_axis"
         case showGrid = "show_grid"
@@ -569,13 +642,15 @@ struct GraphSettings: Codable, Equatable, Sendable {
 
     init(showXAxis: Bool = true, showYAxis: Bool = true, showGrid: Bool = true,
          showExpressionsPanel: Bool = false, lockViewport: Bool = false,
-         angleMode: String? = "radians") {
+         angleMode: String? = "radians",
+         additionalFields: [String: JSONValue] = [:]) {
         self.showXAxis = showXAxis
         self.showYAxis = showYAxis
         self.showGrid = showGrid
         self.showExpressionsPanel = showExpressionsPanel
         self.lockViewport = lockViewport
         self.angleMode = angleMode
+        self.additionalFields = additionalFields
     }
 
     init(from decoder: Decoder) throws {
@@ -587,6 +662,21 @@ struct GraphSettings: Codable, Equatable, Sendable {
                                                               forKey: .showExpressionsPanel) ?? false
         lockViewport = try container.decodeIfPresent(Bool.self, forKey: .lockViewport) ?? false
         angleMode = try container.decodeIfPresent(String.self, forKey: .angleMode) ?? "radians"
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let knownKeys = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: knownKeys, to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(showXAxis, forKey: .showXAxis)
+        try container.encode(showYAxis, forKey: .showYAxis)
+        try container.encode(showGrid, forKey: .showGrid)
+        try container.encode(showExpressionsPanel, forKey: .showExpressionsPanel)
+        try container.encode(lockViewport, forKey: .lockViewport)
+        try container.encodeIfPresent(angleMode, forKey: .angleMode)
     }
 }
 
@@ -596,8 +686,9 @@ struct GraphSourceSelection: Codable, Equatable, Sendable {
     let selectedObjectKeys: [String]
     let originalRecognitionRequestID: String?
     let originalSelectionBBox: GraphFrame?
+    let additionalFields: [String: JSONValue]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case interactionID = "interaction_id"
         case sourceBoardIDs = "source_board_ids"
         case selectedObjectKeys = "selected_object_keys"
@@ -607,12 +698,14 @@ struct GraphSourceSelection: Codable, Equatable, Sendable {
 
     init(interactionID: String? = nil, sourceBoardIDs: [String] = [],
          selectedObjectKeys: [String] = [], originalRecognitionRequestID: String? = nil,
-         originalSelectionBBox: GraphFrame? = nil) {
+         originalSelectionBBox: GraphFrame? = nil,
+         additionalFields: [String: JSONValue] = [:]) {
         self.interactionID = interactionID
         self.sourceBoardIDs = sourceBoardIDs
         self.selectedObjectKeys = selectedObjectKeys
         self.originalRecognitionRequestID = originalRecognitionRequestID
         self.originalSelectionBBox = originalSelectionBBox
+        self.additionalFields = additionalFields
     }
 
     init(from decoder: Decoder) throws {
@@ -627,6 +720,21 @@ struct GraphSourceSelection: Codable, Equatable, Sendable {
         )
         originalSelectionBBox = try container.decodeIfPresent(GraphFrame.self,
                                                                forKey: .originalSelectionBBox)
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let knownKeys = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: knownKeys, to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(interactionID, forKey: .interactionID)
+        try container.encode(sourceBoardIDs, forKey: .sourceBoardIDs)
+        try container.encode(selectedObjectKeys, forKey: .selectedObjectKeys)
+        try container.encodeIfPresent(originalRecognitionRequestID,
+                                      forKey: .originalRecognitionRequestID)
+        try container.encodeIfPresent(originalSelectionBBox, forKey: .originalSelectionBBox)
     }
 }
 
@@ -637,19 +745,44 @@ struct GraphProviderMetadata: Codable, Equatable, Sendable {
     let state: JSONValue?
     let semanticContentHash: String?
     let renderVersion: Int?
+    let additionalFields: [String: JSONValue]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case preference, state
         case semanticContentHash = "semantic_content_hash"
         case renderVersion = "render_version"
     }
 
     init(preference: String? = nil, state: JSONValue? = nil,
-         semanticContentHash: String? = nil, renderVersion: Int? = nil) {
+         semanticContentHash: String? = nil, renderVersion: Int? = nil,
+         additionalFields: [String: JSONValue] = [:]) {
         self.preference = preference
         self.state = state
         self.semanticContentHash = semanticContentHash
         self.renderVersion = renderVersion
+        self.additionalFields = additionalFields
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        preference = try container.decodeIfPresent(String.self, forKey: .preference)
+        state = try container.decodeIfPresent(JSONValue.self, forKey: .state)
+        semanticContentHash = try container.decodeIfPresent(String.self,
+                                                              forKey: .semanticContentHash)
+        renderVersion = try container.decodeIfPresent(Int.self, forKey: .renderVersion)
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let knownKeys = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: knownKeys, to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(preference, forKey: .preference)
+        try container.encodeIfPresent(state, forKey: .state)
+        try container.encodeIfPresent(semanticContentHash, forKey: .semanticContentHash)
+        try container.encodeIfPresent(renderVersion, forKey: .renderVersion)
     }
 }
 
@@ -751,30 +884,50 @@ struct GraphObject: Codable, Equatable, Identifiable, Sendable {
     }
 
     func translated(by delta: CGPoint) -> GraphObject {
-        replacing(frame: GraphFrame(x: frame.x + Double(delta.x),
-                                    y: frame.y + Double(delta.y),
+        replacing(frame: GraphFrame(x: Self.boundedWorld(frame.x + Double(delta.x)),
+                                    y: Self.boundedWorld(frame.y + Double(delta.y)),
                                     width: frame.width, height: frame.height))
     }
 
     func resized(to size: CGSize) -> GraphObject {
-        replacing(frame: GraphFrame(x: frame.x, y: frame.y,
-                                    width: Double(size.width), height: Double(size.height)))
+        replacing(frame: GraphFrame(
+            x: frame.x, y: frame.y,
+            width: Self.boundedDimension(Double(size.width)),
+            height: Self.boundedDimension(Double(size.height))
+        ))
     }
 
     func scaled(around anchor: CGPoint, by factor: Double) -> GraphObject {
-        replacing(frame: GraphFrame(
-            x: Double(anchor.x) + factor * (frame.x - Double(anchor.x)),
-            y: Double(anchor.y) + factor * (frame.y - Double(anchor.y)),
-            width: frame.width * factor,
-            height: frame.height * factor
+        let minimumFactor = max(
+            Self.minimumFrameDimension / max(frame.width, Self.minimumFrameDimension),
+            Self.minimumFrameDimension / max(frame.height, Self.minimumFrameDimension)
+        )
+        let safeFactor = min(100, max(minimumFactor, factor))
+        return replacing(frame: GraphFrame(
+            x: Self.boundedWorld(Double(anchor.x) + safeFactor * (frame.x - Double(anchor.x))),
+            y: Self.boundedWorld(Double(anchor.y) + safeFactor * (frame.y - Double(anchor.y))),
+            width: Self.boundedDimension(frame.width * safeFactor),
+            height: Self.boundedDimension(frame.height * safeFactor)
         ))
+    }
+
+    private static let minimumFrameDimension = GraphFrame.minimumDimension
+    private static let maximumWorldCoordinate = 10_000_000.0
+
+    private static func boundedWorld(_ value: Double) -> Double {
+        min(max(value.isFinite ? value : 0, -maximumWorldCoordinate), maximumWorldCoordinate)
+    }
+
+    private static func boundedDimension(_ value: Double) -> Double {
+        min(max(value.isFinite ? value : minimumFrameDimension, minimumFrameDimension),
+            maximumWorldCoordinate)
     }
 
     func replacing(frame: GraphFrame) -> GraphObject {
         GraphObject(id: id, owningBoardID: owningBoardID, frame: frame,
                     expressions: expressions, viewport: viewport, settings: settings,
                     sourceSelection: sourceSelection, providerMetadata: providerMetadata,
-                    createdAt: createdAt, updatedAt: updatedAt, version: version,
+                    createdAt: createdAt, updatedAt: Date().timeIntervalSince1970, version: version,
                     additionalFields: additionalFields)
     }
 
@@ -782,7 +935,7 @@ struct GraphObject: Codable, Equatable, Identifiable, Sendable {
         GraphObject(id: id, owningBoardID: owningBoardID, frame: frame,
                     expressions: expressions, viewport: viewport, settings: settings,
                     sourceSelection: sourceSelection, providerMetadata: providerMetadata,
-                    createdAt: createdAt, updatedAt: updatedAt, version: version,
+                    createdAt: createdAt, updatedAt: Date().timeIntervalSince1970, version: version,
                     additionalFields: additionalFields)
     }
 
@@ -790,7 +943,7 @@ struct GraphObject: Codable, Equatable, Identifiable, Sendable {
         GraphObject(id: id, owningBoardID: owningBoardID, frame: frame,
                     expressions: expressions, viewport: viewport, settings: settings,
                     sourceSelection: sourceSelection, providerMetadata: providerMetadata,
-                    createdAt: createdAt, updatedAt: updatedAt, version: version,
+                    createdAt: createdAt, updatedAt: Date().timeIntervalSince1970, version: version,
                     additionalFields: additionalFields)
     }
 
@@ -798,7 +951,7 @@ struct GraphObject: Codable, Equatable, Identifiable, Sendable {
         GraphObject(id: id, owningBoardID: owningBoardID, frame: frame,
                     expressions: expressions, viewport: viewport, settings: settings,
                     sourceSelection: sourceSelection, providerMetadata: providerMetadata,
-                    createdAt: createdAt, updatedAt: updatedAt, version: version,
+                    createdAt: createdAt, updatedAt: Date().timeIntervalSince1970, version: version,
                     additionalFields: additionalFields)
     }
 }

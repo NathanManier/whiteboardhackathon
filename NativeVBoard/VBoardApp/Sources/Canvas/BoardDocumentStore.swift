@@ -22,6 +22,121 @@ enum EditorPersistenceStatus: Equatable {
     }
 }
 
+/// One uniform resize factor must be valid for every selected item. Keeping
+/// this policy outside the renderers lets the transient preview and canonical
+/// document commit use the exact same constraints instead of allowing a graph
+/// frame to clamp one axis independently after the rest of the selection has
+/// already moved.
+struct SelectionScaleBounds: Equatable, Sendable {
+    static let minimumObjectScale = 0.01
+    static let maximumObjectScale = 100.0
+
+    private(set) var lowerBound: Double = minimumObjectScale
+    private(set) var upperBound: Double = maximumObjectScale
+
+    var isValid: Bool {
+        lowerBound.isFinite && upperBound.isFinite
+            && lowerBound > 0 && lowerBound <= upperBound
+    }
+
+    mutating func formIntersection(_ other: SelectionScaleBounds) {
+        lowerBound = max(lowerBound, other.lowerBound)
+        upperBound = min(upperBound, other.upperBound)
+    }
+
+    /// Returns the single factor that may be previewed and committed, or nil
+    /// when clamping makes the gesture an effective no-op.
+    func clampedFactor(_ requested: CGFloat, tolerance: Double = 0.001) -> CGFloat? {
+        guard isValid, requested.isFinite, requested > 0 else { return nil }
+        let result = min(upperBound, max(lowerBound, Double(requested)))
+        guard result.isFinite, abs(result - 1) > tolerance else { return nil }
+        return CGFloat(result)
+    }
+
+    static func selection(objects: [CanvasObject],
+                          importedTransforms: [String: ObjectTransform],
+                          editorObjectIDs: Set<String>,
+                          professorPathIDs: Set<String>,
+                          anchor: CGPoint) -> SelectionScaleBounds? {
+        guard anchor.x.isFinite, anchor.y.isFinite else { return nil }
+        let selectedObjects = objects.filter { editorObjectIDs.contains($0.id) }
+        guard !selectedObjects.isEmpty || !professorPathIDs.isEmpty else { return nil }
+
+        var result = SelectionScaleBounds()
+        for object in selectedObjects {
+            if let graph = object.graph {
+                guard result.constrain(graph: graph, around: anchor) else { return nil }
+            } else if object.type == "text" {
+                // CanvasObject.scaled keeps editable text frames at least four
+                // world points. Include that limit here so text cannot distort
+                // relative to a graph or professor path in a mixed selection.
+                guard result.constrainDimension(object.width ?? 400,
+                                                minimum: 4,
+                                                maximum: nil),
+                      result.constrainDimension(object.height ?? 100,
+                                                minimum: 4,
+                                                maximum: nil) else { return nil }
+            } else {
+                guard result.constrain(existingScale: object.scaleX ?? 1),
+                      result.constrain(existingScale: object.scaleY ?? 1) else { return nil }
+            }
+        }
+        for id in professorPathIDs {
+            let transform = importedTransforms[id]
+            guard result.constrain(existingScale: transform?.scaleX ?? 1),
+                  result.constrain(existingScale: transform?.scaleY ?? 1) else { return nil }
+        }
+        return result.isValid ? result : nil
+    }
+
+    private mutating func constrain(existingScale: Double) -> Bool {
+        guard existingScale.isFinite, existingScale > 0 else { return false }
+        lowerBound = max(lowerBound, Self.minimumObjectScale / existingScale)
+        upperBound = min(upperBound, Self.maximumObjectScale / existingScale)
+        return isValid
+    }
+
+    private mutating func constrainDimension(_ dimension: Double,
+                                             minimum: Double,
+                                             maximum: Double?) -> Bool {
+        guard dimension.isFinite, dimension > 0 else { return false }
+        lowerBound = max(lowerBound, minimum / dimension)
+        if let maximum { upperBound = min(upperBound, maximum / dimension) }
+        return isValid
+    }
+
+    private mutating func constrain(graph: GraphObject, around anchor: CGPoint) -> Bool {
+        let maximum = GraphPersistenceValidator.maximumWorldCoordinate
+        guard constrainDimension(graph.frame.width,
+                                 minimum: GraphFrame.minimumDimension,
+                                 maximum: maximum),
+              constrainDimension(graph.frame.height,
+                                 minimum: GraphFrame.minimumDimension,
+                                 maximum: maximum),
+              constrainOrigin(graph.frame.x, around: Double(anchor.x), maximum: maximum),
+              constrainOrigin(graph.frame.y, around: Double(anchor.y), maximum: maximum)
+        else { return false }
+        return isValid
+    }
+
+    /// Intersects the positive scale interval for
+    /// `anchor + factor * (origin - anchor)` with the graph validator's world
+    /// coordinate range. This matters when an off-board selection is scaled
+    /// around a distant opposite handle.
+    private mutating func constrainOrigin(_ origin: Double,
+                                          around anchor: Double,
+                                          maximum: Double) -> Bool {
+        guard origin.isFinite, anchor.isFinite, abs(origin) <= maximum else { return false }
+        let delta = origin - anchor
+        guard abs(delta) > Double.ulpOfOne else { return isValid }
+        let first = (-maximum - anchor) / delta
+        let second = (maximum - anchor) / delta
+        lowerBound = max(lowerBound, min(first, second))
+        upperBound = min(upperBound, max(first, second))
+        return isValid
+    }
+}
+
 struct EditorMergeResult: Equatable {
     let editor: EditorState
     let unresolvedObjectIDs: Set<String>
@@ -244,7 +359,11 @@ enum EditorThreeWayMerger {
             xMin: resolve(base.xMin, local.xMin, server.xMin, conflict: &conflict),
             xMax: resolve(base.xMax, local.xMax, server.xMax, conflict: &conflict),
             yMin: resolve(base.yMin, local.yMin, server.yMin, conflict: &conflict),
-            yMax: resolve(base.yMax, local.yMax, server.yMax, conflict: &conflict)
+            yMax: resolve(base.yMax, local.yMax, server.yMax, conflict: &conflict),
+            additionalFields: mergeJSONFields(base: base.additionalFields,
+                                              local: local.additionalFields,
+                                              server: server.additionalFields,
+                                              conflict: &conflict)
         )
     }
 
@@ -265,7 +384,11 @@ enum EditorThreeWayMerger {
             lockViewport: resolve(base.lockViewport, local.lockViewport,
                                   server.lockViewport, conflict: &conflict),
             angleMode: resolve(base.angleMode, local.angleMode, server.angleMode,
-                               conflict: &conflict)
+                               conflict: &conflict),
+            additionalFields: mergeJSONFields(base: base.additionalFields,
+                                              local: local.additionalFields,
+                                              server: server.additionalFields,
+                                              conflict: &conflict)
         )
     }
 
@@ -511,13 +634,20 @@ final class BoardDocumentStore: ObservableObject {
     /// Inserts one provider-independent graph through the same history,
     /// outbox, autosave, and revision path as every other editor object.
     func addGraph(_ graph: GraphObject, api: APIClient) {
-        guard graph.owningBoardID == boardID,
-              graph.frame.hasFinitePositiveSize,
-              graph.viewport.isValid,
-              !graph.expressions.isEmpty,
-              !editor.objects.contains(where: { $0.id == graph.id }) else { return }
+        let canonical: GraphObject
+        do {
+            canonical = try GraphPersistenceValidator.sanitized(
+                graph, expectedBoardID: boardID
+            )
+        } catch {
+            #if DEBUG
+            print("[VBoard] GRAPH INSERT REJECTED board=\(boardID) error=\(error.localizedDescription)")
+            #endif
+            return
+        }
+        guard !editor.objects.contains(where: { $0.id == canonical.id }) else { return }
         var next = editor
-        next.objects.append(CanvasObject(graph: graph))
+        next.objects.append(CanvasObject(graph: canonical))
         apply(next, api: api)
     }
 
@@ -525,15 +655,22 @@ final class BoardDocumentStore: ObservableObject {
     /// item. Callers use this for expression, viewport, settings, or frame
     /// commits after an interaction session settles.
     func replaceGraph(_ graph: GraphObject, api: APIClient) {
-        guard graph.owningBoardID == boardID,
-              graph.frame.hasFinitePositiveSize,
-              graph.viewport.isValid,
-              !graph.expressions.isEmpty,
-              let index = editor.objects.firstIndex(where: {
-                  $0.id == graph.id && $0.type == "graph"
-              }), editor.objects[index].graph != graph else { return }
+        let canonical: GraphObject
+        do {
+            canonical = try GraphPersistenceValidator.sanitized(
+                graph, expectedBoardID: boardID
+            )
+        } catch {
+            #if DEBUG
+            print("[VBoard] GRAPH UPDATE REJECTED board=\(boardID) graph=\(graph.id) error=\(error.localizedDescription)")
+            #endif
+            return
+        }
+        guard let index = editor.objects.firstIndex(where: {
+            $0.id == canonical.id && $0.type == "graph"
+        }), editor.objects[index].graph != canonical else { return }
         var next = editor
-        next.objects[index] = CanvasObject(graph: graph)
+        next.objects[index] = CanvasObject(graph: canonical)
         apply(next, api: api)
     }
 
@@ -627,58 +764,59 @@ final class BoardDocumentStore: ObservableObject {
     /// Commits one non-cumulative resize transaction for every selected item
     /// in this isolated board document. Professor paths retain their source
     /// SVG and editor objects retain their source points/path/markdown.
+    func selectionScaleBounds(editorObjectIDs: Set<String>,
+                              professorPathIDs: Set<String>,
+                              around anchor: CGPoint) -> SelectionScaleBounds? {
+        SelectionScaleBounds.selection(
+            objects: editor.objects,
+            importedTransforms: editor.importedTransforms,
+            editorObjectIDs: editorObjectIDs,
+            professorPathIDs: professorPathIDs,
+            anchor: anchor
+        )
+    }
+
+    @discardableResult
     func scaleObjects(editorObjectIDs: Set<String>,
                       professorPathIDs: Set<String>,
                       around anchor: CGPoint,
                       by factor: CGFloat,
-                      api: APIClient) {
-        guard !editorObjectIDs.isEmpty || !professorPathIDs.isEmpty,
-              factor.isFinite, factor > 0, abs(factor - 1) > 0.001 else { return }
-
-        // Clamp once for the complete selection. Clamping every object after
-        // applying the requested factor would distort a mixed selection when
-        // one item is already near the supported transform limits.
-        var existingScales: [Double] = []
-        existingScales.reserveCapacity(editorObjectIDs.count * 2 + professorPathIDs.count * 2)
-        for object in editor.objects where editorObjectIDs.contains(object.id) && object.type != "text" {
-            existingScales.append(object.scaleX ?? 1)
-            existingScales.append(object.scaleY ?? 1)
-        }
-        for id in professorPathIDs {
-            let transform = editor.importedTransforms[id]
-            existingScales.append(transform?.scaleX ?? 1)
-            existingScales.append(transform?.scaleY ?? 1)
-        }
-        let lowerBound = existingScales.map { 0.01 / max($0, 0.000_001) }.max() ?? 0.01
-        let upperBound = existingScales.map { 100 / max($0, 0.000_001) }.min() ?? 100
-        let boundedFactor = min(upperBound, max(lowerBound, Double(factor)))
-        guard abs(boundedFactor - 1) > 0.001 else { return }
+                      api: APIClient) -> CGFloat? {
+        guard let boundedFactor = selectionScaleBounds(
+            editorObjectIDs: editorObjectIDs,
+            professorPathIDs: professorPathIDs,
+            around: anchor
+        )?.clampedFactor(factor) else { return nil }
+        let factor = Double(boundedFactor)
 
         var next = editor
         for id in editorObjectIDs {
             guard let index = next.objects.firstIndex(where: { $0.id == id }) else { continue }
-            next.objects[index] = next.objects[index].scaled(around: anchor, by: CGFloat(boundedFactor))
+            next.objects[index] = next.objects[index].scaled(around: anchor, by: boundedFactor)
         }
         for id in professorPathIDs {
             let existing = next.importedTransforms[id]
                 ?? ObjectTransform(x: 0, y: 0, scaleX: 1, scaleY: 1, deleted: false)
             next.importedTransforms[id] = ObjectTransform(
-                x: Double(anchor.x) + boundedFactor * (existing.x - Double(anchor.x)),
-                y: Double(anchor.y) + boundedFactor * (existing.y - Double(anchor.y)),
-                scaleX: (existing.scaleX ?? 1) * boundedFactor,
-                scaleY: (existing.scaleY ?? 1) * boundedFactor,
+                x: Double(anchor.x) + factor * (existing.x - Double(anchor.x)),
+                y: Double(anchor.y) + factor * (existing.y - Double(anchor.y)),
+                scaleX: (existing.scaleX ?? 1) * factor,
+                scaleY: (existing.scaleY ?? 1) * factor,
                 deleted: existing.deleted
             )
         }
+        guard next != editor else { return nil }
         apply(next, api: api)
+        return boundedFactor
     }
 
+    @discardableResult
     func scaleObjects(ids: Set<String>, around anchor: CGPoint, by factor: CGFloat,
-                      api: APIClient) {
+                      api: APIClient) -> CGFloat? {
         let editorIDs = Set(editor.objects.lazy.filter { ids.contains($0.id) }.map(\.id))
-        scaleObjects(editorObjectIDs: editorIDs,
-                     professorPathIDs: ids.subtracting(editorIDs),
-                     around: anchor, by: factor, api: api)
+        return scaleObjects(editorObjectIDs: editorIDs,
+                            professorPathIDs: ids.subtracting(editorIDs),
+                            around: anchor, by: factor, api: api)
     }
 
     func deleteObjects(ids: Set<String>, api: APIClient) {
@@ -780,6 +918,18 @@ final class BoardDocumentStore: ObservableObject {
         }
         status = .saving
         let candidate = editor
+        do {
+            _ = try GraphPersistenceValidator.sanitized(
+                candidate.objects.compactMap(\.graph), expectedBoardID: boardID
+            )
+        } catch {
+            status = .offlinePending
+            persistOutbox()
+            #if DEBUG
+            print("[VBoard] EDITOR SAVE PREFLIGHT REJECTED board=\(boardID) error=\(error.localizedDescription)")
+            #endif
+            return (false, false)
+        }
         let candidateGeneration = mutationGeneration
         saveSequence += 1
         let sequence = saveSequence
