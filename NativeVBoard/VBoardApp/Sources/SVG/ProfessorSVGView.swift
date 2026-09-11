@@ -5,6 +5,11 @@ import UIKit
 /// container; this view only refines visibility after the camera has settled.
 final class ProfessorSVGView: UIView {
     private let contentLayer = CALayer()
+    /// Only a complete professor presentation is ever visible. Path parsing may
+    /// still happen in small implementation batches, but those batches are
+    /// installed into a hidden staging group and promoted together.
+    private var activeContentLayer: CALayer?
+    private var stagingContentLayer: CALayer?
     private var entries: [String: Entry] = [:]
     /// Canonical path bounds are independent of temporary CAShapeLayer
     /// lifetime. Keeping them across imported-transform rebuilds lets hit
@@ -20,8 +25,12 @@ final class ProfessorSVGView: UIView {
     private var rebuildTask: Task<Void, Never>?
     private var rebuildGeneration = UUID()
     var onProgress: ((Double) -> Void)?
+    var hasVisiblePresentation: Bool { activeContentLayer != nil }
 
     var visiblePathIDsForTesting: Set<String> { visibleIDs }
+    func layerTransformForTesting(id: String) -> CGAffineTransform? {
+        entries[id]?.layer.affineTransform()
+    }
 
     #if DEBUG
     var onStats: ((RenderStats) -> Void)?
@@ -143,6 +152,18 @@ final class ProfessorSVGView: UIView {
     }
 
     func bounds(for id: String) -> CGRect {
+        // While a replacement layer is being prepared, `entries` still owns
+        // the complete old visual presentation. Geometry queries must already
+        // describe the newly committed canonical imported transform, not that
+        // deliberately retained display proxy.
+        if rebuildTask != nil, let source = sourceBounds[id] {
+            guard let imported = importedTransforms[id] else { return source }
+            let transform = CGAffineTransform.identity
+                .translatedBy(x: CGFloat(imported.x), y: CGFloat(imported.y))
+                .scaledBy(x: CGFloat(imported.scaleX ?? 1),
+                          y: CGFloat(imported.scaleY ?? 1))
+            return source.applying(transform)
+        }
         if let entry = entries[id] { return entry.bounds }
         guard let source = sourceBounds[id] else { return .null }
         guard let imported = importedTransforms[id] else { return source }
@@ -162,6 +183,13 @@ final class ProfessorSVGView: UIView {
         for id in ids { entries[id]?.layer.setAffineTransform(transform) }
     }
 
+    /// Keeps the GPU-composited gesture result visible while the canonical
+    /// imported transforms are rebuilt offscreen. The next atomic promotion
+    /// replaces these proxy transforms with exact geometry.
+    func retainPreviewTranslation(ids: Set<String>, delta: CGPoint) {
+        previewTranslation(ids: ids, delta: delta)
+    }
+
     func clearPreviewTranslation(ids: Set<String>) {
         for id in ids { entries[id]?.layer.setAffineTransform(.identity) }
     }
@@ -176,27 +204,30 @@ final class ProfessorSVGView: UIView {
         for id in ids { entries[id]?.layer.setAffineTransform(transform) }
     }
 
+    func retainPreviewScale(ids: Set<String>, anchor: CGPoint, scale: CGFloat) {
+        previewScale(ids: ids, anchor: anchor, scale: scale)
+    }
+
     func clearPreviewScale(ids: Set<String>) {
         for id in ids { entries[id]?.layer.setAffineTransform(.identity) }
     }
 
-    /// Parses canonical paths away from the frame-critical interaction path
-    /// and installs them in bounded batches. A board thumbnail remains visible
-    /// while this progresses, then fades as exact contours become available.
+    /// Parses canonical paths away from the frame-critical interaction path.
+    /// Computational batches remain hidden; visual promotion is atomic so the
+    /// contour order can never appear as scanlines, stripes, or subdivisions.
     private func beginProgressiveRebuild(document: SVGDocument,
                                          importedTransforms: [String: ObjectTransform],
                                          composition: SceneComposition?) {
         rebuildTask?.cancel()
+        rebuildTask = nil
+        stagingContentLayer?.removeFromSuperlayer()
+        stagingContentLayer = nil
         rebuildGeneration = UUID()
         let generation = rebuildGeneration
         if self.document != document { sourceBounds.removeAll(keepingCapacity: true) }
         self.document = document
         self.importedTransforms = importedTransforms
         self.composition = composition
-        entries.removeAll(keepingCapacity: true)
-        index = SpatialIndex(cellSize: max(document.viewBox.width, document.viewBox.height) / 32)
-        visibleIDs.removeAll(keepingCapacity: true)
-        contentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         onProgress?(0)
 
         let paths = SceneComposition.canonicalProfessorPaths(document.paths).filter {
@@ -204,9 +235,28 @@ final class ProfessorSVGView: UIView {
             return importedTransforms[id]?.deleted != true
         }
         guard !paths.isEmpty else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            activeContentLayer?.removeFromSuperlayer()
+            activeContentLayer = nil
+            entries.removeAll(keepingCapacity: true)
+            index = SpatialIndex(cellSize: max(document.viewBox.width, document.viewBox.height) / 32)
+            visibleIDs.removeAll(keepingCapacity: true)
+            CATransaction.commit()
             onProgress?(1)
             return
         }
+
+        let staging = CALayer()
+        staging.anchorPoint = .zero
+        staging.position = .zero
+        staging.bounds = contentLayer.bounds
+        staging.isHidden = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.addSublayer(staging)
+        CATransaction.commit()
+        stagingContentLayer = staging
 
         #if DEBUG
         let started = CACurrentMediaTime()
@@ -214,6 +264,9 @@ final class ProfessorSVGView: UIView {
         rebuildTask = Task { [weak self] in
             let batchSize = 128
             var completed = 0
+            var nextEntries: [String: Entry] = [:]
+            var nextIndex = SpatialIndex(cellSize: max(document.viewBox.width, document.viewBox.height) / 32)
+            var nextSourceBounds = self?.sourceBounds ?? [:]
             while completed < paths.count, !Task.isCancelled {
                 let end = min(completed + batchSize, paths.count)
                 let definitions = paths[completed..<end].map(\.d)
@@ -243,7 +296,7 @@ final class ProfessorSVGView: UIView {
                     guard let path = parsedPath.displayPath else { continue }
                     let item = paths[completed + offset]
                     guard let id = item.id else { continue }
-                    self.sourceBounds[id] = parsedPath.sourceBounds
+                    nextSourceBounds[id] = parsedPath.sourceBounds
                     let shape = CAShapeLayer()
                     shape.path = path
                     shape.fillColor = item.fill.cgColor
@@ -258,20 +311,52 @@ final class ProfessorSVGView: UIView {
                     self.applyProvenance(node, to: shape)
                     #endif
                     let bounds = path.boundingBoxOfPath
-                    self.entries[id] = Entry(bounds: bounds, layer: shape,
-                                             isRegionSurface: item.dataInk == "pdf-source")
-                    self.index.insert(id: id, bounds: bounds)
-                    self.contentLayer.addSublayer(shape)
+                    nextEntries[id] = Entry(bounds: bounds, layer: shape,
+                                            isRegionSurface: item.dataInk == "pdf-source")
+                    nextIndex.insert(id: id, bounds: bounds)
+                    staging.addSublayer(shape)
                 }
                 CATransaction.commit()
                 completed = end
-                if let transform = self.currentTransform, !self.isInteracting {
-                    self.refine(transform: transform)
-                }
-                self.onProgress?(Double(completed) / Double(paths.count))
+                // 1.0 is reserved for the atomic visual promotion below.
+                // Emitting it for the last computational batch would let UI
+                // hide its preview before the staged group is committed.
+                self.onProgress?(min(0.998, Double(completed) / Double(paths.count)))
                 await Task.yield()
             }
-            guard let self, self.rebuildGeneration == generation else { return }
+            guard let self, !Task.isCancelled,
+                  self.rebuildGeneration == generation,
+                  self.stagingContentLayer === staging else {
+                staging.removeFromSuperlayer()
+                return
+            }
+
+            // Resolve the initial visible set before revealing the group. No
+            // partially prepared layer is ever presented to Core Animation.
+            var nextVisibleIDs = Set<String>()
+            if let transform = self.currentTransform {
+                let preloadMargin = max(transform.camera.width, transform.camera.height) * 0.15
+                nextVisibleIDs = nextIndex.query(transform.camera.cgRect.expanded(by: preloadMargin))
+            } else {
+                nextVisibleIDs = Set(nextEntries.keys)
+            }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for (id, entry) in nextEntries {
+                entry.layer.isHidden = !nextVisibleIDs.contains(id)
+                entry.layer.setAffineTransform(.identity)
+            }
+            let previous = self.activeContentLayer
+            staging.isHidden = false
+            self.activeContentLayer = staging
+            self.stagingContentLayer = nil
+            self.entries = nextEntries
+            self.index = nextIndex
+            self.sourceBounds = nextSourceBounds
+            self.visibleIDs = nextVisibleIDs
+            previous?.removeFromSuperlayer()
+            CATransaction.commit()
+            self.onProgress?(1)
             #if DEBUG
             var stats = RenderPerformance.shared.last
             stats.indexedObjects = self.entries.count

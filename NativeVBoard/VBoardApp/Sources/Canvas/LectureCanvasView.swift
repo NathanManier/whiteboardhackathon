@@ -16,13 +16,15 @@ enum WorkspaceBackgroundStyle: String, CaseIterable, Identifiable, Sendable {
 
 enum WorkspaceDotFieldPolicy {
     static let worldIntervals: [CGFloat] = [
-        25, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000
+        12.5, 17.5, 25, 35, 50, 70, 100, 140, 200, 280, 400, 560,
+        800, 1_120, 1_600, 2_240, 3_200, 4_480, 6_400, 8_960,
+        12_800, 17_920, 25_600, 35_840, 51_200
     ]
 
-    /// Chooses a stable, clean world interval nearest the desired 78pt screen spacing.
+    /// Chooses a stable, clean world interval near Freeform-like screen spacing.
     /// It changes only when a neighboring interval becomes a better match, so dots do
     /// not continuously crawl or resize while the camera moves.
-    static func worldSpacing(forScale scale: CGFloat, targetScreenSpacing: CGFloat = 78) -> CGFloat {
+    static func worldSpacing(forScale scale: CGFloat, targetScreenSpacing: CGFloat = 60) -> CGFloat {
         guard scale.isFinite, scale > 0 else { return 100 }
         return worldIntervals.min { lhs, rhs in
             abs(log(max(lhs * scale, 0.001) / targetScreenSpacing))
@@ -33,8 +35,8 @@ enum WorkspaceDotFieldPolicy {
     static func opacity(forScale scale: CGFloat) -> CGFloat {
         guard scale.isFinite, scale > 0 else { return 0 }
         if scale >= 12 { return 0 }
-        if scale > 4 { return 0.14 * (12 - scale) / 8 }
-        return 0.14
+        if scale > 4 { return 0.23 * (12 - scale) / 8 }
+        return 0.23
     }
 }
 
@@ -76,6 +78,16 @@ enum BoardVectorLoadState: Equatable, Sendable {
 enum VectorLoadingIndicatorPolicy {
     static let appearanceDelay: TimeInterval = 0.20
     static let minimumVisibleDuration: TimeInterval = 0.50
+}
+
+enum VectorProgressivePresentationPolicy {
+    /// A raster preview stays visually complete until the first exact vector
+    /// group is ready. During later refinements the already-visible exact
+    /// group is the stable proxy, so the thumbnail must not reappear.
+    static func previewOpacity(progress: Double, hasStableVectorPresentation: Bool) -> CGFloat {
+        guard progress < 0.999, !hasStableVectorPresentation else { return 0 }
+        return 1
+    }
 }
 
 /// A board-local indicator whose lifetime follows actual professor-path
@@ -318,6 +330,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private let pencilHoverLayer = CAShapeLayer()
     private var boardViews: [String: LectureBoardRenderView] = [:]
     private var regionLayers: [String: CAShapeLayer] = [:]
+    private var sourceSurfaceLayers: [String: CAShapeLayer] = [:]
     private var workspace: LectureWorkspace
     private var scenes: [String: WorkspaceBoardScene]
     private var selectedKeys: Set<SelectionKey>
@@ -659,7 +672,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         let firstY = worldOrigin.y.truncatingRemainder(dividingBy: screenSpacing)
 
         let dots = UIBezierPath()
-        let radius = traitCollection.userInterfaceStyle == .dark ? 0.8 : 0.7
+        let radius = traitCollection.userInterfaceStyle == .dark ? 0.95 : 0.9
         var x = firstX - screenSpacing
         while x <= bounds.maxX + screenSpacing {
             var y = firstY - screenSpacing
@@ -736,7 +749,17 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         for stale in regionLayers.keys where !currentIDs.contains(stale) {
             regionLayers.removeValue(forKey: stale)?.removeFromSuperlayer()
         }
+        for stale in sourceSurfaceLayers.keys where !currentIDs.contains(stale) {
+            sourceSurfaceLayers.removeValue(forKey: stale)?.removeFromSuperlayer()
+        }
         for item in workspace.items {
+            let sourceSurface = sourceSurfaceLayers[item.boardID] ?? {
+                let layer = CAShapeLayer()
+                layer.lineWidth = 0
+                regionContainer.layer.addSublayer(layer)
+                sourceSurfaceLayers[item.boardID] = layer
+                return layer
+            }()
             let region = regionLayers[item.boardID] ?? {
                 let layer = CAShapeLayer()
                 layer.fillColor = UIColor.clear.cgColor
@@ -745,10 +768,13 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                 regionLayers[item.boardID] = layer
                 return layer
             }()
-            let initial = CGRect(x: item.canvasX,
-                                 y: item.canvasY,
-                                 width: item.boardWidth,
-                                 height: item.boardHeight * WorkspaceEffectiveBounds.initialRegionHeightMultiplier)
+            sourceSurface.path = UIBezierPath(rect: item.sourceContentFrame).cgPath
+            sourceSurface.fillColor = item.sourceKind == .blankBoard
+                ? UIColor.clear.cgColor
+                : boardRegionSurfaceColor(isPDF: item.sourceKind.isPDF).cgColor
+            sourceSurface.strokeColor = UIColor.clear.cgColor
+
+            let initial = item.initialWorkspaceRegionFrame
             let effective = initial.union(item.effectiveFrame)
             let inset = max(10, min(item.boardWidth, item.boardHeight) * 0.012)
             let boundary = effective.insetBy(dx: -inset, dy: -inset)
@@ -765,7 +791,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             region.path = nextPath
             let isActive = item.boardID == workspace.activeBoardID
             let isPDF = item.sourceKind.isPDF
-            region.fillColor = boardRegionSurfaceColor(isPDF: isPDF).cgColor
+            region.fillColor = UIColor.clear.cgColor
             region.strokeColor = boardRegionBoundaryColor(active: isActive).cgColor
             region.lineWidth = (isActive ? 1.5 : 1.2) / max(worldTransform.scale, 0.001)
         }
@@ -1108,19 +1134,24 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             lastEraseWorld = nil
         case .movingSelection(let startWorld, let clickSelection):
             let delta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
-            clearSelectionMovePreview()
             let screenDistance = hypot(delta.x, delta.y) * worldTransform.scale
             if screenDistance >= 3 {
+                retainSelectionMovePreview(delta)
                 callbacks.onMoveSelection(selectedKeys, delta)
             } else if let clickSelection {
+                clearSelectionMovePreview()
                 selectedKeys = clickSelection
                 callbacks.onSelectionChanged(clickSelection, [:])
+            } else {
+                clearSelectionMovePreview()
             }
         case .resizingSelection(let session):
             let scale = SelectionResizeGeometry.scale(session: session, currentPointer: world)
-            clearSelectionResizePreview(keys: session.keys)
             if abs(scale - 1) > 0.001 {
+                retainSelectionResizePreview(session: session, scale: scale)
                 callbacks.onResizeSelection(session.keys, session.anchor, scale)
+            } else {
+                clearSelectionResizePreview(keys: session.keys)
             }
         case .movingBoard(let boardID, let startWorld):
             let delta = CGPoint(x: world.x - startWorld.x, y: world.y - startWorld.y)
@@ -1248,6 +1279,13 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         for (boardID, keys) in grouped { boardViews[boardID]?.clearMovePreview(keys: Set(keys)) }
     }
 
+    private func retainSelectionMovePreview(_ delta: CGPoint) {
+        let grouped = Dictionary(grouping: selectedKeys, by: \.boardID)
+        for (boardID, keys) in grouped {
+            boardViews[boardID]?.retainMovePreview(keys: Set(keys), delta: delta)
+        }
+    }
+
     private func previewSelectionResize(session: SelectionResizeSession, scale: CGFloat) {
         let grouped = Dictionary(grouping: session.keys, by: \.boardID)
         for (boardID, keys) in grouped {
@@ -1261,6 +1299,15 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         let grouped = Dictionary(grouping: keys, by: \.boardID)
         for (boardID, boardKeys) in grouped {
             boardViews[boardID]?.clearResizePreview(keys: Set(boardKeys))
+        }
+    }
+
+    private func retainSelectionResizePreview(session: SelectionResizeSession, scale: CGFloat) {
+        let grouped = Dictionary(grouping: session.keys, by: \.boardID)
+        for (boardID, keys) in grouped {
+            guard let item = workspace.items.first(where: { $0.boardID == boardID }) else { continue }
+            let localAnchor = LectureCoordinateTransform.lectureWorldToBoardLocal(session.anchor, board: item)
+            boardViews[boardID]?.retainResizePreview(keys: Set(keys), anchor: localAnchor, scale: scale)
         }
     }
 
@@ -1449,7 +1496,7 @@ private final class LectureBoardRenderView: UIView {
         paperLayer.strokeColor = UIColor.separator.withAlphaComponent(0.4).cgColor
         paperLayer.lineWidth = 2
         layer.addSublayer(paperLayer)
-        thumbnail.contentMode = .scaleAspectFit
+        thumbnail.contentMode = .scaleAspectFill
         thumbnail.clipsToBounds = true
         addSubview(thumbnail)
         addSubview(pdfSource)
@@ -1458,8 +1505,20 @@ private final class LectureBoardRenderView: UIView {
             guard let self else { return }
             self.vectorProgress = progress
             let incomplete = progress < 0.999
-            self.thumbnail.isHidden = !incomplete
-            self.thumbnail.alpha = incomplete ? max(0.18, 1 - progress * 0.82) : 0
+            let previewOpacity: CGFloat
+            if self.item?.sourceKind == .image {
+                // A generic image is canonical source content, not a temporary
+                // physical-whiteboard processing preview. It remains visible.
+                previewOpacity = 1
+            } else {
+                let hasStableVectorProxy = self.professor.hasVisiblePresentation
+                previewOpacity = VectorProgressivePresentationPolicy.previewOpacity(
+                    progress: progress,
+                    hasStableVectorPresentation: hasStableVectorProxy
+                )
+            }
+            self.thumbnail.isHidden = previewOpacity == 0
+            self.thumbnail.alpha = previewOpacity
             self.vectorIndicator.transition(to: incomplete
                                             ? (progress > 0 ? .vectorPartial : .vectorLoading)
                                             : .vectorReady)
@@ -1544,7 +1603,8 @@ private final class LectureBoardRenderView: UIView {
                 rebuildUserLayers(scene.editor.objects)
             }
             if vectorProgress >= 0.999 {
-                thumbnail.isHidden = true
+                thumbnail.isHidden = item.sourceKind != .image
+                thumbnail.alpha = 1
                 vectorIndicator.transition(to: .vectorReady)
             }
         } else {
@@ -1660,6 +1720,15 @@ private final class LectureBoardRenderView: UIView {
         for key in keys where key.kind == .editorObject { objectLayers[key.objectID]?.setAffineTransform(.identity) }
     }
 
+    func retainMovePreview(keys: Set<SelectionKey>, delta: CGPoint) {
+        professor.retainPreviewTranslation(
+            ids: Set(keys.filter { $0.kind == .professorPath }.map(\.objectID)),
+            delta: delta
+        )
+        // Editor-object layers intentionally keep their cheap presentation
+        // transform until the synchronously updated scene rebuilds them.
+    }
+
     func previewResize(keys: Set<SelectionKey>, anchor: CGPoint, scale: CGFloat) {
         professor.previewScale(ids: Set(keys.filter { $0.kind == .professorPath }.map(\.objectID)),
                                anchor: anchor, scale: scale)
@@ -1688,6 +1757,16 @@ private final class LectureBoardRenderView: UIView {
             }
         }
         CATransaction.commit()
+    }
+
+    func retainResizePreview(keys: Set<SelectionKey>, anchor: CGPoint, scale: CGFloat) {
+        professor.retainPreviewScale(
+            ids: Set(keys.filter { $0.kind == .professorPath }.map(\.objectID)),
+            anchor: anchor,
+            scale: scale
+        )
+        // As with move, exact editor layers replace the transient transform
+        // when the canonical mutation reaches this view.
     }
 
     func showLiveStroke(points: [StrokePoint], color: String, width: Double,

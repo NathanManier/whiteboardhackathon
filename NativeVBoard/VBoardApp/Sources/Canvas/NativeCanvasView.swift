@@ -464,7 +464,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         let firstX = origin.x.truncatingRemainder(dividingBy: spacing)
         let firstY = origin.y.truncatingRemainder(dividingBy: spacing)
         let path = UIBezierPath()
-        let radius: CGFloat = traitCollection.userInterfaceStyle == .dark ? 0.8 : 0.7
+        let radius: CGFloat = traitCollection.userInterfaceStyle == .dark ? 0.95 : 0.9
         var x = firstX - spacing
         while x <= bounds.maxX + spacing {
             var y = firstY - spacing
@@ -920,10 +920,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             let scale = endpoint.map {
                 SelectionResizeGeometry.scale(session: session, currentPointer: $0)
             } ?? 1
-            clearResizePreview()
             if endpoint != nil, abs(scale - 1) > 0.001 {
+                retainResizePreview(anchor: session.anchor, scale: scale)
                 onResize(selectedIDs, session.anchor, scale)
                 debugInputOperation("RESIZE COMMIT")
+            } else {
+                clearResizePreview()
             }
             resizeSession = nil; resizePreviewBounds = nil
             interactionState = .idle; updateSelectionOverlay(); updateInputHUD()
@@ -934,11 +936,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 let delta = CGPoint(x: endpoint.x - editStart.x, y: endpoint.y - editStart.y)
                 if moveActive || hypot(delta.x, delta.y) > 0 {
                     moveDelta = delta
+                    retainMovePreview(delta)
                     onMove(selectedIDs, delta)
                     debugInputOperation("MOVE COMMIT")
+                } else {
+                    clearMovePreview()
                 }
+            } else {
+                clearMovePreview()
             }
-            clearMovePreview()
             moveActive = false; moveDelta = .zero
             interactionState = .idle; updateSelectionOverlay(); updateInputHUD()
             return
@@ -990,6 +996,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         professor.clearPreviewTranslation(ids: selectedIDs)
     }
 
+    private func retainMovePreview(_ delta: CGPoint) {
+        professor.retainPreviewTranslation(ids: selectedIDs, delta: delta)
+        // User-object layers retain the same presentation transform until the
+        // canonical object update rebuilds them on the next SwiftUI pass.
+    }
+
     private func previewResize(anchor: CGPoint, scale: CGFloat) {
         professor.previewScale(ids: selectedIDs, anchor: anchor, scale: scale)
         CATransaction.begin()
@@ -1017,6 +1029,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             }
         }
         CATransaction.commit()
+    }
+
+    private func retainResizePreview(anchor: CGPoint, scale: CGFloat) {
+        professor.retainPreviewScale(ids: selectedIDs, anchor: anchor, scale: scale)
     }
 
     private func eraseSegment(from start: CGPoint, to end: CGPoint) {

@@ -160,7 +160,23 @@ struct WorkspaceBoardItem: Codable, Equatable, Identifiable, Sendable {
     }
 
     var frame: CGRect {
-        CGRect(x: CGFloat(canvasX), y: CGFloat(canvasY), width: CGFloat(boardWidth), height: CGFloat(boardHeight))
+        sourceContentFrame
+    }
+
+    /// The canonical professor/image/PDF source rectangle. The writing apron
+    /// is deliberately not part of this rectangle.
+    var sourceContentFrame: CGRect {
+        BoardSurfaceGeometry.sourceContentRect(
+            origin: CGPoint(x: canvasX, y: canvasY),
+            size: CGSize(width: boardWidth, height: boardHeight)
+        )
+    }
+
+    var initialWorkspaceRegionFrame: CGRect {
+        BoardSurfaceGeometry.workspaceRegion(
+            origin: CGPoint(x: canvasX, y: canvasY),
+            sourceSize: CGSize(width: boardWidth, height: boardHeight)
+        )
     }
 
     var effectiveFrame: CGRect { effectiveContentBounds.cgRect }
@@ -340,9 +356,8 @@ enum WorkspaceEffectiveBounds {
     static let initialRegionHeightMultiplier = 1.5
 
     static func boardLocal(editor: EditorState, boardSize: CGSize) -> CGRect {
-        var result = CGRect(origin: .zero,
-                            size: CGSize(width: max(boardSize.width, 1),
-                                         height: max(boardSize.height * initialRegionHeightMultiplier, 1)))
+        var result = BoardSurfaceGeometry.workspaceRegion(origin: .zero,
+                                                          sourceSize: boardSize)
         for object in SceneComposition.canonicalEditorObjects(editor.objects) {
             result = result.union(objectBounds(object))
         }
@@ -351,6 +366,35 @@ enum WorkspaceEffectiveBounds {
 
     private static func objectBounds(_ object: CanvasObject) -> CGRect {
         BoardHitTestPolicy.bounds(of: object)
+    }
+}
+
+enum BoardSurfaceGeometry {
+    static func sourceContentRect(origin: CGPoint = .zero, size: CGSize) -> CGRect {
+        CGRect(origin: origin,
+               size: CGSize(width: max(size.width, 1), height: max(size.height, 1)))
+    }
+
+    static func workspaceRegion(origin: CGPoint = .zero, sourceSize: CGSize) -> CGRect {
+        CGRect(origin: origin,
+               size: CGSize(width: max(sourceSize.width, 1),
+                            height: max(sourceSize.height * WorkspaceEffectiveBounds.initialRegionHeightMultiplier, 1)))
+    }
+}
+
+enum ThumbnailCropPolicy {
+    /// Aspect-fill geometry used only by cards/previews. Canonical board
+    /// dimensions and the professor source rectangle are never changed.
+    static func aspectFillRect(sourceSize: CGSize, destination: CGRect) -> CGRect {
+        guard sourceSize.width > 0, sourceSize.height > 0,
+              destination.width > 0, destination.height > 0 else { return destination }
+        let scale = max(destination.width / sourceSize.width,
+                        destination.height / sourceSize.height)
+        let size = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
+        return CGRect(x: destination.midX - size.width / 2,
+                      y: destination.midY - size.height / 2,
+                      width: size.width,
+                      height: size.height)
     }
 }
 

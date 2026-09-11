@@ -177,6 +177,7 @@ enum BoardSourceKind: String, Codable, Hashable, Sendable {
     case physicalWhiteboard = "physical_whiteboard"
     case freeformPDF = "freeform_pdf"
     case genericPDF = "generic_pdf"
+    case blankBoard = "blank_board"
     case image
 
     var isPDF: Bool { self == .freeformPDF || self == .genericPDF }
