@@ -134,7 +134,9 @@ def classify_request(context: AIRequestContext) -> AIRoute:
     else:
         scope = ContextScope.BOARD
 
-    if _HARD.search(question):
+    if context.action == "graph_recognition":
+        difficulty = ReasoningDifficulty.SIMPLE
+    elif _HARD.search(question):
         difficulty = ReasoningDifficulty.HARD
     elif _SIMPLE.search(question):
         difficulty = ReasoningDifficulty.SIMPLE

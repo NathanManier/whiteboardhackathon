@@ -93,6 +93,8 @@ MAX_ERASURES_PER_STROKE = 500
 MAX_PATH_D_CHARS = 400_000
 MAX_TEXT_LENGTH = 20_000
 MAX_WORLD_COORDINATE = 10_000_000.0
+MAX_GRAPH_EXTENSION_BYTES = 64 * 1024
+MAX_GRAPH_PROVIDER_STATE_BYTES = 256 * 1024
 MAX_DEBUG_RASTER_DIMENSION = 1600
 MAX_DEBUG_SVG_BYTES = 16 * 1024 * 1024
 MAX_DEBUG_SVG_PATHS = 2_500
@@ -179,6 +181,10 @@ RATE_LIMIT_POLICIES: dict[str, tuple[int, int]] = {
     "study_guide": (
         _positive_environment_integer("RATE_LIMIT_STUDY_GUIDE_COUNT", 30),
         _positive_environment_integer("RATE_LIMIT_STUDY_GUIDE_WINDOW", 3600),
+    ),
+    "graph_recognition": (
+        _positive_environment_integer("RATE_LIMIT_GRAPH_RECOGNITION_COUNT", 120),
+        _positive_environment_integer("RATE_LIMIT_GRAPH_RECOGNITION_WINDOW", 3600),
     ),
 }
 
@@ -1022,6 +1028,347 @@ def validate_point_list(value: Any, label: str, maximum: int) -> list[dict[str, 
     ]
 
 
+def validate_graph_rect(value: Any, label: str, *, minimum_size: float = 1) -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object.")
+    return {
+        "x": finite_number(
+            value.get("x"), f"{label}.x",
+            minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE,
+        ),
+        "y": finite_number(
+            value.get("y"), f"{label}.y",
+            minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE,
+        ),
+        "width": finite_number(
+            value.get("width"), f"{label}.width",
+            minimum=minimum_size, maximum=MAX_WORLD_COORDINATE,
+        ),
+        "height": finite_number(
+            value.get("height"), f"{label}.height",
+            minimum=minimum_size, maximum=MAX_WORLD_COORDINATE,
+        ),
+    }
+
+
+def _safe_graph_json(value: Any, label: str, *, depth: int = 0) -> Any:
+    if depth > 5:
+        raise ValueError(f"{label} is nested too deeply.")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if not np.isfinite(number):
+            raise ValueError(f"{label} contains a non-finite number.")
+        return value
+    if isinstance(value, str):
+        if len(value) > 8_000 or any(ord(char) < 32 and char not in "\n\r\t" for char in value):
+            raise ValueError(f"{label} contains an invalid string.")
+        return value
+    if isinstance(value, list):
+        if len(value) > 64:
+            raise ValueError(f"{label} contains too many items.")
+        return [
+            _safe_graph_json(item, f"{label}[{index}]", depth=depth + 1)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        if len(value) > 64:
+            raise ValueError(f"{label} contains too many fields.")
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", key):
+                raise ValueError(f"{label} contains an invalid field name.")
+            clean[key] = _safe_graph_json(item, f"{label}.{key}", depth=depth + 1)
+        return clean
+    raise ValueError(f"{label} contains an unsupported value.")
+
+
+def _bounded_graph_json(value: Any, label: str, maximum_bytes: int) -> Any:
+    clean = _safe_graph_json(value, label)
+    if len(json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > maximum_bytes:
+        raise ValueError(f"{label} is too large.")
+    return clean
+
+
+def _optional_graph_style(value: Any, label: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object.")
+    clean: dict[str, Any] = {}
+    color = value.get("color")
+    if color is not None:
+        if not isinstance(color, str) or not COLOR_RE.fullmatch(color):
+            raise ValueError(f"{label}.color is invalid.")
+        clean["color"] = color.lower()
+    line_width = value.get("line_width")
+    if line_width is not None:
+        clean["line_width"] = finite_number(
+            line_width, f"{label}.line_width", minimum=0.1, maximum=40,
+        )
+    for key in ("line_style", "point_style"):
+        raw = value.get(key)
+        if raw is not None:
+            if not isinstance(raw, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", raw):
+                raise ValueError(f"{label}.{key} is invalid.")
+            clean[key] = raw
+    opacity = value.get("opacity")
+    if opacity is not None:
+        clean["opacity"] = finite_number(
+            opacity, f"{label}.opacity", minimum=0, maximum=1,
+        )
+    return clean
+
+
+def validate_graph_object(item: dict[str, Any], index: int, board_id: str | None) -> dict[str, Any]:
+    from study.graph_recognition import (
+        GRAPH_EXPRESSION_TYPES,
+        MAX_GRAPH_EXPRESSIONS,
+        MAX_GRAPH_SELECTED_IDS,
+        validate_graph_latex,
+    )
+
+    label = f"Object {index}"
+    owning_board_id = item.get("owning_board_id", item.get("owningBoardID"))
+    if not isinstance(owning_board_id, str) or not BOARD_ID_RE.fullmatch(owning_board_id):
+        raise ValueError(f"{label}.owning_board_id is invalid.")
+    if board_id is not None and owning_board_id != board_id:
+        raise ValueError(f"{label} belongs to a different board.")
+    expressions_value = item.get("expressions")
+    if not isinstance(expressions_value, list) or not 1 <= len(expressions_value) <= MAX_GRAPH_EXPRESSIONS:
+        raise ValueError(f"{label}.expressions must contain one to {MAX_GRAPH_EXPRESSIONS} items.")
+    expressions: list[dict[str, Any]] = []
+    expression_ids: set[str] = set()
+    expression_reserved = {"id", "latex", "type", "visible", "display_style", "restrictions"}
+    for expression_index, raw in enumerate(expressions_value):
+        expression_label = f"{label}.expressions[{expression_index}]"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{expression_label} must be an object.")
+        expression_id = raw.get("id")
+        if (
+            not isinstance(expression_id, str)
+            or not STROKE_ID_RE.fullmatch(expression_id)
+            or expression_id in expression_ids
+        ):
+            raise ValueError(f"{expression_label}.id is invalid or duplicated.")
+        expression_type = raw.get("type")
+        if (
+            not isinstance(expression_type, str)
+            or (
+                expression_type not in GRAPH_EXPRESSION_TYPES
+                and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,39}", expression_type)
+            )
+        ):
+            raise ValueError(f"{expression_label}.type is invalid.")
+        try:
+            latex = validate_graph_latex(raw.get("latex"), expression_label)
+        except Exception as exc:
+            raise ValueError(f"{expression_label}.latex is invalid.") from exc
+        visible = raw.get("visible", True)
+        if not isinstance(visible, bool):
+            raise ValueError(f"{expression_label}.visible must be true or false.")
+        restrictions_value = raw.get("restrictions", [])
+        if (
+            not isinstance(restrictions_value, list)
+            or len(restrictions_value) > 16
+            or any(
+                not isinstance(restriction, str)
+                or not 1 <= len(restriction) <= 500
+                or any(ord(char) < 32 for char in restriction)
+                for restriction in restrictions_value
+            )
+        ):
+            raise ValueError(f"{expression_label}.restrictions must be an array.")
+        restrictions = list(restrictions_value)
+        clean_expression: dict[str, Any] = {
+            "id": expression_id,
+            "latex": latex,
+            "type": expression_type,
+            "visible": visible,
+            "restrictions": restrictions,
+        }
+        style = _optional_graph_style(raw.get("display_style"), f"{expression_label}.display_style")
+        if style is not None:
+            clean_expression["display_style"] = style
+        extensions = {
+            key: value for key, value in raw.items()
+            if key not in expression_reserved
+        }
+        if extensions:
+            clean_expression.update(
+                _bounded_graph_json(extensions, f"{expression_label} extensions", 16 * 1024)
+            )
+        expressions.append(clean_expression)
+        expression_ids.add(expression_id)
+
+    viewport = item.get("viewport")
+    if not isinstance(viewport, dict):
+        raise ValueError(f"{label}.viewport must be an object.")
+    clean_viewport = {
+        key: finite_number(
+            viewport.get(key), f"{label}.viewport.{key}",
+            minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE,
+        )
+        for key in ("x_min", "x_max", "y_min", "y_max")
+    }
+    if clean_viewport["x_min"] >= clean_viewport["x_max"] or clean_viewport["y_min"] >= clean_viewport["y_max"]:
+        raise ValueError(f"{label}.viewport bounds are invalid.")
+
+    settings = item.get("settings")
+    if settings is None:
+        settings = {}
+    if not isinstance(settings, dict):
+        raise ValueError(f"{label}.settings must be an object.")
+    defaults = {
+        "show_x_axis": True,
+        "show_y_axis": True,
+        "show_grid": True,
+        "show_expressions_panel": False,
+        "lock_viewport": False,
+    }
+    clean_settings: dict[str, Any] = {}
+    for key, default in defaults.items():
+        raw = settings.get(key, default)
+        if not isinstance(raw, bool):
+            raise ValueError(f"{label}.settings.{key} must be true or false.")
+        clean_settings[key] = raw
+    angle_mode = settings.get("angle_mode", "radians")
+    if angle_mode not in {"radians", "degrees"}:
+        raise ValueError(f"{label}.settings.angle_mode is invalid.")
+    clean_settings["angle_mode"] = angle_mode
+    settings_extensions = {
+        key: value for key, value in settings.items()
+        if key not in {*defaults, "angle_mode"}
+    }
+    if settings_extensions:
+        clean_settings.update(
+            _bounded_graph_json(settings_extensions, f"{label}.settings extensions", 16 * 1024)
+        )
+
+    clean: dict[str, Any] = {
+        "id": item["id"],
+        "type": "graph",
+        "owning_board_id": owning_board_id,
+        "frame": validate_graph_rect(item.get("frame"), f"{label}.frame", minimum_size=32),
+        "expressions": expressions,
+        "viewport": clean_viewport,
+        "settings": clean_settings,
+        "created_at": finite_number(item.get("created_at"), f"{label}.created_at", minimum=0),
+        "updated_at": finite_number(item.get("updated_at"), f"{label}.updated_at", minimum=0),
+        "version": int(finite_number(item.get("version", 1), f"{label}.version", minimum=1, maximum=10_000)),
+    }
+
+    source = item.get("source_selection")
+    if source is not None:
+        if not isinstance(source, dict):
+            raise ValueError(f"{label}.source_selection must be an object.")
+        source_boards = source.get("source_board_ids")
+        if not isinstance(source_boards, list) or len(source_boards) > 8:
+            raise ValueError(f"{label}.source_selection.source_board_ids is invalid.")
+        clean_source_boards: list[str] = []
+        for source_board in source_boards:
+            if (
+                not isinstance(source_board, str)
+                or not BOARD_ID_RE.fullmatch(source_board)
+                or source_board in clean_source_boards
+            ):
+                raise ValueError(f"{label}.source_selection.source_board_ids is invalid.")
+            clean_source_boards.append(source_board)
+        keys = source.get("selected_object_keys", [])
+        if not isinstance(keys, list) or len(keys) > MAX_GRAPH_SELECTED_IDS:
+            raise ValueError(f"{label}.source_selection.selected_object_keys is invalid.")
+        clean_keys: list[str] = []
+        for key in keys:
+            if (
+                not isinstance(key, str)
+                or not 1 <= len(key) <= 160
+                or any(ord(char) < 33 or ord(char) == 127 for char in key)
+                or key in clean_keys
+            ):
+                raise ValueError(f"{label}.source_selection.selected_object_keys is invalid.")
+            clean_keys.append(key)
+        clean_source: dict[str, Any] = {
+            "source_board_ids": clean_source_boards,
+            "selected_object_keys": clean_keys,
+        }
+        interaction_id = source.get("interaction_id")
+        if interaction_id is not None:
+            if not isinstance(interaction_id, str) or not STROKE_ID_RE.fullmatch(interaction_id):
+                raise ValueError(f"{label}.source_selection.interaction_id is invalid.")
+            clean_source["interaction_id"] = interaction_id
+        request_id = source.get("original_recognition_request_id")
+        if request_id is not None:
+            from study.storage import requested_interaction_id
+            if requested_interaction_id(request_id) is None:
+                raise ValueError(f"{label}.source_selection.original_recognition_request_id is invalid.")
+            clean_source["original_recognition_request_id"] = request_id
+        original_bbox = source.get("original_selection_bbox")
+        if original_bbox is not None:
+            clean_source["original_selection_bbox"] = validate_graph_rect(
+                original_bbox,
+                f"{label}.source_selection.original_selection_bbox",
+            )
+        source_extensions = {
+            key: value for key, value in source.items()
+            if key not in {
+                "interaction_id", "source_board_ids", "selected_object_keys",
+                "original_recognition_request_id", "original_selection_bbox",
+            }
+        }
+        if source_extensions:
+            clean_source.update(
+                _bounded_graph_json(source_extensions, f"{label}.source_selection extensions", 16 * 1024)
+            )
+        clean["source_selection"] = clean_source
+
+    provider = item.get("provider_metadata")
+    if provider is not None:
+        if not isinstance(provider, dict):
+            raise ValueError(f"{label}.provider_metadata must be an object.")
+        clean_provider: dict[str, Any] = {}
+        preference = provider.get("preference")
+        if preference is not None:
+            if not isinstance(preference, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,31}", preference):
+                raise ValueError(f"{label}.provider_metadata.preference is invalid.")
+            clean_provider["preference"] = preference
+        if "state" in provider:
+            clean_provider["state"] = _bounded_graph_json(
+                provider["state"], f"{label}.provider_metadata.state", MAX_GRAPH_PROVIDER_STATE_BYTES,
+            )
+        semantic_hash = provider.get("semantic_content_hash")
+        if semantic_hash is not None:
+            if not isinstance(semantic_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", semantic_hash):
+                raise ValueError(f"{label}.provider_metadata.semantic_content_hash is invalid.")
+            clean_provider["semantic_content_hash"] = semantic_hash
+        render_version = provider.get("render_version")
+        if render_version is not None:
+            clean_provider["render_version"] = int(finite_number(
+                render_version, f"{label}.provider_metadata.render_version", minimum=1, maximum=10_000,
+            ))
+        provider_extensions = {
+            key: value for key, value in provider.items()
+            if key not in {
+                "preference", "state", "semantic_content_hash", "render_version",
+            }
+        }
+        if provider_extensions:
+            clean_provider.update(
+                _bounded_graph_json(provider_extensions, f"{label}.provider_metadata extensions", 32 * 1024)
+            )
+        clean["provider_metadata"] = clean_provider
+
+    reserved = {
+        "id", "type", "owning_board_id", "owningBoardID", "frame", "expressions",
+        "viewport", "settings", "source_selection", "provider_metadata", "created_at",
+        "updated_at", "version",
+    }
+    extensions = {key: value for key, value in item.items() if key not in reserved}
+    if extensions:
+        clean.update(_bounded_graph_json(extensions, f"{label} extensions", MAX_GRAPH_EXTENSION_BYTES))
+    return clean
+
+
 def default_editor_state(metadata: dict[str, Any]) -> dict[str, Any]:
     dimensions = metadata.get("dimensions", {})
     width = max(
@@ -1093,7 +1440,11 @@ def isolate_editor_state(
     for item in isolated.get("objects") or []:
         if not isinstance(item, dict):
             continue
-        owner = item.get("board_id") or item.get("boardId")
+        owner = (
+            item.get("owning_board_id")
+            if item.get("type") == "graph"
+            else None
+        ) or item.get("board_id") or item.get("boardId")
         if isinstance(owner, str) and owner and owner != board_id:
             if isinstance(item.get("id"), str):
                 foreign_object_ids.add(item["id"])
@@ -1101,6 +1452,8 @@ def isolate_editor_state(
         owned = dict(item)
         owned.pop("boardId", None)
         owned["board_id"] = board_id
+        if owned.get("type") == "graph":
+            owned["owning_board_id"] = board_id
         objects.append(owned)
     isolated["objects"] = objects
 
@@ -1201,8 +1554,11 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
             raise ValueError(f"Object id {object_id} is duplicated.")
         seen_ids.add(object_id)
         object_type = item.get("type")
-        if object_type not in {"stroke", "highlighter", "text", "path"}:
+        if object_type not in {"stroke", "highlighter", "text", "path", "graph"}:
             raise ValueError(f"Object {index} has an invalid type.")
+        if object_type == "graph":
+            clean_objects.append(validate_graph_object(item, index, board_id))
+            continue
         color = item.get("color")
         if not isinstance(color, str) or not COLOR_RE.fullmatch(color):
             raise ValueError(f"Object {index} has an invalid color.")
@@ -2572,6 +2928,143 @@ def append_professor_svg(
             board_wrap.append(copied)
 
 
+def append_static_graph_svg(
+    parent: ET.Element,
+    definitions: ET.Element,
+    item: dict[str, Any],
+    namespace: str,
+) -> None:
+    """Export a safe provider-independent graph card without embedding provider HTML/state."""
+    frame = item.get("frame") if isinstance(item.get("frame"), dict) else {}
+    try:
+        x = float(frame.get("x"))
+        y = float(frame.get("y"))
+        width = float(frame.get("width"))
+        height = float(frame.get("height"))
+    except (TypeError, ValueError):
+        return
+    if not all(np.isfinite(value) for value in (x, y, width, height)) or width <= 0 or height <= 0:
+        return
+    object_id = str(item.get("id") or "")
+    group = ET.SubElement(
+        parent,
+        f"{{{namespace}}}g",
+        {
+            "id": object_id,
+            "data-vboard-object": "graph",
+            "data-provider-independent": "true",
+        },
+    )
+    ET.SubElement(
+        group,
+        f"{{{namespace}}}rect",
+        {
+            "x": f"{x:.4f}",
+            "y": f"{y:.4f}",
+            "width": f"{width:.4f}",
+            "height": f"{height:.4f}",
+            "rx": f"{min(16.0, width * 0.04, height * 0.04):.4f}",
+            "fill": "#ffffff",
+            "stroke": "#c8ced8",
+            "stroke-width": "1.5",
+        },
+    )
+    inset = min(24.0, max(8.0, min(width, height) * 0.045))
+    plot_x, plot_y = x + inset, y + inset
+    plot_width, plot_height = max(1.0, width - inset * 2), max(1.0, height - inset * 2)
+    clip_id = f"graph-clip-{object_id}"
+    clip = ET.SubElement(definitions, f"{{{namespace}}}clipPath", {"id": clip_id})
+    ET.SubElement(
+        clip,
+        f"{{{namespace}}}rect",
+        {
+            "x": f"{plot_x:.4f}", "y": f"{plot_y:.4f}",
+            "width": f"{plot_width:.4f}", "height": f"{plot_height:.4f}",
+        },
+    )
+    plot = ET.SubElement(group, f"{{{namespace}}}g", {"clip-path": f"url(#{clip_id})"})
+    settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+    if settings.get("show_grid", True):
+        for grid_index in range(1, 10):
+            gx = plot_x + plot_width * grid_index / 10
+            gy = plot_y + plot_height * grid_index / 10
+            ET.SubElement(
+                plot, f"{{{namespace}}}path",
+                {"d": f"M {gx:.4f} {plot_y:.4f} V {plot_y + plot_height:.4f}",
+                 "stroke": "#e7e9ee", "stroke-width": "1"},
+            )
+            ET.SubElement(
+                plot, f"{{{namespace}}}path",
+                {"d": f"M {plot_x:.4f} {gy:.4f} H {plot_x + plot_width:.4f}",
+                 "stroke": "#e7e9ee", "stroke-width": "1"},
+            )
+    viewport = item.get("viewport") if isinstance(item.get("viewport"), dict) else {}
+    try:
+        x_min, x_max = float(viewport.get("x_min", -10)), float(viewport.get("x_max", 10))
+        y_min, y_max = float(viewport.get("y_min", -10)), float(viewport.get("y_max", 10))
+    except (TypeError, ValueError):
+        x_min, x_max, y_min, y_max = -10, 10, -10, 10
+    if settings.get("show_y_axis", True) and x_min <= 0 <= x_max and x_max > x_min:
+        axis_x = plot_x + (-x_min / (x_max - x_min)) * plot_width
+        ET.SubElement(
+            plot, f"{{{namespace}}}path",
+            {"d": f"M {axis_x:.4f} {plot_y:.4f} V {plot_y + plot_height:.4f}",
+             "stroke": "#667085", "stroke-width": "1.5"},
+        )
+    if settings.get("show_x_axis", True) and y_min <= 0 <= y_max and y_max > y_min:
+        axis_y = plot_y + (y_max / (y_max - y_min)) * plot_height
+        ET.SubElement(
+            plot, f"{{{namespace}}}path",
+            {"d": f"M {plot_x:.4f} {axis_y:.4f} H {plot_x + plot_width:.4f}",
+             "stroke": "#667085", "stroke-width": "1.5"},
+        )
+    expressions = [
+        expression for expression in item.get("expressions") or []
+        if isinstance(expression, dict) and expression.get("visible", True)
+    ]
+    font_size = max(9.0, min(18.0, height * 0.052))
+    label_background_height = min(
+        plot_height,
+        max(font_size * 1.8, min(len(expressions), 4) * font_size * 1.45 + font_size),
+    )
+    ET.SubElement(
+        group,
+        f"{{{namespace}}}rect",
+        {
+            "x": f"{plot_x:.4f}", "y": f"{plot_y:.4f}",
+            "width": f"{min(plot_width, max(120.0, plot_width * 0.58)):.4f}",
+            "height": f"{label_background_height:.4f}",
+            "fill": "#ffffff", "fill-opacity": "0.9",
+        },
+    )
+    for expression_index, expression in enumerate(expressions[:4]):
+        style = expression.get("display_style") if isinstance(expression.get("display_style"), dict) else {}
+        color = str(style.get("color") or "#2d70b3")
+        baseline = plot_y + font_size * (1.35 + expression_index * 1.4)
+        ET.SubElement(
+            group,
+            f"{{{namespace}}}path",
+            {
+                "d": f"M {plot_x + 7:.4f} {baseline - font_size * 0.3:.4f} h {font_size:.4f}",
+                "stroke": color,
+                "stroke-width": str(style.get("line_width") or 3),
+                "stroke-linecap": "round",
+            },
+        )
+        label = ET.SubElement(
+            group,
+            f"{{{namespace}}}text",
+            {
+                "x": f"{plot_x + font_size * 1.8:.4f}",
+                "y": f"{baseline:.4f}",
+                "fill": "#243247",
+                "font-size": f"{font_size:.4f}",
+                "font-family": "Arial, sans-serif",
+            },
+        )
+        label.text = str(expression.get("latex") or "")
+
+
 def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
     dimensions = metadata.get("dimensions", {})
     width = int(dimensions.get("width") or metadata.get("source", {}).get("width") or 1)
@@ -2627,6 +3120,9 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
         )
         if scale_x != 1 or scale_y != 1:
             transform = f"{transform} scale({scale_x:.4f} {scale_y:.4f})"
+        if item.get("type") == "graph":
+            append_static_graph_svg(user, definitions, item, namespace)
+            continue
         if item.get("type") == "text":
             text = ET.SubElement(
                 user,
@@ -4292,6 +4788,69 @@ def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
         requestId=payload.get("requestId") or payload.get("studyInteractionId"),
         followUpEnabled=True,
     )
+
+
+@app.post("/api/boards/<board_id>/study/graph-recognition")
+@locked_board_operation
+@require_authenticated
+def graph_recognition_route(board_id: str) -> Response | tuple[Response, int]:
+    from study.ai import StudyAIError
+    from study.service import recognize_board_graph
+    from study.storage import requested_interaction_id
+
+    require_board_owner(board_id)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    request_id = requested_interaction_id(payload.get("requestId"))
+    if request_id is None:
+        return jsonify(error="requestId must be a 16-character lowercase hexadecimal id."), 400
+    if limited := enforce_rate_limit("graph_recognition"):
+        return limited
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    editor = read_editor_state(board_dir, metadata)
+    selection = payload.get("selection") if isinstance(payload.get("selection"), dict) else {}
+    selected_ids = selection.get("selectedObjectIds")
+    if not isinstance(selected_ids, list):
+        selected_ids = payload.get("selectedObjectIds")
+    selected_ids = selected_ids if isinstance(selected_ids, list) else []
+    try:
+        route_context = ai_context(
+            action="graph_recognition",
+            question="Identify graphable math in this selected region",
+            request_id=request_id,
+            board_id=board_id,
+            selected_ids=selected_ids,
+            selected_board_count=1,
+            has_selected_visual=True,
+        )
+        with routed_study(route_context):
+            outcome = recognize_board_graph(
+                board_id=board_id,
+                board_dir=board_dir,
+                metadata=metadata,
+                editor=editor,
+                payload=payload,
+                combined_svg=combined_svg,
+                atomic_json=atomic_json,
+            )
+    except StudyAIError as exc:
+        LOGGER.warning(
+            "GRAPH RECOGNITION request=%s board=%s success=false status=%d",
+            request_id,
+            board_id,
+            exc.status,
+        )
+        return jsonify(error=str(exc), requestId=request_id), exc.status
+    response = jsonify(
+        result=outcome["result"],
+        requestId=request_id,
+        cacheHit=bool(outcome.get("cache_hit")),
+        idempotentReplay=bool(outcome.get("idempotent_replay")),
+    )
+    response.headers["X-Graph-Recognition-Request-Id"] = request_id
+    return response
 
 
 @app.post("/api/boards/<board_id>/study/<interaction_id>/followup")

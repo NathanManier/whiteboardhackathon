@@ -566,6 +566,7 @@ def render_study_images(
     selection_bbox: dict[str, float] | None,
     board_size: dict[str, float],
     include_overview: bool = True,
+    include_context: bool = True,
     timings: dict[str, float | int | str] | None = None,
 ) -> dict[str, Any]:
     preparation_started = time.perf_counter()
@@ -592,9 +593,13 @@ def render_study_images(
         ET.tostring(crop_scene(selected_root, render_box, SELECTED_MAX), encoding="utf-8"),
         SELECTED_MAX,
     )
-    context_png = rasterize_svg_bytes(
-        ET.tostring(crop_scene(root, context_box, CONTEXT_MAX), encoding="utf-8"),
-        CONTEXT_MAX,
+    context_png = (
+        rasterize_svg_bytes(
+            ET.tostring(crop_scene(root, context_box, CONTEXT_MAX), encoding="utf-8"),
+            CONTEXT_MAX,
+        )
+        if include_context
+        else b""
     )
     overview_png = (
         rasterize_svg_bytes(
@@ -608,7 +613,7 @@ def render_study_images(
         timings["image_rendering_ms"] = round((time.perf_counter() - rendering_started) * 1000, 2)
     encoding_started = time.perf_counter()
     selected_data = encode_png(selected_png)
-    context_data = encode_jpeg(context_png)
+    context_data = encode_jpeg(context_png) if context_png else ""
     overview_data = encode_jpeg(overview_png) if overview_png else ""
     selected_image = Image.open(io.BytesIO(selected_png))
     if timings is not None:

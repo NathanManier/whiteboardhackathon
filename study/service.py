@@ -115,6 +115,56 @@ def visual_cache_key(
     ).hexdigest()
 
 
+def graph_selection_visual_revision(
+    board_dir: Path,
+    metadata: dict[str, Any],
+    editor: dict[str, Any],
+    selected_ids: list[str],
+) -> str:
+    """Hash selected visual content while deliberately excluding camera-only changes."""
+    selected = set(selected_ids)
+    all_content = not selected
+    objects = [
+        item
+        for item in editor.get("objects") or []
+        if isinstance(item, dict)
+        and (all_content or str(item.get("id") or "") in selected)
+    ]
+    groups = [
+        item
+        for item in editor.get("groups") or []
+        if isinstance(item, dict)
+        and (all_content or str(item.get("id") or "") in selected)
+    ]
+    transforms = editor.get("imported_transforms")
+    transforms = transforms if isinstance(transforms, dict) else {}
+    relevant_transforms = {
+        key: value
+        for key, value in transforms.items()
+        if all_content or key in selected
+    }
+    # The existing visual key provides immutable source-file evidence and
+    # source-board placement. Normalize global revision/timestamp so a camera
+    # save alone does not invalidate graph recognition.
+    source_editor = {
+        **editor,
+        "revision": 0,
+        "updated_at": None,
+        "objects": [],
+        "groups": [],
+        "imported_transforms": relevant_transforms,
+    }
+    source = {
+        "source_assets": visual_cache_key(board_dir, metadata, source_editor),
+        "objects": objects,
+        "groups": groups,
+        "imported_transforms": relevant_transforms,
+    }
+    return hashlib.sha256(
+        json.dumps(source, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def _decode_data_url(data_url: str) -> tuple[str, bytes] | None:
     raw = str(data_url or "")
     if not raw.startswith("data:image/") or ";base64," not in raw:
@@ -472,6 +522,9 @@ def _finite_box(x: Any, y: Any, width: Any, height: Any) -> dict[str, float] | N
 def editor_object_box(item: dict[str, Any]) -> dict[str, float] | None:
     if item.get("type") == "text":
         return _finite_box(item.get("x"), item.get("y"), item.get("width"), item.get("height"))
+    if item.get("type") == "graph" and isinstance(item.get("frame"), dict):
+        frame = item["frame"]
+        return _finite_box(frame.get("x"), frame.get("y"), frame.get("width"), frame.get("height"))
     points = item.get("points")
     if not isinstance(points, list) or not points:
         return None
@@ -692,6 +745,7 @@ def render_views(
     bbox: dict[str, float] | None,
     combined_svg: CombinedSvg,
     include_overview: bool = True,
+    include_context: bool = True,
     timings: dict[str, float | int | str] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -704,8 +758,194 @@ def render_views(
         selection_bbox=bbox,
         board_size=board_size(metadata),
         include_overview=include_overview,
+        include_context=include_context,
         timings=timings,
     )
+
+
+def recognize_board_graph(
+    *,
+    board_id: str,
+    board_dir: Path,
+    metadata: dict[str, Any],
+    editor: dict[str, Any],
+    payload: dict[str, Any],
+    combined_svg: CombinedSvg,
+    atomic_json: AtomicJson,
+) -> dict[str, Any]:
+    """Recognize graphable math from one board-local, focused selection."""
+    from .graph_recognition import (
+        cached_graph_entry_for_fingerprint,
+        graph_cache_key,
+        graph_input_fingerprint,
+        graph_recognition_model,
+        idempotent_cached_result,
+        parse_graph_recognition_request,
+        public_graph_result,
+        read_graph_cache,
+        recognize_graph_math,
+        record_graph_cache_hit,
+        remember_graph_request,
+        store_graph_cache_result,
+        validate_cached_graph_result,
+        validate_selection_raster,
+        write_graph_cache,
+    )
+
+    started = time.perf_counter()
+    selection = parse_graph_recognition_request(
+        payload,
+        allowed_ids=known_object_ids(editor, board_dir=board_dir, metadata=metadata),
+    )
+    selected_ids = expand_group_ids(editor, selection.selected_ids)
+    model = graph_recognition_model()
+    input_fingerprint = graph_input_fingerprint(
+        board_id=board_id,
+        visual_revision=graph_selection_visual_revision(
+            board_dir, metadata, editor, selected_ids
+        ),
+        selected_ids=selected_ids,
+        bbox=selection.bbox,
+        model=model,
+    )
+    cache = read_graph_cache(board_dir)
+    replay = idempotent_cached_result(
+        cache,
+        request_id=selection.request_id,
+        input_fingerprint=input_fingerprint,
+    )
+    if replay is not None:
+        try:
+            result = validate_cached_graph_result(replay)
+        except StudyAIError:
+            cache["requests"] = [
+                item for item in cache.get("requests") or []
+                if not isinstance(item, dict) or item.get("request_id") != selection.request_id
+            ]
+        else:
+            record_graph_cache_hit(image_dimensions=None, latency_ms=(time.perf_counter() - started) * 1000)
+            LOGGER.info(
+                "GRAPH RECOGNITION request=%s board=%s objects=%d cache_hit=true replay=true success=true",
+                selection.request_id,
+                board_id,
+                len(selected_ids),
+            )
+            return {
+                "result": public_graph_result(result, selection.request_id),
+                "cache_hit": True,
+                "idempotent_replay": True,
+            }
+
+    existing = cached_graph_entry_for_fingerprint(cache, input_fingerprint)
+    if existing is not None:
+        try:
+            result = validate_cached_graph_result(existing.get("result"))
+        except StudyAIError:
+            result = None
+        if result is not None:
+            remember_graph_request(
+                cache,
+                request_id=selection.request_id,
+                input_fingerprint=input_fingerprint,
+                cache_key=str(existing.get("key") or ""),
+            )
+            write_graph_cache(board_dir, cache, atomic_json)
+            dimensions = existing.get("image_dimensions")
+            dimensions = dimensions if isinstance(dimensions, dict) else None
+            record_graph_cache_hit(
+                image_dimensions=dimensions,
+                latency_ms=(time.perf_counter() - started) * 1000,
+            )
+            LOGGER.info(
+                "GRAPH RECOGNITION request=%s board=%s objects=%d cache_hit=true replay=false success=true",
+                selection.request_id,
+                board_id,
+                len(selected_ids),
+            )
+            return {
+                "result": public_graph_result(result, selection.request_id),
+                "cache_hit": True,
+                "idempotent_replay": False,
+            }
+
+    try:
+        views = render_views(
+            metadata,
+            board_dir,
+            selected_ids=selected_ids,
+            bbox=selection.bbox,
+            combined_svg=combined_svg,
+            include_overview=False,
+            include_context=False,
+        )
+    except Exception as exc:
+        raise StudyAIError(
+            "Couldn't read this selection for graphing. Your board is still saved.",
+            status=503,
+        ) from exc
+    raster_hash, image_dimensions = validate_selection_raster(views.get("selected"))
+    key = graph_cache_key(input_fingerprint, raster_hash)
+    existing = next(
+        (
+            item
+            for item in cache.get("entries") or []
+            if isinstance(item, dict) and item.get("key") == key
+        ),
+        None,
+    )
+    if existing is not None:
+        try:
+            result = validate_cached_graph_result(existing.get("result"))
+        except StudyAIError:
+            result = None
+    else:
+        result = None
+    cache_hit = result is not None
+    if result is None:
+        # Recognition context comes only from the server-owned canonical
+        # objects named by the selection.  Do not accept client-supplied text
+        # as extra evidence for this focused visual action.
+        selection_context = build_selection_context(editor, selected_ids)
+        result = recognize_graph_math(
+            selected_image=views["selected"],
+            selected_text_objects=selection_context.get("text_objects") or [],
+        )
+        store_graph_cache_result(
+            cache,
+            request_id=selection.request_id,
+            input_fingerprint=input_fingerprint,
+            cache_key=key,
+            result=result,
+            image_dimensions=image_dimensions,
+        )
+    else:
+        remember_graph_request(
+            cache,
+            request_id=selection.request_id,
+            input_fingerprint=input_fingerprint,
+            cache_key=key,
+        )
+        record_graph_cache_hit(
+            image_dimensions=image_dimensions,
+            latency_ms=(time.perf_counter() - started) * 1000,
+        )
+    write_graph_cache(board_dir, cache, atomic_json)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    LOGGER.info(
+        "GRAPH RECOGNITION request=%s board=%s objects=%d image=%dx%d cache_hit=%s replay=false success=true latency_ms=%.2f",
+        selection.request_id,
+        board_id,
+        len(selected_ids),
+        image_dimensions["width"],
+        image_dimensions["height"],
+        str(cache_hit).lower(),
+        elapsed_ms,
+    )
+    return {
+        "result": public_graph_result(result, selection.request_id),
+        "cache_hit": cache_hit,
+        "idempotent_replay": False,
+    }
 
 
 def persist_thumbnail(

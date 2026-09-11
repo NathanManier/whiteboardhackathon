@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import jwt
 from cryptography.fernet import Fernet
@@ -260,6 +261,16 @@ class AccountAndOwnershipTests(unittest.TestCase):
         ]:
             response = self.client.get(path, headers={"Accept": "application/json"})
             self.assertEqual(response.status_code, 401, path)
+        graph_response = self.client.post(
+            f"/api/boards/{board_id}/study/graph-recognition",
+            json={
+                "requestId": "a" * 16,
+                "action": "graph_recognition",
+                "contextScope": "local",
+                "selection": {"selectedObjectIds": [], "bbox": {"x": 0, "y": 0, "width": 10, "height": 10}},
+            },
+        )
+        self.assertEqual(graph_response.status_code, 401)
         self.assertEqual(self.client.post("/api/auth/debug", json={"testUser": "public"}).status_code, 404)
 
     def test_login_rate_limit_returns_retry_metadata_without_echoing_credentials(self):
@@ -318,6 +329,17 @@ class AccountAndOwnershipTests(unittest.TestCase):
             f"/api/folders/{folder_b}/workspace",
         ]:
             self.assertEqual(self.client.get(path, headers=headers_a).status_code, 404, path)
+        graph_probe = self.client.post(
+            f"/api/boards/{board_b}/study/graph-recognition",
+            json={
+                "requestId": "a" * 16,
+                "action": "graph_recognition",
+                "contextScope": "local",
+                "selection": {"selectedObjectIds": [], "bbox": {"x": 0, "y": 0, "width": 10, "height": 10}},
+            },
+            headers=headers_a,
+        )
+        self.assertEqual(graph_probe.status_code, 404)
         self.assertEqual(
             self.client.put(
                 f"/api/folders/{folder_b}/workspace",
@@ -326,6 +348,52 @@ class AccountAndOwnershipTests(unittest.TestCase):
             ).status_code,
             404,
         )
+
+    def test_graph_recognition_has_an_account_rate_limit(self):
+        account = self.login("graph-rate-limit")
+        board_id = "e" * 32
+        self.create_board_files(board_id, "Graph board")
+        board_app.AUTH_DB.own_board(
+            account["user"]["id"], board_id, lecture_id=None, title="Graph board"
+        )
+        board_app.RATE_LIMIT_POLICIES["graph_recognition"] = (1, 60)
+        payload = {
+            "requestId": "e" * 16,
+            "action": "graph_recognition",
+            "contextScope": "local",
+            "selection": {
+                "selectedObjectIds": [],
+                "bbox": {"x": 0, "y": 0, "width": 10, "height": 10},
+            },
+        }
+        outcome = {
+            "result": {
+                "graphable": False,
+                "confidence": 0.1,
+                "expressions": [],
+                "warnings": [],
+                "requestID": "e" * 16,
+                "recognitionVersion": 1,
+            },
+            "cache_hit": False,
+            "idempotent_replay": False,
+        }
+        with patch("study.service.recognize_board_graph", return_value=outcome) as recognize:
+            first = self.client.post(
+                f"/api/boards/{board_id}/study/graph-recognition",
+                json=payload,
+                headers=self.headers(account["session"]),
+            )
+            payload["requestId"] = "f" * 16
+            second = self.client.post(
+                f"/api/boards/{board_id}/study/graph-recognition",
+                json=payload,
+                headers=self.headers(account["session"]),
+            )
+        self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
+        self.assertEqual(second.status_code, 429, second.get_data(as_text=True))
+        self.assertGreater(int(second.headers["Retry-After"]), 0)
+        self.assertEqual(recognize.call_count, 1)
 
     def test_lecture_names_and_pdf_import_targets_are_tenant_scoped(self):
         account_a = self.login("apple-a")

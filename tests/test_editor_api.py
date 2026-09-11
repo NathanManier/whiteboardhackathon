@@ -82,6 +82,46 @@ class EditorApiTests(unittest.TestCase):
             ],
         }
 
+    def graph_object(self):
+        return {
+            "id": "graph-one",
+            "type": "graph",
+            "owning_board_id": self.board_id,
+            "frame": {"x": -240, "y": 900, "width": 640, "height": 420},
+            "expressions": [
+                {
+                    "id": "expression-1",
+                    "latex": r"y=x^2-4",
+                    "type": "explicitFunction",
+                    "display_style": {
+                        "color": "#2D70B3",
+                        "line_width": 3,
+                        "line_style": "solid",
+                        "opacity": 0.9,
+                    },
+                }
+            ],
+            "viewport": {"x_min": -10, "x_max": 10, "y_min": -8, "y_max": 12},
+            "settings": {"show_expressions_panel": False},
+            "source_selection": {
+                "interaction_id": "aaaaaaaaaaaaaaaa",
+                "source_board_ids": [self.board_id],
+                "selected_object_keys": [f"{self.board_id}:ink-region-1"],
+                "original_recognition_request_id": "bbbbbbbbbbbbbbbb",
+                "original_selection_bbox": {"x": -10, "y": 20, "width": 180, "height": 60},
+            },
+            "provider_metadata": {
+                "preference": "desmos",
+                "state": {"opaque": "PRIVATE_PROVIDER_STATE"},
+                "semantic_content_hash": "c" * 64,
+                "render_version": 1,
+            },
+            "created_at": 1,
+            "updated_at": 2,
+            "version": 1,
+            "future_graph_option": {"mode": "safe"},
+        }
+
     def test_legacy_strokes_load_as_editor_objects(self):
         response = self.client.get(f"/api/boards/{self.board_id}/editor")
         self.assertEqual(response.status_code, 200)
@@ -146,6 +186,63 @@ class EditorApiTests(unittest.TestCase):
         self.assertIn("erase-stroke-one", markup)
         self.assertIn("Editable text", markup)
         self.assertIn('stroke="#123456"', markup)
+
+    def test_graph_object_round_trips_with_defaults_provenance_and_safe_extensions(self):
+        state = self.editor_state()
+        state["objects"].append(self.graph_object())
+        saved_response = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=state
+        )
+        self.assertEqual(saved_response.status_code, 200, saved_response.get_data(as_text=True))
+        graph = saved_response.get_json()["editor"]["objects"][2]
+        self.assertEqual(graph["type"], "graph")
+        self.assertEqual(graph["owning_board_id"], self.board_id)
+        self.assertEqual(graph["frame"]["x"], -240)
+        self.assertTrue(graph["expressions"][0]["visible"])
+        self.assertEqual(graph["expressions"][0]["restrictions"], [])
+        self.assertTrue(graph["settings"]["show_x_axis"])
+        self.assertFalse(graph["settings"]["show_expressions_panel"])
+        self.assertEqual(graph["source_selection"]["source_board_ids"], [self.board_id])
+        self.assertEqual(graph["provider_metadata"]["semantic_content_hash"], "c" * 64)
+        self.assertEqual(graph["future_graph_option"], {"mode": "safe"})
+
+        loaded = self.client.get(f"/api/boards/{self.board_id}/editor").get_json()["editor"]
+        reloaded = next(item for item in loaded["objects"] if item["id"] == "graph-one")
+        self.assertEqual(reloaded["expressions"][0]["latex"], r"y=x^2-4")
+        self.assertEqual(reloaded["viewport"]["y_max"], 12)
+
+    def test_combined_svg_exports_safe_static_graph_without_provider_state(self):
+        state = self.editor_state()
+        state["objects"].append(self.graph_object())
+        self.assertEqual(
+            self.client.put(f"/api/boards/{self.board_id}/editor", json=state).status_code,
+            200,
+        )
+        response = self.client.get(f"/board/{self.board_id}/svg")
+        markup = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="graph-one"', markup)
+        self.assertIn('data-vboard-object="graph"', markup)
+        self.assertIn("y=x^2-4", markup)
+        self.assertIn("graph-clip-graph-one", markup)
+        self.assertNotIn("PRIVATE_PROVIDER_STATE", markup)
+
+    def test_graph_object_rejects_cross_board_owner_unsafe_latex_and_invalid_viewport(self):
+        mutations = [
+            lambda graph: graph.update(owning_board_id="b" * 32),
+            lambda graph: graph["expressions"][0].update(latex=r"y=\input{secret}"),
+            lambda graph: graph["viewport"].update(x_min=10, x_max=-10),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                state = self.editor_state()
+                graph = self.graph_object()
+                mutate(graph)
+                state["objects"].append(graph)
+                response = self.client.put(
+                    f"/api/boards/{self.board_id}/editor", json=state
+                )
+                self.assertEqual(response.status_code, 400, response.get_data(as_text=True))
 
     def test_editor_rejects_invalid_objects(self):
         state = self.editor_state()
