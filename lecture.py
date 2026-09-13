@@ -219,7 +219,7 @@ def public_study_guide(value: Any) -> dict[str, Any] | None:
             title = ""
     return {
         "id": str(value.get("id") or "")[:32],
-        "title": title or "Lecture Study Guide",
+        "title": title or "Class Study Guide",
         "generatedAt": value.get("generated_at") or value.get("generatedAt"),
         "sourceBoardIds": [str(item) for item in board_ids[:MAX_SOURCE_BOARDS] if item],
         "content": content[:80_000],
@@ -235,7 +235,7 @@ def stored_study_guide(value: Any) -> dict[str, Any] | None:
         return None
     return {
         "id": public["id"],
-        "title": public.get("title") or "Lecture Study Guide",
+        "title": public.get("title") or "Class Study Guide",
         "generated_at": public["generatedAt"],
         "source_board_ids": public["sourceBoardIds"],
         "content": public["content"],

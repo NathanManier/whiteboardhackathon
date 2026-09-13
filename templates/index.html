@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f4f3ef">
   <meta name="description" content="Your digital copies of professor whiteboards.">
-  <title>My Lectures · V-Board</title>
+  <title>My Classes · V-Board</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body class="home-page library-page">
@@ -26,25 +26,25 @@
 
     <header class="library-heading">
       <div>
-        <p class="tool-label">Lecture workspace</p>
-        <h1>My Lectures</h1>
+        <p class="tool-label">Class workspace</p>
+        <h1>My Classes</h1>
       </div>
       <div class="library-heading-actions">
-        <button class="button button-secondary" id="create-folder" type="button">New lecture</button>
+        <button class="button button-secondary" id="create-folder" type="button">New class</button>
         <button class="button button-ghost button-small" id="refresh-library" type="button">Refresh</button>
       </div>
     </header>
 
-    <nav class="library-path" id="library-path" aria-label="Lecture location"></nav>
+    <nav class="library-path" id="library-path" aria-label="Class location"></nav>
     <div class="lecture-actions" id="lecture-actions" hidden>
-      <button class="button button-primary button-small" id="open-lecture" type="button">Open lecture</button>
+      <button class="button button-primary button-small" id="open-lecture" type="button">Open class</button>
       <button class="button button-secondary button-small" id="import-lecture-board" type="button">+ Import Whiteboard</button>
       <button class="button button-ghost button-small" id="generate-folder-guide" type="button">Generate Study Guide</button>
       <p class="study-guide-stale" id="folder-guide-stale" hidden>Study guide may be outdated</p>
     </div>
 
     <section class="library-section" id="folders-section" aria-labelledby="folders-title">
-      <h2 id="folders-title">Lectures</h2>
+      <h2 id="folders-title">Classes</h2>
       <div class="folder-row" id="folder-row"></div>
     </section>
 

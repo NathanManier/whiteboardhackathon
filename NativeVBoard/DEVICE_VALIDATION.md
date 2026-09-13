@@ -17,8 +17,8 @@
 | Barrel roll | No special behavior; marker nib already follows altitude and azimuth | N/A | Evaluate on supported hardware |
 | Palm rejection and Pencil/finger latency | UIKit routing in place | N/A | Required |
 | Real camera capture | `UIImagePickerController` entry point | Falls back to photo library | Required |
-| Shared lecture camera/placements | Revisioned workspace manifest and local outbox | Verified with two hosted boards, pan, zoom, close, and reopen | Re-test |
-| Lecture board LOD | Three-board vector budget plus thumbnail proxies | Profiled with 100-board staging fixture; full-detail count stayed at 3 and scene cache stayed at 6 | Re-test |
+| Shared class camera/placements | Revisioned workspace manifest and local outbox | Verified with two hosted boards, pan, zoom, close, and reopen | Re-test |
+| Class board LOD | Three-board vector budget plus thumbnail proxies | Profiled with 100-board staging fixture; full-detail count stayed at 3 and scene cache stayed at 6 | Re-test |
 | Cross-board lasso | Board spatial query plus board-local 65% containment | Verified with hosted professor content | Re-test |
 | Text/practice resize | Bottom-right handle mutates board-owned text object | XCTest and manual move/resize/reopen pass | Re-test |
 | Local math/chemistry | Bundled KaTeX, mhchem, markdown-it, DOMPurify | XCTest/JavaScript pass and manual rich Study/Explain rendering pass | Re-test |
@@ -30,7 +30,7 @@
 
 Before TestFlight, run the Pencil and camera rows on a physical iPad and
 record the OS/device combination. Basic import, upload, corner confirmation,
-processing, lecture navigation, and board rendering are simulator-testable.
+processing, class navigation, and board rendering are simulator-testable.
 
 ## September 10, 2026 Pencil implementation checkpoint
 
@@ -74,14 +74,14 @@ Verified on the iPad (10th generation), iOS 18.2 simulator:
 - [ ] Space-held pan and Cmd keyboard shortcuts need a fresh keyboard-capture
       pass after install
 
-Verified on the iPad Pro 13-inch (M4), iOS 18.2 simulator for the shared
-lecture workspace:
+Verified on the iPad Pro 13-inch (M4), iOS 18.2 simulator for the shared class
+workspace:
 
-- [x] Chemistry opens as one lecture canvas using real hosted board dimensions
+- [x] Chemistry opens as one class canvas using real hosted board dimensions
 - [x] Navigator focuses either board without opening an isolated editor
 - [x] Zooming out shows both whiteboard containers at once
-- [x] Hand drag changes the lecture camera without injecting Y movement
-- [x] Camera and board focus survive leaving and reopening the lecture
+- [x] Hand drag changes the class camera without injecting Y movement
+- [x] Camera and board focus survive leaving and reopening the class
 - [x] Lasso produces composite board/object selection and visible chrome
 - [x] Mouse Pen creates a canonical board-owned stroke; undo and redo work
 - [x] Full native vector demand remains capped at three board IDs
@@ -91,7 +91,7 @@ lecture workspace:
       remaining 99 full SVG/editor documents
 - [x] Navigator normalized and displayed Unit 1, `UNIT 2`, and `Unit IV` as
       Unit 1, Unit 2, and Unit 4; unassigned boards remained No Unit
-- [x] Navigator focus from Unit 2 to Board 14 kept the same lecture canvas and
+- [x] Navigator focus from Unit 2 to Board 14 kept the same class canvas and
       focused the requested board
 - [x] Photos selection, preview, upload, draggable corner confirmation,
       processing, automatic editor transition, and professor SVG rendering
@@ -112,7 +112,7 @@ lecture workspace:
 ## Hosted-production blocker
 
 On September 9, 2026, `https://chsinteract.com/api/library` returned HTTP 200,
-but the new lecture workspace endpoint still returned HTTP 404. The local and
+but the new class-workspace endpoint still returned HTTP 404. The local and
 staging application contains and exercises the workspace and grouped-study
 contracts. Deploying/reloading those routes on PythonAnywhere requires access
 to the production account or checkout; no production credential is stored in
@@ -122,9 +122,9 @@ its local cache/outbox fallback for offline recovery.
 
 ## Performance snapshot
 
-The staging stress lecture contains 100 manifest entries, including a dense
+The staging stress class contains 100 manifest entries, including a dense
 4,943-path professor SVG. After the compact-manifest backend change, the
-lecture response was about 40.8 KB in 0.15 seconds instead of about 3.94 MB in
+class response was about 40.8 KB in 0.15 seconds instead of about 3.94 MB in
 10.3 seconds. Runtime diagnostics showed at most three full-detail boards and
 six cached scenes. The dense board's main-layer installation measured about
 48 ms after background path prewarming; steady refinement measured roughly

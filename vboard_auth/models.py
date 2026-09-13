@@ -479,7 +479,7 @@ class AuthDatabase:
             if record is None:
                 db.add(LectureRecord(id=lecture_id, user_id=user_id, title=title))
             elif record.user_id != user_id:
-                raise PermissionError("Lecture belongs to another account.")
+                raise PermissionError("Class belongs to another account.")
 
     def own_board(
         self,

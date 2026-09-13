@@ -21,7 +21,7 @@ enum APIError: LocalizedError {
         case .notFound: return "The requested V-Board content is no longer available."
         case .server(_, let message, _): return message
         case .conflict: return "This board changed elsewhere. Reload before saving."
-        case .workspaceConflict: return "This lecture layout changed elsewhere. Reload before saving."
+        case .workspaceConflict: return "This class layout changed elsewhere. Reload before saving."
         }
     }
 }
@@ -195,9 +195,9 @@ final class APIClient: ObservableObject {
     }
 
     func library() async throws -> LibraryResponse { try await get("/api/library") }
-    func lecture(id: String) async throws -> LectureResponse { try await get("/api/folders/\(id)/lecture", label: "lecture") }
+    func lecture(id: String) async throws -> LectureResponse { try await get("/api/folders/\(id)/lecture", label: "class") }
     func lectureWorkspace(id: String) async throws -> LectureWorkspace {
-        let envelope: LectureWorkspaceEnvelope = try await get("/api/folders/\(id)/workspace", label: "lecture workspace")
+        let envelope: LectureWorkspaceEnvelope = try await get("/api/folders/\(id)/workspace", label: "class workspace")
         return envelope.workspace
     }
     func saveLectureWorkspace(_ workspace: LectureWorkspace, folderID: String) async throws -> LectureWorkspace {
@@ -210,7 +210,7 @@ final class APIClient: ObservableObject {
         }
         try validate(response, data: data)
         do { return try decoder.decode(LectureWorkspaceEnvelope.self, from: data).workspace }
-        catch { throw APIError.decoding("Could not decode the saved lecture workspace.") }
+        catch { throw APIError.decoding("Could not decode the saved class workspace.") }
     }
 
     func resolvedURL(_ path: String?) -> URL? {
@@ -556,7 +556,7 @@ final class APIClient: ObservableObject {
         let (data, response) = try await data(for: request)
         try validate(response, data: data)
         do { return try decoder.decode(StudyInteractionResponse.self, from: data) }
-        catch { throw APIError.decoding("Could not decode the lecture study response.") }
+        catch { throw APIError.decoding("Could not decode the class study response.") }
     }
 
     func generateStudyGuide(folderID: String) async throws -> StudyGuide? {

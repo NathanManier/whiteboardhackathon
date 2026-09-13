@@ -437,7 +437,7 @@
     state.sourceBoards = [activeSceneBoard(data)];
     const kicker = $("#lecture-kicker");
     if (kicker) {
-      kicker.textContent = state.lecture.isLecture ? "Lecture workspace" : "Study canvas";
+      kicker.textContent = state.lecture.isLecture ? "Class workspace" : "Study canvas";
     }
     const guideButton = $("#study-guide-button");
     if (guideButton) guideButton.hidden = !state.lecture.folderId;
@@ -602,7 +602,7 @@
       const result = await response.json().catch(() => ({}));
       if (!response.ok) {
         const messages = {
-          404: "This board no longer exists. Return to Lectures and add it again.",
+          404: "This board no longer exists. Return to Classes and add it again.",
           413: "This image is too large.",
           500: "Whiteboard processing failed. Your original photo is still saved."
         };
@@ -5676,7 +5676,7 @@
 
   async function renameCurrentBoard() {
     const current = $("#board-name")?.textContent || "";
-    const name = window.prompt(state.lecture.folderId ? "Lecture name" : "Board name", current);
+    const name = window.prompt(state.lecture.folderId ? "Class name" : "Board name", current);
     if (!name || name.trim() === current) return;
     try {
       if (state.lecture.folderId) {
@@ -5689,7 +5689,7 @@
         state.lecture.folderName = saved;
         $("#board-name").textContent = saved;
         document.title = `${saved} · V-Board`;
-        toast("Lecture renamed.");
+        toast("Class renamed.");
         return;
       }
       const payload = await requestJSON(`/api/boards/${encodeURIComponent(boardId)}`, {
@@ -5702,7 +5702,7 @@
       document.title = `${saved} · V-Board`;
       toast("Board renamed.");
     } catch (error) {
-      toast(error.message || "Could not rename this lecture.", true);
+      toast(error.message || "Could not rename this class.", true);
     }
   }
 
@@ -5749,7 +5749,7 @@
 
   function startStudyGuideProgress() {
     const steps = [
-      "Reading lecture notes…",
+      "Reading class notes…",
       "Organizing concepts…",
       "Writing the study guide…",
       "Formatting math…"
@@ -5841,7 +5841,7 @@
     if (!content) {
       const empty = document.createElement("p");
       empty.className = "library-message";
-      empty.textContent = "Generate a study guide for this lecture.";
+      empty.textContent = "Generate a study guide for this class.";
       body.append(empty);
       return;
     }
@@ -5851,7 +5851,7 @@
   function openStudyGuideSheet() {
     const guide = state.lecture.studyGuide;
     const content = studyGuideContent(guide);
-    $("#study-kicker").textContent = "Lecture study guide";
+    $("#study-kicker").textContent = "Class study guide";
     setStudyHeading(guide?.title || "Study guide");
     showStudyActions(false);
     setStudyGuideMode(Boolean(content));
@@ -5876,13 +5876,13 @@
 
   async function generateStudyGuide() {
     if (!state.lecture.folderId) {
-      toast("Open or create a lecture folder first.", true);
+      toast("Open or create a class first.", true);
       return;
     }
     if (studyGuideBusy) return;
     studyGuideBusy = true;
     syncStudyGuideButton();
-    $("#study-kicker").textContent = "Lecture study guide";
+    $("#study-kicker").textContent = "Class study guide";
     setStudyHeading(state.lecture.studyGuide?.title || "Study guide");
     showStudyActions(false);
     setStudyGuideMode(false);
@@ -5995,7 +5995,7 @@
         });
       }
     } catch (error) {
-      toast(error.message || "Could not create a lecture workspace.", true);
+      toast(error.message || "Could not create a class workspace.", true);
       return;
     }
     const folderField = $("#import-folder-id");
@@ -6036,7 +6036,7 @@
         if (!response.ok) {
           const messages = {
             400: "That photo could not be read. Choose another image.",
-            404: "This lecture no longer exists. Return to Lectures and reopen it.",
+            404: "This class no longer exists. Return to Classes and reopen it.",
             413: "That photo is too large. Choose a smaller image.",
             415: "Choose a JPG, PNG, or WebP photo.",
             500: "Whiteboard processing failed. Please try again."
@@ -6047,7 +6047,7 @@
         location.assign(result.url);
       } catch (error) {
         const message = error?.name === "AbortError"
-          ? "Processing took too long. Return to Lectures to check whether the board was saved."
+          ? "Processing took too long. Return to Classes to check whether the board was saved."
           : (error.message || "Could not add this board.");
         if (errorBox) {
           errorBox.textContent = message;

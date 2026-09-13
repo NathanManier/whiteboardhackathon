@@ -50,7 +50,7 @@ struct LectureWorkspaceView: View {
             if let workspace = store.workspace {
                 workspaceSurface(workspace)
             } else if case .failed(let message) = store.status {
-                ContentUnavailableView("Couldn’t open lecture", systemImage: "rectangle.stack.badge.exclamationmark",
+                ContentUnavailableView("Couldn’t open class", systemImage: "rectangle.stack.badge.exclamationmark",
                                        description: Text(message))
                     .overlay(alignment: .bottom) {
                         Button("Retry") { Task { await store.load(api: api, focusBoardID: initialFocusBoardID) } }
@@ -58,7 +58,7 @@ struct LectureWorkspaceView: View {
                             .padding(.bottom, 30)
                     }
             } else {
-                ProgressView("Opening lecture workspace…")
+                ProgressView("Opening class workspace…")
             }
         }
         .navigationTitle(folder.name)
@@ -71,7 +71,7 @@ struct LectureWorkspaceView: View {
                 Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }
                     .disabled(!store.canRedo)
                 Button { showNavigator = true } label: { Image(systemName: "sidebar.left") }
-                    .accessibilityLabel("Lecture navigator")
+                    .accessibilityLabel("Class navigator")
                 Menu {
                     Button { createBlankBoard() } label: {
                         Label("Blank Board", systemImage: "rectangle.and.pencil.and.ellipsis")
@@ -85,7 +85,7 @@ struct LectureWorkspaceView: View {
                         }
                     }
                 } label: { Image(systemName: "plus") }
-                .accessibilityLabel("Add to lecture")
+                .accessibilityLabel("Add to class")
                 Button { showGuide = true } label: { Image(systemName: "text.book.closed") }
                     .accessibilityLabel("Study Guide")
                 Menu {
@@ -104,7 +104,7 @@ struct LectureWorkspaceView: View {
                     if activeBoard != nil {
                         Button(role: .destructive) { showDeleteBoard = true } label: { Label("Delete Whiteboard", systemImage: "trash") }
                     }
-                    Button(role: .destructive) { showDelete = true } label: { Label("Delete Lecture", systemImage: "trash") }
+                    Button(role: .destructive) { showDelete = true } label: { Label("Delete Class", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
         }
@@ -157,7 +157,7 @@ struct LectureWorkspaceView: View {
             }
         }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
-        .alert("Delete lecture?", isPresented: $showDelete) {
+        .alert("Delete class?", isPresented: $showDelete) {
             Button("Delete", role: .destructive) {
                 Task {
                     do { try await api.deleteLecture(id: folder.id, recursive: true); dismiss() }
@@ -166,9 +166,9 @@ struct LectureWorkspaceView: View {
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("This removes the lecture and all of its whiteboards.")
+            Text("This removes the class and all of its whiteboards.")
         }
-        .alert("Lecture layout changed", isPresented: $showConflict) {
+        .alert("Class layout changed", isPresented: $showConflict) {
             Button("Keep My Layout") { store.keepLocalChanges(api: api) }
             Button("Reload Server Layout", role: .destructive) { store.reloadServerVersion() }
         } message: {
@@ -934,7 +934,7 @@ private struct EmptyWorkspaceAction: View {
     let importWhiteboard: () -> Void
     var body: some View {
         VStack(spacing: 10) {
-            Text("Start this lecture").font(.title3.weight(.semibold))
+            Text("Start this class").font(.title3.weight(.semibold))
             Text("Write on a blank board or bring in existing material.")
                 .font(.subheadline).foregroundStyle(.secondary)
             HStack {
@@ -1066,7 +1066,7 @@ private struct LectureSelectionStudyView: View {
                 if loading {
                     ProgressView("Connecting the selected whiteboards…")
                 } else if let interaction = result?.interaction {
-                    Text(interaction.title ?? "Across this lecture").font(.title2.bold())
+                    Text(interaction.title ?? "Across this class").font(.title2.bold())
                     ScrollView {
                         StudyContentView(source: interaction.answer ?? "No explanation was returned.",
                                          maximumWidth: 700)
@@ -1075,7 +1075,7 @@ private struct LectureSelectionStudyView: View {
                     Image(systemName: "rectangle.3.group.bubble.left")
                         .font(.largeTitle).foregroundStyle(.tint)
                     Text("Explain across whiteboards").font(.title2.bold())
-                    Text("The selected regions stay owned by their original whiteboards. V-Board will connect only this evidence across the lecture.")
+                    Text("The selected regions stay owned by their original whiteboards. V-Board will connect only this evidence across the class.")
                         .multilineTextAlignment(.center).foregroundStyle(.secondary)
                         .frame(maxWidth: 560)
                     TextField("Optional question", text: $question)
@@ -1233,7 +1233,7 @@ private struct LectureNavigatorSheet: View {
                     }
                 }
             }
-            .navigationTitle("Lecture Navigator")
+            .navigationTitle("Class Navigator")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         }
     }
@@ -1264,10 +1264,10 @@ private struct LectureNavigatorSidebar: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Lecture").font(.headline)
+                Text("Class").font(.headline)
                 Spacer()
                 Button(action: close) { Image(systemName: "sidebar.left") }
-                    .accessibilityLabel("Close lecture navigator")
+                    .accessibilityLabel("Close class navigator")
             }
             .padding(.horizontal, 14).frame(height: 44)
             Divider()

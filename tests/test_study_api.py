@@ -107,9 +107,9 @@ class StudyApiTests(unittest.TestCase):
 
         def generated(**kwargs):
             captured.update(kwargs)
-            return {"title": "Lecture Study Guide", "content": "# Guide", "sources": []}
+            return {"title": "Class Study Guide", "content": "# Guide", "sources": []}
 
-        with patch("study.service.ensure_lecture_ai_context", return_value={"summary": "Lecture"}) as context, patch(
+        with patch("study.service.ensure_lecture_ai_context", return_value={"summary": "Class"}) as context, patch(
             "study.service.generate_study_guide", side_effect=generated
         ), patch("study.service.encode_master_overview", return_value=None):
             response = self.client.post(f"/api/folders/{folder['id']}/study-guide", json={})
@@ -507,13 +507,13 @@ class StudyApiTests(unittest.TestCase):
         from study.ai import parse_study_guide
 
         raw = (
-            '{"title": "Vectors", "content": "# Lecture Study Guide\\n\\n'
+            '{"title": "Vectors", "content": "# Class Study Guide\\n\\n'
             'Use $\\\\times$ and $\\\\neq 0$.\\n\\n## Core Concepts\\nDots.", '
             '"sources": [{"concept": "cross product", "boardOrder": 1}]}'
         )
         result = parse_study_guide(raw)
         self.assertEqual(result["title"], "Vectors")
-        self.assertIn("# Lecture Study Guide", result["content"])
+        self.assertIn("# Class Study Guide", result["content"])
         self.assertTrue(any(line.startswith("## Core Concepts") for line in result["content"].splitlines()))
         self.assertNotIn('"title"', result["content"])
         self.assertIn("\\times", result["content"])
@@ -524,28 +524,28 @@ class StudyApiTests(unittest.TestCase):
         from study.ai import parse_study_guide, recover_study_guide_markdown
 
         mangled = (
-            r'{"title": "Lecture Study Guide", "content": '
-            r'"# Lecture Study Guide$\\n$The formula is $\\frac{1}{2}$."}'
+            r'{"title": "Class Study Guide", "content": '
+            r'"# Class Study Guide$\\n$The formula is $\\frac{1}{2}$."}'
         )
         recovered = recover_study_guide_markdown(mangled)
-        self.assertIn("# Lecture Study Guide", recovered)
+        self.assertIn("# Class Study Guide", recovered)
         self.assertIn("The formula is", recovered)
-        self.assertTrue("\n" in recovered or recovered.startswith("# Lecture Study Guide"))
+        self.assertTrue("\n" in recovered or recovered.startswith("# Class Study Guide"))
         parsed = parse_study_guide(mangled)
-        self.assertTrue(parsed["content"].startswith("# Lecture Study Guide"))
+        self.assertTrue(parsed["content"].startswith("# Class Study Guide"))
         self.assertIn("frac", parsed["content"])
 
         wrapped = (
-            '{\n  "title": "Lecture Study Guide: Calculus",\n  "content": '
-            '"# Lecture Study Guide$\\n\\n$## 1. What This Lecture Covered$\\nThis$ lecture '
+            '{\n  "title": "Class Study Guide: Calculus",\n  "content": '
+            '"# Class Study Guide$\\n\\n$## 1. What This Class Covered$\\nThis$ class '
             'covers $\\\\sqrt{a^2 - x^2}$."\n}'
         )
         unwrapped = parse_study_guide(wrapped)
-        self.assertEqual(unwrapped["title"], "Lecture Study Guide: Calculus")
+        self.assertEqual(unwrapped["title"], "Class Study Guide: Calculus")
         lines = unwrapped["content"].splitlines()
-        self.assertTrue(any(line.startswith("# Lecture Study Guide") for line in lines))
-        self.assertTrue(any(line.startswith("## 1. What This Lecture Covered") for line in lines))
-        self.assertTrue(any("This" in line and "lecture" in line.lower() for line in lines))
+        self.assertTrue(any(line.startswith("# Class Study Guide") for line in lines))
+        self.assertTrue(any(line.startswith("## 1. What This Class Covered") for line in lines))
+        self.assertTrue(any("This" in line and "class" in line.lower() for line in lines))
         self.assertNotIn('"title"', unwrapped["content"])
 
     def test_explain_includes_known_text_object_content(self):

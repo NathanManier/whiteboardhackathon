@@ -73,7 +73,7 @@ reopen anonymous resource access as a compatibility workaround.
 
 The main app accepts PDFs from Files, and the extension accepts one PDF or
 image through the system Share sheet. Multi-page PDFs create isolated page
-boards in order and place them to the right in the selected lecture. Original
+boards in order and place them to the right in the selected class. Original
 PDF pages remain canonical and are rendered by PDFKit; V-Board annotations are
 separate editable editor objects.
 

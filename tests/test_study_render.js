@@ -143,10 +143,10 @@ assert(ctx.normalizeChemistryMarkdown("Fluorine ($ce{F}$) and water ($ce{H2O}$).
 assert(render("Fluorine ($ce{F}$) and water ($ce{H2O}$).")
   .match(/class="katex/g)?.length >= 2,
   "repaired delimited mhchem commands did not render through KaTeX");
-const repairedBoundary = ctx.normalizeChemistryMarkdown("Overview\n---### Connection Across the Lecture");
-assert(repairedBoundary === "Overview\n---\n\n### Connection Across the Lecture",
+const repairedBoundary = ctx.normalizeChemistryMarkdown("Overview\n---### Connection Across the Class");
+assert(repairedBoundary === "Overview\n---\n\n### Connection Across the Class",
   "a horizontal rule joined to a heading was not repaired for display");
-assert(render("Overview\n---### Connection Across the Lecture").includes("<h3>Connection Across the Lecture</h3>"),
+assert(render("Overview\n---### Connection Across the Class").includes("<h3>Connection Across the Class</h3>"),
   "a repaired Markdown heading did not render structurally");
 assert(ctx.normalizeChemistryMarkdown("`H2O`") === "`H2O`",
   "inline code was rewritten as chemistry");

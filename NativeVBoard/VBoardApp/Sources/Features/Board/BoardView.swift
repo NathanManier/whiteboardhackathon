@@ -70,7 +70,7 @@ struct BoardView: View {
             case .decoding: message = "Couldn’t decode board data returned by the server."
             case .invalidBaseURL: message = "Couldn’t load board data because the server URL is invalid."
             case .conflict: message = "This board changed elsewhere. Reload it before editing."
-            case .workspaceConflict: message = "This lecture layout changed elsewhere. Reload it before editing."
+            case .workspaceConflict: message = "This class layout changed elsewhere. Reload it before editing."
             }
             state = .failed(message); debug("BOARD OPEN FAILED id=\(board.id) userMessage=\(message) technical=\(error.localizedDescription)")
         } catch {

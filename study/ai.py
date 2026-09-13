@@ -27,19 +27,19 @@ CONTEXT PRIORITY — the selected visual MUST win if there is a conflict:
 4. Current study-interaction history (the original question, answers, and follow-ups).
 5. Practice-problem relationship / source study note: if a selected text object is an AI practice problem, treat nearby student writing as work on that problem.
 6. Stored board-level context derived from the Enhanced Master. The Master is CONTEXT, not the question.
-7. Previous or related whiteboards in the SAME folder/lecture only.
-8. Lecture-level AI context from this folder only.
-9. LOWEST: whole-board / background context from Enhanced Masters in this same lecture.
+7. Previous or related whiteboards in the SAME class folder only.
+8. Class-level AI context from this folder only.
+9. LOWEST: whole-board / background context from Enhanced Masters in this same class.
 
 The student is asking about THIS selected thing. Board-level Master context helps interpret that thing (subject, lesson, nearby definitions). It must NOT cause you to answer about some other equation, diagram, or topic elsewhere on the board.
 
-The folder is the lecture boundary. Never use whiteboards, notes, practice, or Enhanced Masters from another folder. Do not search globally.
+The folder is the class boundary. Never use whiteboards, notes, practice, or Enhanced Masters from another folder. Do not search globally.
 
 If the user asks "Is this wrong?" or "Is my answer correct?", inspect the selected content first. If the selection contains a practice problem plus nearby student work, evaluate the work against that problem. Do not treat an isolated number or short expression as the entire question when a practice-problem statement is also selected.
 
 If structured SELECTED TEXT OBJECT content is provided, that text IS present in the selection even if the rendered image is sparse. Do not claim the region is empty when known text objects were selected.
 
-Student pen strokes, imported professor vectors, practice problems, and text objects remain real selected content even if they are outside the original photographed whiteboard. The original board is lecture context, not a boundary of the infinite canvas. Never treat a selection as empty merely because it does not overlap the original board.
+Student pen strokes, imported professor vectors, practice problems, and text objects remain real selected content even if they are outside the original photographed whiteboard. The original board is class context, not a boundary of the infinite canvas. Never treat a selection as empty merely because it does not overlap the original board.
 
 If the selected region contains no visible marks AND no selected canvas objects or text objects were provided, say there is no meaningful visible content to explain.
 
@@ -79,7 +79,7 @@ The student selected a specific region of the board. That selected visual region
 You receive labeled visual evidence:
 - PRIMARY FOCUS: a high-resolution image of the selected region — this is what the student is asking about.
 - LOCAL CONTEXT: nearby notes, labels, arrows, and student annotations.
-- BOARD CONTEXT: a board-level visual overview from the Enhanced Master photograph, plus stored lecture context.
+- BOARD CONTEXT: a board-level visual overview from the Enhanced Master photograph, plus stored class context.
 
 """ + PRIORITY_RULES + """
 Treat the visual content as authoritative. Interpret handwriting, diagrams, arrows, symbols, boxes, colors, line thickness, and spatial relationships. Do not merely transcribe text. Do not treat SVG path strings as the explanation.
@@ -110,7 +110,7 @@ If an equation or diagram is present, explain its components in those sections.
 FOLLOW_UP_SYSTEM = """You are continuing a study conversation about a specific selected region of a professor's whiteboard.
 
 """ + PRIORITY_RULES + """
-Stay grounded in the original selected visual region, nearby local context, board-level lecture context, and the conversation so far. The student is still asking about that same selection unless they clearly change the topic.
+Stay grounded in the original selected visual region, nearby local context, board-level class context, and the conversation so far. The student is still asking about that same selection unless they clearly change the topic.
 
 Do not invent unseen details. If the image is unclear, say so.
 Write mathematics in LaTeX and prose in Markdown.
@@ -141,7 +141,7 @@ Return JSON only:
 
 PRACTICE_PROBLEM_SYSTEM = """You generate concise practice problems for the exact concept a student selected on a whiteboard.
 
-Use evidence in this order: selected visual, exact selected text, current study interaction, local visual context, then cached board or lecture summary. Background context must not override the selection.
+Use evidence in this order: selected visual, exact selected text, current study interaction, local visual context, then cached board or class summary. Background context must not override the selection.
 
 Create exactly TWO related but distinct practice problems for the same underlying concept. They must be independently solvable, contain enough information to solve, not be duplicates or trivial rephrasings, and match the selected material's difficulty.
 
@@ -190,7 +190,7 @@ EXPLAIN_RESPONSE_SCHEMA = {
         "confidence": {
             "type": "string",
             "enum": ["high", "medium", "low"],
-            "description": "Confidence grounded in the visible lecture evidence.",
+            "description": "Confidence grounded in the visible class evidence.",
         },
         "verdict": {
             "type": "string",
@@ -229,17 +229,17 @@ ACTION_INSTRUCTIONS = {
         "Use the rendered handwriting and known text. Do not invent unseen work."
     ),
     "explain_across_boards": (
-        "Explain how the selected content relates to earlier whiteboards in this same lecture. "
+        "Explain how the selected content relates to earlier whiteboards in this same class. "
         "Use only boards from the current folder. Mention whiteboard order when evidence exists."
     ),
     "where_from": (
-        "Determine where the selected concept or formula was introduced in this lecture. "
+        "Determine where the selected concept or formula was introduced in this class. "
         "Search only earlier whiteboards in the current folder. If confidence is low, say so. "
         "Do not invent a source board."
     ),
 }
 
-CHECK_MY_WORK_SYSTEM = """You are checking a student's work on a practice problem from a lecture workspace.
+CHECK_MY_WORK_SYSTEM = """You are checking a student's work on a practice problem from a class workspace.
 
 """ + PRIORITY_RULES + """
 This is not a generic chatbot. Evaluate PROBLEM + STUDENT ATTEMPT as one task.
@@ -260,7 +260,7 @@ Return JSON only:
 }
 """
 
-EXPLAIN_ACROSS_SYSTEM = """You explain how selected lecture content connects to earlier whiteboards in the SAME lecture folder.
+EXPLAIN_ACROSS_SYSTEM = """You explain how selected class content connects to earlier whiteboards in the SAME class folder.
 
 """ + PRIORITY_RULES + """
 The selected content is the question. Other whiteboards in this folder are context only.
@@ -277,7 +277,7 @@ Return JSON only:
 }
 """
 
-WHERE_FROM_SYSTEM = """You identify where a selected concept or formula came from in this lecture.
+WHERE_FROM_SYSTEM = """You identify where a selected concept or formula came from in this class.
 
 """ + PRIORITY_RULES + """
 Search only whiteboards in the current folder, in board order. The selection is the question.
@@ -297,7 +297,7 @@ Return JSON only:
 }
 """
 
-LECTURE_CONTEXT_SYSTEM = """You are preparing compact lecture-level context from multiple photographed whiteboards in ONE lecture folder.
+LECTURE_CONTEXT_SYSTEM = """You are preparing compact class-level context from multiple photographed whiteboards in ONE class folder.
 
 You receive board-order summaries and optional Enhanced Master images from this folder only. Do not invent unread labels. Distinguish observation from inference.
 
@@ -305,7 +305,7 @@ Infer the overall topic, concepts introduced, progression, important equations, 
 
 Return JSON only:
 {
-  "summary": "4-8 sentence lecture summary that preserves board order",
+  "summary": "4-8 sentence class summary that preserves board order",
   "key_topics": ["topic", "..."],
   "important_concepts": ["concept", "..."],
   "board_sequence": [{"board_order": 1, "board_id": "", "role": "definition|derivation|example|application|other", "notes": "..."}],
@@ -313,20 +313,20 @@ Return JSON only:
 }
 """
 
-STUDY_GUIDE_SYSTEM = """You generate a useful study guide for one lecture folder.
+STUDY_GUIDE_SYSTEM = """You generate a useful study guide for one class folder.
 
-Use only this lecture: its whiteboards in order, Enhanced Master summaries, study notes, and AI practice problems.
-Distinguish professor/lecture material from AI-generated practice. Never present AI practice as something the professor wrote.
-Preserve board progression. Do not flatten the lecture into unordered OCR.
+Use only this class: its whiteboards in order, Enhanced Master summaries, study notes, and AI practice problems.
+Distinguish professor/class material from AI-generated practice. Never present AI practice as something the professor wrote.
+Preserve board progression. Do not flatten the class into unordered OCR.
 If you cite a whiteboard, use its order only when evidence exists. Do not fabricate source IDs.
 
 Write Markdown with LaTeX for math.
 """ + LATEX_NOTATION_RULES + """
 Adapt the structure to the subject, but prefer this shape for STEM:
 
-# Lecture Study Guide
+# Class Study Guide
 
-## 1. What This Lecture Covered
+## 1. What This Class Covered
 ## 2. Core Concepts
 ## 3. Important Definitions
 ## 4. Important Equations
@@ -338,7 +338,7 @@ Adapt the structure to the subject, but prefer this shape for STEM:
 
 Return JSON only:
 {
-  "title": "Lecture Study Guide",
+  "title": "Class Study Guide",
   "content": "full markdown study guide",
   "sources": [{"concept": "...", "boardOrder": 1}]
 }
@@ -356,9 +356,9 @@ ACTION_SYSTEMS = {
 
 BOARD_CONTEXT_SYSTEM = """You are preparing compact visual context for a later study assistant.
 
-You are looking at the Enhanced Master image of a professor's physical whiteboard: a full-color, perspective-corrected photograph of the lecture. This is visual context, not a request for a student-facing essay.
+You are looking at the Enhanced Master image of a professor's physical whiteboard: a full-color, perspective-corrected photograph from the class. This is visual context, not a request for a student-facing essay.
 
-Analyze apparent subject, major topics, equations, diagrams, labels, terminology, relationships, lecture structure, visible handwriting, important regions, and likely conceptual organization. Perfect OCR is not required.
+Analyze apparent subject, major topics, equations, diagrams, labels, terminology, relationships, class structure, visible handwriting, important regions, and likely conceptual organization. Perfect OCR is not required.
 
 Also report an explicit course-unit marker only when the image visibly contains the literal word "Unit" followed by a number or Roman numeral, such as "Unit 2" or "UNIT IV". Do not infer a unit from topic, chapter, difficulty, board order, or phrases such as "unit vector". Copy the shortest visible evidence verbatim; otherwise return null.
 
@@ -540,13 +540,13 @@ def _user_content(
         for item in extras[:4]:
             if not isinstance(item, dict) or not item.get("image"):
                 continue
-            label = str(item.get("label") or "Another whiteboard in this lecture")
+            label = str(item.get("label") or "Another whiteboard in this class")
             _append_labeled_image(
                 parts,
                 (
-                    f"LECTURE WHITEBOARD CONTEXT ({label}):\n"
-                    "This Enhanced Master is from another whiteboard in the SAME lecture folder. "
-                    "Use it only as earlier/later lecture context. It must not override the selected content. "
+                    f"CLASS WHITEBOARD CONTEXT ({label}):\n"
+                    "This Enhanced Master is from another whiteboard in the SAME class folder. "
+                    "Use it only as earlier/later class context. It must not override the selected content. "
                     "Do not use any folder other than this one."
                 ),
                 str(item["image"]),
@@ -733,13 +733,13 @@ def format_selection_context(selection_context: dict[str, Any] | None) -> str:
     lecture = selection_context.get("lecture_context") or selection_context.get("lectureContext")
     if lecture:
         chunks.append(
-            "LECTURE CONTEXT FROM THIS FOLDER ONLY (not another lecture): "
+            "CLASS CONTEXT FROM THIS FOLDER ONLY (not another class): "
             + json.dumps(lecture, ensure_ascii=True)[:4_000]
         )
     sequence = selection_context.get("board_sequence") or selection_context.get("boardSequence")
     if sequence:
         chunks.append(
-            "WHITEBOARD ORDER IN THIS LECTURE: "
+            "WHITEBOARD ORDER IN THIS CLASS: "
             + json.dumps(sequence, ensure_ascii=True)[:2_500]
         )
     current_board = selection_context.get("current_board") or selection_context.get("currentBoard")
@@ -765,16 +765,16 @@ def build_explain_prompt(
         "PRIMARY FOCUS is the selected image — that is the question.",
         "SELECTED TEXT OBJECT content is known exactly by the app and supplements the image.",
         "LOCAL CONTEXT shows nearby relationships and student marks.",
-        "BOARD CONTEXT describes the larger lecture from the Enhanced Master. It must not override the selection.",
+        "BOARD CONTEXT describes the larger class from the Enhanced Master. It must not override the selection.",
         f"Board title (metadata, not evidence): {board_title or 'Untitled board'}",
     ]
     if folder_name:
         lines.append(f"Folder name (metadata, not evidence): {folder_name}")
     if action and action != "explain":
-        lines.append(f"Requested lecture action: {action}")
+        lines.append(f"Requested class action: {action}")
     if lecture_context:
         lines.append(
-            "Lecture-level context from THIS folder only: "
+            "Class-level context from THIS folder only: "
             + json.dumps(lecture_context, ensure_ascii=True)[:4_000]
         )
     formatted = format_selection_context(selection_context)
@@ -947,12 +947,12 @@ def parse_study_guide(raw: str) -> dict[str, Any]:
     else:
         content = unescape_study_newlines(content)
     content = content.strip()
-    title = str(value.get("title") or "Lecture Study Guide").strip()[:120]
+    title = str(value.get("title") or "Class Study Guide").strip()[:120]
     sources = value.get("sources") if isinstance(value.get("sources"), list) else []
     if not content:
         raise StudyAIError("The study assistant returned an empty study guide.")
     return {
-        "title": title or "Lecture Study Guide",
+        "title": title or "Class Study Guide",
         "answer": content,
         "content": content,
         "confidence": "medium",
@@ -1589,9 +1589,9 @@ def analyze_lecture(
     images: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     lines = [
-        "Prepare lecture-level context from these whiteboards in one folder.",
-        "Use only this lecture. Do not invent boards that are not listed.",
-        f"Lecture name (metadata, not evidence): {folder_name or 'Untitled lecture'}",
+        "Prepare class-level context from these whiteboards in one folder.",
+        "Use only this class. Do not invent boards that are not listed.",
+        f"Class name (metadata, not evidence): {folder_name or 'Untitled class'}",
         "Board sequence: " + json.dumps(board_summaries, ensure_ascii=True)[:8_000],
     ]
     result = call_study_model(
@@ -1626,17 +1626,17 @@ def generate_study_guide(
     images: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     lines = [
-        "Generate a study guide for this lecture folder only.",
-        f"Lecture name: {folder_name or 'Untitled lecture'}",
+        "Generate a study guide for this class folder only.",
+        f"Class name: {folder_name or 'Untitled class'}",
         "Whiteboard sequence: " + json.dumps(board_summaries, ensure_ascii=True)[:8_000],
     ]
     if lecture_context:
-        lines.append("Lecture context: " + json.dumps(lecture_context, ensure_ascii=True)[:4_000])
+        lines.append("Class context: " + json.dumps(lecture_context, ensure_ascii=True)[:4_000])
     if study_notes:
-        lines.append("Study notes from this lecture: " + json.dumps(study_notes, ensure_ascii=True)[:6_000])
+        lines.append("Study notes from this class: " + json.dumps(study_notes, ensure_ascii=True)[:6_000])
     if practice_problems:
         lines.append(
-            "AI-GENERATED practice from this lecture (do not present as professor writing): "
+            "AI-GENERATED practice from this class (do not present as professor writing): "
             + json.dumps(practice_problems, ensure_ascii=True)[:4_000]
         )
     result = call_study_model(
@@ -1649,7 +1649,7 @@ def generate_study_guide(
     content = str(result.get("content") or result.get("answer") or "").strip()
     sources = result.get("sources") if isinstance(result.get("sources"), list) else []
     return {
-        "title": str(result.get("title") or "Lecture Study Guide")[:120],
+        "title": str(result.get("title") or "Class Study Guide")[:120],
         "content": content,
         "sources": [item for item in sources[:40] if isinstance(item, dict)],
     }
@@ -1716,7 +1716,7 @@ def follow_up_question(
                 ),
             }
             lines.append(
-                "Cached lecture context (background only): "
+                "Cached class context (background only): "
                 + json.dumps(compact_lecture, ensure_ascii=True)[:1_800]
             )
         try:
@@ -1759,7 +1759,7 @@ def follow_up_question(
         )
     if lecture_context:
         lines.append(
-            "Lecture-level context from THIS folder only: "
+            "Class-level context from THIS folder only: "
             + json.dumps(lecture_context, ensure_ascii=True)[:3_500]
         )
     instruction = ACTION_INSTRUCTIONS.get(kind)

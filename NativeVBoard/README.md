@@ -6,28 +6,28 @@ geometry, editor persistence, and study APIs.
 
 The app now launches through native Sign in with Apple, restores its V-Board
 session from Keychain, and exposes Sign Out and Delete Account in account
-settings. Board, lecture, workspace, study, SVG, and asset routes require both
+settings. Board, class, workspace, study, SVG, and asset routes require both
 authentication and resource ownership. Production provisioning and controlled
 legacy ownership migration are documented in `PRODUCTION_SETUP.md`.
 
 PDFs exported from Freeform or selected in Files are imported as source-
 preserving PDF-backed boards. Multi-page PDFs create ordered, isolated board
-containers in the selected lecture. PDFKit renders the locked source at high
+containers in the selected class. PDFKit renders the locked source at high
 detail while ordinary V-Board strokes, selections, transforms, erasures, and
 AI region requests remain canonical editor operations. A native Share
 Extension transfers one selected image or PDF through the shared App Group and
 the main app completes the authenticated import.
 
-## Shared lecture workspace
+## Shared class workspace
 
-A lecture opens as one persistent infinite canvas containing independently
-owned whiteboards. The lecture workspace persists only camera, placement,
+A class opens as one persistent infinite canvas containing independently
+owned whiteboards. The class workspace persists only camera, placement,
 dates, unit labels, ordering, and effective bounds. Every board continues to
 load and save its own immutable `board.svg`, `editor.json`, and `study.json`;
-the native client never creates a merged lecture editor document.
+the native client never creates a merged class editor document.
 
 Nested coordinate conversion is explicit: screen coordinates map through the
-lecture camera into lecture-world coordinates, then through a board placement
+class camera into class-world coordinates, then through a board placement
 into that board's local coordinates. This is used by drawing, lasso, hit
 testing, object movement, erasing, and grouped AI selections.
 

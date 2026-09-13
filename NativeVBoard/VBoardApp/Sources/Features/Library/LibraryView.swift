@@ -46,7 +46,7 @@ struct LibraryView: View {
             .navigationTitle("V-Board")
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
-                    Button { showNewLecture = true } label: { Label("New Lecture", systemImage: "folder.badge.plus") }
+                    Button { showNewLecture = true } label: { Label("New Class", systemImage: "folder.badge.plus") }
                 }
                 ToolbarItemGroup(placement: .secondaryAction) {
                     Button { load() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh library")
@@ -107,8 +107,8 @@ struct LibraryView: View {
 
     @ViewBuilder private func lectureCollection(_ library: LibraryResponse) -> some View {
         if library.folders.isEmpty {
-            ContentUnavailableView("No lectures yet", systemImage: "books.vertical",
-                                   description: Text("Create a lecture to keep related whiteboards together."))
+            ContentUnavailableView("No classes yet", systemImage: "books.vertical",
+                                   description: Text("Create a class to keep related whiteboards together."))
         } else if layoutRaw == LibraryLayout.list.rawValue {
             LazyVStack(spacing: 0) {
                 ForEach(library.folders) { folder in lectureLink(folder, library: library, list: true) }
@@ -153,7 +153,7 @@ struct LibraryView: View {
             .buttonStyle(.plain)
             .contextMenu {
                 Button("Rename") { renameTarget = .board(board) }
-                Button("Move to Lecture") { moveTarget = board }
+                Button("Move to Class") { moveTarget = board }
                 Button("Delete", role: .destructive) { deleteTarget = .board(board) }
             }
     }
@@ -247,7 +247,7 @@ struct LibraryView: View {
 private enum LibrarySection: String, CaseIterable, Identifiable {
     case lectures, recent
     var id: String { rawValue }
-    var title: String { self == .lectures ? "Lectures" : "Recent" }
+    var title: String { self == .lectures ? "Classes" : "Recent" }
 }
 
 private enum LibraryLayout: String { case grid, list }
@@ -259,13 +259,13 @@ private enum LibraryRenameTarget: Identifiable {
         switch self { case .lecture(let item): return "lecture:\(item.id)"; case .board(let item): return "board:\(item.id)" }
     }
     var name: String { switch self { case .lecture(let item): return item.name; case .board(let item): return item.name } }
-    var title: String { switch self { case .lecture: return "Rename Lecture"; case .board: return "Rename Whiteboard" } }
+    var title: String { switch self { case .lecture: return "Rename Class"; case .board: return "Rename Whiteboard" } }
 }
 
 private enum LibraryDeleteTarget {
     case lecture(LectureFolder)
     case board(LibraryBoard)
-    var title: String { switch self { case .lecture: return "Delete lecture?"; case .board: return "Delete whiteboard?" } }
+    var title: String { switch self { case .lecture: return "Delete class?"; case .board: return "Delete whiteboard?" } }
     var message: String {
         switch self {
         case .lecture(let item): return "\(item.name) and all of its whiteboards will be removed."
@@ -279,7 +279,7 @@ private struct LibraryHeader: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 20) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Your lectures").font(.largeTitle.weight(.bold))
+                Text("Your classes").font(.largeTitle.weight(.bold))
                 Text("Editable professor ink, notes, and study tools in one canvas.")
                     .font(.subheadline).foregroundStyle(.secondary)
             }
@@ -467,17 +467,17 @@ private struct MoveBoardToLectureSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Picker("Lecture", selection: $destination) {
+                Picker("Class", selection: $destination) {
                     Text("Unfiled / Library").tag("unfiled")
                     ForEach(lectures) { lecture in
                         Text(lecture.name).tag(lecture.id)
                     }
                 }
-                Text("A whiteboard belongs to one lecture. Moving it preserves its ink, edits, and study history.")
+                Text("A whiteboard belongs to one class. Moving it preserves its ink, edits, and study history.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
-            .navigationTitle("Move to Lecture")
+            .navigationTitle("Move to Class")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
@@ -604,7 +604,7 @@ struct ImportFlowView: View {
     private var chooseView: some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(folderID == nil ? "New Whiteboard" : "Add to Lecture").font(.title2.weight(.semibold))
+                Text(folderID == nil ? "New Whiteboard" : "Add to Class").font(.title2.weight(.semibold))
                 Text("Choose a source. Photos continue through board detection and corner confirmation; PDFs stay as their original page surface.")
                     .font(.subheadline).foregroundStyle(.secondary)
             }
@@ -651,7 +651,7 @@ struct ImportFlowView: View {
         .frame(minHeight: 58)
     }
     private var previewView: some View { ScrollView { VStack(spacing: 18) { if let previewImage { Image(uiImage: previewImage).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: 16)).padding(.horizontal) }; if pdfData != nil { Label(pdfPageCount == 1 ? "1 PDF page" : "\(pdfPageCount) PDF pages", systemImage: "doc.richtext").font(.headline); if pdfPageCount > 1 { Text("Each page will become a separate board in source order.").font(.subheadline).foregroundStyle(.secondary) } }; TextField("Board name (optional)", text: $name).textFieldStyle(.roundedBorder).padding(.horizontal); destinationControls; Button(pdfData == nil ? "Use This Photo" : "Import PDF") { pdfData == nil ? beginImageUpload() : beginPDFUpload() }.buttonStyle(.borderedProminent).controlSize(.large).disabled(importState.phase.isBusy); if let error { Text(error).foregroundStyle(.red).multilineTextAlignment(.center) } }.padding(.vertical, 20).frame(maxWidth: 700) }.frame(maxWidth: .infinity) }
-    @ViewBuilder private var destinationControls: some View { if folderID == nil { VStack(alignment: .leading, spacing: 10) { Toggle("Create a new lecture", isOn: $createLecture); if createLecture { TextField("Lecture name", text: $newLectureName).textFieldStyle(.roundedBorder) } else if !availableLectures.isEmpty { Picker("Add to lecture", selection: $selectedFolderID) { Text("No lecture").tag(String?.none); ForEach(availableLectures) { lecture in Text(lecture.name).tag(Optional(lecture.id)) } }.pickerStyle(.menu) } }.padding(.horizontal) } }
+    @ViewBuilder private var destinationControls: some View { if folderID == nil { VStack(alignment: .leading, spacing: 10) { Toggle("Create a new class", isOn: $createLecture); if createLecture { TextField("Class name", text: $newLectureName).textFieldStyle(.roundedBorder) } else if !availableLectures.isEmpty { Picker("Add to class", selection: $selectedFolderID) { Text("No class").tag(String?.none); ForEach(availableLectures) { lecture in Text(lecture.name).tag(Optional(lecture.id)) } }.pickerStyle(.menu) } }.padding(.horizontal) } }
     private var cornerView: some View {
         VStack(spacing: 0) {
             if let imageAsset {
@@ -1116,7 +1116,7 @@ struct ImportFlowView: View {
 private enum ImportFileKind { case image, pdf }
 private enum ImportUIError: LocalizedError {
     case missingLectureName, emptyImport
-    var errorDescription: String? { switch self { case .missingLectureName: return "Enter a name for the new lecture."; case .emptyImport: return "The PDF did not contain an importable page." } }
+    var errorDescription: String? { switch self { case .missingLectureName: return "Enter a name for the new class."; case .emptyImport: return "The PDF did not contain an importable page." } }
 }
 
 enum ImportFlowPhase: Equatable {
@@ -1480,7 +1480,7 @@ struct StudyGuideView: View {
                         Button("Try Again") { generate() }.buttonStyle(.borderedProminent)
                     }
                 } else {
-                    ContentUnavailableView("No study guide yet", systemImage: "text.book.closed", description: Text("Generate a concise guide from this lecture’s whiteboards."))
+                    ContentUnavailableView("No study guide yet", systemImage: "text.book.closed", description: Text("Generate a concise guide from this class’s whiteboards."))
                 }
             }
                 .navigationTitle("Study Guide")
@@ -1497,6 +1497,6 @@ private struct NewLectureView: View {
     @State private var name = ""
     @State private var saving = false
     @State private var error: String?
-    var body: some View { NavigationStack { Form { Section("Lecture") { TextField("Lecture name", text: $name); if let error { Text(error).foregroundStyle(.red) } }; Section { Button(saving ? "Creating…" : "Create Lecture") { create() }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || saving) } }.navigationTitle("New Lecture").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } } } }
-    private func create() { saving = true; Task { do { _ = try await api.createLecture(name: name.trimmingCharacters(in: .whitespacesAndNewlines)); saving = false; onCreated() } catch { saving = false; self.error = "Couldn’t create lecture." } } }
+    var body: some View { NavigationStack { Form { Section("Class") { TextField("Class name", text: $name); if let error { Text(error).foregroundStyle(.red) } }; Section { Button(saving ? "Creating…" : "Create Class") { create() }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || saving) } }.navigationTitle("New Class").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } } } }
+    private func create() { saving = true; Task { do { _ = try await api.createLecture(name: name.trimmingCharacters(in: .whitespacesAndNewlines)); saving = false; onCreated() } catch { saving = false; self.error = "Couldn’t create class." } } }
 }

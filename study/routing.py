@@ -92,7 +92,7 @@ class AIRoute:
         )
 
     def escalate_context_once(self, *, has_lecture: bool) -> "AIRoute":
-        """One retry may jump directly to useful lecture context."""
+        """One retry may jump directly to useful class context."""
         next_scope = ContextScope.LECTURE if has_lecture and self.scope in {
             ContextScope.LOCAL, ContextScope.BOARD
         } else self.escalate_scope().scope
@@ -108,8 +108,8 @@ class AIRoute:
         )
 
 
-_PREVIOUS = re.compile(r"\b(previous|earlier|before|yesterday|last\s+lecture|prior\s+board)\b", re.I)
-_LECTURE = re.compile(r"\b(this\s+lecture|the\s+lecture|across\s+(?:these\s+)?boards?|whiteboards?\s+in\s+this\s+lecture)\b", re.I)
+_PREVIOUS = re.compile(r"\b(previous|earlier|before|yesterday|last\s+(?:class|lecture)|prior\s+board)\b", re.I)
+_LECTURE = re.compile(r"\b(this\s+(?:class|lecture)|the\s+(?:class|lecture)|across\s+(?:these\s+)?boards?|whiteboards?\s+in\s+this\s+(?:class|lecture))\b", re.I)
 _COURSE = re.compile(r"\b(this\s+course|the\s+course|this\s+semester|all\s+units?|whole\s+course)\b", re.I)
 _HARD = re.compile(r"\b(prove|rigorously|derive|derivation|find\s+(?:where\s+)?(?:my\s+)?(?:proof|argument).*flaw|multi[- ]step|converges?|theorem)\b", re.I)
 _NORMAL = re.compile(r"\b(explain|why|compare|connect|relationship|different|how\s+does)\b", re.I)

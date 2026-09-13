@@ -105,7 +105,7 @@ struct AccountView: View {
                     Button("Sign Out") { Task { await auth.signOut(); dismiss() } }
                     Button("Delete Account", role: .destructive) { confirmDelete = true }
                 } footer: {
-                    Text("Deleting your account permanently removes your lectures, boards, uploaded sources, generated vectors, notes, study history, and workspace layouts.")
+                    Text("Deleting your account permanently removes your classes, boards, uploaded sources, generated vectors, notes, study history, and workspace layouts.")
                 }
                 if let deletionError {
                     Section { Text(deletionError).foregroundStyle(.red) }

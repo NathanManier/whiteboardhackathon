@@ -407,7 +407,7 @@ def parse_grouped_graph_recognition_request(
     boards: list[GroupedGraphBoardSelection] = []
     for index, (board_id, raw) in enumerate(zip(board_ids, raw_boards)):
         if board_id not in lecture_board_ids:
-            raise StudyAIError("Every selected board must belong to this lecture.", status=400)
+            raise StudyAIError("Every selected board must belong to this class.", status=400)
         raw_ids = raw.get("selectedObjectIds", raw.get("selected_ids"))
         raw_bbox = raw.get(
             "bbox",

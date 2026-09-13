@@ -2066,7 +2066,7 @@ final class LectureWorkspacePersistenceTests: XCTestCase {
             """.utf8)
         }
         let lectureJSON = Data("""
-        {"folder":{"id":"\(folderID)","name":"Lecture","workspace_board_id":"\(boardID)","board_order":["\(boardID)"]},"boards":[{"id":"\(boardID)","name":"Board A","folder_id":"\(folderID)","status":"ready","width":800,"height":600,"created_at":1}],"study_guide":null,"study_guide_stale":false}
+        {"folder":{"id":"\(folderID)","name":"Class","workspace_board_id":"\(boardID)","board_order":["\(boardID)"]},"boards":[{"id":"\(boardID)","name":"Board A","folder_id":"\(folderID)","status":"ready","width":800,"height":600,"created_at":1}],"study_guide":null,"study_guide_stale":false}
         """.utf8)
         let editorJSON = Data("""
         {"editor":{"schema_version":4,"revision":0,"viewport":{"x":0,"y":0,"width":800,"height":600},"objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}}

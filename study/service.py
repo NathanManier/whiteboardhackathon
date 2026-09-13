@@ -1047,14 +1047,14 @@ def recognize_lecture_graph(
     started = time.perf_counter()
     folder = folder_by_id(library, folder_id)
     if folder is None:
-        raise StudyAIError("That lecture could not be found.", status=404)
+        raise StudyAIError("That class could not be found.", status=404)
     _request_id, _primary_board_id, requested_board_ids = grouped_graph_requested_board_ids(payload)
     lecture_members = set(folder_board_ids(library, folder_id))
     board_sources: dict[str, tuple[Path, dict[str, Any], dict[str, Any]]] = {}
     allowed_ids_by_board: dict[str, set[str]] = {}
     for board_id in requested_board_ids:
         if board_id not in lecture_members:
-            raise StudyAIError("Every selected board must belong to this lecture.", status=400)
+            raise StudyAIError("Every selected board must belong to this class.", status=400)
         board_dir = BOARDS_DIR / board_id
         if not board_dir.is_dir():
             raise StudyAIError("A selected board is unavailable.", status=404)
@@ -1314,7 +1314,7 @@ def explain_lecture_selection(
 
     folder = folder_by_id(library, folder_id)
     if folder is None:
-        raise StudyAIError("That lecture could not be found.", status=404)
+        raise StudyAIError("That class could not be found.", status=404)
     study_path = BOARDS_DIR / ".workspaces" / f"{folder_id}.study.json"
     study_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1346,7 +1346,7 @@ def explain_lecture_selection(
             raise StudyAIError("Each selected whiteboard must be an object.", status=400)
         board_id = str(raw.get("board_id") or "")
         if board_id not in member_set or board_id in seen:
-            raise StudyAIError("Every selected whiteboard must belong to this lecture once.", status=400)
+            raise StudyAIError("Every selected whiteboard must belong to this class once.", status=400)
         seen.add(board_id)
         board_dir = BOARDS_DIR / board_id
         if not board_dir.is_dir():
@@ -1394,7 +1394,7 @@ def explain_lecture_selection(
         raise StudyAIError("Select content from at least two whiteboards.", status=400)
 
     question = clamp_text(
-        payload.get("question") or "Explain how this selected content connects across the lecture.",
+        payload.get("question") or "Explain how this selected content connects across the class.",
         MAX_QUESTION_LENGTH,
     )
     lecture_context = public_lecture_context(stored_lecture_context(folder.get("lecture_context")))
@@ -1428,7 +1428,7 @@ def explain_lecture_selection(
     result = explain_selection(
         question=question,
         board_title=f"{len(materials)} selected whiteboards",
-        folder_name=str(folder.get("name") or "Untitled lecture"),
+        folder_name=str(folder.get("name") or "Untitled class"),
         object_meta=object_meta,
         board_context=None,
         lecture_context=lecture_context,
@@ -2144,7 +2144,7 @@ def generate_lecture_study_guide(
 ) -> dict[str, Any]:
     folder = folder_by_id(library, folder_id)
     if folder is None:
-        raise StudyAIError("That lecture could not be found.", status=404)
+        raise StudyAIError("That class could not be found.", status=404)
     lecture_context = ensure_lecture_ai_context(
         folder_id=folder_id,
         library=library,
@@ -2249,7 +2249,7 @@ def generate_lecture_study_guide(
     )
     stored = stored_study_guide({
         "id": secrets.token_hex(8),
-        "title": result.get("title") or "Lecture Study Guide",
+        "title": result.get("title") or "Class Study Guide",
         "generated_at": time.time(),
         "source_board_ids": member_ids,
         "content": result.get("content"),

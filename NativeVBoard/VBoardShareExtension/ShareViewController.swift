@@ -48,7 +48,7 @@ final class ShareViewController: UIViewController {
             if let identifier = accepted.first(where: { provider.hasItemConformingToTypeIdentifier($0) }) {
                 self.provider = provider; typeIdentifier = identifier
                 statusLabel.text = identifier == UTType.pdf.identifier
-                    ? "Import this PDF into V-Board. You’ll choose its lecture in the app."
+                    ? "Import this PDF into V-Board. You’ll choose its class in the app."
                     : "Import this image into V-Board. You’ll confirm it in the app."
                 importButton.isEnabled = true
                 return

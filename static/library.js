@@ -195,7 +195,7 @@
     rootButton.type = "button";
     rootButton.className = "path-button";
     rootButton.dataset.action = "open-root";
-    rootButton.textContent = "My Lectures";
+    rootButton.textContent = "My Classes";
     path.replaceChildren(rootButton);
     if (activeFolder) {
       path.append(" › ");
@@ -244,8 +244,8 @@
     status.className = "library-message";
     status.setAttribute("role", "status");
     status.textContent = activeFolder
-      ? "This lecture has no whiteboards yet. Import a photographed board to start."
-      : "No lectures yet. Create a lecture, then import photographed whiteboards.";
+      ? "This class has no whiteboards yet. Import a photographed board to start."
+      : "No classes yet. Create a class, then import photographed whiteboards.";
     status.hidden = !isEmpty;
     grid.hidden = isEmpty;
   }
@@ -353,7 +353,7 @@
         state.folderId = folder.id;
         render();
       } else if (action === "rename-folder" && folder) {
-        openNameDialog("Rename lecture", "Use a short course or lecture name.", itemName(folder, ""), name =>
+        openNameDialog("Rename class", "Use a short course or class name.", itemName(folder, ""), name =>
           request(`/api/folders/${encodeURIComponent(folder.id)}`, { method: "PATCH", body: JSON.stringify({ name }) }));
       } else if (action === "rename-board" && board) {
         openNameDialog("Rename board", "The saved canvas stays the same.", itemName(board, ""), name =>
@@ -467,7 +467,7 @@
     $("#library-path").addEventListener("click", handleLibraryAction);
     $("#refresh-library").addEventListener("click", loadLibrary);
     $("#create-folder").addEventListener("click", () => {
-      openNameDialog("Create lecture", "A lecture holds every whiteboard from one class session.", "", name =>
+      openNameDialog("Create class", "A class keeps related whiteboards together.", "", name =>
         request("/api/folders", { method: "POST", body: JSON.stringify({ name }) }));
     });
     $("#new-board-button").addEventListener("click", openCapture);

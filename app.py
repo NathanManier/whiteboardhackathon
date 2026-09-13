@@ -916,7 +916,7 @@ def read_lecture_workspace(library: dict[str, Any], folder_id: str) -> dict[str,
         value = _new_lecture_workspace(library, folder_id)
         created = True
     except (OSError, json.JSONDecodeError, ValueError):
-        abort(500, description="Lecture workspace is unavailable.")
+        abort(500, description="Class workspace is unavailable.")
     value, reconciled = _reconcile_lecture_workspace(value, library, folder_id)
     if reconciled and not created:
         # Membership changed outside the manifest (import/delete). Treat that
@@ -950,7 +950,7 @@ def validate_lecture_workspace(
             raise ValueError(f"items[{index}] must be a board workspace item.")
         board_id = raw.get("board_id")
         if board_id not in allowed:
-            raise ValueError(f"items[{index}] references a board outside this lecture.")
+            raise ValueError(f"items[{index}] references a board outside this class.")
         if board_id in seen:
             raise ValueError(f"items[{index}] repeats board_id {board_id}.")
         seen.add(board_id)
@@ -992,10 +992,10 @@ def validate_lecture_workspace(
         clean_items.append(item)
     missing = allowed - seen
     if missing:
-        raise ValueError("The workspace must include every board in the lecture.")
+        raise ValueError("The workspace must include every board in the class.")
     active_board_id = payload.get("active_board_id")
     if active_board_id is not None and active_board_id not in allowed:
-        raise ValueError("active_board_id must belong to this lecture.")
+        raise ValueError("active_board_id must belong to this class.")
     return {
         "schema_version": max(1, int(payload.get("schema_version") or current.get("schema_version") or 1)),
         "revision": int(current.get("revision") or 0) + 1,
@@ -4137,19 +4137,19 @@ def upload() -> Response | tuple[str, int]:
     if workspace_board_id and not BOARD_ID_RE.fullmatch(workspace_board_id):
         workspace_board_id = None
     if requested_folder is not None and requested_folder not in folder_ids(library):
-        return upload_failure("The selected lecture no longer exists.", 404)
+        return upload_failure("The selected class no longer exists.", 404)
     if requested_folder is not None:
         require_lecture_owner(requested_folder)
     if workspace_board_id:
         require_board_owner(workspace_board_id)
         workspace_entry = library["boards"].get(workspace_board_id)
         if not isinstance(workspace_entry, dict):
-            return upload_failure("The lecture workspace could not be found.", 404)
+            return upload_failure("The class workspace could not be found.", 404)
         workspace_folder = workspace_entry.get("folder_id")
         if workspace_folder not in folder_ids(library):
-            return upload_failure("The lecture workspace no longer belongs to a lecture.", 404)
+            return upload_failure("The class workspace no longer belongs to a class.", 404)
         if requested_folder and workspace_folder != requested_folder:
-            return upload_failure("The lecture workspace does not match the selected lecture.", 400)
+            return upload_failure("The class workspace does not match the selected class.", 400)
         if not requested_folder:
             requested_folder = workspace_folder
             require_lecture_owner(requested_folder)
@@ -4335,7 +4335,7 @@ def import_pdf() -> Response | tuple[Response, int]:
     requested_folder = str(request.form.get("folder_id") or "").strip() or None
     if requested_folder is not None:
         if requested_folder not in folder_ids(library):
-            return jsonify(error="The selected lecture no longer exists."), 404
+            return jsonify(error="The selected class no longer exists."), 404
         require_lecture_owner(requested_folder)
     requested_kind = str(request.form.get("source_kind") or "freeform_pdf").strip()
     if requested_kind not in {"freeform_pdf", "generic_pdf"}:
@@ -4814,7 +4814,7 @@ def create_blank_board() -> Response | tuple[Response, int]:
     library = read_library()
     requested_folder = payload.get("folder_id")
     if not isinstance(requested_folder, str) or requested_folder not in folder_ids(library):
-        return jsonify(error="Choose a lecture for this blank board."), 400
+        return jsonify(error="Choose a class for this blank board."), 400
     require_lecture_owner(requested_folder)
     try:
         requested_name = str(payload.get("name") or "").strip()
@@ -5042,7 +5042,7 @@ def put_folder_workspace(folder_id: str) -> Response | tuple[Response, int]:
         client_revision = int(raw.get("revision")) if isinstance(raw, dict) else -1
         if client_revision != int(current.get("revision") or 0):
             return jsonify(
-                error="This lecture workspace changed elsewhere.",
+                error="This class workspace changed elsewhere.",
                 workspace=current,
             ), 409
         clean = validate_lecture_workspace(
@@ -5085,7 +5085,7 @@ def analyze_lecture_route(folder_id: str) -> Response | tuple[Response, int]:
     try:
         route_context = ai_context(
             action="lecture_analysis",
-            question="Analyze this lecture",
+            question="Analyze this class",
             request_id=(str(payload.get("requestId") or "") or None) if isinstance(payload, dict) else None,
             folder_id=folder_id,
             selected_board_count=len(folder_board_ids(library, folder_id)),
@@ -5123,7 +5123,7 @@ def generate_study_guide_route(folder_id: str) -> Response | tuple[Response, int
     try:
         route_context = ai_context(
             action="study_guide",
-            question="Create a study guide for this lecture",
+            question="Create a study guide for this class",
             folder_id=folder_id,
             selected_board_count=len(folder_board_ids(library, folder_id)),
         )
@@ -5166,7 +5166,7 @@ def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int
             created=False,
         )
     try:
-        name = validate_display_name(str(catalog.get("name") or metadata.get("name") or "Lecture"))
+        name = validate_display_name(str(catalog.get("name") or metadata.get("name") or "Class"))
     except ValueError:
         name = default_board_title()
     existing = {
@@ -5178,7 +5178,7 @@ def ensure_board_lecture_folder(board_id: str) -> Response | tuple[Response, int
         try:
             name = validate_display_name(unique_folder_name(owned_library(library), name))
         except ValueError:
-            name = f"Lecture {secrets.token_hex(2)}"
+            name = f"Class {secrets.token_hex(2)}"
     folder = normalize_folder({
         "id": secrets.token_hex(8),
         "name": name,

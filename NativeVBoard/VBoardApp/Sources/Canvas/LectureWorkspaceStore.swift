@@ -19,7 +19,7 @@ enum WorkspacePersistenceStatus: Equatable {
         case .saving: return "Saving…"
         case .offlinePending: return "Saved locally"
         case .conflict: return "Layout needs review"
-        case .failed: return "Couldn’t load lecture"
+        case .failed: return "Couldn’t load class"
         }
     }
 }
@@ -212,7 +212,7 @@ final class LectureWorkspaceStore: ObservableObject {
                 requestDetail(for: [active], api: api)
             }
         } catch {
-            status = .failed("Your lecture workspace could not be loaded.")
+            status = .failed("Your class workspace could not be loaded.")
         }
     }
 
