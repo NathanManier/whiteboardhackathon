@@ -463,6 +463,15 @@ private struct BoardEditorSurface: View {
                 onSelectionRegionChanged: { selectedPDFRegion = $0 },
                 onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) },
                 onResize: { ids, anchor, factor in selectedPDFRegion = nil; store.scaleObjects(ids: ids, around: anchor, by: factor, api: api) },
+                onResizeGraphHeight: { id, anchorY, factor in
+                    selectedPDFRegion = nil
+                    store.resizeGraphHeight(id: id, around: anchorY,
+                                            by: factor, api: api)
+                },
+                onGraphDoubleTap: { id in
+                    interactiveGraph = store.editor.objects
+                        .first(where: { $0.id == id })?.graph
+                },
                 onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) },
                 onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) },
                 onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) },

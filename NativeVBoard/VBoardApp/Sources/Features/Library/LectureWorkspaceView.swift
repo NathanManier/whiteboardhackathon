@@ -328,6 +328,14 @@ struct LectureWorkspaceView: View {
                     onResizeSelection: { keys, anchor, scale in
                         store.resizeSelection(keys, around: anchor, by: scale, api: api)
                     },
+                    onResizeGraphHeight: { key, anchorY, factor in
+                        store.resizeGraphHeight(key, around: anchorY,
+                                                by: factor, api: api)
+                    },
+                    onGraphDoubleTap: { key in
+                        interactiveGraph = store.scenes[key.boardID]?.editor.objects
+                            .first(where: { $0.id == key.objectID })?.graph
+                    },
                     onDelete: { store.deleteSelection($0, api: api) },
                     onMoveBoard: { boardID, delta in store.moveBoard(boardID: boardID, by: delta, api: api) },
                     onUndo: { store.undo(api: api) },

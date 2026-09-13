@@ -848,6 +848,22 @@ final class BoardDocumentStore: ObservableObject {
                             around: anchor, by: factor, api: api)
     }
 
+    @discardableResult
+    func resizeGraphHeight(id: String, around anchorY: CGFloat,
+                           by requestedFactor: CGFloat, api: APIClient) -> CGFloat? {
+        guard let index = editor.objects.firstIndex(where: { $0.id == id }),
+              let graph = editor.objects[index].graph,
+              let factor = GraphCardResizePolicy.clampedVerticalFactor(
+                currentHeight: graph.frame.height, requested: requestedFactor
+              ) else { return nil }
+        let updated = graph.resizedVertically(around: anchorY, by: factor)
+        guard updated.frame.width == graph.frame.width, updated != graph else { return nil }
+        var next = editor
+        next.objects[index] = CanvasObject(graph: updated)
+        apply(next, api: api)
+        return factor
+    }
+
     func deleteObjects(ids: Set<String>, api: APIClient) {
         let editorIDs = Set(editor.objects.lazy.filter { ids.contains($0.id) }.map(\.id))
         deleteObjects(editorObjectIDs: editorIDs,

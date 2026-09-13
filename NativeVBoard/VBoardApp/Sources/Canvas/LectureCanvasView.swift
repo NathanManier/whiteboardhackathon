@@ -150,7 +150,10 @@ final class BoardVectorLoadingIndicator: UIView {
 }
 
 enum SelectionResizeHandle: CaseIterable, Sendable {
-    case topLeft, topRight, bottomRight, bottomLeft
+    case topLeft, topRight, bottomRight, bottomLeft, topCenter, bottomCenter
+
+    static let cornerHandles: [Self] = [.topLeft, .topRight, .bottomRight, .bottomLeft]
+    static let verticalHandles: [Self] = [.topCenter, .bottomCenter]
 
     func point(in bounds: CGRect) -> CGPoint {
         switch self {
@@ -158,6 +161,8 @@ enum SelectionResizeHandle: CaseIterable, Sendable {
         case .topRight: return CGPoint(x: bounds.maxX, y: bounds.minY)
         case .bottomRight: return CGPoint(x: bounds.maxX, y: bounds.maxY)
         case .bottomLeft: return CGPoint(x: bounds.minX, y: bounds.maxY)
+        case .topCenter: return CGPoint(x: bounds.midX, y: bounds.minY)
+        case .bottomCenter: return CGPoint(x: bounds.midX, y: bounds.maxY)
         }
     }
 
@@ -167,15 +172,20 @@ enum SelectionResizeHandle: CaseIterable, Sendable {
         case .topRight: return SelectionResizeHandle.bottomLeft.point(in: bounds)
         case .bottomRight: return SelectionResizeHandle.topLeft.point(in: bounds)
         case .bottomLeft: return SelectionResizeHandle.topRight.point(in: bounds)
+        case .topCenter: return SelectionResizeHandle.bottomCenter.point(in: bounds)
+        case .bottomCenter: return SelectionResizeHandle.topCenter.point(in: bounds)
         }
     }
 }
+
+enum SelectionResizeMode: Equatable, Sendable { case uniform, graphVertical }
 
 struct SelectionResizeSession {
     let keys: Set<SelectionKey>
     let startBounds: CGRect
     let handle: SelectionResizeHandle
     let startPointer: CGPoint
+    var mode: SelectionResizeMode = .uniform
 
     var anchor: CGPoint { handle.oppositePoint(in: startBounds) }
 }
@@ -185,15 +195,25 @@ enum SelectionResizeGeometry {
         let handleStart = session.handle.point(in: session.startBounds)
         let desiredHandle = CGPoint(x: handleStart.x + currentPointer.x - session.startPointer.x,
                                     y: handleStart.y + currentPointer.y - session.startPointer.y)
-        let base = CGPoint(x: handleStart.x - session.anchor.x,
-                           y: handleStart.y - session.anchor.y)
-        let desired = CGPoint(x: desiredHandle.x - session.anchor.x,
-                              y: desiredHandle.y - session.anchor.y)
-        let denominator = base.x * base.x + base.y * base.y
-        guard denominator > 0.001 else { return 1 }
-        let projected = (desired.x * base.x + desired.y * base.y) / denominator
-        let minimumFactor = max(0.01, 24 / max(min(session.startBounds.width,
-                                                   session.startBounds.height), 24))
+        let projected: CGFloat
+        let minimumFactor: CGFloat
+        if session.mode == .graphVertical {
+            let base = handleStart.y - session.anchor.y
+            guard abs(base) > 0.001 else { return 1 }
+            projected = (desiredHandle.y - session.anchor.y) / base
+            minimumFactor = GraphCardResizePolicy.minimumReadableHeight
+                / max(session.startBounds.height, GraphCardResizePolicy.minimumReadableHeight)
+        } else {
+            let base = CGPoint(x: handleStart.x - session.anchor.x,
+                               y: handleStart.y - session.anchor.y)
+            let desired = CGPoint(x: desiredHandle.x - session.anchor.x,
+                                  y: desiredHandle.y - session.anchor.y)
+            let denominator = base.x * base.x + base.y * base.y
+            guard denominator > 0.001 else { return 1 }
+            projected = (desired.x * base.x + desired.y * base.y) / denominator
+            minimumFactor = max(0.01, 24 / max(min(session.startBounds.width,
+                                                       session.startBounds.height), 24))
+        }
         return min(100, max(minimumFactor, projected))
     }
 
@@ -202,6 +222,12 @@ enum SelectionResizeGeometry {
         let dragged = session.handle.point(in: session.startBounds)
         let next = CGPoint(x: anchor.x + (dragged.x - anchor.x) * scale,
                            y: anchor.y + (dragged.y - anchor.y) * scale)
+        if session.mode == .graphVertical {
+            return CGRect(x: session.startBounds.minX,
+                          y: min(anchor.y, next.y),
+                          width: session.startBounds.width,
+                          height: abs(next.y - anchor.y))
+        }
         return CGRect(x: min(anchor.x, next.x), y: min(anchor.y, next.y),
                       width: abs(next.x - anchor.x), height: abs(next.y - anchor.y))
     }
@@ -242,6 +268,8 @@ struct LectureCanvasView: UIViewRepresentable {
     var onBoardExpansionRequested: (String, CGRect) -> Void = { _, _ in }
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeSelection: (Set<SelectionKey>, CGPoint, CGFloat) -> Void
+    var onResizeGraphHeight: (SelectionKey, CGFloat, CGFloat) -> Void = { _, _, _ in }
+    var onGraphDoubleTap: (SelectionKey) -> Void = { _ in }
     var onDelete: (Set<SelectionKey>) -> Void
     var onMoveBoard: (String, CGPoint) -> Void
     var onUndo: () -> Void
@@ -294,6 +322,8 @@ struct LectureCanvasView: UIViewRepresentable {
                                onBoardExpansionRequested: onBoardExpansionRequested,
                                onMoveSelection: onMoveSelection,
                                onResizeSelection: onResizeSelection,
+                               onResizeGraphHeight: onResizeGraphHeight,
+                               onGraphDoubleTap: onGraphDoubleTap,
                                onDelete: onDelete,
                                onMoveBoard: onMoveBoard,
                                onUndo: onUndo,
@@ -316,6 +346,8 @@ struct LectureCanvasCallbacks {
     var onBoardExpansionRequested: (String, CGRect) -> Void = { _, _ in }
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeSelection: (Set<SelectionKey>, CGPoint, CGFloat) -> Void
+    var onResizeGraphHeight: (SelectionKey, CGFloat, CGFloat) -> Void = { _, _, _ in }
+    var onGraphDoubleTap: (SelectionKey) -> Void = { _ in }
     var onDelete: (Set<SelectionKey>) -> Void
     var onMoveBoard: (String, CGPoint) -> Void
     var onUndo: () -> Void
@@ -486,6 +518,17 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         pinch.delegate = self
         addGestureRecognizer(pinch)
         pinchRecognizer = pinch
+
+        let graphDoubleTap = UITapGestureRecognizer(target: self,
+                                                     action: #selector(didDoubleTapGraph(_:)))
+        graphDoubleTap.numberOfTapsRequired = 2
+        graphDoubleTap.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+        ]
+        graphDoubleTap.cancelsTouchesInView = true
+        graphDoubleTap.delegate = self
+        addGestureRecognizer(graphDoubleTap)
 
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(pencilHover(_:)))
         hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
@@ -1224,6 +1267,21 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         CanvasGestureHitTestPolicy.allowsCanvasGesture(from: touch.view, canvasRoot: self)
     }
 
+    @objc private func didDoubleTapGraph(_ recognizer: UITapGestureRecognizer) {
+        guard recognizer.state == .ended else { return }
+        let world = screenToWorld(recognizer.location(in: self))
+        guard let item = boardItem(at: world),
+              let graph = scenes[item.boardID]?.editor.objects.reversed().first(where: {
+                $0.graph != nil && BoardHitTestPolicy.bounds(of: $0).contains(
+                    LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item)
+                )
+              })?.graph else { return }
+        callbacks.onGraphDoubleTap(SelectionKey(boardID: item.boardID,
+                                                objectID: graph.id,
+                                                kind: .editorObject,
+                                                objectType: "graph"))
+    }
+
     // MARK: - Pointer, Pencil, and tool routing
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1267,7 +1325,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
            let bounds = selectionWorldBounds(),
            let handle = resizeHandle(at: world, bounds: bounds) {
             let session = SelectionResizeSession(keys: selectedKeys, startBounds: bounds,
-                                                 handle: handle, startPointer: world)
+                                                 handle: handle, startPointer: world,
+                                                 mode: selectedGraphForVerticalResize == nil
+                                                    ? .uniform : .graphVertical)
             resizePreviewBounds = bounds
             interaction = .resizingSelection(session)
             if let boardID = selectedKeys.first?.boardID { callbacks.onActiveBoardChanged(boardID) }
@@ -1500,8 +1560,13 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         case .resizingSelection(let session):
             let requested = SelectionResizeGeometry.scale(session: session, currentPointer: world)
             if let scale = boundedSelectionResizeScale(session: session, requested: requested) {
-                retainSelectionResizePreview(session: session, scale: scale)
-                callbacks.onResizeSelection(session.keys, session.anchor, scale)
+                if session.mode == .graphVertical,
+                   let selected = selectedGraphForVerticalResize {
+                    callbacks.onResizeGraphHeight(selected.key, session.anchor.y, scale)
+                } else {
+                    retainSelectionResizePreview(session: session, scale: scale)
+                    callbacks.onResizeSelection(session.keys, session.anchor, scale)
+                }
             } else {
                 clearSelectionResizePreview(keys: session.keys)
             }
@@ -1757,6 +1822,15 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     }
 
     private func previewSelectionResize(session: SelectionResizeSession, scale: CGFloat) {
+        if session.mode == .graphVertical,
+           let selected = selectedGraphForVerticalResize,
+           let item = workspace.items.first(where: { $0.boardID == selected.key.boardID }) {
+            let localAnchorY = session.anchor.y - CGFloat(item.canvasY)
+            boardViews[selected.key.boardID]?.previewGraphVerticalResize(
+                key: selected.key, anchorY: localAnchorY, scale: scale
+            )
+            return
+        }
         let grouped = Dictionary(grouping: session.keys, by: \.boardID)
         for (boardID, keys) in grouped {
             guard let item = workspace.items.first(where: { $0.boardID == boardID }) else { continue }
@@ -1786,6 +1860,13 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     /// factor before displaying or committing any transform.
     private func boundedSelectionResizeScale(session: SelectionResizeSession,
                                              requested: CGFloat) -> CGFloat? {
+        if session.mode == .graphVertical {
+            guard let selected = selectedGraphForVerticalResize else { return nil }
+            return GraphCardResizePolicy.clampedVerticalFactor(
+                currentHeight: selected.graph.frame.height,
+                requested: requested
+            )
+        }
         let grouped = Dictionary(grouping: session.keys, by: \.boardID)
         var sharedBounds: SelectionScaleBounds?
         for (boardID, keys) in grouped {
@@ -1839,7 +1920,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         let path = UIBezierPath(rect: union.insetBy(dx: -screenSpaceInset,
                                                     dy: -screenSpaceInset))
         let radius = 6 / max(worldTransform.scale, 0.001)
-        for handle in SelectionResizeHandle.allCases {
+        for handle in availableResizeHandles {
             let center = handle.point(in: union)
             path.append(UIBezierPath(ovalIn: CGRect(x: center.x - radius,
                                                     y: center.y - radius,
@@ -1871,10 +1952,29 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     private func resizeHandle(at world: CGPoint, bounds: CGRect) -> SelectionResizeHandle? {
         let tolerance = PencilHitTarget.resizeHandleRadius / max(worldTransform.scale, 0.001)
-        return SelectionResizeHandle.allCases.first {
+        return availableResizeHandles.first {
             let point = $0.point(in: bounds)
             return hypot(world.x - point.x, world.y - point.y) <= tolerance
         }
+    }
+
+    private var selectedGraphForVerticalResize: (key: SelectionKey, graph: GraphObject)? {
+        guard selectedKeys.count == 1,
+              let key = selectedKeys.first,
+              key.kind == .editorObject,
+              let graph = scenes[key.boardID]?.editor.objects
+                .first(where: { $0.id == key.objectID })?.graph else { return nil }
+        return (key, graph)
+    }
+
+    private var availableResizeHandles: [SelectionResizeHandle] {
+        if selectedGraphForVerticalResize != nil { return SelectionResizeHandle.verticalHandles }
+        let containsGraph = selectedKeys.contains { key in
+            guard key.kind == .editorObject else { return false }
+            return scenes[key.boardID]?.editor.objects
+                .first(where: { $0.id == key.objectID })?.graph != nil
+        }
+        return containsGraph ? [] : SelectionResizeHandle.cornerHandles
     }
 
     private func selectionWorldBounds() -> CGRect? {
@@ -2328,6 +2428,20 @@ private final class LectureBoardRenderView: UIView {
             layer.position = CGPoint(x: anchor.x + (original.x - anchor.x) * scale,
                                      y: anchor.y + (original.y - anchor.y) * scale)
         }
+        CATransaction.commit()
+    }
+
+    func previewGraphVerticalResize(key: SelectionKey, anchorY: CGFloat, scale: CGFloat) {
+        guard key.kind == .editorObject,
+              renderedObjects[key.objectID]?.graph != nil,
+              let layer = objectLayers[key.objectID] else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let original = resizePreviewPositions[key.objectID] ?? layer.position
+        resizePreviewPositions[key.objectID] = original
+        layer.setAffineTransform(CGAffineTransform(scaleX: 1, y: scale))
+        layer.position = CGPoint(x: original.x,
+                                 y: anchorY + (original.y - anchorY) * scale)
         CATransaction.commit()
     }
 

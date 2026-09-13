@@ -198,7 +198,7 @@ final class EditorNavigationGestureGuardTests: XCTestCase {
 final class SelectionResizeTests: XCTestCase {
     func testEveryCornerUsesFixedOppositeAnchorAndUniformScale() {
         let bounds = CGRect(x: -40, y: 20, width: 200, height: 100)
-        for handle in SelectionResizeHandle.allCases {
+        for handle in SelectionResizeHandle.cornerHandles {
             let start = handle.point(in: bounds)
             let anchor = handle.oppositePoint(in: bounds)
             let target = CGPoint(x: anchor.x + (start.x - anchor.x) * 1.5,
@@ -213,6 +213,45 @@ final class SelectionResizeTests: XCTestCase {
             XCTAssertTrue(abs(resized.minX - anchor.x) < 0.001 || abs(resized.maxX - anchor.x) < 0.001)
             XCTAssertTrue(abs(resized.minY - anchor.y) < 0.001 || abs(resized.maxY - anchor.y) < 0.001)
         }
+    }
+
+    func testGraphVerticalResizeKeepsWidthAndOppositeEdgeFixed() {
+        let bounds = CGRect(x: -240, y: 80, width: 560, height: 340)
+        for handle in SelectionResizeHandle.verticalHandles {
+            let start = handle.point(in: bounds)
+            let anchor = handle.oppositePoint(in: bounds)
+            let target = CGPoint(x: start.x + 900,
+                                 y: anchor.y + (start.y - anchor.y) * 1.5)
+            let session = SelectionResizeSession(keys: [], startBounds: bounds,
+                                                 handle: handle, startPointer: start,
+                                                 mode: .graphVertical)
+            let scale = SelectionResizeGeometry.scale(session: session,
+                                                      currentPointer: target)
+            let resized = SelectionResizeGeometry.bounds(session: session, scale: scale)
+            XCTAssertEqual(scale, 1.5, accuracy: 0.0001)
+            XCTAssertEqual(resized.minX, bounds.minX, accuracy: 0.0001)
+            XCTAssertEqual(resized.width, bounds.width, accuracy: 0.0001)
+            XCTAssertEqual(resized.height, bounds.height * 1.5, accuracy: 0.0001)
+            XCTAssertTrue(abs(resized.minY - anchor.y) < 0.001
+                          || abs(resized.maxY - anchor.y) < 0.001)
+        }
+    }
+
+    func testGraphVerticalResizeClampsToReadableMinimumHeight() {
+        let bounds = CGRect(x: 20, y: 40, width: 560, height: 340)
+        let start = SelectionResizeHandle.bottomCenter.point(in: bounds)
+        let session = SelectionResizeSession(keys: [], startBounds: bounds,
+                                             handle: .bottomCenter, startPointer: start,
+                                             mode: .graphVertical)
+        let scale = SelectionResizeGeometry.scale(
+            session: session,
+            currentPointer: CGPoint(x: start.x, y: bounds.minY + 10)
+        )
+        let resized = SelectionResizeGeometry.bounds(session: session, scale: scale)
+        XCTAssertEqual(resized.width, bounds.width, accuracy: 0.0001)
+        XCTAssertEqual(resized.height, GraphCardResizePolicy.minimumReadableHeight,
+                       accuracy: 0.0001)
+        XCTAssertEqual(resized.minY, bounds.minY, accuracy: 0.0001)
     }
 
     func testCanonicalStrokeScalePreservesPointsAndComposesTransform() throws {
@@ -2814,6 +2853,50 @@ final class GraphDomainModelTests: XCTestCase {
         XCTAssertEqual(scaled.graph?.frame.height, source.frame.height * 2)
         XCTAssertEqual(scaled.graph?.viewport, source.viewport)
         XCTAssertEqual(scaled.graph?.settings, source.settings)
+    }
+
+    func testGraphVerticalResizePreservesFixedWidthAndCanonicalSemantics() throws {
+        let source = graph(frame: GraphFrame(x: -240, y: 80, width: 560, height: 340))
+        let resized = source.resizedVertically(around: 80, by: 1.5)
+
+        XCTAssertEqual(resized.frame.x, source.frame.x)
+        XCTAssertEqual(resized.frame.y, source.frame.y)
+        XCTAssertEqual(resized.frame.width, source.frame.width)
+        XCTAssertEqual(resized.frame.height, 510)
+        XCTAssertEqual(resized.expressions, source.expressions)
+        XCTAssertEqual(resized.viewport, source.viewport)
+        XCTAssertEqual(resized.settings, source.settings)
+        XCTAssertEqual(resized.sourceSelection, source.sourceSelection)
+        XCTAssertEqual(resized.providerMetadata, source.providerMetadata)
+        XCTAssertEqual(resized.additionalFields, source.additionalFields)
+
+        let roundTrip = try JSONDecoder().decode(
+            GraphObject.self, from: JSONEncoder().encode(resized)
+        )
+        XCTAssertEqual(roundTrip, resized)
+    }
+
+    func testGraphStoreVerticalResizeUsesOneUndoableCanonicalMutation() throws {
+        let source = graph()
+        let api = APIClient(baseURL: URL(string: "https://graph-resize.invalid")!)
+        let store = BoardDocumentStore(boardID: boardID,
+                                       editor: editor(revision: 8, object: source))
+
+        let applied = try XCTUnwrap(store.resizeGraphHeight(id: source.id, around: 80,
+                                                           by: 0.1, api: api))
+        let resized = store.editor.objects.first?.graph
+
+        XCTAssertEqual(applied, GraphCardResizePolicy.minimumReadableHeight / 340,
+                       accuracy: 0.0001)
+        XCTAssertEqual(resized?.frame.x, source.frame.x)
+        XCTAssertEqual(resized?.frame.y, source.frame.y)
+        XCTAssertEqual(resized?.frame.width, source.frame.width)
+        XCTAssertEqual(resized?.frame.height,
+                       Double(GraphCardResizePolicy.minimumReadableHeight))
+        XCTAssertTrue(store.canUndo)
+
+        store.undo(api: api)
+        XCTAssertEqual(store.editor.objects.first?.graph, source)
     }
 
     func testAddGraphUsesCanonicalEditorSavePath() async throws {

@@ -334,6 +334,8 @@ struct NativeCanvasView: UIViewRepresentable {
     var onSelectionRegionChanged: (CGRect?) -> Void = { _ in }
     var onMove: (Set<String>, CGPoint) -> Void = { _, _ in }
     var onResize: (Set<String>, CGPoint, CGFloat) -> Void = { _, _, _ in }
+    var onResizeGraphHeight: (String, CGFloat, CGFloat) -> Void = { _, _, _ in }
+    var onGraphDoubleTap: (String) -> Void = { _ in }
     var onDelete: (Set<String>) -> Void = { _ in }
     var onCameraChanged: (CameraRect) -> Void = { _ in }
     var onUndo: () -> Void = {}
@@ -354,7 +356,10 @@ struct NativeCanvasView: UIViewRepresentable {
                              isPencilPalettePresented: isPencilPalettePresented,
                              showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                              onStroke: onStroke, tool: tool,
-                             onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo,
+                             onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize,
+                             onResizeGraphHeight: onResizeGraphHeight,
+                             onGraphDoubleTap: onGraphDoubleTap,
+                             onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo,
                              onPencilAction: onPencilAction, onPencilPaletteMoved: onPencilPaletteMoved,
                              onPencilPaletteHighlight: onPencilPaletteHighlight,
                              onPencilPaletteCommit: onPencilPaletteCommit,
@@ -371,7 +376,10 @@ struct NativeCanvasView: UIViewRepresentable {
                       isPencilPalettePresented: isPencilPalettePresented,
                       showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                       onStroke: onStroke, tool: tool,
-                      onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo,
+                      onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize,
+                      onResizeGraphHeight: onResizeGraphHeight,
+                      onGraphDoubleTap: onGraphDoubleTap,
+                      onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo,
                       onPencilAction: onPencilAction, onPencilPaletteMoved: onPencilPaletteMoved,
                       onPencilPaletteHighlight: onPencilPaletteHighlight,
                       onPencilPaletteCommit: onPencilPaletteCommit,
@@ -412,6 +420,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var onSelectionRegionChanged: (CGRect?) -> Void
     private var onMove: (Set<String>, CGPoint) -> Void
     private var onResize: (Set<String>, CGPoint, CGFloat) -> Void
+    private var onResizeGraphHeight: (String, CGFloat, CGFloat) -> Void
+    private var onGraphDoubleTap: (String) -> Void
     private var onDelete: (Set<String>) -> Void
     private var onCameraChanged: (CameraRect) -> Void
     private var onUndo: () -> Void
@@ -497,6 +507,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
          onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
          onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in },
          onResize: @escaping (Set<String>, CGPoint, CGFloat) -> Void = { _, _, _ in },
+         onResizeGraphHeight: @escaping (String, CGFloat, CGFloat) -> Void = { _, _, _ in },
+         onGraphDoubleTap: @escaping (String) -> Void = { _ in },
          onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {},
          onPencilAction: @escaping (PencilLogicalAction, CGPoint?) -> Void = { _, _ in },
          onPencilPaletteMoved: @escaping (CGPoint) -> Void = { _ in },
@@ -514,7 +526,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         self.onStroke = onStroke
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
-        self.onMove = onMove; self.onResize = onResize; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
+        self.onMove = onMove; self.onResize = onResize
+        self.onResizeGraphHeight = onResizeGraphHeight
+        self.onGraphDoubleTap = onGraphDoubleTap
+        self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
         self.onPencilAction = onPencilAction
         self.onPencilPaletteMoved = onPencilPaletteMoved
         self.onPencilPaletteHighlight = onPencilPaletteHighlight
@@ -654,6 +669,16 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                                    NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         pinch.cancelsTouchesInView = true
         pinch.delegate = self; pinchGesture = pinch; addGestureRecognizer(pinch)
+        let graphDoubleTap = UITapGestureRecognizer(target: self,
+                                                     action: #selector(didDoubleTapGraph(_:)))
+        graphDoubleTap.numberOfTapsRequired = 2
+        graphDoubleTap.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+        ]
+        graphDoubleTap.cancelsTouchesInView = true
+        graphDoubleTap.delegate = self
+        addGestureRecognizer(graphDoubleTap)
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(pencilHover(_:)))
         hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
         hover.cancelsTouchesInView = false
@@ -957,6 +982,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                 onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
                 onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in },
                 onResize: @escaping (Set<String>, CGPoint, CGFloat) -> Void = { _, _, _ in },
+                onResizeGraphHeight: @escaping (String, CGFloat, CGFloat) -> Void = { _, _, _ in },
+                onGraphDoubleTap: @escaping (String) -> Void = { _ in },
                 onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {},
                 onPencilAction: @escaping (PencilLogicalAction, CGPoint?) -> Void = { _, _ in },
                 onPencilPaletteMoved: @escaping (CGPoint) -> Void = { _ in },
@@ -1011,7 +1038,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         }
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
-        self.onMove = onMove; self.onResize = onResize; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
+        self.onMove = onMove; self.onResize = onResize
+        self.onResizeGraphHeight = onResizeGraphHeight
+        self.onGraphDoubleTap = onGraphDoubleTap
+        self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
         self.onPencilAction = onPencilAction
         self.onPencilPaletteMoved = onPencilPaletteMoved
         self.onPencilPaletteHighlight = onPencilPaletteHighlight
@@ -1316,6 +1346,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         if gestureRecognizer === panGesture || gestureRecognizer === scrollPanGesture
             || gestureRecognizer === wheelZoomGesture { return true }
         return true
+    }
+
+    @objc private func didDoubleTapGraph(_ recognizer: UITapGestureRecognizer) {
+        guard recognizer.state == .ended else { return }
+        let world = worldPoint(recognizer.location(in: self), from: self)
+        guard let graphID = objects.reversed().first(where: {
+            $0.graph != nil && BoardHitTestPolicy.bounds(of: $0).contains(world)
+        })?.id else { return }
+        onGraphDoubleTap(graphID)
     }
 
     private var drawsWithFinger: Bool {
@@ -1746,7 +1785,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                   let bounds = selectionWorldBounds(),
                   let handle = resizeHandle(at: point, bounds: bounds) {
             let session = SelectionResizeSession(keys: [], startBounds: bounds,
-                                                 handle: handle, startPointer: point)
+                                                 handle: handle, startPointer: point,
+                                                 mode: selectedGraphForVerticalResize == nil
+                                                    ? .uniform : .graphVertical)
             resizeSession = session
             resizePreviewBounds = bounds
             interactionState = .resizingSelection
@@ -1795,9 +1836,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         }
         if interactionState == .resizingSelection, let session = resizeSession {
             let requested = SelectionResizeGeometry.scale(session: session, currentPointer: point)
-            let scale = boundedResizeScale(anchor: session.anchor, requested: requested) ?? 1
+            let scale = boundedResizeScale(session: session, requested: requested) ?? 1
             resizePreviewBounds = SelectionResizeGeometry.bounds(session: session, scale: scale)
-            previewResize(anchor: session.anchor, scale: scale)
+            if session.mode == .graphVertical {
+                previewGraphVerticalResize(anchorY: session.anchor.y, scale: scale)
+            } else {
+                previewResize(anchor: session.anchor, scale: scale)
+            }
             updateSelectionOverlay()
             lastEditPoint = point
             return
@@ -1827,9 +1872,14 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                 SelectionResizeGeometry.scale(session: session, currentPointer: $0)
             } ?? 1
             if endpoint != nil,
-               let scale = boundedResizeScale(anchor: session.anchor, requested: requested) {
-                retainResizePreview(anchor: session.anchor, scale: scale)
-                onResize(selectedIDs, session.anchor, scale)
+               let scale = boundedResizeScale(session: session, requested: requested) {
+                if session.mode == .graphVertical,
+                   let graph = selectedGraphForVerticalResize {
+                    onResizeGraphHeight(graph.id, session.anchor.y, scale)
+                } else {
+                    retainResizePreview(anchor: session.anchor, scale: scale)
+                    onResize(selectedIDs, session.anchor, scale)
+                }
                 debugInputOperation("RESIZE COMMIT")
             } else {
                 clearResizePreview()
@@ -1956,6 +2006,19 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         CATransaction.commit()
     }
 
+    private func previewGraphVerticalResize(anchorY: CGFloat, scale: CGFloat) {
+        guard let graph = selectedGraphForVerticalResize,
+              let layer = userObjectLayers[graph.id] else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let original = resizePreviewPositions[graph.id] ?? layer.position
+        resizePreviewPositions[graph.id] = original
+        layer.setAffineTransform(CGAffineTransform(scaleX: 1, y: scale))
+        layer.position = CGPoint(x: original.x,
+                                 y: anchorY + (original.y - anchorY) * scale)
+        CATransaction.commit()
+    }
+
     private func clearResizePreview() {
         professor.clearPreviewScale(ids: selectedIDs)
         if selectedIDs.contains(PDFBoardSource.imageLogicalID) {
@@ -2006,7 +2069,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     /// The visual proxy must use the same factor as the document mutation.
     /// Otherwise a graph already at its minimum/maximum can leave a retained
     /// transform behind even though the canonical store correctly no-ops.
-    private func boundedResizeScale(anchor: CGPoint, requested: CGFloat) -> CGFloat? {
+    private func boundedResizeScale(session: SelectionResizeSession,
+                                    requested: CGFloat) -> CGFloat? {
+        if session.mode == .graphVertical {
+            guard let graph = selectedGraphForVerticalResize else { return nil }
+            return GraphCardResizePolicy.clampedVerticalFactor(
+                currentHeight: graph.frame.height, requested: requested
+            )
+        }
+        let anchor = session.anchor
         let editorIDs = Set(objects.lazy.filter { self.selectedIDs.contains($0.id) }.map(\.id))
         return SelectionScaleBounds.selection(
             objects: objects,
@@ -2096,7 +2167,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         let path = UIBezierPath(rect: bounds.insetBy(dx: -10 * inverseScale,
                                                      dy: -10 * inverseScale))
         let handleRadius = 6 * inverseScale
-        for handle in SelectionResizeHandle.allCases {
+        for handle in availableResizeHandles {
             let point = handle.point(in: bounds)
             path.append(UIBezierPath(ovalIn: CGRect(x: point.x - handleRadius,
                                                     y: point.y - handleRadius,
@@ -2120,10 +2191,21 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
 
     private func resizeHandle(at point: CGPoint, bounds: CGRect) -> SelectionResizeHandle? {
         let tolerance = PencilHitTarget.resizeHandleRadius / max(worldTransform.scale, 0.001)
-        return SelectionResizeHandle.allCases.first {
+        return availableResizeHandles.first {
             let handlePoint = $0.point(in: bounds)
             return hypot(point.x - handlePoint.x, point.y - handlePoint.y) <= tolerance
         }
+    }
+
+    private var selectedGraphForVerticalResize: GraphObject? {
+        guard selectedIDs.count == 1, let id = selectedIDs.first else { return nil }
+        return objects.first(where: { $0.id == id })?.graph
+    }
+
+    private var availableResizeHandles: [SelectionResizeHandle] {
+        if selectedGraphForVerticalResize != nil { return SelectionResizeHandle.verticalHandles }
+        let containsGraph = objects.contains { selectedIDs.contains($0.id) && $0.graph != nil }
+        return containsGraph ? [] : SelectionResizeHandle.cornerHandles
     }
 
     private func polygonContains(_ point: CGPoint, polygon: [CGPoint]) -> Bool {

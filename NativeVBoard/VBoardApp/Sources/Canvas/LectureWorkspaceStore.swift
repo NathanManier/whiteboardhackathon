@@ -422,6 +422,21 @@ final class LectureWorkspaceStore: ObservableObject {
         refreshSceneSnapshot(key.boardID, api: api)
     }
 
+    @discardableResult
+    func resizeGraphHeight(_ key: SelectionKey, around lectureAnchorY: CGFloat,
+                           by factor: CGFloat, api: APIClient) -> CGFloat? {
+        guard key.kind == .editorObject,
+              let item = workspace?.items.first(where: { $0.boardID == key.boardID }),
+              let store = boardStores[key.boardID] else { return nil }
+        let localAnchorY = lectureAnchorY - CGFloat(item.canvasY)
+        guard let applied = store.resizeGraphHeight(id: key.objectID,
+                                                    around: localAnchorY,
+                                                    by: factor, api: api) else { return nil }
+        recordBoardUndo([key.boardID])
+        refreshSceneSnapshot(key.boardID, api: api)
+        return applied
+    }
+
     /// Resizes a mixed or cross-board selection as one workspace history
     /// gesture while keeping each board's editor.json isolated.
     @discardableResult

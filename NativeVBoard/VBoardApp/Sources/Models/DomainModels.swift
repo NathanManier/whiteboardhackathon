@@ -604,6 +604,18 @@ struct GraphFrame: Codable, Equatable, Sendable {
     var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
 }
 
+enum GraphCardResizePolicy {
+    static let minimumReadableHeight: CGFloat = 180
+
+    static func clampedVerticalFactor(currentHeight: Double, requested: CGFloat) -> CGFloat? {
+        guard currentHeight.isFinite, currentHeight > 0,
+              requested.isFinite, requested > 0 else { return nil }
+        let lower = minimumReadableHeight / CGFloat(currentHeight)
+        let result = min(100, max(lower, requested))
+        return abs(result - 1) > 0.001 ? result : nil
+    }
+}
+
 /// Open raw-value model: known cases have constants while future server values
 /// survive decode/encode exactly instead of collapsing to `unknown`.
 struct GraphExpressionType: RawRepresentable, Codable, Equatable, Hashable, Sendable {
@@ -1086,6 +1098,21 @@ struct GraphObject: Codable, Equatable, Identifiable, Sendable {
             y: Self.boundedWorld(Double(anchor.y) + safeFactor * (frame.y - Double(anchor.y))),
             width: Self.boundedDimension(frame.width * safeFactor),
             height: Self.boundedDimension(frame.height * safeFactor)
+        ))
+    }
+
+    /// Ordinary on-canvas graph resizing is vertical only. The graph's X
+    /// origin and fixed card width remain byte-for-byte stable.
+    func resizedVertically(around anchorY: CGFloat, by factor: CGFloat) -> GraphObject {
+        let safeFactor = GraphCardResizePolicy.clampedVerticalFactor(
+            currentHeight: frame.height, requested: factor
+        ) ?? 1
+        return replacing(frame: GraphFrame(
+            x: frame.x,
+            y: Self.boundedWorld(Double(anchorY)
+                + Double(safeFactor) * (frame.y - Double(anchorY))),
+            width: frame.width,
+            height: Self.boundedDimension(frame.height * Double(safeFactor))
         ))
     }
 
