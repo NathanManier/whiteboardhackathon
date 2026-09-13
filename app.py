@@ -30,6 +30,7 @@ from flask import (
     Response,
     abort,
     g,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
@@ -123,6 +124,86 @@ app.config.update(
     MAX_CONTENT_LENGTH=max(MAX_IMAGE_UPLOAD_BYTES, MAX_PDF_UPLOAD_BYTES),
     SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
 )
+
+PERFORMANCE_TRACE_HEADER = "X-VBoard-Trace-ID"
+PERFORMANCE_TRACE_RE = re.compile(r"^[A-Za-z0-9._-]{8,96}$")
+
+
+def performance_trace_enabled() -> bool:
+    return os.getenv("VBOARD_PERFORMANCE_TRACE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def current_performance_trace_id() -> str | None:
+    if not has_request_context():
+        return None
+    value = getattr(g, "vboard_performance_trace_id", None)
+    return value if isinstance(value, str) else None
+
+
+def record_performance_stage(stage: str, elapsed_ms: float) -> None:
+    """Record one request-local monotonic duration without persisting user data."""
+
+    trace_id = current_performance_trace_id()
+    if trace_id is None:
+        return
+    safe_stage = re.sub(r"[^A-Za-z0-9_.-]", "_", stage)[:64]
+    timings = getattr(g, "vboard_performance_stages", None)
+    if not isinstance(timings, list):
+        timings = []
+        g.vboard_performance_stages = timings
+    timings.append((safe_stage, max(0.0, float(elapsed_ms))))
+    LOGGER.info(
+        "PERF TRACE trace=%s side=server stage=%s elapsed_ms=%.2f",
+        trace_id,
+        safe_stage,
+        elapsed_ms,
+    )
+
+
+@app.before_request
+def begin_performance_trace() -> None:
+    requested = str(request.headers.get(PERFORMANCE_TRACE_HEADER) or "").strip()
+    trace_id = requested if PERFORMANCE_TRACE_RE.fullmatch(requested) else None
+    if trace_id is None and performance_trace_enabled():
+        trace_id = secrets.token_hex(12)
+    if trace_id is None:
+        return
+    g.vboard_performance_trace_id = trace_id
+    g.vboard_performance_started = time.perf_counter()
+    g.vboard_performance_stages = []
+    LOGGER.info(
+        "PERF TRACE trace=%s side=server stage=request_start method=%s path=%s content_length=%s",
+        trace_id,
+        request.method,
+        request.path,
+        request.content_length,
+    )
+
+
+@app.after_request
+def finish_performance_trace(response: Response) -> Response:
+    trace_id = current_performance_trace_id()
+    started = getattr(g, "vboard_performance_started", None)
+    if trace_id is None or not isinstance(started, float):
+        return response
+    total_ms = (time.perf_counter() - started) * 1000
+    response.headers[PERFORMANCE_TRACE_HEADER] = trace_id
+    stages = list(getattr(g, "vboard_performance_stages", []))
+    server_timing = [f'app;dur={total_ms:.2f}']
+    server_timing.extend(f'{stage};dur={duration:.2f}' for stage, duration in stages[-24:])
+    response.headers["Server-Timing"] = ", ".join(server_timing)
+    LOGGER.info(
+        "PERF TRACE trace=%s side=server stage=request_end method=%s path=%s status=%d elapsed_ms=%.2f response_length=%s",
+        trace_id,
+        request.method,
+        request.path,
+        response.status_code,
+        total_ms,
+        response.calculate_content_length(),
+    )
+    return response
 BOARDS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 _BOARD_THREAD_LOCKS: dict[str, threading.RLock] = {}
@@ -244,7 +325,10 @@ def authenticated_user() -> AuthUser | None:
 def require_authenticated(handler):
     @wraps(handler)
     def wrapped(*args, **kwargs):
-        if authenticated_user() is None:
+        started = time.perf_counter()
+        user = authenticated_user()
+        record_performance_stage("auth", (time.perf_counter() - started) * 1000)
+        if user is None:
             reason = getattr(g, "vboard_auth_rejection_reason", "unknown_access_token")
             # Keep this at warning so managed WSGI hosts that install their own
             # WARNING-level logging handler still emit the secret-free reason.
@@ -506,7 +590,11 @@ def board_operation_lock(board_id: str):
 def locked_board_operation(handler):
     @wraps(handler)
     def wrapped(board_id: str, *args, **kwargs):
+        started = time.perf_counter()
         with board_operation_lock(board_id):
+            record_performance_stage(
+                "board_lock_wait", (time.perf_counter() - started) * 1000
+            )
             return handler(board_id, *args, **kwargs)
 
     return wrapped
@@ -2491,6 +2579,7 @@ def persist_pipeline_thumbnail(
 def set_stage(metadata: dict[str, Any], stage: str, started: float) -> None:
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     metadata.setdefault("pipeline", {}).setdefault("timings_ms", {})[stage] = elapsed_ms
+    record_performance_stage(stage, elapsed_ms)
     print(f"[PIPELINE] {stage.upper()} END: {elapsed_ms / 1000:.3f}s", flush=True)
 
 
@@ -4111,8 +4200,15 @@ def terms() -> str:
 @app.post("/upload")
 @require_authenticated
 def upload() -> Response | tuple[str, int]:
+    rate_limit_started = time.perf_counter()
     if limited := enforce_rate_limit("upload"):
+        record_performance_stage(
+            "rate_limit", (time.perf_counter() - rate_limit_started) * 1000
+        )
         return limited
+    record_performance_stage(
+        "rate_limit", (time.perf_counter() - rate_limit_started) * 1000
+    )
     upload_started = time.perf_counter()
     LOGGER.info(
         "UPLOAD START content_length=%s content_type=%s",
@@ -4134,7 +4230,11 @@ def upload() -> Response | tuple[str, int]:
             "We couldn't read that image type. Choose a JPG, PNG, or WEBP photo.",
             415,
         )
+    multipart_started = time.perf_counter()
     data = uploaded.read(MAX_IMAGE_UPLOAD_BYTES + 1)
+    record_performance_stage(
+        "multipart_read", (time.perf_counter() - multipart_started) * 1000
+    )
     LOGGER.info(
         "UPLOAD COMPLETE filename=%s bytes=%d elapsed=%.3fs",
         Path(uploaded.filename).name,
@@ -4150,6 +4250,9 @@ def upload() -> Response | tuple[str, int]:
         if image_format != FORMAT_FOR_EXTENSION[extension] or image_format != FORMAT_FOR_MIME[content_type]:
             raise ValueError("The filename, content type, and image encoding do not match.")
         image = decode_image(data)
+        record_performance_stage(
+            "image_decode_validate", (time.perf_counter() - load_started) * 1000
+        )
         LOGGER.info(
             "IMAGE LOAD COMPLETE format=%s dimensions=%dx%d pixels=%d elapsed=%.3fs",
             image_format,
@@ -4164,7 +4267,11 @@ def upload() -> Response | tuple[str, int]:
             400,
         )
 
+    library_started = time.perf_counter()
     library = read_library()
+    record_performance_stage(
+        "library_read", (time.perf_counter() - library_started) * 1000
+    )
     requested_folder = request.form.get("folder_id", "").strip() or None
     workspace_board_id = request.form.get("workspace_board_id", "").strip() or None
     if workspace_board_id and not BOARD_ID_RE.fullmatch(workspace_board_id):
@@ -4207,6 +4314,7 @@ def upload() -> Response | tuple[str, int]:
     except ValueError as exc:
         return upload_failure(str(exc), 400)
 
+    persist_started = time.perf_counter()
     board_id = secrets.token_hex(16)
     LOGGER.info("BOARD CREATE START board=%s lecture=%s", board_id, requested_folder or "none")
     board_dir = board_directory(board_id, create=True)
@@ -4270,6 +4378,9 @@ def upload() -> Response | tuple[str, int]:
         folder_id=requested_folder,
         title=board_name,
     )
+    record_performance_stage(
+        "upload_persist", (time.perf_counter() - persist_started) * 1000
+    )
 
     started = time.perf_counter()
     LOGGER.info(
@@ -4306,6 +4417,7 @@ def upload() -> Response | tuple[str, int]:
         "score": round(float(detection["score"]), 4),
         "corners": corners.tolist() if corners is not None else None,
     }
+    preview_started = time.perf_counter()
     detection_overlay = image.copy()
     if corners is not None:
         cv2.polylines(
@@ -4335,6 +4447,9 @@ def upload() -> Response | tuple[str, int]:
     set_processing_stage(
         board_dir, metadata, "awaiting_corners", 1, count=1,
         message="Confirm the whiteboard boundary", status="needs_corners",
+    )
+    record_performance_stage(
+        "detection_preview_persist", (time.perf_counter() - preview_started) * 1000
     )
     LOGGER.info("BOARD NEEDS_CORNERS board=%s", board_id)
     LOGGER.info(
@@ -4553,11 +4668,16 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
     require_board_owner(board_id)
     request_started = time.perf_counter()
     LOGGER.info("BOARD CORNERS RECEIVED board=%s", board_id)
+    board_load_started = time.perf_counter()
     board_dir = require_board_id(board_id)
     metadata = read_metadata(board_dir)
     image = load_original(board_dir, metadata)
+    record_performance_stage(
+        "corner_board_load", (time.perf_counter() - board_load_started) * 1000
+    )
     payload = request.get_json(silent=True)
     raw_corners = payload.get("corners") if isinstance(payload, dict) else request.form.get("corners")
+    validation_started = time.perf_counter()
     try:
         corners = validate_corners(raw_corners, image)
     except CornerValidationError as exc:
@@ -4576,6 +4696,10 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
                 error=exc.message,
             ), 400
         return exc.message, 400
+    record_performance_stage(
+        "corner_validation", (time.perf_counter() - validation_started) * 1000
+    )
+    corner_persist_started = time.perf_counter()
     metadata["confirmed_corners"] = corners.tolist()
     metadata["corners_confirmed_at"] = time.time()
     if isinstance(payload, dict) and isinstance(payload.get("normalized_corners"), list):
@@ -4600,10 +4724,17 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
         board_dir, metadata, "submitting_corners", 0,
         message="Submitting corners",
     )
+    record_performance_stage(
+        "corner_persist", (time.perf_counter() - corner_persist_started) * 1000
+    )
     LOGGER.info("BOARD CORNERS SAVED board=%s", board_id)
     LOGGER.info("BOARD PROCESSING RESUME board=%s manual=true", board_id)
     try:
+        downstream_started = time.perf_counter()
         run_downstream(board_dir, metadata, image, corners)
+        record_performance_stage(
+            "downstream_route", (time.perf_counter() - downstream_started) * 1000
+        )
     except Exception:
         LOGGER.exception("BOARD CORNERS FAILED board=%s stage=processing", board_id)
         failed_pipeline = metadata.setdefault("pipeline", {})

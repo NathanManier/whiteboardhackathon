@@ -130,6 +130,39 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertIn("processing_started_at", payload)
         self.assertIn("processing_updated_at", payload)
 
+    def test_performance_trace_correlates_request_without_cross_clock_math(self):
+        board_id = "d" * 32
+        self.ready_board(board_id, None)
+        trace_id = "native-open-12345678"
+
+        response = self.client.get(
+            f"/board/{board_id}",
+            headers={
+                "Accept": "application/json",
+                board_app.PERFORMANCE_TRACE_HEADER: trace_id,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers[board_app.PERFORMANCE_TRACE_HEADER], trace_id)
+        self.assertIn("app;dur=", response.headers["Server-Timing"])
+        self.assertIn("auth;dur=", response.headers["Server-Timing"])
+
+    def test_invalid_performance_trace_is_not_reflected(self):
+        board_id = "e" * 32
+        self.ready_board(board_id, None)
+
+        response = self.client.get(
+            f"/board/{board_id}",
+            headers={
+                "Accept": "application/json",
+                board_app.PERFORMANCE_TRACE_HEADER: "contains spaces",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(board_app.PERFORMANCE_TRACE_HEADER, response.headers)
+
     def test_downstream_reports_real_stage_order_and_ready_only_after_save(self):
         board_id = "b" * 32
         board_dir = board_app.board_directory(board_id, create=True)
