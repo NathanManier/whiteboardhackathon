@@ -1,6 +1,7 @@
 import XCTest
 @preconcurrency import WebKit
 import UIKit
+import Darwin
 @testable import VBoardApp
 
 final class WorkspaceAppearanceTests: XCTestCase {
@@ -656,11 +657,39 @@ final class PDFVisibleSourceTests: XCTestCase {
         )
         let order = canvas.sourceLayerOrderForTesting
         XCTAssertLessThan(try XCTUnwrap(order.firstIndex(of: "VBoardPaper")),
+                          try XCTUnwrap(order.firstIndex(of: "VBoardPreviewSource")))
+        XCTAssertLessThan(try XCTUnwrap(order.firstIndex(of: "VBoardPreviewSource")),
                           try XCTUnwrap(order.firstIndex(of: "VBoardPDFSource")))
         XCTAssertLessThan(try XCTUnwrap(order.firstIndex(of: "VBoardPDFSource")),
                           try XCTUnwrap(order.firstIndex(of: "VBoardProfessorSource")))
         XCTAssertLessThan(try XCTUnwrap(order.firstIndex(of: "VBoardProfessorSource")),
                           try XCTUnwrap(order.firstIndex(of: "VBoardUserContent")))
+    }
+
+    @MainActor
+    func testBoardPreviewStaysVisibleUntilExactProfessorPromotion() async throws {
+        let paths = (0..<500).map { index in
+            "<path id='preview-\(index)' d='M \(index) 0 L \(index + 1) 0 L \(index + 1) 1 Z' fill='#000000'/>"
+        }.joined()
+        let document = try SVGDocument.parse("<svg viewBox='0 0 500 100'>\(paths)</svg>")
+        let editor = try JSONDecoder().decode(EditorState.self, from: Data("""
+        {"schema_version":4,"revision":0,"viewport":{"x":0,"y":0,"width":500,"height":100},"objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}
+        """.utf8))
+        let preview = UIGraphicsImageRenderer(size: CGSize(width: 50, height: 10)).image {
+            UIColor.white.setFill()
+            $0.fill(CGRect(x: 0, y: 0, width: 50, height: 10))
+        }
+        let canvas = InfiniteCanvasUIView(
+            boardID: "preview-board", document: document, previewImage: preview,
+            camera: editor.viewport,
+            composition: SceneComposition.build(boardID: "preview-board",
+                                                document: document, editor: editor)
+        )
+        XCTAssertTrue(canvas.previewIsVisibleForTesting)
+        for _ in 0..<200 where canvas.previewIsVisibleForTesting {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertFalse(canvas.previewIsVisibleForTesting)
     }
 
     @MainActor
@@ -695,6 +724,25 @@ final class PDFVisibleSourceTests: XCTestCase {
 }
 
 final class SourceAssetCacheTests: XCTestCase {
+    @MainActor
+    func testImportTraceIsConsumedOnceAndReopenGetsFreshTrace() {
+        let boardID = "trace-board-\(UUID().uuidString)"
+        let imported = VBoardPerformanceTrace(operation: "image_import",
+                                              id: "import-trace-1234")
+        VBoardPerformanceTraceRegistry.shared.bind(imported, to: boardID)
+
+        let firstOpen = VBoardPerformanceTraceRegistry.shared.takeBoundTrace(
+            for: boardID, operation: "board_open"
+        )
+        let reopen = VBoardPerformanceTraceRegistry.shared.takeBoundTrace(
+            for: boardID, operation: "board_open"
+        )
+
+        XCTAssertTrue(firstOpen === imported)
+        XCTAssertFalse(reopen === imported)
+        XCTAssertNotEqual(reopen.id, imported.id)
+    }
+
     func testCacheIsNamespacedByAccountAndBoard() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("VBoardAssetCacheTests-\(UUID().uuidString)")
@@ -745,6 +793,48 @@ final class SourceAssetCacheTests: XCTestCase {
                                                     version: "1")
         XCTAssertEqual(first, second)
         XCTAssertEqual(requests, 1)
+    }
+
+    @MainActor
+    func testProfessorSVGCacheIsContentAddressedAndForwardsTraceHeader() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VBoardProfessorSVGCacheTests-\(UUID().uuidString)")
+        defer {
+            WorkspaceURLProtocolStub.handler = nil
+            try? FileManager.default.removeItem(at: root)
+        }
+        let svg = "<svg viewBox='0 0 10 10'><path id='p' d='M 0 0 L 1 1' fill='#000000'/></svg>"
+        var requests = 0
+        WorkspaceURLProtocolStub.handler = { request in
+            requests += 1
+            XCTAssertEqual(request.url?.path, "/boards/board-svg/board.svg")
+            XCTAssertEqual(request.value(forHTTPHeaderField: VBoardPerformanceTrace.header),
+                           "cache-trace-1234")
+            return (HTTPURLResponse(url: request.url!, statusCode: 200,
+                                    httpVersion: "HTTP/1.1",
+                                    headerFields: ["Content-Type": "image/svg+xml"])!,
+                    Data(svg.utf8))
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorkspaceURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://assets.test")!,
+                            session: URLSession(configuration: configuration),
+                            sourceAssetCache: SourceAssetCache(root: root))
+        api.install(credentials: AuthCredentials(accessToken: "access-token",
+                                                  refreshToken: "refresh-token",
+                                                  accessExpiresAt: 100,
+                                                  refreshExpiresAt: 200,
+                                                  appleUserIdentifier: nil))
+        let trace = VBoardPerformanceTrace(operation: "cache_test", id: "cache-trace-1234")
+
+        let first = try await api.cachedProfessorSVG(id: "board-svg", version: "7", trace: trace)
+        let second = try await api.cachedProfessorSVG(id: "board-svg", version: "7", trace: trace)
+        let invalidated = try await api.cachedProfessorSVG(id: "board-svg", version: "8", trace: trace)
+
+        XCTAssertEqual(first, svg)
+        XCTAssertEqual(second, svg)
+        XCTAssertEqual(invalidated, svg)
+        XCTAssertEqual(requests, 2)
     }
 }
 
@@ -935,6 +1025,60 @@ private func requestBodyData(_ request: URLRequest) throws -> Data {
 }
 
 final class WorldScreenTransformTests: XCTestCase {
+    @MainActor
+    func testSyntheticVectorScalingBenchmark() async throws {
+        for count in [100, 500, 1_000, 2_500, 5_000, 10_000, 20_000] {
+            let uniqueOffset = String(format: "%.6f", Double(count) / 1_000_000)
+            let source = (0..<count).map { index in
+                let x = index % 200
+                let y = index / 200
+                let detail = (0..<96).map { step in
+                    "L \(x + (step % 12)) \(y + (step / 12))"
+                }.joined(separator: " ")
+                return "<path id='scale-\(count)-\(index)' d='M \(x).\(uniqueOffset.dropFirst(2)) \(y) \(detail) Z' fill='#183153'/>"
+            }.joined()
+            let parseStarted = ProcessInfo.processInfo.systemUptime
+            let document = try SVGDocument.parse("<svg viewBox='0 0 200 200'>\(source)</svg>")
+            let manifestMS = (ProcessInfo.processInfo.systemUptime - parseStarted) * 1_000
+            let camera = WorldScreenTransform(
+                camera: CameraRect(x: 0, y: 0, width: 200, height: 200),
+                viewport: CGSize(width: 1_000, height: 1_000)
+            )
+            let view = ProfessorSVGView(frame: CGRect(x: 0, y: 0, width: 1_000, height: 1_000))
+            let ready = expectation(description: "\(count) exact paths")
+            let renderStarted = ProcessInfo.processInfo.systemUptime
+            view.onProgress = { if $0 >= 0.999 { ready.fulfill() } }
+            view.display(document, transform: camera)
+            await fulfillment(of: [ready], timeout: 60)
+            let renderMS = (ProcessInfo.processInfo.systemUptime - renderStarted) * 1_000
+            XCTAssertEqual(view.visiblePathIDsForTesting.count, count)
+            let warmView = ProfessorSVGView(frame: view.frame)
+            let warmReady = expectation(description: "\(count) warm exact paths")
+            let warmStarted = ProcessInfo.processInfo.systemUptime
+            warmView.onProgress = { if $0 >= 0.999 { warmReady.fulfill() } }
+            warmView.display(document, transform: camera)
+            await fulfillment(of: [warmReady], timeout: 60)
+            let warmMS = (ProcessInfo.processInfo.systemUptime - warmStarted) * 1_000
+            XCTAssertEqual(warmView.visiblePathIDsForTesting.count, count)
+            print(String(format: "[VBoard] VECTOR SCALE paths=%d svg_bytes=%d manifest_ms=%.2f cold_exact_ms=%.2f warm_exact_ms=%.2f resident_mb=%.1f",
+                         count, source.utf8.count, manifestMS, renderMS, warmMS,
+                         Self.residentMemoryMegabytes()))
+        }
+    }
+
+    private static func residentMemoryMegabytes() -> Double {
+        var info = mach_task_basic_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<mach_task_basic_info_data_t>.size / MemoryLayout<natural_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576 : -1
+    }
+
     @MainActor
     func testProgressiveVectorBatchesStayHiddenUntilAtomicPromotion() async throws {
         let initial = try SVGDocument.parse("""

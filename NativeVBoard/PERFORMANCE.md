@@ -143,3 +143,111 @@ the old vector-only thumbnail omitted. The Master itself is never modified.
 
 No contour/vector fidelity setting was changed. Expensive diagnostics remain
 available with `VBOARD_PROCESSING_DEBUG=1`; production defaults to off.
+
+## End-to-end 25-second latency audit (2026-09-12)
+
+### First decision gate
+
+The reported 20–25 second delay does **not** reproduce when opening the same
+already-processed dense board over local HTTP. The representative dense input
+is `photos/IMG_1874.jpg`; full-board corners produce 7,978 canonical paths and
+an 8,798,035-byte SVG. On the current Mac:
+
+| Boundary | Measured time |
+|---|---:|
+| Multipart upload through local HTTP | 0.417 s |
+| Corner POST through server-ready | 3.297 s |
+| Processed-board metadata GET | 0.018 s |
+| Processed-board editor GET | 0.017 s |
+| Processed-board 8.80 MB SVG GET | 0.022 s |
+
+The server trace divides the 3.297-second corner request into 0.038 seconds to
+load the original, 0.159 seconds correction, 0.380 seconds enhancement, 0.001
+seconds analysis metadata, 2.445 seconds vectorization, and 3.233 seconds total
+downstream work. Nested measurements are not additive. This confirms that the
+missing ~20 seconds are outside the local protected CV pipeline.
+
+Production edge probes from the Mac took 0.229–0.409 seconds for a new TLS
+request and confirmed PythonAnywhere gzip on the public HTML response. An exact
+production dense-SVG transfer remains pending because the asset route requires
+the owner's bearer session. CoreDevice currently sees `iPad (416)`, an iPad Pro
+13-inch (M5), as unavailable; the only available paired physical device is an
+iPhone SE. The physical-iPad trace therefore remains pending. No production
+mutation or infrastructure migration was made.
+
+### Correlated trace contract
+
+Debug imports and board opens create one privacy-safe trace ID. Native requests
+send it as `X-VBoard-Trace-ID`; Flask echoes it and emits `Server-Timing` plus
+secret-free server log entries. Native durations use system uptime, backend
+durations use `time.perf_counter()`, and the two clocks are never subtracted.
+The shared identifier is only for joining each side's monotonic timeline.
+
+The timeline covers source normalization, multipart upload/progress, corner
+submission, status polls/backoff, server request/auth/rate-limit/lock/storage
+work, all protected processing stages, resource response sizes, redirects,
+DNS/connect/TLS/TTFB/transfer metrics, SVG cache hit/miss/checksum, off-main XML
+manifest parsing, CGPath batches, spatial indexing/layer staging, atomic
+promotion, first preview pixels, current-viewport editability, and all-path
+editability. Set `VBOARD_PERFORMANCE_TRACE=1` to create traces for non-native
+HTTP clients; a validated incoming trace header is also honored.
+
+### Measured fixes
+
+- Standalone board metadata, editor state, and immutable SVG now start in
+  parallel instead of paying three serialized production round trips.
+- Canonical SVG bytes are cached per account and board. The lookup resolves to
+  bytes addressed by SHA-256 plus parser/render version; corrupt bytes miss the
+  cache instead of being parsed.
+- SVG XML parsing runs off the main actor.
+- A cached board thumbnail supplies first useful pixels and remains visible
+  until the exact hidden staging tree is atomically promoted. Partial contour
+  batches are never exposed.
+- The same cache and trace path is used by standalone and lecture-board opens.
+
+No Enhanced Master, contour extraction, hierarchy, simplification, color,
+stable-ID, SVG serialization, editor ownership, or Apple Pencil behavior was
+changed.
+
+### Native path-count scaling
+
+The iPad Air 11-inch (M4) simulator on iPadOS 26.5 generated SVG paths averaging
+roughly the same character density as the 8.80 MB real fixture. Resident memory
+is the process footprint sampled after both cold and warm construction, so it
+is a conservative observed value rather than an allocation attributed solely
+to that row.
+
+| Paths | SVG bytes | Manifest parse | Cold exact | Warm exact | Resident MB |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 73,268 | 1.05 ms | 22.53 ms | 2.19 ms | 352.9 |
+| 500 | 386,024 | 2.05 ms | 78.10 ms | 7.83 ms | 361.1 |
+| 1,000 | 789,980 | 3.98 ms | 157.84 ms | 14.05 ms | 373.8 |
+| 2,500 | 2,069,504 | 10.29 ms | 439.86 ms | 40.07 ms | 404.9 |
+| 5,000 | 4,276,540 | 20.79 ms | 831.88 ms | 81.66 ms | 451.0 |
+| 10,000 | 8,690,990 | 43.11 ms | 1,636.24 ms | 1,555.43 ms | 470.4 |
+| 20,000 | 17,587,090 | 91.69 ms | 3,202.65 ms | 3,129.88 ms | 521.2 |
+
+The warm discontinuity above 8,192 paths is intentional: the in-memory CGPath
+cache is bounded. Raising it to 20,000 would trade latency for substantial
+memory without evidence that this is the production bottleneck. The disk SVG
+cache still eliminates repeat transfer at every size. A binary render pack is
+therefore deferred until a physical trace proves geometry construction—not
+network/hosting—is the remaining dominant segment.
+
+### Verification
+
+- Backend: 181 tests passed, plus 63 parameterized subtests.
+- Native: 229 tests executed on the iPad Air 11-inch (M4), iPadOS 26.5
+  simulator; one optional test skipped and zero failed.
+- Web JavaScript: all three suites passed.
+- Release simulator build: succeeded.
+- Cache behavior: two reads of one board/version produced one SVG request;
+  changing the version produced exactly one new request.
+- Patch hygiene: `git diff --check` passed.
+
+No old native binary with the new trace points exists, so a numeric pre-change
+native breakdown would be fabricated. The repeatable post-change benchmark,
+the serial-to-parallel code boundary, and cold-versus-warm results are recorded
+instead. The trace is now ready to capture an honest before/after comparison
+against the reported production operation once the owner session and physical
+iPad are available.
