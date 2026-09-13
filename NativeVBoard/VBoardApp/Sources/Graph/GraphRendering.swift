@@ -11,6 +11,71 @@ enum GraphRepresentationState: String, Equatable, Sendable {
     case failed
 }
 
+enum GraphPromotionStage: String, Equatable, Sendable {
+    case idle
+    case checkingConfiguration = "checking_configuration"
+    case providerCreated = "provider_created"
+    case webViewCreated = "webview_created"
+    case pageLoadStarted = "page_load_started"
+    case pageLoadCommitted = "page_load_committed"
+    case pageLoadFinished = "page_load_finished"
+    case javaScriptBootStarted = "javascript_boot_started"
+    case desmosScriptReady = "desmos_script_ready"
+    case calculatorCreated = "calculator_created"
+    case providerReady = "provider_ready"
+    case expressionsApplied = "expressions_applied"
+    case viewportApplied = "viewport_applied"
+    case activating
+    case ready
+    case failed
+
+    var diagnosticEventName: String {
+        switch self {
+        case .idle: return "GRAPH PROMOTION IDLE"
+        case .checkingConfiguration: return "GRAPH CONFIGURATION CHECK"
+        case .providerCreated: return "GRAPH PROVIDER CREATE"
+        case .webViewCreated: return "GRAPH WEBVIEW CREATED"
+        case .pageLoadStarted: return "GRAPH PAGE LOAD START"
+        case .pageLoadCommitted: return "GRAPH PAGE LOAD COMMITTED"
+        case .pageLoadFinished: return "GRAPH PAGE LOAD FINISHED"
+        case .javaScriptBootStarted: return "GRAPH JS BOOT START"
+        case .desmosScriptReady: return "GRAPH DESMOS SCRIPT READY"
+        case .calculatorCreated: return "GRAPH CALCULATOR CREATED"
+        case .providerReady: return "GRAPH PROVIDER READY CALLBACK"
+        case .expressionsApplied: return "GRAPH EXPRESSIONS APPLIED"
+        case .viewportApplied: return "GRAPH VIEWPORT APPLIED"
+        case .activating: return "GRAPH ACTIVATION START"
+        case .ready: return "GRAPH PROMOTION READY"
+        case .failed: return "GRAPH PROMOTION FAILED"
+        }
+    }
+}
+
+/// Optional lifecycle reporting implemented by expensive providers. It keeps
+/// provider-specific WebKit/JavaScript stages out of the canonical GraphObject
+/// and gives the single session owner enough evidence to diagnose a bounded
+/// failure without logging equations or credentials.
+@MainActor
+protocol GraphProviderLifecycleReporting: AnyObject {
+    var lifecycleEventHandler: ((GraphPromotionStage) -> Void)? { get set }
+}
+
+struct GraphProviderDeadlines: Equatable, Sendable {
+    let transitionNanoseconds: UInt64
+    let preemptionNanoseconds: UInt64
+    let mountNanoseconds: UInt64
+    let updateNanoseconds: UInt64
+    let activationNanoseconds: UInt64
+
+    static let standard = GraphProviderDeadlines(
+        transitionNanoseconds: 2_000_000_000,
+        preemptionNanoseconds: 1_500_000_000,
+        mountNanoseconds: 8_000_000_000,
+        updateNanoseconds: 3_000_000_000,
+        activationNanoseconds: 3_000_000_000
+    )
+}
+
 enum GraphRendererError: LocalizedError, Equatable {
     case unavailable
     case invalidExpression(String)
@@ -136,14 +201,25 @@ final class GraphProviderCoordinator {
     private(set) var activeProvider: GraphRendererProvider?
     private var activePreemptionHandler: PreemptionHandler?
     private var transitionIsOwned = false
-    private var transitionWaiters: [CheckedContinuation<Void, Never>] = []
+    private struct TransitionWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+        let timeoutTask: Task<Void, Never>
+    }
+    private var transitionWaiters: [TransitionWaiter] = []
+    private let deadlines: GraphProviderDeadlines
+
+    init(deadlines: GraphProviderDeadlines = .standard) {
+        self.deadlines = deadlines
+    }
 
     var activeProviderCount: Int { activeProvider == nil ? 0 : 1 }
 
     func promote(graph: GraphObject, provider: GraphRendererProvider,
                  frame: CGRect,
-                 onPreempt: PreemptionHandler? = nil) async throws {
-        await acquireTransition()
+                 onPreempt: PreemptionHandler? = nil,
+                 onStage: ((GraphPromotionStage) -> Void)? = nil) async throws {
+        try await acquireTransition()
         defer { releaseTransition() }
         try Task.checkCancellation()
         if activeGraphID != graph.id || activeProvider !== provider {
@@ -153,7 +229,13 @@ final class GraphProviderCoordinator {
             activeGraphID = nil
             activePreemptionHandler = nil
             if let previousPreemptionHandler {
-                await previousPreemptionHandler()
+                let completed = await GraphProviderOperationDeadline.value(
+                    before: deadlines.preemptionNanoseconds
+                ) {
+                    await previousPreemptionHandler()
+                    return true
+                } == true
+                if !completed { previousProvider?.unmount() }
             } else {
                 previousProvider?.unmount()
             }
@@ -168,23 +250,55 @@ final class GraphProviderCoordinator {
         activeProvider = provider
         activeGraphID = graph.id
         activePreemptionHandler = onPreempt
-        try await GraphProviderOperationDeadline.run(
-            before: 15_000_000_000
-        ) {
-            try await provider.mount(graph: graph, in: frame)
+        do {
+            try await GraphProviderOperationDeadline.run(
+                before: deadlines.mountNanoseconds
+            ) {
+                try await provider.mount(graph: graph, in: frame)
+            }
+            onStage?(.providerReady)
+            try Task.checkCancellation()
+            try await GraphProviderOperationDeadline.run(
+                before: deadlines.updateNanoseconds
+            ) {
+                try await provider.update(graph: graph)
+            }
+            onStage?(.expressionsApplied)
+            onStage?(.viewportApplied)
+            try Task.checkCancellation()
+            onStage?(.activating)
+            try await GraphProviderOperationDeadline.run(
+                before: deadlines.activationNanoseconds
+            ) {
+                try await provider.setInteractive(true)
+            }
+            try Task.checkCancellation()
+        } catch {
+            // Release the logical single-provider slot immediately. The owning
+            // session removes/unmounts the concrete view exactly once; any
+            // cancellation-ignoring operation may finish later but no longer
+            // has authority to become interactive.
+            if activeProvider === provider {
+                activeProvider = nil
+                activeGraphID = nil
+                activePreemptionHandler = nil
+            }
+            throw error
         }
-        try Task.checkCancellation()
-        try await GraphProviderOperationDeadline.run(
-            before: 3_000_000_000
-        ) {
-            try await provider.setInteractive(true)
-        }
-        try Task.checkCancellation()
     }
 
     func demote(fallbackViewport: GraphViewport? = nil,
                 timeoutNanoseconds: UInt64 = 750_000_000) async -> GraphViewport? {
-        await acquireTransition()
+        do {
+            try await acquireTransition()
+        } catch {
+            let provider = activeProvider
+            activeProvider = nil
+            activeGraphID = nil
+            activePreemptionHandler = nil
+            provider?.unmount()
+            return fallbackViewport
+        }
         defer { releaseTransition() }
         guard let provider = activeProvider else { return nil }
         activeProvider = nil
@@ -207,13 +321,38 @@ final class GraphProviderCoordinator {
         activePreemptionHandler = nil
     }
 
-    private func acquireTransition() async {
+    private func acquireTransition() async throws {
         if !transitionIsOwned {
             transitionIsOwned = true
             return
         }
-        await withCheckedContinuation { continuation in
-            transitionWaiters.append(continuation)
+        let waiterID = UUID()
+        let acquired = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let timeoutTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(
+                        nanoseconds: max(self?.deadlines.transitionNanoseconds ?? 1, 1)
+                    )
+                    guard !Task.isCancelled else { return }
+                    self?.resolveTransitionWaiter(id: waiterID, acquired: false)
+                }
+                transitionWaiters.append(TransitionWaiter(
+                    id: waiterID, continuation: continuation,
+                    timeoutTask: timeoutTask
+                ))
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.resolveTransitionWaiter(id: waiterID, acquired: false)
+            }
+        }
+        guard acquired else {
+            if Task.isCancelled { throw CancellationError() }
+            throw GraphRendererError.provider("transition_timeout")
         }
     }
 
@@ -221,8 +360,19 @@ final class GraphProviderCoordinator {
         if transitionWaiters.isEmpty {
             transitionIsOwned = false
         } else {
-            transitionWaiters.removeFirst().resume()
+            let waiter = transitionWaiters.removeFirst()
+            waiter.timeoutTask.cancel()
+            waiter.continuation.resume(returning: true)
         }
+    }
+
+    private func resolveTransitionWaiter(id: UUID, acquired: Bool) {
+        guard let index = transitionWaiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let waiter = transitionWaiters.remove(at: index)
+        waiter.timeoutTask.cancel()
+        waiter.continuation.resume(returning: acquired)
     }
 
     func handleMemoryWarning() {

@@ -40,22 +40,6 @@ enum WorkspaceDotFieldPolicy {
     }
 }
 
-enum PencilPressureResponse {
-    static func curved(_ normalized: CGFloat) -> CGFloat {
-        pow(min(1, max(0, normalized)), 0.72)
-    }
-
-    static func smoothed(previous: CGFloat?, sample: CGFloat) -> CGFloat {
-        let next = curved(sample)
-        guard let previous else { return next }
-        return previous * 0.68 + next * 0.32
-    }
-
-    static func widthMultiplier(for pressure: CGFloat) -> CGFloat {
-        0.68 + curved(pressure) * 0.52
-    }
-}
-
 enum BoardVectorLoadState: Equatable, Sendable {
     case unloaded
     case previewReady
@@ -243,6 +227,9 @@ struct LectureCanvasView: UIViewRepresentable {
     let physicalBoardShowsPaper: Bool
     let penStyle: CanvasStrokeStyle
     let markerStyle: CanvasStrokeStyle
+    let pencilPreferences: PencilPreferences
+    let isPencilPalettePresented: Bool
+    var showsDeveloperDiagnostics = false
     let thumbnailURLs: [String: URL]
     var loadAsset: (String) async throws -> Data
     let focusRequest: WorkspaceFocusRequest?
@@ -258,8 +245,9 @@ struct LectureCanvasView: UIViewRepresentable {
     var onMoveBoard: (String, CGPoint) -> Void
     var onUndo: () -> Void
     var onRedo: () -> Void
-    var onPencilDoubleTap: () -> Void
-    var onPencilSqueeze: (CGPoint) -> Void
+    var onPencilAction: (PencilLogicalAction, CGPoint?) -> Void
+    var onPencilPaletteMoved: (CGPoint) -> Void
+    var onPencilPaletteDismiss: () -> Void
 
     func makeUIView(context: Context) -> LectureCanvasUIView {
         LectureCanvasUIView(
@@ -271,6 +259,9 @@ struct LectureCanvasView: UIViewRepresentable {
             physicalBoardShowsPaper: physicalBoardShowsPaper,
             penStyle: penStyle,
             markerStyle: markerStyle,
+            pencilPreferences: pencilPreferences,
+            isPencilPalettePresented: isPencilPalettePresented,
+            showsDeveloperDiagnostics: showsDeveloperDiagnostics,
             thumbnailURLs: thumbnailURLs,
             loadAsset: loadAsset,
             callbacks: callbacks
@@ -282,6 +273,9 @@ struct LectureCanvasView: UIViewRepresentable {
                     tool: tool, backgroundStyle: backgroundStyle,
                     physicalBoardShowsPaper: physicalBoardShowsPaper,
                     penStyle: penStyle, markerStyle: markerStyle,
+                    pencilPreferences: pencilPreferences,
+                    isPencilPalettePresented: isPencilPalettePresented,
+                    showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                     thumbnailURLs: thumbnailURLs,
                     loadAsset: loadAsset,
                     focusRequest: focusRequest, callbacks: callbacks)
@@ -300,8 +294,9 @@ struct LectureCanvasView: UIViewRepresentable {
                                onMoveBoard: onMoveBoard,
                                onUndo: onUndo,
                                onRedo: onRedo,
-                               onPencilDoubleTap: onPencilDoubleTap,
-                               onPencilSqueeze: onPencilSqueeze)
+                               onPencilAction: onPencilAction,
+                               onPencilPaletteMoved: onPencilPaletteMoved,
+                               onPencilPaletteDismiss: onPencilPaletteDismiss)
     }
 }
 
@@ -318,8 +313,9 @@ struct LectureCanvasCallbacks {
     var onMoveBoard: (String, CGPoint) -> Void
     var onUndo: () -> Void
     var onRedo: () -> Void
-    var onPencilDoubleTap: () -> Void
-    var onPencilSqueeze: (CGPoint) -> Void
+    var onPencilAction: (PencilLogicalAction, CGPoint?) -> Void
+    var onPencilPaletteMoved: (CGPoint) -> Void
+    var onPencilPaletteDismiss: () -> Void
 }
 
 final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilInteractionDelegate {
@@ -339,6 +335,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private var physicalBoardShowsPaper: Bool
     private var penStyle: CanvasStrokeStyle
     private var markerStyle: CanvasStrokeStyle
+    private var pencilPreferences: PencilPreferences
+    private var showsDeveloperDiagnostics: Bool
     private var thumbnailURLs: [String: URL]
     private var loadAsset: (String) async throws -> Data
     private var callbacks: LectureCanvasCallbacks
@@ -350,8 +348,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private var lassoPoints: [CGPoint] = []
     private var liveStrokePoints: [StrokePoint] = []
     private var predictedStrokePoints: [StrokePoint] = []
-    private var lastPencilPressure: CGFloat?
+    private var strokeAccumulator = PencilStrokeAccumulator()
     private var liveStrokeBoardID: String?
+    private var recentlyCommittedStroke: (stroke: UserStroke, boardID: String)?
     private var movePreviewDelta = CGPoint.zero
     private var resizePreviewBounds: CGRect?
     private var lastEraseWorld: CGPoint?
@@ -363,8 +362,15 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private var twoTouchMagnification: CGFloat = 1
     private var panRecognizer: UIPanGestureRecognizer!
     private var pinchRecognizer: UIPinchGestureRecognizer!
-    private var lastHandledSqueezeTimestamp: TimeInterval = -1
+    private var pencilInteraction: UIPencilInteraction!
+    private var pencilHoverRecognizer: UIHoverGestureRecognizer!
+    private var squeezeState = PencilPaletteStateMachine()
+    private var activeSqueezeAction: PencilLogicalAction = .none
+    private var pencilFeedback: PencilFeedbackProviding!
     private var previousViewportSize: CGSize = .zero
+    #if DEBUG
+    private let pencilRawMonitor = PencilRawEventMonitor(owner: "LectureCanvasUIView")
+    #endif
 
     init(workspace: LectureWorkspace,
          scenes: [String: WorkspaceBoardScene],
@@ -374,6 +380,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
          physicalBoardShowsPaper: Bool,
          penStyle: CanvasStrokeStyle,
          markerStyle: CanvasStrokeStyle,
+         pencilPreferences: PencilPreferences,
+         isPencilPalettePresented: Bool,
+         showsDeveloperDiagnostics: Bool,
          thumbnailURLs: [String: URL],
          loadAsset: @escaping (String) async throws -> Data,
          callbacks: LectureCanvasCallbacks) {
@@ -385,6 +394,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         self.physicalBoardShowsPaper = physicalBoardShowsPaper
         self.penStyle = penStyle
         self.markerStyle = markerStyle
+        self.pencilPreferences = pencilPreferences
+        self.showsDeveloperDiagnostics = showsDeveloperDiagnostics
         self.thumbnailURLs = thumbnailURLs
         self.loadAsset = loadAsset
         self.callbacks = callbacks
@@ -446,10 +457,19 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
         hover.cancelsTouchesInView = false
         addGestureRecognizer(hover)
+        pencilHoverRecognizer = hover
 
-        let pencilInteraction = UIPencilInteraction()
-        pencilInteraction.delegate = self
-        addInteraction(pencilInteraction)
+        let interaction = UIPencilInteraction()
+        interaction.delegate = self
+        addInteraction(interaction)
+        pencilInteraction = interaction
+        pencilFeedback = UIKitPencilFeedbackProvider(view: self)
+
+        #if DEBUG
+        pencilRawMonitor.installOverlay(on: self)
+        pencilRawMonitor.setVisible(showsDeveloperDiagnostics)
+        pencilRawMonitor.setContext(tool: activeTool.rawValue, state: "IDLE")
+        #endif
 
         registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (view: LectureCanvasUIView, _) in
             view.updateWorkspaceBackground()
@@ -462,28 +482,91 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     override var canBecomeFirstResponder: Bool { true }
 
+    var pencilInteractionCountForTesting: Int {
+        interactions.filter { $0 is UIPencilInteraction }.count
+    }
+
     func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
-        callbacks.onPencilDoubleTap()
+        #if DEBUG
+        pencilRawMonitor.recordLegacyDoubleTap()
+        #endif
+        routePencilAction(PencilActionResolver.doubleTap(
+            setting: pencilPreferences.doubleTap,
+            system: PencilPreferredAction(UIPencilInteraction.preferredTapAction)
+        ), anchor: nil)
     }
 
     @available(iOS 17.5, *)
     func pencilInteraction(_ interaction: UIPencilInteraction,
                            didReceiveTap tap: UIPencilInteraction.Tap) {
-        callbacks.onPencilDoubleTap()
+        #if DEBUG
+        pencilRawMonitor.recordDoubleTap(tap)
+        #endif
+        routePencilAction(PencilActionResolver.doubleTap(
+            setting: pencilPreferences.doubleTap,
+            system: PencilPreferredAction(UIPencilInteraction.preferredTapAction)
+        ), anchor: tap.hoverPose?.location)
     }
 
     @available(iOS 17.5, *)
     func pencilInteraction(_ interaction: UIPencilInteraction,
                            didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
-        guard squeeze.phase == .began || squeeze.phase == .ended else { return }
-        guard squeeze.timestamp != lastHandledSqueezeTimestamp else { return }
-        lastHandledSqueezeTimestamp = squeeze.timestamp
-        callbacks.onPencilSqueeze(squeeze.hoverPose?.location
-                                  ?? CGPoint(x: bounds.midX, y: bounds.midY))
+        #if DEBUG
+        pencilRawMonitor.recordSqueeze(squeeze)
+        #endif
+        let point = squeeze.hoverPose?.location
+        let phase: PencilSqueezePhase
+        switch squeeze.phase {
+        case .began: phase = .began
+        case .changed: phase = .changed
+        case .ended: phase = .ended
+        case .cancelled: phase = .cancelled
+        @unknown default: phase = .cancelled
+        }
+        if phase == .began {
+            activeSqueezeAction = PencilActionResolver.squeeze(
+                setting: pencilPreferences.squeeze,
+                system: PencilPreferredAction(UIPencilInteraction.preferredSqueezeAction)
+            )
+            if activeSqueezeAction == .showToolPalette || activeSqueezeAction == .showInkAttributes
+                || activeSqueezeAction == .showColorPalette {
+                if case .present(let anchor) = squeezeState.receive(.began, anchor: point) {
+                    routePencilAction(activeSqueezeAction, anchor: anchor)
+                    pencilFeedback.request(.paletteActivation(anchor
+                        ?? CGPoint(x: bounds.midX, y: bounds.midY)))
+                }
+            } else {
+                routePencilAction(activeSqueezeAction, anchor: point)
+            }
+            return
+        }
+        let effect = squeezeState.receive(phase, anchor: point)
+        if case .update(let anchor?) = effect { callbacks.onPencilPaletteMoved(anchor) }
+        if effect == .dismiss { callbacks.onPencilPaletteDismiss() }
+        if phase == .ended || phase == .cancelled { activeSqueezeAction = .none }
+    }
+
+    private func routePencilAction(_ action: PencilLogicalAction, anchor: CGPoint?) {
+        guard action != .none else { return }
+        callbacks.onPencilAction(action, anchor)
+    }
+
+    private var shouldShowPencilHoverPreview: Bool {
+        switch pencilPreferences.hover {
+        case .off: return false
+        case .on: return true
+        case .followSystem:
+            if #available(iOS 17.5, *) { return UIPencilInteraction.prefersHoverToolPreview }
+            return true
+        }
     }
 
     @objc private func pencilHover(_ recognizer: UIHoverGestureRecognizer) {
-        guard recognizer.state == .began || recognizer.state == .changed else {
+        #if DEBUG
+        pencilRawMonitor.recordHover(recognizer, in: self)
+        #endif
+        guard shouldShowPencilHoverPreview,
+              recognizer.state == .began || recognizer.state == .changed else {
             pencilHoverLayer.isHidden = true
             pencilHoverLayer.path = nil
             return
@@ -497,14 +580,22 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             path.append(UIBezierPath(ovalIn: CGRect(x: point.x - radius, y: point.y - radius,
                                                     width: radius * 2, height: radius * 2)))
         case .highlighter:
-            let width = max(8, CGFloat(markerStyle.width) * scale)
-            let height = max(3, width * max(0.18, sin(recognizer.altitudeAngle)))
-            let nib = UIBezierPath(ovalIn: CGRect(x: -width / 2, y: -height / 2,
-                                                 width: width, height: height))
-            let transform = CGAffineTransform(translationX: point.x, y: point.y)
-                .rotated(by: recognizer.azimuthAngle(in: self))
-            nib.apply(transform)
-            path.append(nib)
+            let roll: CGFloat?
+            if #available(iOS 17.5, *) { roll = recognizer.rollAngle } else { roll = nil }
+            let geometry = PencilNibGeometry.marker(
+                baseWidth: CGFloat(markerStyle.width) * scale,
+                pressure: nil, altitude: recognizer.altitudeAngle,
+                azimuth: recognizer.azimuthAngle(in: self), roll: roll
+            )
+            let nib = UIBezierPath(ovalIn: CGRect(x: -geometry.majorAxis / 2,
+                                                 y: -geometry.minorAxis / 2,
+                                                 width: geometry.majorAxis,
+                                                 height: geometry.minorAxis))
+            var transform = CGAffineTransform(rotationAngle: geometry.orientation)
+            transform = transform.concatenating(
+                CGAffineTransform(translationX: point.x, y: point.y)
+            )
+            nib.apply(transform); path.append(nib)
         case .objectEraser:
             let radius = max(8, 14 * scale)
             path.append(UIBezierPath(ovalIn: CGRect(x: point.x - radius, y: point.y - radius,
@@ -541,7 +632,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         worldContainer.layer.position = .zero
         regionContainer.frame = worldContainer.bounds
         gridMinorLayer.frame = bounds
+        pencilHoverLayer.frame = bounds
         WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
+        #if DEBUG
+        pencilRawMonitor.layout(in: bounds, top: 8)
+        #endif
         applyCamera(interacting: false)
         refineRepresentations()
     }
@@ -554,6 +649,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                 physicalBoardShowsPaper: Bool,
                 penStyle: CanvasStrokeStyle,
                 markerStyle: CanvasStrokeStyle,
+                pencilPreferences: PencilPreferences,
+                isPencilPalettePresented: Bool,
+                showsDeveloperDiagnostics: Bool,
                 thumbnailURLs: [String: URL],
                 loadAsset: @escaping (String) async throws -> Data,
                 focusRequest: WorkspaceFocusRequest?,
@@ -563,6 +661,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         self.workspace = workspace
         self.scenes = scenes
         self.selectedKeys = selectedKeys
+        if self.activeTool != tool { pencilFeedback.request(.toolSelection(nil)) }
         self.activeTool = tool
         let appearanceChanged = self.backgroundStyle != backgroundStyle
             || self.physicalBoardShowsPaper != physicalBoardShowsPaper
@@ -570,6 +669,13 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         self.physicalBoardShowsPaper = physicalBoardShowsPaper
         self.penStyle = penStyle
         self.markerStyle = markerStyle
+        self.pencilPreferences = pencilPreferences
+        if !isPencilPalettePresented { _ = squeezeState.dismiss() }
+        self.showsDeveloperDiagnostics = showsDeveloperDiagnostics
+        #if DEBUG
+        pencilRawMonitor.setVisible(showsDeveloperDiagnostics)
+        pencilRawMonitor.setContext(tool: tool.rawValue, state: interactionLabel)
+        #endif
         self.thumbnailURLs = thumbnailURLs
         self.loadAsset = loadAsset
         self.callbacks = callbacks
@@ -894,7 +1000,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     private func beginTwoTouchNavigation(midpoint: CGPoint) {
         guard twoTouchStartCamera == nil else { return }
-        cancelContentInteraction()
+        // Preserve an in-flight Pencil stroke while two fingers navigate.
+        // Other content gestures are cancelled because they share direct
+        // manipulation state with the camera.
+        if case .drawing = interaction { } else { cancelContentInteraction() }
         twoTouchStartCamera = controller.camera
         twoTouchStartMidpoint = midpoint
         twoTouchCurrentMidpoint = midpoint
@@ -933,12 +1042,24 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     // MARK: - Pointer, Pencil, and tool routing
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard twoTouchStartCamera == nil, let touch = touches.first else { return }
+        guard let touch = touches.first else { return }
+        if twoTouchStartCamera != nil && touch.type != .pencil { return }
         if touches.count > 1 && touch.type == .direct { return }
         let screen = touch.location(in: self)
         let world = screenToWorld(screen)
         #if DEBUG
+        pencilRawMonitor.recordTouch("BEGIN", touch: touch, event: event, in: self,
+                                     tool: activeTool.rawValue, state: interactionLabel)
         debugInput("BEGIN", touch: touch, screen: screen, world: world)
+        #endif
+        #if !targetEnvironment(simulator)
+        // UIKit/system palm rejection plus explicit touch-type ownership:
+        // direct contacts can navigate through the two-finger recognizers but
+        // cannot mutate board content.
+        if touch.type == .direct {
+            super.touchesBegan(touches, with: event)
+            return
+        }
         #endif
         if isSpacePressed || activeTool == .navigation {
             interaction = .panning(startScreen: screen, startCamera: controller.camera)
@@ -1012,25 +1133,34 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             }
             return
         }
-        let local = LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item)
         let strokeID = UUID().uuidString
-        lastPencilPressure = nil
+        recentlyCommittedStroke = nil
+        strokeAccumulator.reset()
         predictedStrokePoints.removeAll(keepingCapacity: true)
         liveStrokeBoardID = item.boardID
-        liveStrokePoints = [sample(local, touch: touch)]
+        let initialTouches = event?.coalescedTouches(for: touch) ?? [touch]
+        strokeAccumulator.appendConfirmed(initialTouches.map {
+            let sampleWorld = screenToWorld($0.preciseLocation(in: self))
+            let sampleLocal = LectureCoordinateTransform.lectureWorldToBoardLocal(sampleWorld, board: item)
+            return sample(sampleLocal, touch: $0)
+        })
+        liveStrokePoints = strokeAccumulator.canonicalPoints
         boardViews[item.boardID]?.showLiveStroke(points: liveStrokePoints,
                                                 color: strokeColor,
                                                 width: strokeWidth,
-                                                pressure: lastPencilPressure)
+                                                tool: activePencilStrokeTool)
         callbacks.onActiveBoardChanged(item.boardID)
         interaction = .drawing(boardID: item.boardID, strokeID: strokeID)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard twoTouchStartCamera == nil, let touch = touches.first else { return }
+        guard let touch = touches.first else { return }
+        if twoTouchStartCamera != nil && touch.type != .pencil { return }
         let screen = touch.location(in: self)
         let world = screenToWorld(screen)
         #if DEBUG
+        pencilRawMonitor.recordTouch("MOVE", touch: touch, event: event, in: self,
+                                     tool: activeTool.rawValue, state: interactionLabel)
         debugInput("MOVE", touch: touch, screen: screen, world: world)
         #endif
         switch interaction {
@@ -1043,19 +1173,21 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         case .drawing(let boardID, _):
             guard let item = workspace.items.first(where: { $0.boardID == boardID }) else { return }
             let samples = event?.coalescedTouches(for: touch) ?? [touch]
-            liveStrokePoints.append(contentsOf: samples.map {
-                let world = screenToWorld($0.location(in: self))
+            strokeAccumulator.appendConfirmed(samples.map {
+                let world = screenToWorld($0.preciseLocation(in: self))
                 return sample(LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item), touch: $0)
             })
-            predictedStrokePoints = (event?.predictedTouches(for: touch) ?? []).map {
-                let predictedWorld = screenToWorld($0.location(in: self))
+            strokeAccumulator.setPredicted((event?.predictedTouches(for: touch) ?? []).map {
+                let predictedWorld = screenToWorld($0.preciseLocation(in: self))
                 return sample(LectureCoordinateTransform.lectureWorldToBoardLocal(predictedWorld, board: item),
-                              touch: $0, updatesPressure: false)
-            }
-            boardViews[boardID]?.showLiveStroke(points: liveStrokePoints + predictedStrokePoints,
+                              touch: $0)
+            })
+            liveStrokePoints = strokeAccumulator.canonicalPoints
+            predictedStrokePoints = strokeAccumulator.predicted
+            boardViews[boardID]?.showLiveStroke(points: strokeAccumulator.livePoints,
                                                 color: strokeColor,
                                                 width: strokeWidth,
-                                                pressure: lastPencilPressure)
+                                                tool: activePencilStrokeTool)
         case .lassoing:
             lassoPoints.append(world)
             updateInteractionOverlay()
@@ -1082,10 +1214,13 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard twoTouchStartCamera == nil, let touch = touches.first else { return }
+        guard let touch = touches.first else { return }
+        if twoTouchStartCamera != nil && touch.type != .pencil { return }
         let screen = touch.location(in: self)
         let world = screenToWorld(screen)
         #if DEBUG
+        pencilRawMonitor.recordTouch("END", touch: touch, event: event, in: self,
+                                     tool: activeTool.rawValue, state: interactionLabel)
         debugInput("END", touch: touch, screen: screen, world: world)
         #endif
         switch interaction {
@@ -1104,24 +1239,30 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             callbacks.onCameraChanged(controller.camera)
         case .drawing(let boardID, let strokeID):
             if let item = workspace.items.first(where: { $0.boardID == boardID }) {
-                let local = LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item)
-                let endpoint = sample(local, touch: touch)
-                if let last = liveStrokePoints.last,
-                   hypot(last.x - endpoint.x, last.y - endpoint.y) > 0.001 {
-                    liveStrokePoints.append(endpoint)
-                }
+                let finalTouches = event?.coalescedTouches(for: touch) ?? [touch]
+                strokeAccumulator.appendConfirmed(finalTouches.map {
+                    let sampleWorld = screenToWorld($0.preciseLocation(in: self))
+                    let sampleLocal = LectureCoordinateTransform.lectureWorldToBoardLocal(
+                        sampleWorld, board: item
+                    )
+                    return sample(sampleLocal, touch: $0)
+                })
+                liveStrokePoints = strokeAccumulator.canonicalPoints
             }
             if !liveStrokePoints.isEmpty {
-                callbacks.onStroke(UserStroke(id: strokeID,
-                                              color: strokeColor,
-                                              width: strokeWidth,
-                                              opacity: strokeOpacity,
-                                              points: liveStrokePoints), boardID)
+                let stroke = UserStroke(id: strokeID,
+                                        color: strokeColor,
+                                        width: strokeWidth,
+                                        opacity: strokeOpacity,
+                                        points: liveStrokePoints,
+                                        pencilTool: activePencilStrokeTool)
+                recentlyCommittedStroke = (stroke, boardID)
+                callbacks.onStroke(stroke, boardID)
             }
             boardViews[boardID]?.clearLiveStroke()
             liveStrokePoints.removeAll()
             predictedStrokePoints.removeAll()
-            lastPencilPressure = nil
+            strokeAccumulator.reset()
             liveStrokeBoardID = nil
         case .lassoing:
             finishLasso(endpoint: world)
@@ -1166,7 +1307,44 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        #if DEBUG
+        if let touch = touches.first {
+            pencilRawMonitor.recordTouch("CANCEL", touch: touch, event: event, in: self,
+                                         tool: activeTool.rawValue, state: interactionLabel)
+        }
+        #endif
         cancelContentInteraction()
+    }
+
+    override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
+        #if DEBUG
+        pencilRawMonitor.recordEstimatedUpdates(touches, in: self)
+        #endif
+        if case .drawing(let boardID, _) = interaction,
+           let item = workspace.items.first(where: { $0.boardID == boardID }) {
+            let corrected = touches.filter(isDrawingTouch).map {
+                let world = screenToWorld($0.preciseLocation(in: self))
+                return sample(LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item),
+                              touch: $0)
+            }
+            strokeAccumulator.replaceEstimated(corrected)
+            liveStrokePoints = strokeAccumulator.canonicalPoints
+            boardViews[boardID]?.showLiveStroke(points: strokeAccumulator.livePoints,
+                                                color: strokeColor, width: strokeWidth,
+                                                tool: activePencilStrokeTool)
+        } else if let recent = recentlyCommittedStroke,
+                  let item = workspace.items.first(where: { $0.boardID == recent.boardID }) {
+            let corrections = touches.filter(isDrawingTouch).map {
+                let world = screenToWorld($0.preciseLocation(in: self))
+                let local = LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item)
+                return sample(local, touch: $0)
+            }
+            if let corrected = PencilStrokeCorrection.applying(corrections, to: recent.stroke) {
+                recentlyCommittedStroke = (corrected, recent.boardID)
+                callbacks.onStroke(corrected, recent.boardID)
+            }
+        }
+        super.touchesEstimatedPropertiesUpdated(touches)
     }
 
     private func cancelContentInteraction() {
@@ -1184,7 +1362,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         lassoPoints.removeAll()
         liveStrokePoints.removeAll()
         predictedStrokePoints.removeAll()
-        lastPencilPressure = nil
+        strokeAccumulator.reset()
         liveStrokeBoardID = nil
         lastEraseWorld = nil
         resizePreviewBounds = nil
@@ -1400,7 +1578,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     }
 
     private func resizeHandle(at world: CGPoint, bounds: CGRect) -> SelectionResizeHandle? {
-        let tolerance = 16 / max(worldTransform.scale, 0.001)
+        let tolerance = PencilHitTarget.resizeHandleRadius / max(worldTransform.scale, 0.001)
         return SelectionResizeHandle.allCases.first {
             let point = $0.point(in: bounds)
             return hypot(world.x - point.x, world.y - point.y) <= tolerance
@@ -1432,25 +1610,32 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         #endif
     }
 
-    private func sample(_ local: CGPoint, touch: UITouch, updatesPressure: Bool = true) -> StrokePoint {
-        let pressure: Double
+    private func sample(_ local: CGPoint, touch: UITouch) -> StrokePoint {
         #if targetEnvironment(simulator)
-        pressure = 1
+        let pressure: CGFloat? = nil
         #else
-        let normalized = touch.force / max(touch.maximumPossibleForce, 1)
-        let filtered = updatesPressure
-            ? PencilPressureResponse.smoothed(previous: lastPencilPressure, sample: normalized)
-            : PencilPressureResponse.curved(normalized)
-        if updatesPressure { lastPencilPressure = filtered }
-        pressure = Double(filtered)
+        let pressure = touch.type == .pencil
+            ? PencilPressureResponse.normalized(force: touch.force,
+                                                maximum: touch.maximumPossibleForce)
+            : nil
         #endif
-        return StrokePoint(x: local.x, y: local.y, pressure: pressure)
+        let isPencil = touch.type == .pencil
+        let roll: CGFloat?
+        if #available(iOS 17.5, *), isPencil { roll = touch.rollAngle } else { roll = nil }
+        return StrokePoint(x: local.x, y: local.y, pressure: pressure.map(Double.init),
+                           altitude: isPencil ? Double(touch.altitudeAngle) : nil,
+                           azimuth: isPencil ? Double(touch.azimuthAngle(in: self)) : nil,
+                           roll: roll.map(Double.init), timestamp: touch.timestamp,
+                           estimationUpdateIndex: touch.estimationUpdateIndex?.intValue)
     }
 
     private var activeStrokeStyle: CanvasStrokeStyle { activeTool == .highlighter ? markerStyle : penStyle }
     private var strokeColor: String { activeStrokeStyle.colorHex }
     private var strokeWidth: Double { activeStrokeStyle.width }
     private var strokeOpacity: Double { activeStrokeStyle.opacity }
+    private var activePencilStrokeTool: PencilStrokeTool {
+        activeTool == .highlighter ? .marker : .pen
+    }
 
     // MARK: - Keyboard development controls
 
@@ -1813,12 +1998,11 @@ private final class LectureBoardRenderView: UIView {
     }
 
     func showLiveStroke(points: [StrokePoint], color: String, width: Double,
-                        pressure: CGFloat?) {
+                        tool: PencilStrokeTool) {
         let layer = liveStrokeLayer ?? {
             let layer = CAShapeLayer()
-            layer.fillColor = UIColor.clear.cgColor
-            layer.lineCap = .round
-            layer.lineJoin = .round
+            layer.fillColor = UIColor(svgHex: color).cgColor
+            layer.strokeColor = nil
             // This is a transient preview, not canonical document ordering.
             // Keep it above graph proxy layers until lift commits the stroke.
             layer.zPosition = 1_000_000
@@ -1826,14 +2010,9 @@ private final class LectureBoardRenderView: UIView {
             liveStrokeLayer = layer
             return layer
         }()
-        let path = UIBezierPath()
-        for (index, point) in points.enumerated() {
-            let p = CGPoint(x: point.x, y: point.y)
-            index == 0 ? path.move(to: p) : path.addLine(to: p)
-        }
-        layer.path = path.cgPath
-        layer.strokeColor = UIColor(svgHex: color).cgColor
-        layer.lineWidth = width * Double(PencilPressureResponse.widthMultiplier(for: pressure ?? 1))
+        layer.path = PencilStrokeGeometry.path(points: points, tool: tool,
+                                               baseWidth: CGFloat(width))
+        layer.fillColor = UIColor(svgHex: color).cgColor
     }
 
     func clearLiveStroke() {
@@ -1890,18 +2069,35 @@ private final class LectureBoardRenderView: UIView {
                 let translation = object.translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
                 let scaleX = object.scaleX ?? 1
                 let scaleY = object.scaleY ?? 1
-                for (index, point) in (object.points ?? []).enumerated() {
-                    let p = CGPoint(x: point.x * scaleX + translation.x,
-                                    y: point.y * scaleY + translation.y)
+                let transformedPoints = (object.points ?? []).map { point in
+                    StrokePoint(x: point.x * scaleX + translation.x,
+                                y: point.y * scaleY + translation.y,
+                                pressure: point.pressure, altitude: point.altitude,
+                                azimuth: point.azimuth, roll: point.roll,
+                                timestamp: point.timestamp,
+                                estimationUpdateIndex: point.estimationUpdateIndex)
+                }
+                for (index, point) in transformedPoints.enumerated() {
+                    let p = CGPoint(x: point.x, y: point.y)
                     index == 0 ? path.move(to: p) : path.addLine(to: p)
                 }
-                shape.path = path.cgPath
-                shape.fillColor = UIColor.clear.cgColor
-                shape.strokeColor = UIColor(svgHex: object.color ?? "#183153")
+                let color = UIColor(svgHex: object.color ?? "#183153")
                     .withAlphaComponent(CGFloat(object.opacity ?? 1)).cgColor
-                shape.lineWidth = (object.width ?? 4) * sqrt(abs(scaleX * scaleY))
-                shape.lineCap = .round
-                shape.lineJoin = .round
+                if let pencilTool = object.pencilTool {
+                    shape.path = PencilStrokeGeometry.path(
+                        points: transformedPoints, tool: pencilTool,
+                        baseWidth: CGFloat((object.width ?? 4) * sqrt(abs(scaleX * scaleY)))
+                    )
+                    shape.fillColor = color
+                    shape.strokeColor = nil
+                } else {
+                    shape.path = path.cgPath
+                    shape.fillColor = UIColor.clear.cgColor
+                    shape.strokeColor = color
+                    shape.lineWidth = (object.width ?? 4) * sqrt(abs(scaleX * scaleY))
+                    shape.lineCap = .round
+                    shape.lineJoin = .round
+                }
                 layer = shape
             }
             layer.zPosition = CGFloat(index)

@@ -570,10 +570,29 @@ final class BoardDocumentStore: ObservableObject {
     func applyStroke(_ stroke: UserStroke, api: APIClient) {
         let object = CanvasObject(id: stroke.id, type: stroke.type, color: stroke.color,
                                   width: stroke.width, opacity: stroke.opacity,
-                                  points: stroke.points.map { WorldPoint(x: $0.x, y: $0.y, pressure: $0.pressure) },
+                                  points: stroke.points.map {
+                                      WorldPoint(x: $0.x, y: $0.y, pressure: $0.pressure,
+                                                 altitude: $0.altitude, azimuth: $0.azimuth,
+                                                 roll: $0.roll, timestamp: $0.timestamp,
+                                                 estimationUpdateIndex: $0.estimationUpdateIndex)
+                                  },
                                   translation: stroke.translation, sourceMarkdown: nil, text: nil,
-                                  x: nil, y: nil, height: nil, fontSize: nil)
+                                  x: nil, y: nil, height: nil, fontSize: nil,
+                                  pencilTool: stroke.pencilTool)
         var next = editor
+        if let existingIndex = next.objects.firstIndex(where: { $0.id == object.id }) {
+            guard next.objects[existingIndex] != object else { return }
+            // UIKit may correct estimated Pencil properties after touch-up.
+            // Replace that stable stroke in-place without adding a second undo
+            // entry; the original stroke commit remains the single user action.
+            next.objects[existingIndex] = object
+            editor = next
+            mutationGeneration += 1
+            status = .dirty
+            persistOutbox()
+            scheduleSave(api: api)
+            return
+        }
         next.objects.append(object)
         apply(next, api: api)
     }

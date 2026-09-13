@@ -21,8 +21,17 @@ struct WorldPoint: Codable, Equatable, Sendable {
     var x: Double
     var y: Double
     var pressure: Double?
+    var altitude: Double? = nil
+    var azimuth: Double? = nil
+    var roll: Double? = nil
+    var timestamp: Double? = nil
+    var estimationUpdateIndex: Int? = nil
 
-    enum CodingKeys: String, CodingKey { case x, y, pressure = "p" }
+    enum CodingKeys: String, CodingKey {
+        case x, y, pressure = "p"
+        case altitude = "alt", azimuth = "azi", roll = "r", timestamp = "t"
+        case estimationUpdateIndex = "ei"
+    }
 }
 
 struct LibraryResponse: Codable, Sendable {
@@ -1009,6 +1018,9 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
     /// Populated only for `type == "graph"`. Graph fields encode flat into the
     /// canonical editor object rather than into a parallel document collection.
     let graph: GraphObject?
+    /// Optional advanced Pencil rendering metadata. Its absence preserves the
+    /// exact legacy round-stroke behavior.
+    let pencilTool: PencilStrokeTool?
 
     enum CodingKeys: String, CodingKey {
         case id, type, color, width, opacity, points, translation
@@ -1018,6 +1030,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         case createdAt = "created_at"
         case unitLabel = "unit_label"
         case origin
+        case pencilTool = "pencil_tool"
     }
 
     init(id: String, type: String, color: String?, width: Double?, opacity: Double?,
@@ -1026,7 +1039,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
          scaleX: Double? = nil, scaleY: Double? = nil, d: String? = nil, fill: String? = nil,
          role: String? = nil, sourceStudyInteractionID: String? = nil,
          createdAt: Double? = nil, unitLabel: String? = nil, origin: String? = nil,
-         graph: GraphObject? = nil) {
+         graph: GraphObject? = nil, pencilTool: PencilStrokeTool? = nil) {
         self.id = id; self.type = type; self.color = color; self.width = width
         self.opacity = opacity; self.points = points; self.translation = translation
         self.sourceMarkdown = sourceMarkdown; self.text = text; self.x = x; self.y = y
@@ -1035,6 +1048,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         self.sourceStudyInteractionID = sourceStudyInteractionID
         self.createdAt = createdAt; self.unitLabel = unitLabel; self.origin = origin
         self.graph = graph
+        self.pencilTool = pencilTool
     }
 
     init(graph: GraphObject) {
@@ -1044,6 +1058,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         d = nil; fill = nil; role = nil; sourceStudyInteractionID = nil
         createdAt = graph.createdAt; unitLabel = nil; origin = nil
         self.graph = graph
+        pencilTool = nil
     }
 
     init(from decoder: Decoder) throws {
@@ -1057,6 +1072,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
             fontSize = nil; scaleX = nil; scaleY = nil; d = nil; fill = nil
             role = nil; sourceStudyInteractionID = nil; createdAt = value.createdAt
             unitLabel = nil; origin = nil; graph = value
+            pencilTool = nil
             return
         }
         color = try container.decodeIfPresent(String.self, forKey: .color)
@@ -1081,6 +1097,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         createdAt = try container.decodeIfPresent(Double.self, forKey: .createdAt)
         unitLabel = try container.decodeIfPresent(String.self, forKey: .unitLabel)
         origin = try container.decodeIfPresent(String.self, forKey: .origin)
+        pencilTool = try container.decodeIfPresent(PencilStrokeTool.self, forKey: .pencilTool)
         graph = nil
     }
 
@@ -1113,6 +1130,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         try container.encodeIfPresent(createdAt, forKey: .createdAt)
         try container.encodeIfPresent(unitLabel, forKey: .unitLabel)
         try container.encodeIfPresent(origin, forKey: .origin)
+        try container.encodeIfPresent(pencilTool, forKey: .pencilTool)
     }
 
     func translated(by delta: CGPoint) -> CanvasObject {
@@ -1124,7 +1142,8 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                            height: height, fontSize: fontSize,
                            scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
                            sourceStudyInteractionID: sourceStudyInteractionID,
-                           createdAt: createdAt, unitLabel: unitLabel, origin: origin)
+                           createdAt: createdAt, unitLabel: unitLabel, origin: origin,
+                           pencilTool: pencilTool)
     }
 
     func resized(to size: CGSize) -> CanvasObject {
@@ -1136,7 +1155,8 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                             height: Double(size.height), fontSize: fontSize,
                             scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
                             sourceStudyInteractionID: sourceStudyInteractionID,
-                            createdAt: createdAt, unitLabel: unitLabel, origin: origin)
+                            createdAt: createdAt, unitLabel: unitLabel, origin: origin,
+                            pencilTool: pencilTool)
     }
 
     /// Scales the displayed object uniformly around a board-local anchor.
@@ -1167,7 +1187,8 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                 height: max(4, (height ?? 100) * safeFactor), fontSize: fontSize,
                 scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
                 sourceStudyInteractionID: sourceStudyInteractionID,
-                createdAt: createdAt, unitLabel: unitLabel, origin: origin
+                createdAt: createdAt, unitLabel: unitLabel, origin: origin,
+                pencilTool: pencilTool
             )
         }
 
@@ -1180,7 +1201,8 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
             scaleY: (scaleY ?? 1) * safeFactor,
             d: d, fill: fill, role: role,
             sourceStudyInteractionID: sourceStudyInteractionID,
-            createdAt: createdAt, unitLabel: unitLabel, origin: origin
+            createdAt: createdAt, unitLabel: unitLabel, origin: origin,
+            pencilTool: pencilTool
         )
     }
 }
@@ -1191,8 +1213,25 @@ struct StrokePoint: Codable, Equatable, Sendable {
     let x: Double
     let y: Double
     let pressure: Double?
+    let altitude: Double?
+    let azimuth: Double?
+    let roll: Double?
+    let timestamp: Double?
+    let estimationUpdateIndex: Int?
 
-    enum CodingKeys: String, CodingKey { case x, y, pressure = "p" }
+    enum CodingKeys: String, CodingKey {
+        case x, y, pressure = "p"
+        case altitude = "alt", azimuth = "azi", roll = "r", timestamp = "t"
+        case estimationUpdateIndex = "ei"
+    }
+
+    init(x: Double, y: Double, pressure: Double?, altitude: Double? = nil,
+         azimuth: Double? = nil, roll: Double? = nil, timestamp: Double? = nil,
+         estimationUpdateIndex: Int? = nil) {
+        self.x = x; self.y = y; self.pressure = pressure
+        self.altitude = altitude; self.azimuth = azimuth; self.roll = roll
+        self.timestamp = timestamp; self.estimationUpdateIndex = estimationUpdateIndex
+    }
 }
 
 struct UserStroke: Codable, Identifiable, Equatable, Sendable {
@@ -1203,14 +1242,27 @@ struct UserStroke: Codable, Identifiable, Equatable, Sendable {
     var opacity: Double = 1
     var points: [StrokePoint]
     var translation: WorldPoint = WorldPoint(x: 0, y: 0, pressure: nil)
+    var pencilTool: PencilStrokeTool? = nil
 
     func asCanvasObject(boardID: String? = nil) -> [String: Any] {
         // This helper documents the exact server shape; EditorState remains
         // Codable and the next persistence module will use a typed envelope.
         var result: [String: Any] = ["id": id, "type": type, "color": color,
                                      "width": width, "opacity": opacity,
-                                     "points": points.map { ["x": $0.x, "y": $0.y, "p": $0.pressure as Any] },
+                                     "points": points.map { point in
+                                         var value: [String: Any] = ["x": point.x, "y": point.y]
+                                         if let pressure = point.pressure { value["p"] = pressure }
+                                         if let altitude = point.altitude { value["alt"] = altitude }
+                                         if let azimuth = point.azimuth { value["azi"] = azimuth }
+                                         if let roll = point.roll { value["r"] = roll }
+                                         if let timestamp = point.timestamp { value["t"] = timestamp }
+                                         if let estimationUpdateIndex = point.estimationUpdateIndex {
+                                             value["ei"] = estimationUpdateIndex
+                                         }
+                                         return value
+                                     },
                                      "translation": ["x": translation.x, "y": translation.y]]
+        if let pencilTool { result["pencil_tool"] = pencilTool.rawValue }
         if let boardID { result["board_id"] = boardID }
         return result
     }

@@ -1,0 +1,376 @@
+import XCTest
+import UIKit
+@testable import VBoardApp
+
+final class PencilCapabilityContractTests: XCTestCase {
+    func testGenerationProfilesDescribeOnlyDocumentedContractDifferences() {
+        let first = PencilGenerationProfile.firstGeneration.capabilities
+        XCTAssertTrue(first.pressure && first.tilt && first.azimuth)
+        XCTAssertFalse(first.hover || first.doubleTap || first.squeeze || first.barrelRoll || first.pencilHaptics)
+
+        let second = PencilGenerationProfile.secondGeneration.capabilities
+        XCTAssertTrue(second.pressure && second.doubleTap && second.hover)
+        XCTAssertFalse(second.squeeze || second.barrelRoll || second.pencilHaptics)
+
+        let usbC = PencilGenerationProfile.usbC.capabilities
+        XCTAssertFalse(usbC.pressure || usbC.doubleTap || usbC.squeeze || usbC.barrelRoll || usbC.pencilHaptics)
+        XCTAssertTrue(usbC.tilt && usbC.azimuth && usbC.hover)
+
+        let pro = PencilGenerationProfile.pro.capabilities
+        XCTAssertTrue(pro.pressure && pro.tilt && pro.azimuth && pro.hover)
+        XCTAssertTrue(pro.doubleTap && pro.squeeze && pro.barrelRoll && pro.pencilHaptics)
+    }
+
+    func testEverySystemDoubleTapActionMapsExactlyOnce() {
+        let mappings: [(PencilPreferredAction, PencilLogicalAction)] = [
+            (.ignore, .none), (.switchEraser, .switchEraser),
+            (.switchPrevious, .switchPrevious), (.showColorPalette, .showColorPalette),
+            (.showInkAttributes, .showInkAttributes),
+            (.showContextualPalette, .showToolPalette),
+            (.runSystemShortcut, .runSystemShortcut), (.unknown, .none)
+        ]
+        for (system, expected) in mappings {
+            XCTAssertEqual(PencilActionResolver.doubleTap(setting: .followSystem,
+                                                           system: system), expected)
+        }
+    }
+
+    func testExplicitActionOverridesAndUnsupportedCapability() {
+        XCTAssertEqual(PencilActionResolver.doubleTap(setting: .previousTool,
+                                                       system: .ignore), .switchPrevious)
+        XCTAssertEqual(PencilActionResolver.doubleTap(setting: .eraser,
+                                                       system: .showColorPalette), .switchEraser)
+        XCTAssertEqual(PencilActionResolver.doubleTap(setting: .palette,
+                                                       system: .ignore), .showToolPalette)
+        XCTAssertEqual(PencilActionResolver.doubleTap(setting: .off,
+                                                       system: .switchEraser), .none)
+        XCTAssertEqual(PencilActionResolver.doubleTap(setting: .eraser,
+                                                       system: .switchEraser,
+                                                       supported: false), .none)
+        XCTAssertEqual(PencilActionResolver.squeeze(setting: .inkAttributes,
+                                                     system: .ignore), .showInkAttributes)
+        XCTAssertEqual(PencilActionResolver.squeeze(setting: .off,
+                                                     system: .showContextualPalette), .none)
+    }
+}
+
+final class PencilDeliveryPipelineTests: XCTestCase {
+    private func point(_ x: Double, pressure: Double = 0.5, timestamp: Double,
+                       estimate: Int? = nil, roll: Double? = nil) -> StrokePoint {
+        StrokePoint(x: x, y: x, pressure: pressure, altitude: 1, azimuth: 0.4,
+                    roll: roll, timestamp: timestamp, estimationUpdateIndex: estimate)
+    }
+
+    func testConfirmedSamplesStayOrderedAndPrimaryDuplicateIsReplaced() {
+        var pipeline = PencilStrokeAccumulator()
+        pipeline.appendConfirmed([point(1, timestamp: 1), point(2, timestamp: 2)])
+        pipeline.appendConfirmed([point(2, pressure: 0.8, timestamp: 2),
+                                  point(3, timestamp: 3)])
+        XCTAssertEqual(pipeline.canonicalPoints.map(\.x), [1, 2, 3])
+        XCTAssertEqual(pipeline.canonicalPoints[1].pressure, 0.8)
+    }
+
+    func testPredictedTailAppearsLiveButNeverCanonical() {
+        var pipeline = PencilStrokeAccumulator()
+        pipeline.appendConfirmed([point(1, timestamp: 1), point(2, timestamp: 2)])
+        pipeline.setPredicted([point(3, timestamp: 3), point(4, timestamp: 4)])
+        XCTAssertEqual(pipeline.livePoints.map(\.x), [1, 2, 3, 4])
+        XCTAssertEqual(pipeline.canonicalPoints.map(\.x), [1, 2])
+    }
+
+    func testEstimatedCorrectionUpdatesSameSampleWithoutDuplicate() {
+        var pipeline = PencilStrokeAccumulator()
+        pipeline.appendConfirmed([point(1, pressure: 0.2, timestamp: 1, estimate: 42)])
+        pipeline.replaceEstimated([point(1.1, pressure: 0.9, timestamp: 1.1,
+                                         estimate: 42, roll: 1.2)])
+        XCTAssertEqual(pipeline.canonicalPoints.count, 1)
+        XCTAssertEqual(pipeline.canonicalPoints[0].x, 1.1)
+        XCTAssertEqual(pipeline.canonicalPoints[0].pressure, 0.9)
+        XCTAssertEqual(pipeline.canonicalPoints[0].roll, 1.2)
+    }
+
+    func testLateEstimatedCorrectionKeepsCommittedStrokeIdentity() {
+        let stroke = UserStroke(id: "stable", points: [
+            point(1, pressure: 0.2, timestamp: 1, estimate: 42)
+        ], pencilTool: .pen)
+        let corrected = PencilStrokeCorrection.applying([
+            point(1.1, pressure: 0.9, timestamp: 1.1, estimate: 42, roll: 1.2)
+        ], to: stroke)
+        XCTAssertEqual(corrected?.id, "stable")
+        XCTAssertEqual(corrected?.points.count, 1)
+        XCTAssertEqual(corrected?.points[0].pressure, 0.9)
+        XCTAssertEqual(corrected?.points[0].roll, 1.2)
+    }
+}
+
+final class PencilGeometryAndPressureTests: XCTestCase {
+    func testPressureNormalizationClampsAndHandlesUnavailableSensor() {
+        XCTAssertNil(PencilPressureResponse.normalized(force: 1, maximum: 0))
+        XCTAssertNil(PencilPressureResponse.normalized(force: .nan, maximum: 4))
+        XCTAssertNil(PencilPressureResponse.normalized(force: 2, maximum: 4,
+                                                        supported: false))
+        XCTAssertEqual(PencilPressureResponse.normalized(force: -1, maximum: 4), 0)
+        XCTAssertEqual(PencilPressureResponse.normalized(force: 9, maximum: 4), 1)
+        XCTAssertEqual(PencilPressureResponse.normalized(force: 2, maximum: 4), 0.5)
+    }
+
+    func testPressureMappingIsFiniteGentleAndMonotonic() {
+        let values = stride(from: CGFloat(0), through: 1, by: 0.05)
+            .map { PencilPressureResponse.widthMultiplier(forDisplayPressure: $0) }
+        XCTAssertTrue(zip(values, values.dropFirst()).allSatisfy(<=))
+        XCTAssertTrue(values.allSatisfy(\.isFinite))
+        XCTAssertGreaterThanOrEqual(values.first ?? 0, 0.65)
+        XCTAssertLessThanOrEqual(values.last ?? 99, 1.25)
+        XCTAssertEqual(PencilPressureResponse.widthMultiplier(forDisplayPressure: nil), 1)
+    }
+
+    func testRollUsesShortestPathAcrossZeroDegrees() {
+        let start = CGFloat(359) * .pi / 180
+        let end: CGFloat = 0
+        XCTAssertEqual(PencilAngleMath.shortestDelta(from: start, to: end),
+                       .pi / 180, accuracy: 0.000_01)
+        let midpoint = PencilAngleMath.interpolated(from: start, to: end, fraction: 0.5)
+        XCTAssertTrue(midpoint > CGFloat(359) * .pi / 180 || midpoint < CGFloat(1) * .pi / 180)
+    }
+
+    func testMarkerFootprintHonorsCardinalRollAngles() {
+        for degrees in [0, 90, 180, 270] {
+            let angle = CGFloat(degrees) * .pi / 180
+            let nib = PencilNibGeometry.marker(baseWidth: 20, pressure: 0.5,
+                                               altitude: .pi / 3, azimuth: 0,
+                                               roll: angle)
+            XCTAssertEqual(nib.orientation, angle, accuracy: 0.000_01)
+            XCTAssertGreaterThan(nib.majorAxis, nib.minorAxis)
+        }
+    }
+
+    func testMarkerPathRotatesVisibleChiselFootprint() {
+        let horizontal = [StrokePoint(x: 50, y: 50, pressure: 0.5, roll: 0)]
+        let vertical = [StrokePoint(x: 50, y: 50, pressure: 0.5, roll: .pi / 2)]
+        let horizontalBounds = PencilStrokeGeometry.path(points: horizontal, tool: .marker,
+                                                         baseWidth: 24).boundingBox
+        let verticalBounds = PencilStrokeGeometry.path(points: vertical, tool: .marker,
+                                                       baseWidth: 24).boundingBox
+        XCTAssertGreaterThan(horizontalBounds.width, horizontalBounds.height)
+        XCTAssertGreaterThan(verticalBounds.height, verticalBounds.width)
+    }
+}
+
+final class PencilPaletteAndArbitrationTests: XCTestCase {
+    func testResizeHandleInvisibleTargetIsWithinPencilGuidance() {
+        XCTAssertGreaterThanOrEqual(PencilHitTarget.resizeHandleRadius * 2, 28)
+        XCTAssertLessThanOrEqual(PencilHitTarget.resizeHandleRadius * 2, 44)
+    }
+
+    func testOneSqueezeProducesOnePaletteLifecycle() {
+        var state = PencilPaletteStateMachine()
+        XCTAssertEqual(state.receive(.began, anchor: CGPoint(x: 10, y: 20)),
+                       .present(CGPoint(x: 10, y: 20)))
+        XCTAssertEqual(state.receive(.began, anchor: CGPoint(x: 11, y: 21)), .none)
+        XCTAssertEqual(state.receive(.changed, anchor: CGPoint(x: 12, y: 22)),
+                       .update(CGPoint(x: 12, y: 22)))
+        XCTAssertEqual(state.receive(.ended, anchor: CGPoint(x: 13, y: 23)), .none)
+        XCTAssertTrue(state.isPresented)
+        XCTAssertEqual(state.dismiss(), .dismiss)
+        XCTAssertFalse(state.isPresented)
+    }
+
+    func testSqueezeCancellationDismissesAndClearsHitBlockingState() {
+        var state = PencilPaletteStateMachine()
+        _ = state.receive(.began, anchor: nil)
+        XCTAssertEqual(state.receive(.cancelled, anchor: nil), .dismiss)
+        XCTAssertFalse(state.isPresented)
+        XCTAssertNil(state.anchor)
+        XCTAssertEqual(state.receive(.cancelled, anchor: nil), .none)
+    }
+
+    func testPalettePlacementFlipsAndClampsAtScreenEdges() {
+        let bounds = CGRect(x: 8, y: 8, width: 1_008, height: 752)
+        let size = CGSize(width: 300, height: 60)
+        let right = PencilPalettePlacement.origin(anchor: CGPoint(x: 1_000, y: 400),
+                                                  paletteSize: size, safeBounds: bounds)
+        XCTAssertLessThan(right.x, 1_000)
+        XCTAssertTrue(bounds.contains(CGRect(origin: right, size: size)))
+        let corner = PencilPalettePlacement.origin(anchor: CGPoint(x: 0, y: 0),
+                                                   paletteSize: size, safeBounds: bounds)
+        XCTAssertTrue(bounds.contains(CGRect(origin: corner, size: size)))
+    }
+
+    func testPencilEditsFingerNavigatesAndPalmNeverDraws() {
+        XCTAssertTrue(PencilInputArbitration.allows(.pencil, intent: .draw,
+                                                    pencilOwnsStroke: false))
+        XCTAssertTrue(PencilInputArbitration.allows(.pencil, intent: .edit,
+                                                    pencilOwnsStroke: false))
+        XCTAssertFalse(PencilInputArbitration.allows(.finger, intent: .draw,
+                                                     pencilOwnsStroke: false))
+        XCTAssertTrue(PencilInputArbitration.allows(.finger, intent: .navigate,
+                                                    pencilOwnsStroke: false))
+        XCTAssertTrue(PencilInputArbitration.allows(.finger, intent: .navigate,
+                                                    pencilOwnsStroke: true))
+        XCTAssertFalse(PencilInputArbitration.allows(.palm, intent: .navigate,
+                                                     pencilOwnsStroke: true))
+        XCTAssertTrue(PencilInputArbitration.allows(.finger, intent: .graph,
+                                                    pencilOwnsStroke: false))
+    }
+}
+
+final class PencilPersistenceTests: XCTestCase {
+    func testLegacyStrokeDecodesWithoutAdvancedMetadata() throws {
+        let data = Data("""
+        {"id":"old","type":"stroke","color":"#000000","width":4,"opacity":1,"points":[{"x":1,"y":2,"p":0.5}],"translation":{"x":0,"y":0}}
+        """.utf8)
+        let stroke = try JSONDecoder().decode(UserStroke.self, from: data)
+        XCTAssertNil(stroke.pencilTool)
+        XCTAssertNil(stroke.points[0].altitude)
+        XCTAssertNil(stroke.points[0].roll)
+    }
+
+    func testAdvancedMarkerMetadataRoundTripsExactly() throws {
+        let point = StrokePoint(x: -20, y: 30, pressure: 0.72, altitude: 0.8,
+                                azimuth: 1.1, roll: 6.27, timestamp: 123.4,
+                                estimationUpdateIndex: 9)
+        let stroke = UserStroke(id: "new", color: "#FFD60A", width: 22,
+                                opacity: 0.32, points: [point], pencilTool: .marker)
+        let decoded = try JSONDecoder().decode(UserStroke.self,
+                                               from: JSONEncoder().encode(stroke))
+        XCTAssertEqual(decoded, stroke)
+        XCTAssertEqual(decoded.points[0].pressure, 0.72)
+        XCTAssertEqual(decoded.points[0].roll, 6.27)
+    }
+
+    func testCanvasObjectKeepsPencilMetadataAcrossMoveAndResize() throws {
+        let point = WorldPoint(x: 1, y: 2, pressure: 0.4, altitude: 0.7,
+                               azimuth: 0.9, roll: 1.3, timestamp: 2,
+                               estimationUpdateIndex: 4)
+        let object = CanvasObject(id: "stroke", type: "stroke", color: "#123456",
+                                  width: 10, opacity: 0.5, points: [point],
+                                  translation: nil, sourceMarkdown: nil, text: nil,
+                                  x: nil, y: nil, height: nil, fontSize: nil,
+                                  pencilTool: .marker)
+        let moved = object.translated(by: CGPoint(x: 3, y: 4))
+        let scaled = moved.scaled(around: .zero, by: 2)
+        XCTAssertEqual(scaled.pencilTool, .marker)
+        XCTAssertEqual(scaled.points?.first?.roll, 1.3)
+        let decoded = try JSONDecoder().decode(CanvasObject.self,
+                                               from: JSONEncoder().encode(scaled))
+        XCTAssertEqual(decoded, scaled)
+    }
+}
+
+@MainActor
+final class PencilInteractionOwnershipTests: XCTestCase {
+    private func lectureCallbacks() -> LectureCanvasCallbacks {
+        LectureCanvasCallbacks(onCameraChanged: { _ in }, onActiveBoardChanged: { _ in },
+                               onDetailDemand: { _ in }, onSelectionChanged: { _, _ in },
+                               onSelectionScreenBoundsChanged: { _ in },
+                               onStroke: { _, _ in }, onMoveSelection: { _, _ in },
+                               onResizeSelection: { _, _, _ in }, onDelete: { _ in },
+                               onMoveBoard: { _, _ in }, onUndo: {}, onRedo: {},
+                               onPencilAction: { _, _ in }, onPencilPaletteMoved: { _ in },
+                               onPencilPaletteDismiss: {})
+    }
+
+    func testStandaloneCanvasRetainsExactlyOnePencilInteractionAcrossUpdates() throws {
+        let document = try SVGDocument.parse("<svg viewBox='0 0 100 100'/>")
+        let editor = try JSONDecoder().decode(EditorState.self, from: Data("""
+        {"schema_version":4,"revision":0,"viewport":{"x":0,"y":0,"width":100,"height":100},"objects":[],"groups":[],"imported_transforms":{},"source_boards":[],"merged_board_ids":[]}
+        """.utf8))
+        let canvas = InfiniteCanvasUIView(
+            boardID: "one", document: document, camera: editor.viewport,
+            composition: SceneComposition.build(boardID: "one", document: document,
+                                                editor: editor)
+        )
+        XCTAssertEqual(canvas.pencilInteractionCountForTesting, 1)
+        canvas.update(boardID: "two", document: document, camera: editor.viewport,
+                      objects: [], importedTransforms: [:],
+                      composition: SceneComposition.build(boardID: "two", document: document,
+                                                          editor: editor),
+                      pencilPreferences: PencilPreferences(doubleTap: .eraser,
+                                                           squeeze: .toolPalette,
+                                                           hover: .on))
+        XCTAssertEqual(canvas.pencilInteractionCountForTesting, 1)
+    }
+
+    func testClassCanvasRetainsExactlyOnePencilInteractionAcrossUpdates() {
+        let workspace = LectureWorkspace(
+            schemaVersion: 1, revision: 0,
+            camera: CameraRect(x: -100, y: -100, width: 1_000, height: 800),
+            items: [], activeBoardID: nil, lastViewedAt: nil
+        )
+        let view = LectureCanvasUIView(
+            workspace: workspace, scenes: [:], selectedKeys: [], tool: .pen,
+            backgroundStyle: .dots, physicalBoardShowsPaper: false,
+            penStyle: .pen, markerStyle: .marker,
+            pencilPreferences: .defaults, isPencilPalettePresented: false,
+            showsDeveloperDiagnostics: false,
+            thumbnailURLs: [:], loadAsset: { _ in Data() },
+            callbacks: lectureCallbacks()
+        )
+        XCTAssertEqual(view.pencilInteractionCountForTesting, 1)
+        view.update(workspace: workspace, scenes: [:], selectedKeys: [],
+                    tool: .highlighter, backgroundStyle: .blank,
+                    physicalBoardShowsPaper: false, penStyle: .pen,
+                    markerStyle: .marker,
+                    pencilPreferences: PencilPreferences(doubleTap: .previousTool,
+                                                         squeeze: .inkAttributes,
+                                                         hover: .off),
+                    isPencilPalettePresented: false,
+                    showsDeveloperDiagnostics: false, thumbnailURLs: [:],
+                    loadAsset: { _ in Data() }, focusRequest: nil,
+                    callbacks: lectureCallbacks())
+        XCTAssertEqual(view.pencilInteractionCountForTesting, 1)
+    }
+
+    func testFeedbackProviderCanBeReplacedByRecordingMock() {
+        final class Mock: PencilFeedbackProviding {
+            var requests: [PencilFeedbackRequest] = []
+            func request(_ feedback: PencilFeedbackRequest) { requests.append(feedback) }
+        }
+        let mock = Mock()
+        mock.request(.paletteActivation(CGPoint(x: 10, y: 20)))
+        mock.request(.toolSelection(nil))
+        XCTAssertEqual(mock.requests, [.paletteActivation(CGPoint(x: 10, y: 20)),
+                                       .toolSelection(nil)])
+    }
+
+    func testLateStrokeCorrectionUpdatesInPlaceAndKeepsOneUndoAction() {
+        let editor = EditorState(
+            schemaVersion: 4, revision: 0, updatedAt: nil,
+            viewport: CameraRect(x: 0, y: 0, width: 100, height: 100),
+            objects: [], groups: [], importedTransforms: [:],
+            sourceBoards: [], mergedBoardIDs: []
+        )
+        let store = BoardDocumentStore(boardID: "pencil-correction", editor: editor)
+        let api = APIClient(baseURL: URL(string: "https://pencil-correction.test")!)
+        let original = UserStroke(id: "stroke", points: [
+            StrokePoint(x: 1, y: 2, pressure: 0.2, timestamp: 1,
+                        estimationUpdateIndex: 9)
+        ], pencilTool: .pen)
+        let corrected = UserStroke(id: "stroke", points: [
+            StrokePoint(x: 1.1, y: 2.1, pressure: 0.9, roll: 1.2,
+                        timestamp: 1.1, estimationUpdateIndex: 9)
+        ], pencilTool: .pen)
+
+        store.applyStroke(original, api: api)
+        store.applyStroke(corrected, api: api)
+        XCTAssertEqual(store.editor.objects.count, 1)
+        XCTAssertEqual(store.editor.objects[0].points?[0].pressure, 0.9)
+        XCTAssertEqual(store.editor.objects[0].points?[0].roll, 1.2)
+        store.undo(api: api)
+        XCTAssertTrue(store.editor.objects.isEmpty)
+    }
+
+    #if DEBUG
+    func testHardwareHarnessStartsWithEveryRequiredCategoryNotTested() {
+        let store = PencilHardwareValidationStore.shared
+        store.reset()
+        XCTAssertEqual(Set(PencilHardwareFeature.allCases.map(\.rawValue)), Set([
+            "DRAW", "PRESSURE", "TILT", "HOVER", "DOUBLE TAP", "SQUEEZE",
+            "BARREL ROLL", "HAPTICS", "PALM", "FINGER COEXISTENCE"
+        ]))
+        XCTAssertTrue(PencilHardwareFeature.allCases.allSatisfy {
+            store.status(for: $0) == .notTested
+        })
+    }
+    #endif
+}

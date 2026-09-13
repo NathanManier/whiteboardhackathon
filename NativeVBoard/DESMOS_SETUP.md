@@ -18,14 +18,18 @@ documentation](https://www.desmos.com/api/v1.12/docs/index.html) and
 [changelog](https://www.desmos.com/api/changelog) before intentionally upgrading
 the pin.
 
-## Local development
+## Local configuration
 
-No API key is committed to this repository. Choose one of these DEBUG-only
-development configurations:
+No API key is committed to this repository. Choose one of these local
+configuration methods:
 
-1. In the `VBoardApp` scheme, add the environment variable
+1. From the repository root, run `NativeVBoard/scripts/set_desmos_api_key.sh`
+   and enter the issued key at the hidden prompt. This updates the existing
+   Debug and Release `VBOARD_DESMOS_API_KEY` build settings. Review the project
+   diff carefully and do not commit the resulting literal key.
+2. In the `VBoardApp` scheme, add the environment variable
    `VBoardDesmosAPIKey` with the issued key, then launch from Xcode.
-2. Add a user-defined build setting named `VBOARD_DESMOS_API_KEY` in a local
+3. Add a user-defined build setting named `VBOARD_DESMOS_API_KEY` in a local
    `.xcconfig` file that is excluded from source control. The app Info plist
    maps that setting to `VBoardDesmosAPIKey`.
 

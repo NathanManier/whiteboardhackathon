@@ -1,157 +1,651 @@
 // !$*UTF8*$!
 {
 	archiveVersion = 1;
-	classes = {};
-	objectVersion = 77;
+	classes = {
+	};
+	objectVersion = 71;
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A001 /* VBoardApp.swift */ = {isa = PBXBuildFile; fileRef = A101; };
-		A002 /* DomainModels.swift */ = {isa = PBXBuildFile; fileRef = A102; };
-		A003 /* APIClient.swift */ = {isa = PBXBuildFile; fileRef = A103; };
-		A004 /* WorldScreenTransform.swift */ = {isa = PBXBuildFile; fileRef = A104; };
-		A005 /* NativeCanvasView.swift */ = {isa = PBXBuildFile; fileRef = A105; };
-		A006 /* SVGDocument.swift */ = {isa = PBXBuildFile; fileRef = A106; };
-		A007 /* ProfessorSVGView.swift */ = {isa = PBXBuildFile; fileRef = A107; };
-		A008 /* LibraryView.swift */ = {isa = PBXBuildFile; fileRef = A108; };
-		A009 /* BoardView.swift */ = {isa = PBXBuildFile; fileRef = A109; };
-		A011 /* SceneComposition.swift */ = {isa = PBXBuildFile; fileRef = A111; };
-		A012 /* SpatialIndex.swift */ = {isa = PBXBuildFile; fileRef = A112; };
-		A013 /* BoardDocumentStore.swift */ = {isa = PBXBuildFile; fileRef = A113; };
-		A014 /* LectureWorkspaceModels.swift */ = {isa = PBXBuildFile; fileRef = A114; };
-		A015 /* LectureWorkspaceStore.swift */ = {isa = PBXBuildFile; fileRef = A115; };
-		A016 /* LectureCanvasView.swift */ = {isa = PBXBuildFile; fileRef = A116; };
-		A017 /* LectureWorkspaceView.swift */ = {isa = PBXBuildFile; fileRef = A117; };
-		A018 /* StudyContentRenderer.swift */ = {isa = PBXBuildFile; fileRef = A118; };
-		A019 /* katex */ = {isa = PBXBuildFile; fileRef = A119; };
-		A020 /* markdown-it */ = {isa = PBXBuildFile; fileRef = A120; };
-		A021 /* markdown-it-texmath */ = {isa = PBXBuildFile; fileRef = A121; };
-		A022 /* dompurify */ = {isa = PBXBuildFile; fileRef = A122; };
-		A023 /* study-render.js */ = {isa = PBXBuildFile; fileRef = A123; };
-		A024 /* Assets.xcassets */ = {isa = PBXBuildFile; fileRef = A124; };
-		A025 /* StudySelectionRequest.swift */ = {isa = PBXBuildFile; fileRef = A125; };
-		A026 /* AuthSessionStore.swift */ = {isa = PBXBuildFile; fileRef = A126; };
-		A027 /* LoginView.swift */ = {isa = PBXBuildFile; fileRef = A127; };
-		A028 /* PDFPageRenderView.swift */ = {isa = PBXBuildFile; fileRef = A128; };
-		A029 /* PendingImportStore.swift */ = {isa = PBXBuildFile; fileRef = A129; };
-		A030 /* ShareViewController.swift */ = {isa = PBXBuildFile; fileRef = A130; };
-		A031 /* VBoardShareExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B003; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		A010 /* Tests */ = {isa = PBXBuildFile; fileRef = A110; };
-		J001 /* GraphRendering.swift */ = {isa = PBXBuildFile; fileRef = J101; };
-		J002 /* DesmosGraphRenderer.swift */ = {isa = PBXBuildFile; fileRef = J102; };
-		J003 /* GraphCreationFlow.swift */ = {isa = PBXBuildFile; fileRef = J103; };
-		K001 /* GraphInteractiveSurface.swift */ = {isa = PBXBuildFile; fileRef = K101; };
-		K002 /* GraphInteractiveSurfaceTests.swift */ = {isa = PBXBuildFile; fileRef = K102; };
-		L001 /* GraphStageBTests.swift */ = {isa = PBXBuildFile; fileRef = L101; };
-		M001 /* GraphProxyCache.swift */ = {isa = PBXBuildFile; fileRef = M101; };
-		N001 /* GraphValidation.swift */ = {isa = PBXBuildFile; fileRef = N101; };
-		N002 /* GraphValidationTests.swift */ = {isa = PBXBuildFile; fileRef = N102; };
-		O001 /* GraphStageBHardeningTests.swift */ = {isa = PBXBuildFile; fileRef = O101; };
+		A001 /* Sources/App/VBoardApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A101 /* Sources/App/VBoardApp.swift */; };
+		A002 /* Sources/Models/DomainModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A102 /* Sources/Models/DomainModels.swift */; };
+		A003 /* Sources/API/APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A103 /* Sources/API/APIClient.swift */; };
+		A004 /* Sources/Canvas/WorldScreenTransform.swift in Sources */ = {isa = PBXBuildFile; fileRef = A104 /* Sources/Canvas/WorldScreenTransform.swift */; };
+		A005 /* Sources/Canvas/NativeCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A105 /* Sources/Canvas/NativeCanvasView.swift */; };
+		A006 /* Sources/SVG/SVGDocument.swift in Sources */ = {isa = PBXBuildFile; fileRef = A106 /* Sources/SVG/SVGDocument.swift */; };
+		A007 /* Sources/SVG/ProfessorSVGView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A107 /* Sources/SVG/ProfessorSVGView.swift */; };
+		A008 /* Sources/Features/Library/LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A108 /* Sources/Features/Library/LibraryView.swift */; };
+		A009 /* Sources/Features/Board/BoardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A109 /* Sources/Features/Board/BoardView.swift */; };
+		A010 /* VBoardAppTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A110 /* VBoardAppTests.swift */; };
+		A011 /* Sources/Canvas/SceneComposition.swift in Sources */ = {isa = PBXBuildFile; fileRef = A111 /* Sources/Canvas/SceneComposition.swift */; };
+		A012 /* Sources/Canvas/SpatialIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = A112 /* Sources/Canvas/SpatialIndex.swift */; };
+		A013 /* Sources/Canvas/BoardDocumentStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A113 /* Sources/Canvas/BoardDocumentStore.swift */; };
+		A014 /* Sources/Models/LectureWorkspaceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A114 /* Sources/Models/LectureWorkspaceModels.swift */; };
+		A015 /* Sources/Canvas/LectureWorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A115 /* Sources/Canvas/LectureWorkspaceStore.swift */; };
+		A016 /* Sources/Canvas/LectureCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A116 /* Sources/Canvas/LectureCanvasView.swift */; };
+		A017 /* Sources/Features/Library/LectureWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A117 /* Sources/Features/Library/LectureWorkspaceView.swift */; };
+		A018 /* Sources/Study/StudyContentRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A118 /* Sources/Study/StudyContentRenderer.swift */; };
+		A019 /* katex in Resources */ = {isa = PBXBuildFile; fileRef = A119 /* katex */; };
+		A020 /* markdown-it in Resources */ = {isa = PBXBuildFile; fileRef = A120 /* markdown-it */; };
+		A021 /* markdown-it-texmath in Resources */ = {isa = PBXBuildFile; fileRef = A121 /* markdown-it-texmath */; };
+		A022 /* dompurify in Resources */ = {isa = PBXBuildFile; fileRef = A122 /* dompurify */; };
+		A023 /* study-render.js in Resources */ = {isa = PBXBuildFile; fileRef = A123 /* study-render.js */; };
+		A024 /* Resources/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A124 /* Resources/Assets.xcassets */; };
+		A025 /* Sources/Study/StudySelectionRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = A125 /* Sources/Study/StudySelectionRequest.swift */; };
+		A026 /* Sources/Auth/AuthSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A126 /* Sources/Auth/AuthSessionStore.swift */; };
+		A027 /* Sources/Auth/LoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A127 /* Sources/Auth/LoginView.swift */; };
+		A028 /* Sources/PDF/PDFPageRenderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A128 /* Sources/PDF/PDFPageRenderView.swift */; };
+		A029 /* Sources/Import/PendingImportStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A129 /* Sources/Import/PendingImportStore.swift */; };
+		A030 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A130 /* ShareViewController.swift */; };
+		A031 /* VBoardShareExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B003 /* VBoardShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		J001 /* Sources/Graph/GraphRendering.swift in Sources */ = {isa = PBXBuildFile; fileRef = J101 /* Sources/Graph/GraphRendering.swift */; };
+		J002 /* Sources/Graph/DesmosGraphRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = J102 /* Sources/Graph/DesmosGraphRenderer.swift */; };
+		J003 /* Sources/Graph/GraphCreationFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = J103 /* Sources/Graph/GraphCreationFlow.swift */; };
+		K001 /* Sources/Graph/GraphInteractiveSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = K101 /* Sources/Graph/GraphInteractiveSurface.swift */; };
+		K002 /* GraphInteractiveSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = K102 /* GraphInteractiveSurfaceTests.swift */; };
+		L001 /* GraphStageBTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = L101 /* GraphStageBTests.swift */; };
+		M001 /* Sources/Graph/GraphProxyCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = M101 /* Sources/Graph/GraphProxyCache.swift */; };
+		N001 /* Sources/Graph/GraphValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = N101 /* Sources/Graph/GraphValidation.swift */; };
+		N002 /* GraphValidationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = N102 /* GraphValidationTests.swift */; };
+		O001 /* GraphStageBHardeningTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = O101 /* GraphStageBHardeningTests.swift */; };
+		Q001 /* Sources/Canvas/PencilInputSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = Q101 /* Sources/Canvas/PencilInputSystem.swift */; };
+		R001 /* PencilInputSystemTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = R101 /* PencilInputSystemTests.swift */; };
 /* End PBXBuildFile section */
-/* Begin PBXFileReference section */
-		A101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/App/VBoardApp.swift; sourceTree = "<group>"; };
-		A102 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Models/DomainModels.swift; sourceTree = "<group>"; };
-		A103 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/API/APIClient.swift; sourceTree = "<group>"; };
-		A104 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/WorldScreenTransform.swift; sourceTree = "<group>"; };
-		A105 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/NativeCanvasView.swift; sourceTree = "<group>"; };
-		A106 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/SVG/SVGDocument.swift; sourceTree = "<group>"; };
-		A107 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/SVG/ProfessorSVGView.swift; sourceTree = "<group>"; };
-		A108 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Features/Library/LibraryView.swift; sourceTree = "<group>"; };
-		A109 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Features/Board/BoardView.swift; sourceTree = "<group>"; };
-		A111 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/SceneComposition.swift; sourceTree = "<group>"; };
-		A112 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/SpatialIndex.swift; sourceTree = "<group>"; };
-		A113 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/BoardDocumentStore.swift; sourceTree = "<group>"; };
-		A114 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Models/LectureWorkspaceModels.swift; sourceTree = "<group>"; };
-		A115 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/LectureWorkspaceStore.swift; sourceTree = "<group>"; };
-		A116 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/LectureCanvasView.swift; sourceTree = "<group>"; };
-		A117 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Features/Library/LectureWorkspaceView.swift; sourceTree = "<group>"; };
-		A118 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Study/StudyContentRenderer.swift; sourceTree = "<group>"; };
-		A119 = {isa = PBXFileReference; lastKnownFileType = folder; name = katex; path = ../static/vendor/katex; sourceTree = "<group>"; };
-		A120 = {isa = PBXFileReference; lastKnownFileType = folder; name = "markdown-it"; path = ../static/vendor/markdown-it; sourceTree = "<group>"; };
-		A121 = {isa = PBXFileReference; lastKnownFileType = folder; name = "markdown-it-texmath"; path = ../static/vendor/markdown-it-texmath; sourceTree = "<group>"; };
-		A122 = {isa = PBXFileReference; lastKnownFileType = folder; name = dompurify; path = ../static/vendor/dompurify; sourceTree = "<group>"; };
-		A123 = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = "study-render.js"; path = ../static/study-render.js; sourceTree = "<group>"; };
-		A124 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
-		A125 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Study/StudySelectionRequest.swift; sourceTree = "<group>"; };
-		A126 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Auth/AuthSessionStore.swift; sourceTree = "<group>"; };
-		A127 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Auth/LoginView.swift; sourceTree = "<group>"; };
-		A128 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/PDF/PDFPageRenderView.swift; sourceTree = "<group>"; };
-		A129 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Import/PendingImportStore.swift; sourceTree = "<group>"; };
-		A130 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
-		A131 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		A132 = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VBoardShareExtension.entitlements; sourceTree = "<group>"; };
-		A110 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VBoardAppTests.swift; sourceTree = "<group>"; };
-		B001 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		B002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		B003 = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; path = VBoardShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		J101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphRendering.swift; sourceTree = "<group>"; };
-		J102 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/DesmosGraphRenderer.swift; sourceTree = "<group>"; };
-		J103 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphCreationFlow.swift; sourceTree = "<group>"; };
-		K101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphInteractiveSurface.swift; sourceTree = "<group>"; };
-		K102 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphInteractiveSurfaceTests.swift; sourceTree = "<group>"; };
-		L101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphStageBTests.swift; sourceTree = "<group>"; };
-		M101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphProxyCache.swift; sourceTree = "<group>"; };
-		N101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphValidation.swift; sourceTree = "<group>"; };
-		N102 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphValidationTests.swift; sourceTree = "<group>"; };
-		O101 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphStageBHardeningTests.swift; sourceTree = "<group>"; };
-/* End PBXFileReference section */
-/* Begin PBXCopyFilesBuildPhase section */
-		F010 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 13; files = (A031, ); name = "Embed App Extensions"; runOnlyForDeploymentPostprocessing = 0; };
-/* End PBXCopyFilesBuildPhase section */
-/* Begin PBXGroup section */
-		C001 = {isa = PBXGroup; children = (C002, C003, C004, C005, B001, B002, B003); sourceTree = "<group>"; };
-		C002 = {isa = PBXGroup; path = VBoardApp; sourceTree = "<group>"; children = (A101, A126, A127, A128, A129, A102, A114, A103, A104, A105, A115, A116, A106, A107, A108, A117, A109, A111, A112, A113, A118, A125, J101, J102, J103, K101, M101, N101, A124); };
-		C003 = {isa = PBXGroup; path = VBoardAppTests; sourceTree = "<group>"; children = (A110, K102, L101, N102, O101); };
-		C004 = {isa = PBXGroup; name = "Study Renderer Resources"; sourceTree = "<group>"; children = (A119, A120, A121, A122, A123); };
-		C005 = {isa = PBXGroup; path = VBoardShareExtension; sourceTree = "<group>"; children = (A130, A131, A132); };
-/* End PBXGroup section */
-/* Begin PBXNativeTarget section */
-		D001 = {isa = PBXNativeTarget; buildConfigurationList = E001; buildPhases = (F001, F002, F003, F010); buildRules = (); dependencies = (G003); name = VBoardApp; productName = VBoardApp; productReference = B001; productType = "com.apple.product-type.application"; };
-		D002 = {isa = PBXNativeTarget; buildConfigurationList = E002; buildPhases = (F004, F005, F006); buildRules = (); dependencies = (G001); name = VBoardAppTests; productName = VBoardAppTests; productReference = B002; productType = "com.apple.product-type.bundle.unit-test"; };
-		D003 = {isa = PBXNativeTarget; buildConfigurationList = E004; buildPhases = (F007, F008, F009); buildRules = (); dependencies = (); name = VBoardShareExtension; productName = VBoardShareExtension; productReference = B003; productType = "com.apple.product-type.app-extension"; };
-/* End PBXNativeTarget section */
-/* Begin PBXProject section */
-		P001 = {isa = PBXProject; attributes = { LastUpgradeCheck = 1620; TargetAttributes = { D001 = { CreatedOnToolsVersion = 16.2; SystemCapabilities = { com.apple.SignInWithApple = { enabled = 1; }; com.apple.ApplicationGroups.iOS = { enabled = 1; }; }; }; D002 = { CreatedOnToolsVersion = 16.2; TestTargetID = D001; }; D003 = { CreatedOnToolsVersion = 16.2; SystemCapabilities = { com.apple.ApplicationGroups.iOS = { enabled = 1; }; }; }; }; }; buildConfigurationList = E003; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = C001; productRefGroup = C001; projectDirPath = ""; projectRoot = ""; targets = (D001, D002, D003); };
-/* End PBXProject section */
-/* Begin PBXResourcesBuildPhase section */
-		F002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A019, A020, A021, A022, A023, A024); runOnlyForDeploymentPostprocessing = 0; };
-		F005 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-		F008 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-/* End PBXResourcesBuildPhase section */
-/* Begin PBXSourcesBuildPhase section */
-		F001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A001, A026, A027, A028, A029, A002, A014, A003, A004, A005, A015, A016, A006, A007, A008, A017, A009, A011, A012, A013, A018, A025, J001, J002, J003, K001, M001, N001); runOnlyForDeploymentPostprocessing = 0; };
-		F004 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A010, K002, L001, N002, O001); runOnlyForDeploymentPostprocessing = 0; };
-		F007 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A030); runOnlyForDeploymentPostprocessing = 0; };
-/* End PBXSourcesBuildPhase section */
-/* Begin PBXFrameworksBuildPhase section */
-		F003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-		F006 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-		F009 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-/* End PBXFrameworksBuildPhase section */
-/* Begin PBXTargetDependency section */
-		G001 = {isa = PBXTargetDependency; target = D001; targetProxy = G002; };
-		G003 = {isa = PBXTargetDependency; target = D003; targetProxy = G004; };
-/* End PBXTargetDependency section */
+
 /* Begin PBXContainerItemProxy section */
-		G002 = {isa = PBXContainerItemProxy; containerPortal = P001; proxyType = 1; remoteGlobalIDString = D001; remoteInfo = VBoardApp; };
-		G004 = {isa = PBXContainerItemProxy; containerPortal = P001; proxyType = 1; remoteGlobalIDString = D003; remoteInfo = VBoardShareExtension; };
+		G002 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = P001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D001;
+			remoteInfo = VBoardApp;
+		};
+		G004 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = P001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D003;
+			remoteInfo = VBoardShareExtension;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		F010 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A031 /* VBoardShareExtension.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A101 /* Sources/App/VBoardApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/App/VBoardApp.swift; sourceTree = "<group>"; };
+		A102 /* Sources/Models/DomainModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Models/DomainModels.swift; sourceTree = "<group>"; };
+		A103 /* Sources/API/APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/API/APIClient.swift; sourceTree = "<group>"; };
+		A104 /* Sources/Canvas/WorldScreenTransform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/WorldScreenTransform.swift; sourceTree = "<group>"; };
+		A105 /* Sources/Canvas/NativeCanvasView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/NativeCanvasView.swift; sourceTree = "<group>"; };
+		A106 /* Sources/SVG/SVGDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/SVG/SVGDocument.swift; sourceTree = "<group>"; };
+		A107 /* Sources/SVG/ProfessorSVGView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/SVG/ProfessorSVGView.swift; sourceTree = "<group>"; };
+		A108 /* Sources/Features/Library/LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Features/Library/LibraryView.swift; sourceTree = "<group>"; };
+		A109 /* Sources/Features/Board/BoardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Features/Board/BoardView.swift; sourceTree = "<group>"; };
+		A110 /* VBoardAppTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VBoardAppTests.swift; sourceTree = "<group>"; };
+		A111 /* Sources/Canvas/SceneComposition.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/SceneComposition.swift; sourceTree = "<group>"; };
+		A112 /* Sources/Canvas/SpatialIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/SpatialIndex.swift; sourceTree = "<group>"; };
+		A113 /* Sources/Canvas/BoardDocumentStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/BoardDocumentStore.swift; sourceTree = "<group>"; };
+		A114 /* Sources/Models/LectureWorkspaceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Models/LectureWorkspaceModels.swift; sourceTree = "<group>"; };
+		A115 /* Sources/Canvas/LectureWorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/LectureWorkspaceStore.swift; sourceTree = "<group>"; };
+		A116 /* Sources/Canvas/LectureCanvasView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/LectureCanvasView.swift; sourceTree = "<group>"; };
+		A117 /* Sources/Features/Library/LectureWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Features/Library/LectureWorkspaceView.swift; sourceTree = "<group>"; };
+		A118 /* Sources/Study/StudyContentRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Study/StudyContentRenderer.swift; sourceTree = "<group>"; };
+		A119 /* katex */ = {isa = PBXFileReference; lastKnownFileType = folder; name = katex; path = ../static/vendor/katex; sourceTree = "<group>"; };
+		A120 /* markdown-it */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "markdown-it"; path = "../static/vendor/markdown-it"; sourceTree = "<group>"; };
+		A121 /* markdown-it-texmath */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "markdown-it-texmath"; path = "../static/vendor/markdown-it-texmath"; sourceTree = "<group>"; };
+		A122 /* dompurify */ = {isa = PBXFileReference; lastKnownFileType = folder; name = dompurify; path = ../static/vendor/dompurify; sourceTree = "<group>"; };
+		A123 /* study-render.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = "study-render.js"; path = "../static/study-render.js"; sourceTree = "<group>"; };
+		A124 /* Resources/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
+		A125 /* Sources/Study/StudySelectionRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Study/StudySelectionRequest.swift; sourceTree = "<group>"; };
+		A126 /* Sources/Auth/AuthSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Auth/AuthSessionStore.swift; sourceTree = "<group>"; };
+		A127 /* Sources/Auth/LoginView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Auth/LoginView.swift; sourceTree = "<group>"; };
+		A128 /* Sources/PDF/PDFPageRenderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/PDF/PDFPageRenderView.swift; sourceTree = "<group>"; };
+		A129 /* Sources/Import/PendingImportStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Import/PendingImportStore.swift; sourceTree = "<group>"; };
+		A130 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
+		A131 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A132 /* VBoardShareExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VBoardShareExtension.entitlements; sourceTree = "<group>"; };
+		J101 /* Sources/Graph/GraphRendering.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphRendering.swift; sourceTree = "<group>"; };
+		J102 /* Sources/Graph/DesmosGraphRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/DesmosGraphRenderer.swift; sourceTree = "<group>"; };
+		J103 /* Sources/Graph/GraphCreationFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphCreationFlow.swift; sourceTree = "<group>"; };
+		K101 /* Sources/Graph/GraphInteractiveSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphInteractiveSurface.swift; sourceTree = "<group>"; };
+		K102 /* GraphInteractiveSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphInteractiveSurfaceTests.swift; sourceTree = "<group>"; };
+		L101 /* GraphStageBTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphStageBTests.swift; sourceTree = "<group>"; };
+		M101 /* Sources/Graph/GraphProxyCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphProxyCache.swift; sourceTree = "<group>"; };
+		N101 /* Sources/Graph/GraphValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphValidation.swift; sourceTree = "<group>"; };
+		N102 /* GraphValidationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphValidationTests.swift; sourceTree = "<group>"; };
+		O101 /* GraphStageBHardeningTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphStageBHardeningTests.swift; sourceTree = "<group>"; };
+		Q101 /* Sources/Canvas/PencilInputSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/PencilInputSystem.swift; sourceTree = "<group>"; };
+		R101 /* PencilInputSystemTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilInputSystemTests.swift; sourceTree = "<group>"; };
+		B001 /* VBoardApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B002 /* VBoardAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B003 /* VBoardShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; path = VBoardShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F003 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F009 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		C001 = {
+			isa = PBXGroup;
+			children = (
+				C002 /* VBoardApp */,
+				C003 /* VBoardAppTests */,
+				C004 /* Study Renderer Resources */,
+				C005 /* VBoardShareExtension */,
+				B001 /* VBoardApp.app */,
+				B002 /* VBoardAppTests.xctest */,
+				B003 /* VBoardShareExtension.appex */,
+			);
+			sourceTree = "<group>";
+		};
+		C002 /* VBoardApp */ = {
+			isa = PBXGroup;
+			children = (
+				A101 /* Sources/App/VBoardApp.swift */,
+				A126 /* Sources/Auth/AuthSessionStore.swift */,
+				A127 /* Sources/Auth/LoginView.swift */,
+				A128 /* Sources/PDF/PDFPageRenderView.swift */,
+				A129 /* Sources/Import/PendingImportStore.swift */,
+				A102 /* Sources/Models/DomainModels.swift */,
+				A114 /* Sources/Models/LectureWorkspaceModels.swift */,
+				A103 /* Sources/API/APIClient.swift */,
+				A104 /* Sources/Canvas/WorldScreenTransform.swift */,
+				A105 /* Sources/Canvas/NativeCanvasView.swift */,
+				Q101 /* Sources/Canvas/PencilInputSystem.swift */,
+				A115 /* Sources/Canvas/LectureWorkspaceStore.swift */,
+				A116 /* Sources/Canvas/LectureCanvasView.swift */,
+				A106 /* Sources/SVG/SVGDocument.swift */,
+				A107 /* Sources/SVG/ProfessorSVGView.swift */,
+				A108 /* Sources/Features/Library/LibraryView.swift */,
+				A117 /* Sources/Features/Library/LectureWorkspaceView.swift */,
+				A109 /* Sources/Features/Board/BoardView.swift */,
+				A111 /* Sources/Canvas/SceneComposition.swift */,
+				A112 /* Sources/Canvas/SpatialIndex.swift */,
+				A113 /* Sources/Canvas/BoardDocumentStore.swift */,
+				A118 /* Sources/Study/StudyContentRenderer.swift */,
+				A125 /* Sources/Study/StudySelectionRequest.swift */,
+				J101 /* Sources/Graph/GraphRendering.swift */,
+				J102 /* Sources/Graph/DesmosGraphRenderer.swift */,
+				J103 /* Sources/Graph/GraphCreationFlow.swift */,
+				K101 /* Sources/Graph/GraphInteractiveSurface.swift */,
+				M101 /* Sources/Graph/GraphProxyCache.swift */,
+				N101 /* Sources/Graph/GraphValidation.swift */,
+				A124 /* Resources/Assets.xcassets */,
+			);
+			path = VBoardApp;
+			sourceTree = "<group>";
+		};
+		C003 /* VBoardAppTests */ = {
+			isa = PBXGroup;
+			children = (
+				A110 /* VBoardAppTests.swift */,
+				K102 /* GraphInteractiveSurfaceTests.swift */,
+				L101 /* GraphStageBTests.swift */,
+				N102 /* GraphValidationTests.swift */,
+				O101 /* GraphStageBHardeningTests.swift */,
+				R101 /* PencilInputSystemTests.swift */,
+			);
+			path = VBoardAppTests;
+			sourceTree = "<group>";
+		};
+		C004 /* Study Renderer Resources */ = {
+			isa = PBXGroup;
+			children = (
+				A119 /* katex */,
+				A120 /* markdown-it */,
+				A121 /* markdown-it-texmath */,
+				A122 /* dompurify */,
+				A123 /* study-render.js */,
+			);
+			name = "Study Renderer Resources";
+			sourceTree = "<group>";
+		};
+		C005 /* VBoardShareExtension */ = {
+			isa = PBXGroup;
+			children = (
+				A130 /* ShareViewController.swift */,
+				A131 /* Info.plist */,
+				A132 /* VBoardShareExtension.entitlements */,
+			);
+			path = VBoardShareExtension;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		D001 /* VBoardApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E001 /* Build configuration list for PBXNativeTarget "VBoardApp" */;
+			buildPhases = (
+				F001 /* Sources */,
+				F002 /* Resources */,
+				F003 /* Frameworks */,
+				F010 /* Embed App Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				G003 /* PBXTargetDependency */,
+			);
+			name = VBoardApp;
+			productName = VBoardApp;
+			productReference = B001 /* VBoardApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+		D002 /* VBoardAppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E002 /* Build configuration list for PBXNativeTarget "VBoardAppTests" */;
+			buildPhases = (
+				F004 /* Sources */,
+				F005 /* Resources */,
+				F006 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				G001 /* PBXTargetDependency */,
+			);
+			name = VBoardAppTests;
+			productName = VBoardAppTests;
+			productReference = B002 /* VBoardAppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		D003 /* VBoardShareExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E004 /* Build configuration list for PBXNativeTarget "VBoardShareExtension" */;
+			buildPhases = (
+				F007 /* Sources */,
+				F008 /* Resources */,
+				F009 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = VBoardShareExtension;
+			productName = VBoardShareExtension;
+			productReference = B003 /* VBoardShareExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		P001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 1620;
+				TargetAttributes = {
+					D001 = {
+						CreatedOnToolsVersion = 16.2;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups.iOS = {
+								enabled = 1;
+							};
+							com.apple.SignInWithApple = {
+								enabled = 1;
+							};
+						};
+					};
+					D002 = {
+						CreatedOnToolsVersion = 16.2;
+						TestTargetID = D001;
+					};
+					D003 = {
+						CreatedOnToolsVersion = 16.2;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups.iOS = {
+								enabled = 1;
+							};
+						};
+					};
+				};
+			};
+			buildConfigurationList = E003 /* Build configuration list for PBXProject "VBoardApp" */;
+			compatibilityVersion = "Xcode 16.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = C001;
+			productRefGroup = C001;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				D001 /* VBoardApp */,
+				D002 /* VBoardAppTests */,
+				D003 /* VBoardShareExtension */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		F002 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A019 /* katex in Resources */,
+				A020 /* markdown-it in Resources */,
+				A021 /* markdown-it-texmath in Resources */,
+				A022 /* dompurify in Resources */,
+				A023 /* study-render.js in Resources */,
+				A024 /* Resources/Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F005 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F008 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		F001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A001 /* Sources/App/VBoardApp.swift in Sources */,
+				A026 /* Sources/Auth/AuthSessionStore.swift in Sources */,
+				A027 /* Sources/Auth/LoginView.swift in Sources */,
+				A028 /* Sources/PDF/PDFPageRenderView.swift in Sources */,
+				A029 /* Sources/Import/PendingImportStore.swift in Sources */,
+				A002 /* Sources/Models/DomainModels.swift in Sources */,
+				A014 /* Sources/Models/LectureWorkspaceModels.swift in Sources */,
+				A003 /* Sources/API/APIClient.swift in Sources */,
+				A004 /* Sources/Canvas/WorldScreenTransform.swift in Sources */,
+				A005 /* Sources/Canvas/NativeCanvasView.swift in Sources */,
+				Q001 /* Sources/Canvas/PencilInputSystem.swift in Sources */,
+				A015 /* Sources/Canvas/LectureWorkspaceStore.swift in Sources */,
+				A016 /* Sources/Canvas/LectureCanvasView.swift in Sources */,
+				A006 /* Sources/SVG/SVGDocument.swift in Sources */,
+				A007 /* Sources/SVG/ProfessorSVGView.swift in Sources */,
+				A008 /* Sources/Features/Library/LibraryView.swift in Sources */,
+				A017 /* Sources/Features/Library/LectureWorkspaceView.swift in Sources */,
+				A009 /* Sources/Features/Board/BoardView.swift in Sources */,
+				A011 /* Sources/Canvas/SceneComposition.swift in Sources */,
+				A012 /* Sources/Canvas/SpatialIndex.swift in Sources */,
+				A013 /* Sources/Canvas/BoardDocumentStore.swift in Sources */,
+				A018 /* Sources/Study/StudyContentRenderer.swift in Sources */,
+				A025 /* Sources/Study/StudySelectionRequest.swift in Sources */,
+				J001 /* Sources/Graph/GraphRendering.swift in Sources */,
+				J002 /* Sources/Graph/DesmosGraphRenderer.swift in Sources */,
+				J003 /* Sources/Graph/GraphCreationFlow.swift in Sources */,
+				K001 /* Sources/Graph/GraphInteractiveSurface.swift in Sources */,
+				M001 /* Sources/Graph/GraphProxyCache.swift in Sources */,
+				N001 /* Sources/Graph/GraphValidation.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A010 /* VBoardAppTests.swift in Sources */,
+				K002 /* GraphInteractiveSurfaceTests.swift in Sources */,
+				L001 /* GraphStageBTests.swift in Sources */,
+				N002 /* GraphValidationTests.swift in Sources */,
+				O001 /* GraphStageBHardeningTests.swift in Sources */,
+				R001 /* PencilInputSystemTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A030 /* ShareViewController.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		G001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D001 /* VBoardApp */;
+			targetProxy = G002 /* PBXContainerItemProxy */;
+		};
+		G003 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D003 /* VBoardShareExtension */;
+			targetProxy = G004 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
-		H001 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad; PRODUCT_NAME = VBoardApp; MARKETING_VERSION = 0.1.0; CURRENT_PROJECT_VERSION = 1; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; ENABLE_TESTABILITY = YES; CODE_SIGN_ENTITLEMENTS = VBoardApp/VBoardApp.entitlements; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VBoardApp/Resources/Info.plist; }; name = Debug; };
-		H002 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad; PRODUCT_NAME = VBoardApp; MARKETING_VERSION = 0.1.0; CURRENT_PROJECT_VERSION = 1; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; CODE_SIGN_ENTITLEMENTS = VBoardApp/VBoardApp.entitlements; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VBoardApp/Resources/Info-Release.plist; }; name = Release; };
-		H003 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.tests; PRODUCT_NAME = VBoardAppTests; SDKROOT = iphoneos; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; GENERATE_INFOPLIST_FILE = YES; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VBoardApp.app/VBoardApp"; BUNDLE_LOADER = "$(TEST_HOST)"; }; name = Debug; };
-		H004 = {isa = XCBuildConfiguration; buildSettings = { PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.tests; PRODUCT_NAME = VBoardAppTests; SDKROOT = iphoneos; TARGETED_DEVICE_FAMILY = 2; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; GENERATE_INFOPLIST_FILE = YES; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VBoardApp.app/VBoardApp"; BUNDLE_LOADER = "$(TEST_HOST)"; }; name = Release; };
-		H005 = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; }; name = Debug; };
-		H006 = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; }; name = Release; };
-		H007 = {isa = XCBuildConfiguration; buildSettings = { APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = VBoardShareExtension/VBoardShareExtension.entitlements; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VBoardShareExtension/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.share; PRODUCT_NAME = VBoardShareExtension; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 2; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; }; name = Debug; };
-		H008 = {isa = XCBuildConfiguration; buildSettings = { APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = VBoardShareExtension/VBoardShareExtension.entitlements; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VBoardShareExtension/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.share; PRODUCT_NAME = VBoardShareExtension; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 2; ALWAYS_SEARCH_USER_PATHS = NO; ALWAYS_USE_SEPARATE_HEADERMAPS = YES; }; name = Release; };
+		H001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ALWAYS_USE_SEPARATE_HEADERMAPS = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = VBoardApp/VBoardApp.entitlements;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5C83S23J7M;
+				ENABLE_TESTABILITY = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = VBoardApp/Resources/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad;
+				PRODUCT_NAME = VBoardApp;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VBOARD_DESMOS_API_KEY = "937254366e9a43f2a6d377baa8de1b13";
+			};
+			name = Debug;
+		};
+		H002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ALWAYS_USE_SEPARATE_HEADERMAPS = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = VBoardApp/VBoardApp.entitlements;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5C83S23J7M;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "VBoardApp/Resources/Info-Release.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad;
+				PRODUCT_NAME = VBoardApp;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VBOARD_DESMOS_API_KEY = "937254366e9a43f2a6d377baa8de1b13";
+			};
+			name = Release;
+		};
+		H003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ALWAYS_USE_SEPARATE_HEADERMAPS = YES;
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				DEVELOPMENT_TEAM = 5C83S23J7M;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.tests;
+				PRODUCT_NAME = VBoardAppTests;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VBoardApp.app/VBoardApp";
+			};
+			name = Debug;
+		};
+		H004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ALWAYS_USE_SEPARATE_HEADERMAPS = YES;
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				DEVELOPMENT_TEAM = 5C83S23J7M;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.tests;
+				PRODUCT_NAME = VBoardAppTests;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VBoardApp.app/VBoardApp";
+			};
+			name = Release;
+		};
+		H005 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ALWAYS_USE_SEPARATE_HEADERMAPS = YES;
+			};
+			name = Debug;
+		};
+		H006 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ALWAYS_USE_SEPARATE_HEADERMAPS = YES;
+			};
+			name = Release;
+		};
+		H007 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ALWAYS_USE_SEPARATE_HEADERMAPS = YES;
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = VBoardShareExtension/VBoardShareExtension.entitlements;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5C83S23J7M;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = VBoardShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.share;
+				PRODUCT_NAME = VBoardShareExtension;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Debug;
+		};
+		H008 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ALWAYS_USE_SEPARATE_HEADERMAPS = YES;
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = VBoardShareExtension/VBoardShareExtension.entitlements;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5C83S23J7M;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = VBoardShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vboard.ipad.share;
+				PRODUCT_NAME = VBoardShareExtension;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
+
 /* Begin XCConfigurationList section */
-		E001 = {isa = XCConfigurationList; buildConfigurations = (H001, H002); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
-		E002 = {isa = XCConfigurationList; buildConfigurations = (H003, H004); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
-		E003 = {isa = XCConfigurationList; buildConfigurations = (H005, H006); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
-		E004 = {isa = XCConfigurationList; buildConfigurations = (H007, H008); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		E001 /* Build configuration list for PBXNativeTarget "VBoardApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				H001 /* Debug */,
+				H002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		E002 /* Build configuration list for PBXNativeTarget "VBoardAppTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				H003 /* Debug */,
+				H004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		E003 /* Build configuration list for PBXProject "VBoardApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				H005 /* Debug */,
+				H006 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		E004 /* Build configuration list for PBXNativeTarget "VBoardShareExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				H007 /* Debug */,
+				H008 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 	};
-	rootObject = P001;
+	rootObject = P001 /* Project object */;
 }

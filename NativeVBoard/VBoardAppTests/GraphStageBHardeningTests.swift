@@ -345,6 +345,9 @@ final class GraphStageBHardeningTests: XCTestCase {
         )
         host.layoutIfNeeded()
         await session.promoteNow(in: host)
+        // Simulate the viewport produced by an interactive provider after the
+        // canonical graph has been applied during promotion.
+        provider.viewport = finalViewport
 
         let startedAt = CACurrentMediaTime()
         let result = await session.demote(reason: .done)
@@ -379,6 +382,7 @@ final class GraphStageBHardeningTests: XCTestCase {
         )
         host.layoutIfNeeded()
         await session.promoteNow(in: host)
+        provider.viewport = providerViewport
 
         let result = await session.demote(reason: .done)
 
@@ -477,6 +481,7 @@ final class GraphStageBHardeningTests: XCTestCase {
             await Task.yield()
         }
         XCTAssertTrue(provider.events.contains("interactive:true"))
+        provider.viewport = finalViewport
 
         let demotion = Task { @MainActor in
             await session.demote(reason: .done)
@@ -520,6 +525,7 @@ final class GraphStageBHardeningTests: XCTestCase {
             await Task.yield()
         }
         XCTAssertTrue(provider.events.contains("interactive:true"))
+        provider.viewport = finalViewport
 
         var result: GraphDemotionResult?
         let completed = expectation(description: "bounded demotion")

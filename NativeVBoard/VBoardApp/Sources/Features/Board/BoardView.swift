@@ -181,6 +181,8 @@ private struct BoardEditorSurface: View {
     @State private var exportError: String?
     @State private var showConflict = false
     @State private var activeTool: CanvasTool = .pen
+    @State private var previousPencilTool: CanvasTool = .pen
+    @State private var pencilQuickPalettePoint: CGPoint?
     @State private var selectedIDs = Set<String>()
     @State private var selectedPDFRegion: CGRect?
     @State private var liveCamera: CameraRect?
@@ -198,8 +200,12 @@ private struct BoardEditorSurface: View {
     @AppStorage("vboard.marker.color") private var markerColor = CanvasStrokeStyle.marker.colorHex
     @AppStorage("vboard.marker.width") private var markerWidth = CanvasStrokeStyle.marker.width
     @AppStorage("vboard.marker.opacity") private var markerOpacity = CanvasStrokeStyle.marker.opacity
+    @AppStorage("vboard.pencil.doubleTap") private var pencilDoubleTapRaw = PencilDoubleTapSetting.followSystem.rawValue
+    @AppStorage("vboard.pencil.squeeze") private var pencilSqueezeRaw = PencilSqueezeSetting.followSystem.rawValue
+    @AppStorage("vboard.pencil.hover") private var pencilHoverRaw = PencilHoverSetting.followSystem.rawValue
     #if DEBUG
     @AppStorage("vboard.developer.diagnostics") private var developerDiagnostics = false
+    @State private var showPencilValidation = false
     #endif
 
     init(board: LibraryBoard, document: SVGDocument, pdfData: Data?, editor: EditorState, composition: SceneComposition) {
@@ -244,8 +250,14 @@ private struct BoardEditorSurface: View {
                         ForEach(WorkspaceBackgroundStyle.allCases) { style in Text(style.title).tag(style.rawValue) }
                     }
                     if pdfData == nil { Toggle("Show Whiteboard Paper", isOn: $physicalBoardShowsPaper) }
+                    PencilSettingsControls(doubleTapRaw: $pencilDoubleTapRaw,
+                                           squeezeRaw: $pencilSqueezeRaw,
+                                           hoverRaw: $pencilHoverRaw)
                     #if DEBUG
                     Toggle("Developer Diagnostics", isOn: $developerDiagnostics)
+                    Button { showPencilValidation = true } label: {
+                        Label("Apple Pencil Validation", systemImage: "pencil.and.scribble")
+                    }
                     #endif
                     Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
@@ -272,13 +284,17 @@ private struct BoardEditorSurface: View {
             }
         }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
+        #if DEBUG
+        .sheet(isPresented: $showPencilValidation) { PencilHardwareValidationView() }
+        #endif
         .alert("Couldn’t export board", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) { Button("OK", role: .cancel) {} } message: { Text(exportError ?? "") }
         .alert("Board changed on the server", isPresented: $showConflict) {
             Button("Keep My Changes") { Task { await store.keepLocalChanges(api: api) } }
             Button("Reload Server Version", role: .destructive) { store.reloadServerVersion() }
         } message: { Text("Your local edits are preserved locally. Choose which version should remain.") }
         .onChange(of: store.status) { _, status in if status == .conflict { showConflict = true } }
-        .onChange(of: activeTool) { _, tool in
+        .onChange(of: activeTool) { oldTool, tool in
+            if oldTool != tool && oldTool != .objectEraser { previousPencilTool = oldTool }
             if !GraphPencilInteractionPolicy.allowsAnnotation(for: tool) {
                 interactiveGraph = nil
             }
@@ -303,7 +319,32 @@ private struct BoardEditorSurface: View {
             // Keep one UIKit input surface alive for the board. Tool changes
             // update that surface in place so recognizers, responder focus,
             // and the live camera cannot be reset by SwiftUI identity churn.
-            NativeCanvasView(boardID: board.id, document: document, pdfData: pdfData, camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects, importedTransforms: store.editor.importedTransforms, composition: SceneComposition.build(boardID: board.id, document: document, editor: store.editor), showsPaper: pdfData != nil || physicalBoardShowsPaper, backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots, penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1), markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity), showsDeveloperDiagnostics: developerDiagnosticsIfAvailable, onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool, onSelectionChanged: { selectedIDs = $0 }, onSelectionRegionChanged: { selectedPDFRegion = $0 }, onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) }, onResize: { ids, anchor, factor in selectedPDFRegion = nil; store.scaleObjects(ids: ids, around: anchor, by: factor, api: api) }, onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) }, onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) }, onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) })
+            NativeCanvasView(
+                boardID: board.id, document: document, pdfData: pdfData,
+                camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects,
+                importedTransforms: store.editor.importedTransforms,
+                composition: SceneComposition.build(boardID: board.id, document: document,
+                                                    editor: store.editor),
+                showsPaper: pdfData != nil || physicalBoardShowsPaper,
+                backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots,
+                penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),
+                markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth,
+                                               opacity: markerOpacity),
+                pencilPreferences: pencilPreferences,
+                isPencilPalettePresented: pencilQuickPalettePoint != nil,
+                showsDeveloperDiagnostics: developerDiagnosticsIfAvailable,
+                onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool,
+                onSelectionChanged: { selectedIDs = $0 },
+                onSelectionRegionChanged: { selectedPDFRegion = $0 },
+                onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) },
+                onResize: { ids, anchor, factor in selectedPDFRegion = nil; store.scaleObjects(ids: ids, around: anchor, by: factor, api: api) },
+                onDelete: { ids in selectedPDFRegion = nil; store.deleteObjects(ids: ids, api: api) },
+                onCameraChanged: { camera in liveCamera = camera; store.updateViewport(camera, api: api) },
+                onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) },
+                onPencilAction: handlePencilAction,
+                onPencilPaletteMoved: { pencilQuickPalettePoint = $0 },
+                onPencilPaletteDismiss: { pencilQuickPalettePoint = nil }
+            )
                 .ignoresSafeArea(edges: .bottom)
             ForEach(store.editor.objects.compactMap(\.graph).filter {
                 $0.id != interactiveGraph?.id
@@ -343,6 +384,7 @@ private struct BoardEditorSurface: View {
                         ? CanvasStrokeStyle(colorHex: markerColor, width: markerWidth,
                                             opacity: markerOpacity)
                         : CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),
+                    pencilPreferences: pencilPreferences,
                     onPencilStroke: { store.applyStroke($0, api: api) },
                     onPencilRequestsPassiveMode: { interactiveGraph = nil },
                     onCommitViewport: { owningBoardID, graphID, viewport in
@@ -372,6 +414,28 @@ private struct BoardEditorSurface: View {
                                  markerOpacity: $markerOpacity)
             .padding(.bottom, 12)
             .zIndex(30)
+
+            if let point = pencilQuickPalettePoint {
+                let paletteSize = CGSize(width: 420, height: 56)
+                let origin = PencilPalettePlacement.origin(
+                    anchor: point, paletteSize: paletteSize,
+                    safeBounds: CGRect(origin: .zero, size: proxy.size).insetBy(dx: 8, dy: 8)
+                )
+                PencilQuickPalette(activeTool: activeTool, recentColors: [penColor, markerColor],
+                                   width: activeTool == .highlighter ? $markerWidth : $penWidth,
+                                   selectColor: { color in
+                                       if activeTool == .highlighter { markerColor = color }
+                                       else { penColor = color }
+                                   },
+                                   undo: { store.undo(api: api) }, redo: { store.redo(api: api) }) {
+                    activeTool = $0
+                    pencilQuickPalettePoint = nil
+                }
+                .position(x: origin.x + paletteSize.width / 2,
+                          y: origin.y + paletteSize.height / 2)
+                .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                .zIndex(31)
+            }
 
             if interactiveGraph == nil, let rect = selectionScreenRect(viewport: proxy.size) {
                 SelectionActionBar(canCheckWork: selectionCanCheckWork,
@@ -418,6 +482,39 @@ private struct BoardEditorSurface: View {
         #else
         false
         #endif
+    }
+
+    private var pencilPreferences: PencilPreferences {
+        PencilPreferences(
+            doubleTap: PencilDoubleTapSetting(rawValue: pencilDoubleTapRaw) ?? .followSystem,
+            squeeze: PencilSqueezeSetting(rawValue: pencilSqueezeRaw) ?? .followSystem,
+            hover: PencilHoverSetting(rawValue: pencilHoverRaw) ?? .followSystem
+        )
+    }
+
+    private func handlePencilAction(_ action: PencilLogicalAction, anchor: CGPoint?) {
+        switch action {
+        case .none, .runSystemShortcut: break
+        case .switchEraser: togglePencilEraser()
+        case .switchPrevious:
+            let next = previousPencilTool == activeTool ? .pen : previousPencilTool
+            previousPencilTool = activeTool
+            activeTool = next
+        case .showColorPalette, .showInkAttributes, .showToolPalette:
+            withAnimation(.easeOut(duration: 0.16)) {
+                pencilQuickPalettePoint = anchor ?? CGPoint(x: canvasSize.width / 2,
+                                                            y: canvasSize.height / 2)
+            }
+        }
+    }
+
+    private func togglePencilEraser() {
+        if activeTool == .objectEraser {
+            activeTool = previousPencilTool == .objectEraser ? .pen : previousPencilTool
+        } else {
+            previousPencilTool = activeTool
+            activeTool = .objectEraser
+        }
     }
 
     @ViewBuilder private func studyPanel(compact: Bool) -> some View {

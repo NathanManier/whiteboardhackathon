@@ -17,6 +17,262 @@ struct CanvasStrokeStyle: Equatable, Sendable {
 private enum InputSource: String { case pencil, touch, indirectPointer, mouse, trackpad }
 private enum InteractionState: String { case idle = "IDLE", drawing = "DRAWING", panning = "PANNING", pinching = "PINCHING", lassoing = "LASSOING", erasing = "ERASING", selecting = "SELECTING", movingSelection = "MOVING_SELECTION", resizingSelection = "RESIZING_SELECTION" }
 
+#if DEBUG
+/// Read-only instrumentation for proving which Apple Pencil signals UIKit is
+/// delivering to the live canvas. It deliberately owns no drawing state and
+/// never writes to the board document.
+@MainActor
+final class PencilRawEventMonitor: NSObject {
+    let label = UILabel()
+
+    private var owner: String
+    private var tool = "unknown"
+    private var interactionState = "IDLE"
+    private var eventLine = "event: waiting for Pencil"
+    private var poseLine = "pose: pressure/tilt/azimuth/roll waiting"
+    private var deliveryLine = "delivery: coalesced=0 predicted=0 estimated=none"
+    private var hoverLine = "hover: waiting"
+    private var gestureLine = "gestures: doubleTap=0 squeeze=0"
+    private var doubleTapCount = 0
+    private var squeezeCount = 0
+    private var estimatedUpdateCount = 0
+    private var lastConsoleMoveTimestamp: TimeInterval = -1
+
+    init(owner: String) {
+        self.owner = owner
+        super.init()
+        label.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+        label.textColor = .label
+        label.numberOfLines = 0
+        label.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.9)
+        label.layer.borderColor = UIColor.systemOrange.withAlphaComponent(0.75).cgColor
+        label.layer.borderWidth = 1
+        label.layer.cornerRadius = 8
+        label.layer.masksToBounds = true
+        label.isUserInteractionEnabled = false
+        label.accessibilityIdentifier = "pencilDebugRawEventMonitor"
+        render()
+    }
+
+    func installOverlay(on view: UIView) {
+        view.addSubview(label)
+    }
+
+    func setVisible(_ visible: Bool) {
+        label.isHidden = !visible
+    }
+
+    func setContext(tool: String, state: String) {
+        self.tool = tool
+        interactionState = state
+        render()
+    }
+
+    func layout(in bounds: CGRect, top: CGFloat) {
+        let width = max(0, min(520, bounds.width - 16))
+        label.frame = CGRect(x: 8, y: top, width: width, height: 174)
+    }
+
+    func recordTouch(_ phase: String,
+                     touch: UITouch,
+                     event: UIEvent?,
+                     in view: UIView,
+                     tool: String,
+                     state: String) {
+        self.tool = tool
+        interactionState = state
+        let location = touch.preciseLocation(in: view)
+        let contactCount = event?.allTouches?.count ?? 1
+        let pencilCount = event?.allTouches?.filter { $0.type == .pencil }.count
+            ?? (touch.type == .pencil ? 1 : 0)
+        let source = Self.touchTypeName(touch.type)
+        let latencyMS = max(0, (ProcessInfo.processInfo.systemUptime - touch.timestamp) * 1_000)
+        eventLine = String(
+            format: "event: %@ %@ x=%.1f y=%.1f contacts=%d pencil=%d latency=%.1fms",
+            phase, source, location.x, location.y, contactCount, pencilCount, latencyMS
+        )
+
+        if touch.type == .pencil {
+            PencilHardwareValidationStore.shared.detect(.draw)
+            let normalizedForce = touch.maximumPossibleForce > 0
+                ? touch.force / touch.maximumPossibleForce : 0
+            if touch.maximumPossibleForce > 0 {
+                PencilHardwareValidationStore.shared.detect(.pressure)
+            }
+            if touch.altitudeAngle.isFinite {
+                PencilHardwareValidationStore.shared.detect(.tilt)
+            }
+            let roll: String
+            if #available(iOS 17.5, *) {
+                roll = Self.degrees(touch.rollAngle)
+                if abs(touch.rollAngle) > 0.0001 {
+                    PencilHardwareValidationStore.shared.detect(.barrelRoll)
+                }
+            } else {
+                roll = "n/a"
+            }
+            poseLine = String(
+                format: "pose: force=%.3f/%.3f norm=%.3f altitude=%@ azimuth=%@ roll=%@",
+                touch.force, touch.maximumPossibleForce, normalizedForce,
+                Self.degrees(touch.altitudeAngle),
+                Self.degrees(touch.azimuthAngle(in: view)), roll
+            )
+        } else {
+            poseLine = "pose: non-Pencil input (Pencil-only fields not sampled)"
+        }
+
+        let coalesced = event?.coalescedTouches(for: touch)?.count ?? 0
+        let predicted = event?.predictedTouches(for: touch)?.count ?? 0
+        deliveryLine = "delivery: coalesced=\(coalesced) predicted=\(predicted) estimated=\(Self.propertyNames(touch.estimatedProperties)) expecting=\(Self.propertyNames(touch.estimatedPropertiesExpectingUpdates)) corrections=\(estimatedUpdateCount)"
+        if touch.type == .pencil,
+           event?.allTouches?.contains(where: { $0.type == .direct }) == true {
+            PencilHardwareValidationStore.shared.detect(.fingerCoexistence)
+        }
+        render()
+
+        if phase != "MOVE" || touch.timestamp - lastConsoleMoveTimestamp >= 0.05 {
+            lastConsoleMoveTimestamp = touch.timestamp
+            log("touch \(eventLine) \(poseLine) \(deliveryLine)")
+        }
+    }
+
+    func recordEstimatedUpdates(_ touches: Set<UITouch>, in view: UIView) {
+        estimatedUpdateCount += touches.count
+        guard let touch = touches.first else { return }
+        deliveryLine = "delivery: estimated UPDATE index=\(touch.estimationUpdateIndex?.stringValue ?? "nil") properties=\(Self.propertyNames(touch.estimatedProperties)) expecting=\(Self.propertyNames(touch.estimatedPropertiesExpectingUpdates)) corrections=\(estimatedUpdateCount)"
+        if touch.type == .pencil {
+            let location = touch.preciseLocation(in: view)
+            log("estimated-update x=\(Self.number(location.x)) y=\(Self.number(location.y)) \(deliveryLine)")
+        }
+        render()
+    }
+
+    func recordHover(_ recognizer: UIHoverGestureRecognizer, in view: UIView) {
+        PencilHardwareValidationStore.shared.detect(.hover)
+        let point = recognizer.location(in: view)
+        let roll: String
+        if #available(iOS 17.5, *) {
+            roll = Self.degrees(recognizer.rollAngle)
+            if abs(recognizer.rollAngle) > 0.0001 {
+                PencilHardwareValidationStore.shared.detect(.barrelRoll)
+            }
+        } else {
+            roll = "n/a"
+        }
+        hoverLine = String(
+            format: "hover: %@ x=%.1f y=%.1f z=%.3f altitude=%@ azimuth=%@ roll=%@",
+            Self.gestureStateName(recognizer.state), point.x, point.y,
+            recognizer.zOffset, Self.degrees(recognizer.altitudeAngle),
+            Self.degrees(recognizer.azimuthAngle(in: view)), roll
+        )
+        render()
+        log(hoverLine)
+    }
+
+    func recordLegacyDoubleTap() {
+        PencilHardwareValidationStore.shared.detect(.doubleTap)
+        doubleTapCount += 1
+        gestureLine = "gestures: doubleTap=\(doubleTapCount) squeeze=\(squeezeCount) preferredTap=\(Self.preferredActionName(UIPencilInteraction.preferredTapAction))"
+        render()
+        log("double-tap legacy preferred=\(Self.preferredActionName(UIPencilInteraction.preferredTapAction))")
+    }
+
+    @available(iOS 17.5, *)
+    func recordDoubleTap(_ tap: UIPencilInteraction.Tap) {
+        PencilHardwareValidationStore.shared.detect(.doubleTap)
+        doubleTapCount += 1
+        let pose = tap.hoverPose.map(Self.poseDescription) ?? "pose=nil"
+        gestureLine = "gestures: doubleTap=\(doubleTapCount) squeeze=\(squeezeCount) preferredTap=\(Self.preferredActionName(UIPencilInteraction.preferredTapAction))"
+        render()
+        log("double-tap timestamp=\(Self.number(tap.timestamp)) \(pose)")
+    }
+
+    @available(iOS 17.5, *)
+    func recordSqueeze(_ squeeze: UIPencilInteraction.Squeeze) {
+        PencilHardwareValidationStore.shared.detect(.squeeze)
+        if squeeze.phase == .began { squeezeCount += 1 }
+        let pose = squeeze.hoverPose.map(Self.poseDescription) ?? "pose=nil"
+        gestureLine = "gestures: doubleTap=\(doubleTapCount) squeeze=\(squeezeCount) phase=\(Self.squeezePhaseName(squeeze.phase)) preferredSqueeze=\(Self.preferredActionName(UIPencilInteraction.preferredSqueezeAction))"
+        render()
+        log("squeeze phase=\(Self.squeezePhaseName(squeeze.phase)) timestamp=\(Self.number(squeeze.timestamp)) \(pose)")
+    }
+
+    private func render() {
+        label.text = "  RAW PENCIL — DEBUG ONLY\n  owner: \(owner)  tool=\(tool) state=\(interactionState)\n  \(eventLine)\n  \(poseLine)\n  \(deliveryLine)\n  \(hoverLine)\n  \(gestureLine)"
+    }
+
+    private func log(_ message: String) {
+        print("[VBoard] PENCIL_RAW owner=\(owner) tool=\(tool) state=\(interactionState) \(message)")
+    }
+
+    private static func number(_ value: CGFloat) -> String { String(format: "%.3f", value) }
+    private static func number(_ value: TimeInterval) -> String { String(format: "%.3f", value) }
+    private static func degrees(_ radians: CGFloat) -> String {
+        String(format: "%.1f°", radians * 180 / .pi)
+    }
+
+    private static func propertyNames(_ properties: UITouch.Properties) -> String {
+        var names: [String] = []
+        if properties.contains(.location) { names.append("location") }
+        if properties.contains(.force) { names.append("force") }
+        if properties.contains(.azimuth) { names.append("azimuth") }
+        if properties.contains(.altitude) { names.append("altitude") }
+        return names.isEmpty ? "none" : names.joined(separator: ",")
+    }
+
+    private static func touchTypeName(_ type: UITouch.TouchType) -> String {
+        switch type {
+        case .pencil: return "pencil"
+        case .direct: return "finger"
+        case .indirectPointer: return "pointer"
+        case .indirect: return "indirect"
+        @unknown default: return "unknown(\(type.rawValue))"
+        }
+    }
+
+    private static func gestureStateName(_ state: UIGestureRecognizer.State) -> String {
+        switch state {
+        case .possible: return "possible"
+        case .began: return "began"
+        case .changed: return "changed"
+        case .ended: return "ended"
+        case .cancelled: return "cancelled"
+        case .failed: return "failed"
+        @unknown default: return "unknown"
+        }
+    }
+
+    private static func preferredActionName(_ action: UIPencilPreferredAction) -> String {
+        switch action {
+        case .ignore: return "ignore"
+        case .switchEraser: return "switchEraser"
+        case .switchPrevious: return "switchPrevious"
+        case .showColorPalette: return "showColorPalette"
+        case .showInkAttributes: return "showInkAttributes"
+        case .showContextualPalette: return "showContextualPalette"
+        case .runSystemShortcut: return "runSystemShortcut"
+        @unknown default: return "unknown(\(action.rawValue))"
+        }
+    }
+
+    @available(iOS 17.5, *)
+    private static func squeezePhaseName(_ phase: UIPencilInteraction.Phase) -> String {
+        switch phase {
+        case .began: return "began"
+        case .changed: return "changed"
+        case .ended: return "ended"
+        case .cancelled: return "cancelled"
+        @unknown default: return "unknown"
+        }
+    }
+
+    @available(iOS 17.5, *)
+    private static func poseDescription(_ pose: UIPencilHoverPose) -> String {
+        "pose=(x=\(number(pose.location.x)) y=\(number(pose.location.y)) z=\(number(pose.zOffset)) altitude=\(degrees(pose.altitudeAngle)) azimuth=\(degrees(pose.azimuthAngle)) roll=\(degrees(pose.rollAngle)))"
+    }
+}
+#endif
+
 struct NativeCanvasView: UIViewRepresentable {
     let boardID: String
     let document: SVGDocument
@@ -29,6 +285,8 @@ struct NativeCanvasView: UIViewRepresentable {
     var backgroundStyle = WorkspaceBackgroundStyle.dots
     var penStyle = CanvasStrokeStyle.pen
     var markerStyle = CanvasStrokeStyle.marker
+    var pencilPreferences = PencilPreferences.defaults
+    var isPencilPalettePresented = false
     var showsDeveloperDiagnostics = false
     var onStroke: (UserStroke) -> Void = { _ in }
     var tool: CanvasTool = .pen
@@ -40,15 +298,22 @@ struct NativeCanvasView: UIViewRepresentable {
     var onCameraChanged: (CameraRect) -> Void = { _ in }
     var onUndo: () -> Void = {}
     var onRedo: () -> Void = {}
+    var onPencilAction: (PencilLogicalAction, CGPoint?) -> Void = { _, _ in }
+    var onPencilPaletteMoved: (CGPoint) -> Void = { _ in }
+    var onPencilPaletteDismiss: () -> Void = {}
 
     func makeUIView(context: Context) -> InfiniteCanvasUIView {
         InfiniteCanvasUIView(boardID: boardID, document: document, pdfData: pdfData, camera: camera,
                              objects: objects, importedTransforms: importedTransforms,
                              composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
                              penStyle: penStyle, markerStyle: markerStyle,
+                             pencilPreferences: pencilPreferences,
+                             isPencilPalettePresented: isPencilPalettePresented,
                              showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                              onStroke: onStroke, tool: tool,
-                             onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
+                             onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo,
+                             onPencilAction: onPencilAction, onPencilPaletteMoved: onPencilPaletteMoved,
+                             onPencilPaletteDismiss: onPencilPaletteDismiss)
     }
 
     func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) {
@@ -56,16 +321,20 @@ struct NativeCanvasView: UIViewRepresentable {
                       objects: objects, importedTransforms: importedTransforms,
                       composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
                       penStyle: penStyle, markerStyle: markerStyle,
+                      pencilPreferences: pencilPreferences,
+                      isPencilPalettePresented: isPencilPalettePresented,
                       showsDeveloperDiagnostics: showsDeveloperDiagnostics,
                       onStroke: onStroke, tool: tool,
-                      onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo)
+                      onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo,
+                      onPencilAction: onPencilAction, onPencilPaletteMoved: onPencilPaletteMoved,
+                      onPencilPaletteDismiss: onPencilPaletteDismiss)
     }
 }
 
 /// UIKit owns the high-frequency input and layer composition. World-space
 /// content is transformed as one GPU-composited layer; expensive visibility
 /// refinement only runs after a gesture ends.
-final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
+final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilInteractionDelegate {
     private let gridLayer = CAShapeLayer()
     /// The root view is intentionally never camera-transformed. It owns the
     /// input stream and stays in the same coordinate space as UIKit events.
@@ -77,6 +346,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private let vectorIndicator = BoardVectorLoadingIndicator()
     private let userLayer = CALayer()
     private let paperLayer = CAShapeLayer()
+    private let pencilHoverLayer = CAShapeLayer()
     private var userObjectLayers: [String: CALayer] = [:]
     private var renderedObjects: [String: CanvasObject] = [:]
     private var strokeLayers: [String: CALayer] = [:]
@@ -84,8 +354,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private(set) var userStrokes: [UserStroke] = []
     private var activePoints: [StrokePoint] = []
     private var predictedPoints: [StrokePoint] = []
-    private var lastPencilPressure: CGFloat?
+    private var strokeAccumulator = PencilStrokeAccumulator()
     private var activeID: String?
+    private var recentlyCommittedStroke: UserStroke?
     private var onStroke: (UserStroke) -> Void
     private var activeTool: CanvasTool
     private var onSelectionChanged: (Set<String>) -> Void
@@ -96,6 +367,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var onCameraChanged: (CameraRect) -> Void
     private var onUndo: () -> Void
     private var onRedo: () -> Void
+    private var pencilPreferences: PencilPreferences
+    private var onPencilAction: (PencilLogicalAction, CGPoint?) -> Void
+    private var onPencilPaletteMoved: (CGPoint) -> Void
+    private var onPencilPaletteDismiss: () -> Void
+    private var pencilInteraction: UIPencilInteraction!
+    private var pencilHoverRecognizer: UIHoverGestureRecognizer!
+    private var squeezeState = PencilPaletteStateMachine()
+    private var activeSqueezeAction: PencilLogicalAction = .none
+    private var pencilFeedback: PencilFeedbackProviding!
     private var selectedIDs = Set<String>()
     private var editStart = CGPoint.zero
     private var editStartScreen = CGPoint.zero
@@ -135,6 +415,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var pinchStartMidpoint = CGPoint.zero
     #if DEBUG
     private let perfLabel = UILabel()
+    private let pencilRawMonitor = PencilRawEventMonitor(owner: "InfiniteCanvasUIView")
     private var lastRenderStats: RenderStats?
     private let crosshairLayer = CAShapeLayer()
     private var lastCameraMutationReason: CameraMutationReason?
@@ -145,22 +426,31 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
          composition: SceneComposition, showsPaper: Bool = true,
          backgroundStyle: WorkspaceBackgroundStyle = .dots,
          penStyle: CanvasStrokeStyle = .pen, markerStyle: CanvasStrokeStyle = .marker,
+         pencilPreferences: PencilPreferences = .defaults,
+         isPencilPalettePresented: Bool = false,
          showsDeveloperDiagnostics: Bool = false,
          onStroke: @escaping (UserStroke) -> Void = { _ in },
          tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
          onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
          onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in },
          onResize: @escaping (Set<String>, CGPoint, CGFloat) -> Void = { _, _, _ in },
-         onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
+         onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {},
+         onPencilAction: @escaping (PencilLogicalAction, CGPoint?) -> Void = { _, _ in },
+         onPencilPaletteMoved: @escaping (CGPoint) -> Void = { _ in },
+         onPencilPaletteDismiss: @escaping () -> Void = {}) {
         self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
+        self.pencilPreferences = pencilPreferences
         self.showsDeveloperDiagnostics = showsDeveloperDiagnostics
         self.backgroundStyle = backgroundStyle
         self.onStroke = onStroke
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
         self.onMove = onMove; self.onResize = onResize; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
+        self.onPencilAction = onPencilAction
+        self.onPencilPaletteMoved = onPencilPaletteMoved
+        self.onPencilPaletteDismiss = onPencilPaletteDismiss
         controller = CameraController(camera: camera)
         persistedCamera = camera
         super.init(frame: .zero)
@@ -175,6 +465,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         gridLayer.lineWidth = 1
         gridLayer.contentsScale = UIScreen.main.scale
         layer.addSublayer(gridLayer)
+        pencilHoverLayer.fillColor = UIColor.clear.cgColor
+        pencilHoverLayer.strokeColor = UIColor.label.withAlphaComponent(0.62).cgColor
+        pencilHoverLayer.lineWidth = 1
+        pencilHoverLayer.isHidden = true
+        layer.addSublayer(pencilHoverLayer)
         worldContainer.backgroundColor = .clear
         worldContainer.clipsToBounds = false
         worldContainer.isUserInteractionEnabled = false
@@ -238,7 +533,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             PDFBoardSource.apply(transform: importedTransforms[PDFBoardSource.logicalID], to: pdfSource)
         }
         let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
-        pan.minimumNumberOfTouches = 1; pan.maximumNumberOfTouches = 2
+        pan.minimumNumberOfTouches = 2; pan.maximumNumberOfTouches = 2
         pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue), NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         pan.allowedScrollTypesMask = .all
         pan.cancelsTouchesInView = false
@@ -257,6 +552,16 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
                                    NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         pinch.cancelsTouchesInView = false
         pinch.delegate = self; pinchGesture = pinch; addGestureRecognizer(pinch)
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(pencilHover(_:)))
+        hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        hover.cancelsTouchesInView = false
+        addGestureRecognizer(hover)
+        pencilHoverRecognizer = hover
+        let interaction = UIPencilInteraction()
+        interaction.delegate = self
+        addInteraction(interaction)
+        pencilInteraction = interaction
+        pencilFeedback = UIKitPencilFeedbackProvider(view: self)
         registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (view: InfiniteCanvasUIView, _) in
             view.updateWorkspaceBackground()
         }
@@ -269,6 +574,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         perfLabel.layer.cornerRadius = 6; perfLabel.layer.masksToBounds = true
         perfLabel.isHidden = !showsDeveloperDiagnostics
         addSubview(perfLabel)
+        pencilRawMonitor.installOverlay(on: self)
+        pencilRawMonitor.setVisible(showsDeveloperDiagnostics)
+        pencilRawMonitor.setContext(tool: activeTool.rawValue, state: interactionState.rawValue)
         updateInputHUD()
         debugViewHierarchy()
         #endif
@@ -301,6 +609,136 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         worldContainer.layer.sublayers?.compactMap(\.name) ?? []
     }
 
+    var pencilInteractionCountForTesting: Int {
+        interactions.filter { $0 is UIPencilInteraction }.count
+    }
+
+    func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+        #if DEBUG
+        pencilRawMonitor.recordLegacyDoubleTap()
+        #endif
+        routePencilAction(PencilActionResolver.doubleTap(
+            setting: pencilPreferences.doubleTap,
+            system: PencilPreferredAction(UIPencilInteraction.preferredTapAction)
+        ), anchor: nil)
+    }
+
+    @available(iOS 17.5, *)
+    func pencilInteraction(_ interaction: UIPencilInteraction,
+                           didReceiveTap tap: UIPencilInteraction.Tap) {
+        #if DEBUG
+        pencilRawMonitor.recordDoubleTap(tap)
+        #endif
+        routePencilAction(PencilActionResolver.doubleTap(
+            setting: pencilPreferences.doubleTap,
+            system: PencilPreferredAction(UIPencilInteraction.preferredTapAction)
+        ), anchor: tap.hoverPose?.location)
+    }
+
+    @available(iOS 17.5, *)
+    func pencilInteraction(_ interaction: UIPencilInteraction,
+                           didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        #if DEBUG
+        pencilRawMonitor.recordSqueeze(squeeze)
+        #endif
+        let point = squeeze.hoverPose?.location
+        let phase: PencilSqueezePhase
+        switch squeeze.phase {
+        case .began: phase = .began
+        case .changed: phase = .changed
+        case .ended: phase = .ended
+        case .cancelled: phase = .cancelled
+        @unknown default: phase = .cancelled
+        }
+
+        if phase == .began {
+            activeSqueezeAction = PencilActionResolver.squeeze(
+                setting: pencilPreferences.squeeze,
+                system: PencilPreferredAction(UIPencilInteraction.preferredSqueezeAction)
+            )
+            if activeSqueezeAction == .showToolPalette || activeSqueezeAction == .showInkAttributes
+                || activeSqueezeAction == .showColorPalette {
+                if case .present(let anchor) = squeezeState.receive(.began, anchor: point) {
+                    routePencilAction(activeSqueezeAction, anchor: anchor)
+                    pencilFeedback.request(.paletteActivation(anchor
+                        ?? CGPoint(x: bounds.midX, y: bounds.midY)))
+                }
+            } else {
+                routePencilAction(activeSqueezeAction, anchor: point)
+            }
+            return
+        }
+
+        let effect = squeezeState.receive(phase, anchor: point)
+        if case .update(let anchor?) = effect { onPencilPaletteMoved(anchor) }
+        if effect == .dismiss { onPencilPaletteDismiss() }
+        if phase == .ended || phase == .cancelled { activeSqueezeAction = .none }
+    }
+
+    private func routePencilAction(_ action: PencilLogicalAction, anchor: CGPoint?) {
+        guard action != .none else { return }
+        onPencilAction(action, anchor)
+    }
+
+    private var shouldShowPencilHoverPreview: Bool {
+        switch pencilPreferences.hover {
+        case .off: return false
+        case .on: return true
+        case .followSystem:
+            if #available(iOS 17.5, *) { return UIPencilInteraction.prefersHoverToolPreview }
+            return true
+        }
+    }
+
+    @objc private func pencilHover(_ recognizer: UIHoverGestureRecognizer) {
+        #if DEBUG
+        pencilRawMonitor.recordHover(recognizer, in: self)
+        #endif
+        guard shouldShowPencilHoverPreview,
+              recognizer.state == .began || recognizer.state == .changed else {
+            pencilHoverLayer.path = nil
+            pencilHoverLayer.isHidden = true
+            return
+        }
+        let point = recognizer.location(in: self)
+        let scale = max(worldTransform.scale, 0.001)
+        let path = UIBezierPath()
+        switch activeTool {
+        case .pen:
+            let radius = max(2.5, CGFloat(penStyle.width) * scale / 2)
+            path.append(UIBezierPath(ovalIn: CGRect(x: point.x - radius, y: point.y - radius,
+                                                    width: radius * 2, height: radius * 2)))
+        case .highlighter:
+            let roll: CGFloat?
+            if #available(iOS 17.5, *) { roll = recognizer.rollAngle } else { roll = nil }
+            let nib = PencilNibGeometry.marker(baseWidth: CGFloat(markerStyle.width) * scale,
+                                               pressure: nil,
+                                               altitude: recognizer.altitudeAngle,
+                                               azimuth: recognizer.azimuthAngle(in: self),
+                                               roll: roll)
+            let stamp = UIBezierPath(ovalIn: CGRect(x: -nib.majorAxis / 2,
+                                                    y: -nib.minorAxis / 2,
+                                                    width: nib.majorAxis,
+                                                    height: nib.minorAxis))
+            var transform = CGAffineTransform(rotationAngle: nib.orientation)
+            transform = transform.concatenating(
+                CGAffineTransform(translationX: point.x, y: point.y)
+            )
+            stamp.apply(transform); path.append(stamp)
+        case .objectEraser:
+            let radius = max(8, 14 * scale)
+            path.append(UIBezierPath(ovalIn: CGRect(x: point.x - radius, y: point.y - radius,
+                                                    width: radius * 2, height: radius * 2)))
+        case .lasso, .select, .navigation:
+            path.move(to: CGPoint(x: point.x - 6, y: point.y))
+            path.addLine(to: CGPoint(x: point.x + 6, y: point.y))
+            path.move(to: CGPoint(x: point.x, y: point.y - 6))
+            path.addLine(to: CGPoint(x: point.x, y: point.y + 6))
+        }
+        pencilHoverLayer.path = path.cgPath
+        pencilHoverLayer.isHidden = false
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         let newViewportSize = bounds.size
@@ -319,6 +757,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         previousViewportSize = newViewportSize
         gridLayer.frame = bounds
+        pencilHoverLayer.frame = bounds
         // Never assign `frame` to a transformed layer. Establish the stable
         // untransformed geometry first, then apply the camera transform in
         // `applyCamera`.
@@ -334,6 +773,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
         #if DEBUG
         perfLabel.frame = CGRect(x: 8, y: 8, width: 360, height: 112)
+        pencilRawMonitor.layout(in: bounds, top: 126)
         #endif
         let indicatorSize = vectorIndicator.systemLayoutSizeFitting(
             UIView.layoutFittingCompressedSize
@@ -353,13 +793,18 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
                 composition: SceneComposition, showsPaper: Bool = true,
                 backgroundStyle: WorkspaceBackgroundStyle = .dots,
                 penStyle: CanvasStrokeStyle = .pen, markerStyle: CanvasStrokeStyle = .marker,
+                pencilPreferences: PencilPreferences = .defaults,
+                isPencilPalettePresented: Bool = false,
                 showsDeveloperDiagnostics: Bool = false,
                 onStroke: @escaping (UserStroke) -> Void = { _ in },
                 tool: CanvasTool = .pen, onSelectionChanged: @escaping (Set<String>) -> Void = { _ in },
                 onSelectionRegionChanged: @escaping (CGRect?) -> Void = { _ in },
                 onMove: @escaping (Set<String>, CGPoint) -> Void = { _, _ in },
                 onResize: @escaping (Set<String>, CGPoint, CGFloat) -> Void = { _, _, _ in },
-                onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {}) {
+                onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {},
+                onPencilAction: @escaping (PencilLogicalAction, CGPoint?) -> Void = { _, _ in },
+                onPencilPaletteMoved: @escaping (CGPoint) -> Void = { _ in },
+                onPencilPaletteDismiss: @escaping () -> Void = {}) {
         let boardChanged = self.boardID != boardID
         let documentChanged = self.document != document || self.importedTransforms != importedTransforms
         let pdfChanged = self.pdfData != pdfData
@@ -367,9 +812,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
+        self.pencilPreferences = pencilPreferences
+        if !isPencilPalettePresented { _ = squeezeState.dismiss() }
         self.showsDeveloperDiagnostics = showsDeveloperDiagnostics
         #if DEBUG
         perfLabel.isHidden = !showsDeveloperDiagnostics
+        pencilRawMonitor.setVisible(showsDeveloperDiagnostics)
+        pencilRawMonitor.setContext(tool: tool.rawValue, state: interactionState.rawValue)
         if !showsDeveloperDiagnostics { crosshairLayer.isHidden = true }
         #endif
         self.backgroundStyle = backgroundStyle
@@ -384,6 +833,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         self.onStroke = onStroke
         if self.activeTool != tool {
+            pencilFeedback.request(.toolSelection(nil))
             #if DEBUG
             print("[VBoard] TOOL CHANGED \(self.activeTool.rawValue) -> \(tool.rawValue) board=\(boardID)")
             #endif
@@ -391,6 +841,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
         self.onMove = onMove; self.onResize = onResize; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
+        self.onPencilAction = onPencilAction
+        self.onPencilPaletteMoved = onPencilPaletteMoved
+        self.onPencilPaletteDismiss = onPencilPaletteDismiss
         // Hand and simulator Space-pan own the root touch stream directly.
         // This keeps one camera owner for indirect-pointer drags; physical
         // devices retain the recognizer path below.
@@ -746,7 +1199,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if interactionState == .panning { professor.endNavigation(worldTransform) }
         interactionState = .idle; panStart = .zero
         activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
-        activePoints.removeAll(); predictedPoints.removeAll(); lastPencilPressure = nil; activeID = nil
+        activePoints.removeAll(); predictedPoints.removeAll(); strokeAccumulator.reset(); activeID = nil
         lassoWorldPoints.removeAll(); updateInteractionPath(); updateInputHUD()
     }
 
@@ -777,7 +1230,19 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
+        #if DEBUG
+        pencilRawMonitor.recordTouch("BEGIN", touch: touch, event: event, in: self,
+                                     tool: activeTool.rawValue, state: interactionState.rawValue)
+        #endif
         debugInput("BEGIN", touch: touch)
+        #if !targetEnvironment(simulator)
+        // Direct touches belong to the two-finger camera recognizers. A lone
+        // finger or palm never enters drawing, lasso, eraser, move, or resize.
+        if touch.type == .direct {
+            super.touchesBegan(touches, with: event)
+            return
+        }
+        #endif
         let screen = touch.location(in: self)
         let point = worldPoint(screen, from: self)
         // Space is a modal simulator hand-pan override. It is checked before
@@ -795,12 +1260,14 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         if activeTool != .pen && activeTool != .highlighter { beginEditing(at: point, screen: screen); return }
         guard isDrawingTouch(touch) else { super.touchesBegan(touches, with: event); return }
         interactionState = .drawing; debugInputOperation("STROKE BEGIN"); updateInputHUD()
-        lastPencilPressure = nil
+        recentlyCommittedStroke = nil
+        strokeAccumulator.reset()
+        strokeAccumulator.appendConfirmed(samples(for: touch, event: event))
+        activePoints = strokeAccumulator.canonicalPoints
         predictedPoints.removeAll(keepingCapacity: true)
-        activeID = UUID().uuidString; activePoints = samples(for: touch, event: event)
-        let layer = CAShapeLayer(); layer.fillColor = UIColor.clear.cgColor
-        layer.strokeColor = strokeColor.cgColor; layer.lineWidth = strokeWidth
-        layer.lineCap = .round; layer.lineJoin = .round
+        activeID = UUID().uuidString
+        let layer = CAShapeLayer(); layer.fillColor = strokeColor.cgColor
+        layer.strokeColor = nil
         // Canonical object layers retain document order. The transient trace
         // is presentation-only and must remain visible above opaque graph
         // proxies until the finalized canonical stroke replaces it.
@@ -811,7 +1278,20 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
+        #if DEBUG
+        pencilRawMonitor.recordTouch("MOVE", touch: touch, event: event, in: self,
+                                     tool: activeTool.rawValue, state: interactionState.rawValue)
+        #endif
         debugInput("MOVE", touch: touch)
+        if (interactionState == .panning || interactionState == .pinching),
+           activeStrokeLayer != nil, isDrawingTouch(touch) {
+            strokeAccumulator.appendConfirmed(samples(for: touch, event: event))
+            strokeAccumulator.setPredicted(predictedSamples(for: touch, event: event))
+            activePoints = strokeAccumulator.canonicalPoints
+            predictedPoints = strokeAccumulator.predicted
+            updateActiveStroke()
+            return
+        }
         if interactionState == .panning {
             let screen = touch.location(in: self)
             setCamera(panStartCamera, reason: .handPan)
@@ -820,14 +1300,27 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         }
         if activeTool != .pen && activeTool != .highlighter { continueEditing(at: worldPoint(touch.location(in: self), from: self), screen: touch.location(in: self)); return }
         guard isDrawingTouch(touch) else { return }
-        activePoints.append(contentsOf: samples(for: touch, event: event))
-        predictedPoints = predictedSamples(for: touch, event: event)
+        strokeAccumulator.appendConfirmed(samples(for: touch, event: event))
+        strokeAccumulator.setPredicted(predictedSamples(for: touch, event: event))
+        activePoints = strokeAccumulator.canonicalPoints
+        predictedPoints = strokeAccumulator.predicted
         updateActiveStroke(); debugInputOperation("STROKE APPEND")
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
+        #if DEBUG
+        pencilRawMonitor.recordTouch("END", touch: touch, event: event, in: self,
+                                     tool: activeTool.rawValue, state: interactionState.rawValue)
+        #endif
         debugInput("END", touch: touch)
+        if (interactionState == .panning || interactionState == .pinching),
+           activeStrokeLayer != nil, isDrawingTouch(touch) {
+            strokeAccumulator.appendConfirmed(samples(for: touch, event: event))
+            activePoints = strokeAccumulator.canonicalPoints
+            commitActiveStroke()
+            return
+        }
         if interactionState == .panning {
             // The Mac/iPad simulator may coalesce an indirect-pointer drag
             // into only BEGIN/END callbacks. Derive the final camera from the
@@ -844,25 +1337,61 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             finishEditing(at: worldPoint(touch.location(in: self), from: self)); return
         }
         guard isDrawingTouch(touch) else { return }
-        activePoints.append(contentsOf: samples(for: touch, event: event))
-        if let activeID, !activePoints.isEmpty {
-            onStroke(UserStroke(id: activeID, color: strokeColorHex, width: strokeWidth, opacity: strokeOpacity, points: activePoints))
-            debugInputOperation("STROKE FINALIZE")
-        }
-        activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
-        activePoints.removeAll(); predictedPoints.removeAll(); lastPencilPressure = nil
-        activeID = nil; interactionState = .idle; updateInputHUD()
+        strokeAccumulator.appendConfirmed(samples(for: touch, event: event))
+        activePoints = strokeAccumulator.canonicalPoints
+        commitActiveStroke()
+        interactionState = .idle; updateInputHUD()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        #if DEBUG
+        if let touch = touches.first {
+            pencilRawMonitor.recordTouch("CANCEL", touch: touch, event: event, in: self,
+                                         tool: activeTool.rawValue, state: interactionState.rawValue)
+        }
+        #endif
         if interactionState == .panning {
             professor.endNavigation(worldTransform); interactionState = .idle; panStart = .zero; updateInputHUD(); return
         }
         if activeTool != .pen && activeTool != .highlighter { finishEditing(at: nil); return }
         if touches.contains(where: { isDrawingTouch($0) }) {
             activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
-            activePoints.removeAll(); predictedPoints.removeAll(); lastPencilPressure = nil; activeID = nil
+            activePoints.removeAll(); predictedPoints.removeAll(); strokeAccumulator.reset(); activeID = nil
         }
+    }
+
+    override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
+        #if DEBUG
+        pencilRawMonitor.recordEstimatedUpdates(touches, in: self)
+        #endif
+        let corrections = touches.filter(isDrawingTouch).map(sample(for:))
+        if interactionState == .drawing {
+            strokeAccumulator.replaceEstimated(corrections)
+            activePoints = strokeAccumulator.canonicalPoints
+            updateActiveStroke()
+        } else if let stroke = recentlyCommittedStroke,
+                  let corrected = PencilStrokeCorrection.applying(corrections, to: stroke) {
+            recentlyCommittedStroke = corrected
+            onStroke(corrected)
+        }
+        super.touchesEstimatedPropertiesUpdated(touches)
+    }
+
+    private func commitActiveStroke() {
+        if let activeID, !activePoints.isEmpty {
+            let stroke = UserStroke(id: activeID, color: strokeColorHex, width: strokeWidth,
+                                    opacity: strokeOpacity, points: activePoints,
+                                    pencilTool: activePencilStrokeTool)
+            recentlyCommittedStroke = stroke
+            onStroke(stroke)
+            debugInputOperation("STROKE FINALIZE")
+        }
+        activeStrokeLayer?.removeFromSuperlayer()
+        activeStrokeLayer = nil
+        activePoints.removeAll()
+        predictedPoints.removeAll()
+        strokeAccumulator.reset()
+        activeID = nil
     }
 
     private func beginEditing(at point: CGPoint, screen: CGPoint) {
@@ -1140,7 +1669,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func resizeHandle(at point: CGPoint, bounds: CGRect) -> SelectionResizeHandle? {
-        let tolerance = 16 / max(worldTransform.scale, 0.001)
+        let tolerance = PencilHitTarget.resizeHandleRadius / max(worldTransform.scale, 0.001)
         return SelectionResizeHandle.allCases.first {
             let handlePoint = $0.point(in: bounds)
             return hypot(point.x - handlePoint.x, point.y - handlePoint.y) <= tolerance
@@ -1181,38 +1710,41 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
 
     private func samples(for touch: UITouch, event: UIEvent?) -> [StrokePoint] {
         let source = event?.coalescedTouches(for: touch) ?? [touch]
-        return source.map { item in
-            sample(for: item, updatesPressure: true)
-        }
+        return source.map(sample(for:))
     }
 
     private func predictedSamples(for touch: UITouch, event: UIEvent?) -> [StrokePoint] {
-        (event?.predictedTouches(for: touch) ?? []).map { sample(for: $0, updatesPressure: false) }
+        (event?.predictedTouches(for: touch) ?? []).map(sample(for:))
     }
 
-    private func sample(for touch: UITouch, updatesPressure: Bool) -> StrokePoint {
-        let point = worldPoint(touch.location(in: touch.view ?? self), from: touch.view ?? self)
+    private func sample(for touch: UITouch) -> StrokePoint {
+        let sourceView = touch.view ?? self
+        let point = worldPoint(touch.preciseLocation(in: sourceView), from: sourceView)
         #if targetEnvironment(simulator)
-        let pressure: CGFloat = 1
+        let pressure: CGFloat? = nil
         #else
-        let normalized = touch.force / max(touch.maximumPossibleForce, 1)
-        let pressure = updatesPressure
-            ? PencilPressureResponse.smoothed(previous: lastPencilPressure, sample: normalized)
-            : PencilPressureResponse.curved(normalized)
-        if updatesPressure { lastPencilPressure = pressure }
+        let pressure = touch.type == .pencil
+            ? PencilPressureResponse.normalized(force: touch.force,
+                                                maximum: touch.maximumPossibleForce)
+            : nil
         #endif
-        return StrokePoint(x: point.x, y: point.y, pressure: Double(pressure))
+        let isPencil = touch.type == .pencil
+        let roll: CGFloat?
+        if #available(iOS 17.5, *), isPencil { roll = touch.rollAngle } else { roll = nil }
+        return StrokePoint(
+            x: point.x, y: point.y, pressure: pressure.map(Double.init),
+            altitude: isPencil ? Double(touch.altitudeAngle) : nil,
+            azimuth: isPencil ? Double(touch.azimuthAngle(in: self)) : nil,
+            roll: roll.map(Double.init), timestamp: touch.timestamp,
+            estimationUpdateIndex: touch.estimationUpdateIndex?.intValue
+        )
     }
 
     private func updateActiveStroke() {
         guard let layer = activeStrokeLayer else { return }
-        let path = UIBezierPath()
-        for (index, point) in (activePoints + predictedPoints).enumerated() {
-            let world = CGPoint(x: point.x, y: point.y)
-            if index == 0 { path.move(to: world) } else { path.addLine(to: world) }
-        }
-        layer.path = path.cgPath
-        layer.lineWidth = strokeWidth * PencilPressureResponse.widthMultiplier(for: lastPencilPressure ?? 1)
+        layer.path = PencilStrokeGeometry.path(points: activePoints + predictedPoints,
+                                               tool: activePencilStrokeTool,
+                                               baseWidth: strokeWidth)
         layer.frame = bounds
         if layer.superlayer == nil { userLayer.addSublayer(layer) }
     }
@@ -1222,6 +1754,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     private var strokeColor: UIColor { UIColor(svgHex: strokeColorHex).withAlphaComponent(CGFloat(strokeOpacity)) }
     private var strokeWidth: CGFloat { CGFloat(activeStrokeStyle.width) }
     private var strokeOpacity: Double { activeStrokeStyle.opacity }
+    private var activePencilStrokeTool: PencilStrokeTool {
+        activeTool == .highlighter ? .marker : .pen
+    }
 
     private func rebuildUserLayers() {
         let canonical = SceneComposition.canonicalEditorObjects(objects)
@@ -1281,14 +1816,28 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
         let path = UIBezierPath()
         let tx = object.translation?.x ?? 0; let ty = object.translation?.y ?? 0
         let scaleX = object.scaleX ?? 1; let scaleY = object.scaleY ?? 1
-        for (index, point) in (object.points ?? []).enumerated() {
-            let world = CGPoint(x: point.x * scaleX + tx, y: point.y * scaleY + ty)
+        let transformedPoints = (object.points ?? []).map { point in
+            StrokePoint(x: point.x * scaleX + tx, y: point.y * scaleY + ty,
+                        pressure: point.pressure, altitude: point.altitude,
+                        azimuth: point.azimuth, roll: point.roll,
+                        timestamp: point.timestamp,
+                        estimationUpdateIndex: point.estimationUpdateIndex)
+        }
+        for (index, point) in transformedPoints.enumerated() {
+            let world = CGPoint(x: point.x, y: point.y)
             if index == 0 { path.move(to: world) } else { path.addLine(to: world) }
         }
-        layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor
-        layer.strokeColor = UIColor(svgHex: object.color ?? "#183153").withAlphaComponent(CGFloat(object.opacity ?? 1)).cgColor
-        layer.lineWidth = (object.width ?? 4) * sqrt(abs(scaleX * scaleY))
-        layer.lineCap = .round; layer.lineJoin = .round
+        let color = UIColor(svgHex: object.color ?? "#183153").withAlphaComponent(CGFloat(object.opacity ?? 1)).cgColor
+        if let pencilTool = object.pencilTool {
+            layer.path = PencilStrokeGeometry.path(points: transformedPoints, tool: pencilTool,
+                                                   baseWidth: CGFloat((object.width ?? 4) * sqrt(abs(scaleX * scaleY))))
+            layer.fillColor = color; layer.strokeColor = nil
+        } else {
+            layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor
+            layer.strokeColor = color
+            layer.lineWidth = (object.width ?? 4) * sqrt(abs(scaleX * scaleY))
+            layer.lineCap = .round; layer.lineJoin = .round
+        }
         applyProvenance(object.id, to: layer); return layer
     }
 
@@ -1298,9 +1847,22 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
             let world = CGPoint(x: point.x + stroke.translation.x, y: point.y + stroke.translation.y)
             if index == 0 { path.move(to: world) } else { path.addLine(to: world) }
         }
-        layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor
-        layer.strokeColor = UIColor(svgHex: stroke.color).withAlphaComponent(CGFloat(stroke.opacity)).cgColor
-        layer.lineWidth = stroke.width; layer.lineCap = .round; layer.lineJoin = .round
+        let color = UIColor(svgHex: stroke.color).withAlphaComponent(CGFloat(stroke.opacity)).cgColor
+        if let pencilTool = stroke.pencilTool {
+            let translated = stroke.points.map {
+                StrokePoint(x: $0.x + stroke.translation.x, y: $0.y + stroke.translation.y,
+                            pressure: $0.pressure, altitude: $0.altitude, azimuth: $0.azimuth,
+                            roll: $0.roll, timestamp: $0.timestamp,
+                            estimationUpdateIndex: $0.estimationUpdateIndex)
+            }
+            layer.path = PencilStrokeGeometry.path(points: translated, tool: pencilTool,
+                                                   baseWidth: CGFloat(stroke.width))
+            layer.fillColor = color; layer.strokeColor = nil
+        } else {
+            layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor
+            layer.strokeColor = color
+            layer.lineWidth = stroke.width; layer.lineCap = .round; layer.lineJoin = .round
+        }
         applyProvenance(stroke.id, to: layer); strokeLayers[stroke.id] = layer; userLayer.addSublayer(layer)
     }
 
@@ -1323,6 +1885,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func renderDebugHUD() {
+        pencilRawMonitor.setContext(tool: activeTool.rawValue, state: interactionState.rawValue)
         var text = "Tool: \(activeTool.rawValue)\nInput: \(activeInputSource.rawValue)\nState: \(interactionState.rawValue)  Selected: \(selectedIDs.count) Space: \(isSpacePressed)\nCamera: x=\(Int(controller.camera.x)) y=\(Int(controller.camera.y)) w=\(Int(controller.camera.width)) h=\(Int(controller.camera.height))\nBoard: \(Int(document.viewBox.width))×\(Int(document.viewBox.height))  Paper: \(!paperLayer.isHidden)\nLast camera: \(lastCameraMutationReason?.rawValue ?? "none")"
         if let stats = lastRenderStats { text += "\n" + stats.overlayText }
         perfLabel.text = text

@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import OSLog
 
 /// The single application-wide budget for an expensive graph provider. Passive
 /// graph objects never reach this coordinator and therefore never allocate a
@@ -12,6 +13,20 @@ enum GraphProviderEnvironment {
         let configuration = DesmosConfiguration()
         guard configuration.isConfigured else { return nil }
         return DesmosGraphRenderer(configuration: configuration)
+    }
+}
+
+enum GraphPromotionDiagnostics {
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.vboard.ipad",
+        category: "GraphPromotion"
+    )
+
+    static func record(_ message: String) {
+        #if DEBUG
+        logger.debug("\(message, privacy: .public)")
+        print(message)
+        #endif
     }
 }
 
@@ -229,6 +244,10 @@ final class GraphInteractiveSession: ObservableObject {
     @Published private(set) var displayGraph: GraphObject
     @Published private(set) var representationState: GraphRepresentationState = .proxy
     @Published private(set) var providerError: String?
+    @Published private(set) var promotionStage: GraphPromotionStage = .idle
+    @Published private(set) var promotionGeneration = 0
+    @Published private(set) var promotionStartedAt: CFTimeInterval?
+    @Published private(set) var providerIdentifier = "none"
 
     private let coordinator: GraphProviderCoordinator
     private let providerFactory: ProviderFactory
@@ -266,6 +285,67 @@ final class GraphInteractiveSession: ObservableObject {
     var hasLiveProviderView: Bool {
         guard let provider else { return false }
         return provider.view.superview === hostView
+    }
+
+    var promotionElapsedSeconds: Double {
+        guard let promotionStartedAt else { return 0 }
+        return max(CACurrentMediaTime() - promotionStartedAt, 0)
+    }
+
+    private func transition(to newState: GraphRepresentationState) {
+        #if DEBUG
+        let allowed: Set<GraphRepresentationState>
+        switch representationState {
+        case .unloaded: allowed = [.proxy, .failed]
+        case .proxy: allowed = [.promoting, .interactive, .demoting, .failed, .proxy]
+        case .promoting: allowed = [.interactive, .demoting, .failed, .proxy]
+        case .interactive: allowed = [.demoting, .failed, .interactive]
+        case .demoting: allowed = [.proxy, .failed, .demoting]
+        case .failed: allowed = [.proxy, .demoting, .failed]
+        }
+        assert(allowed.contains(newState),
+               "Invalid graph state transition \(representationState.rawValue) -> \(newState.rawValue)")
+        #endif
+        representationState = newState
+    }
+
+    private func recordPromotionStage(_ stage: GraphPromotionStage,
+                                      generation expectedGeneration: Int,
+                                      providerID expectedProviderID: ObjectIdentifier? = nil) {
+        guard expectedGeneration == generation else { return }
+        if let expectedProviderID {
+            guard let provider, ObjectIdentifier(provider) == expectedProviderID else { return }
+        }
+        promotionStage = stage
+        let elapsedMilliseconds = promotionElapsedSeconds * 1_000
+        GraphPromotionDiagnostics.record(
+            "\(stage.diagnosticEventName) graphID=\(displayGraph.id) provider=\(providerIdentifier) "
+            + "sessionGeneration=\(expectedGeneration) stage=\(stage.rawValue) "
+            + "elapsedMs=\(String(format: "%.1f", elapsedMilliseconds))"
+        )
+    }
+
+    private func stopLifecycleReporting(for provider: GraphRendererProvider?) {
+        (provider as? GraphProviderLifecycleReporting)?.lifecycleEventHandler = nil
+    }
+
+    private func promotionFailureCategory(for error: Error) -> String {
+        if error is CancellationError { return "cancelled" }
+        guard let rendererError = error as? GraphRendererError else {
+            return "provider_error"
+        }
+        switch rendererError {
+        case .unavailable:
+            return "provider_unavailable"
+        case .invalidExpression:
+            return "invalid_expression"
+        case .provider(let category):
+            let safe = category.unicodeScalars.map { scalar -> Character in
+                CharacterSet.alphanumerics.contains(scalar) || scalar == "_" || scalar == "-"
+                    ? Character(String(scalar)) : "_"
+            }
+            return String(safe.prefix(96))
+        }
     }
 
     func attach(to hostView: GraphProviderContainerView) {
@@ -309,6 +389,17 @@ final class GraphInteractiveSession: ObservableObject {
     }
 
     func requestInteractivePresentation() {
+        guard representationState == .proxy else { return }
+        lifecycleSuspendsInteractivePresentation = false
+        wantsInteractivePresentation = true
+        schedulePromotionIfReady()
+    }
+
+    func retryInteractivePresentation() {
+        guard representationState == .failed else { return }
+        providerError = nil
+        promotionStage = .idle
+        transition(to: .proxy)
         lifecycleSuspendsInteractivePresentation = false
         wantsInteractivePresentation = true
         schedulePromotionIfReady()
@@ -329,9 +420,19 @@ final class GraphInteractiveSession: ObservableObject {
     /// Test seam and deterministic activation path used by the representable.
     func promoteNow(in hostView: GraphProviderContainerView) async {
         attach(to: hostView)
+        if representationState == .failed { transition(to: .proxy) }
         wantsInteractivePresentation = true
         generation += 1
-        await promote(generation: generation)
+        let requestedGeneration = generation
+        let task: Task<Void, Never> = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.promote(generation: requestedGeneration)
+        }
+        promotionTask = task
+        await task.value
+        if generation == requestedGeneration {
+            promotionTask = nil
+        }
     }
 
     func resetView() {
@@ -379,17 +480,26 @@ final class GraphInteractiveSession: ObservableObject {
         promotionToJoin?.cancel()
         promotionTask = nil
         invalidateProviderUpdates()
-        representationState = .demoting
+        transition(to: .demoting)
         let demotionID = UUID()
         activeDemotionID = demotionID
         activeDemotionAllowsSnapshot = reason != .memoryPressure && reason != .background
         let task: Task<GraphDemotionResult?, Never> = Task { @MainActor [weak self] in
             guard let self else { return nil }
-            if let promotionToJoin { await promotionToJoin.value }
+            if let promotionToJoin {
+                _ = await GraphProviderOperationDeadline.value(
+                    before: 500_000_000
+                ) {
+                    await promotionToJoin.value
+                    return true
+                }
+            }
             guard self.activeDemotionID == demotionID else { return nil }
             guard let provider = self.provider else {
                 if self.generation == demotionGeneration {
-                    self.representationState = .proxy
+                    self.promotionStage = .idle
+                    self.providerIdentifier = "none"
+                    self.transition(to: .proxy)
                 }
                 return nil
             }
@@ -424,6 +534,7 @@ final class GraphInteractiveSession: ObservableObject {
     ) async -> GraphDemotionResult? {
         var viewport: GraphViewport?
         var snapshot: UIImage?
+        stopLifecycleReporting(for: provider)
         let didFreezeInteraction = await GraphProviderFinalizer.freezeInteraction(
             provider,
             timeoutNanoseconds: max(
@@ -490,7 +601,9 @@ final class GraphInteractiveSession: ObservableObject {
         }
         hostView?.removeProviderView(provider.view)
         if generation == demotionGeneration, self.provider == nil {
-            representationState = .proxy
+            promotionStage = .idle
+            providerIdentifier = "none"
+            transition(to: .proxy)
         }
         #if DEBUG
         let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
@@ -549,11 +662,16 @@ final class GraphInteractiveSession: ObservableObject {
         guard lastLayoutSize != bounds.size else { return }
         lastLayoutSize = bounds.size
         guard let resizable = provider as? GraphResizableRendererProvider else { return }
-        Task { @MainActor in try? await resizable.resize(to: bounds) }
+        Task { @MainActor in
+            try? await GraphProviderOperationDeadline.run(before: 2_000_000_000) {
+                try await resizable.resize(to: bounds)
+            }
+        }
     }
 
     private func schedulePromotionIfReady() {
         guard wantsInteractivePresentation,
+              representationState == .proxy,
               promotionTask == nil,
               let hostView,
               hostView.bounds.width > 1,
@@ -576,23 +694,55 @@ final class GraphInteractiveSession: ObservableObject {
               hostView.bounds.width > 1,
               hostView.bounds.height > 1 else { return }
 
+        promotionStartedAt = startedAt
+        promotionGeneration = requestedGeneration
+        providerIdentifier = "none"
+        recordPromotionStage(.checkingConfiguration,
+                             generation: requestedGeneration)
+        GraphPromotionDiagnostics.record(
+            "GRAPH PROMOTION START graphID=\(displayGraph.id) provider=checking "
+            + "sessionGeneration=\(requestedGeneration)"
+        )
+
         if let provider,
            coordinator.activeProvider === provider,
            coordinator.activeGraphID == displayGraph.id {
             hostView.install(provider.view)
-            representationState = .interactive
+            recordPromotionStage(.ready, generation: requestedGeneration,
+                                 providerID: ObjectIdentifier(provider))
+            transition(to: .interactive)
             return
         }
 
         guard let nextProvider = providerFactory() else {
-            representationState = .failed
-            providerError = GraphRendererError.unavailable.localizedDescription
+            wantsInteractivePresentation = false
+            promotionStage = .failed
+            transition(to: .failed)
+            providerError = "Interactive graph isn’t configured in this build."
+            GraphPromotionDiagnostics.record(
+                "GRAPH PROMOTION FAILED graphID=\(displayGraph.id) provider=none "
+                + "sessionGeneration=\(requestedGeneration) stage=checking_configuration "
+                + "errorCategory=missing_configuration elapsedMs="
+                + String(format: "%.1f", promotionElapsedSeconds * 1_000)
+            )
             return
         }
 
         invalidateProviderUpdates()
         provider = nextProvider
-        representationState = .promoting
+        providerIdentifier = nextProvider.identifier
+        let nextProviderID = ObjectIdentifier(nextProvider)
+        recordPromotionStage(.providerCreated, generation: requestedGeneration,
+                             providerID: nextProviderID)
+        if let reporting = nextProvider as? GraphProviderLifecycleReporting {
+            reporting.lifecycleEventHandler = { [weak self] stage in
+                self?.recordPromotionStage(
+                    stage, generation: requestedGeneration,
+                    providerID: nextProviderID
+                )
+            }
+        }
+        transition(to: .promoting)
         providerError = nil
         nextProvider.view.alpha = 0
         hostView.install(nextProvider.view)
@@ -609,6 +759,13 @@ final class GraphInteractiveSession: ObservableObject {
                                           frame: hostView.bounds,
                                           onPreempt: { [weak self] in
                                               await self?.handleCoordinatorPreemption()
+                                          },
+                                          onStage: { [weak self] stage in
+                                              self?.recordPromotionStage(
+                                                  stage,
+                                                  generation: requestedGeneration,
+                                                  providerID: nextProviderID
+                                              )
                                           })
             // The provider now owns this exact canonical input even if a
             // concurrent Done/background request made the promotion stale.
@@ -645,11 +802,16 @@ final class GraphInteractiveSession: ObservableObject {
             lastProviderAppliedGraph = appliedGraph
             nextProvider.view.frame = hostView.bounds
             UIView.animate(withDuration: 0.16) { nextProvider.view.alpha = 1 }
-            representationState = .interactive
-            #if DEBUG
+            recordPromotionStage(.ready, generation: requestedGeneration,
+                                 providerID: nextProviderID)
+            transition(to: .interactive)
             let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
-            print("GRAPH PROVIDER PROMOTED graph=\(displayGraph.id) provider=\(nextProvider.identifier) elapsedMs=\(String(format: "%.1f", elapsedMilliseconds)) activeProviders=\(coordinator.activeProviderCount)")
-            #endif
+            GraphPromotionDiagnostics.record(
+                "GRAPH PROMOTION COMPLETE graphID=\(displayGraph.id) "
+                + "provider=\(nextProvider.identifier) sessionGeneration=\(requestedGeneration) "
+                + "totalMs=\(String(format: "%.1f", elapsedMilliseconds)) "
+                + "activeProviders=\(coordinator.activeProviderCount)"
+            )
         } catch {
             // A cancelled/expired provider operation can finish late, but the
             // active demotion now owns the provider lease. Let that one path
@@ -672,6 +834,7 @@ final class GraphInteractiveSession: ObservableObject {
         if activeDemotionID != nil, provider === staleProvider {
             return
         }
+        stopLifecycleReporting(for: staleProvider)
         if coordinator.activeProvider === staleProvider {
             _ = await coordinator.demote()
         } else {
@@ -684,9 +847,13 @@ final class GraphInteractiveSession: ObservableObject {
     private func failProvider(_ error: Error,
                               expectedProvider: GraphRendererProvider? = nil) async {
         if let expectedProvider, provider !== expectedProvider {
+            stopLifecycleReporting(for: expectedProvider)
             if coordinator.activeProvider === expectedProvider {
                 _ = await coordinator.demote()
-            } else {
+            } else if expectedProvider.view.superview != nil {
+                // A bounded demotion may already have physically removed this
+                // cancellation-ignoring provider before its late mount task
+                // returns. Do not finalize the same instance twice.
                 expectedProvider.unmount()
             }
             hostView?.removeProviderView(expectedProvider.view)
@@ -694,6 +861,8 @@ final class GraphInteractiveSession: ObservableObject {
         }
         invalidateProviderUpdates()
         let failedProvider = provider
+        let failedStage = promotionStage
+        stopLifecycleReporting(for: failedProvider)
         if let failedProvider, coordinator.activeProvider === failedProvider {
             _ = await coordinator.demote()
         } else {
@@ -702,12 +871,17 @@ final class GraphInteractiveSession: ObservableObject {
         if let failedProvider { hostView?.removeProviderView(failedProvider.view) }
         provider = nil
         lastProviderAppliedGraph = nil
-        representationState = .failed
-        providerError = (error as? LocalizedError)?.errorDescription
-            ?? GraphRendererError.unavailable.localizedDescription
-        #if DEBUG
-        print("GRAPH PROVIDER FAILED graph=\(displayGraph.id) error=\(error.localizedDescription)")
-        #endif
+        wantsInteractivePresentation = false
+        promotionStage = .failed
+        transition(to: .failed)
+        providerError = "Interactive graph couldn’t open."
+        GraphPromotionDiagnostics.record(
+            "GRAPH PROMOTION FAILED graphID=\(displayGraph.id) "
+            + "provider=\(providerIdentifier) sessionGeneration=\(promotionGeneration) "
+            + "stage=\(failedStage.rawValue) "
+            + "errorCategory=\(promotionFailureCategory(for: error)) elapsedMs="
+            + String(format: "%.1f", promotionElapsedSeconds * 1_000)
+        )
     }
 
     private func enqueueProviderUpdate(_ graph: GraphObject,
@@ -800,6 +974,7 @@ struct GraphInteractiveSurface: View {
     let canonicalStrokeObjects: [CanvasObject]
     let pencilAnnotationEnabled: Bool
     let pencilStyle: CanvasStrokeStyle
+    let pencilPreferences: PencilPreferences
     let onPencilStroke: (UserStroke) -> Void
     let onPencilRequestsPassiveMode: () -> Void
     let onCommitViewport: (String, String, GraphViewport) -> Void
@@ -814,6 +989,7 @@ struct GraphInteractiveSurface: View {
          canonicalStrokeObjects: [CanvasObject] = [],
          pencilAnnotationEnabled: Bool,
          pencilStyle: CanvasStrokeStyle = .pen,
+         pencilPreferences: PencilPreferences = .defaults,
          onPencilStroke: @escaping (UserStroke) -> Void = { _ in },
          onPencilRequestsPassiveMode: @escaping () -> Void,
          onCommitViewport: @escaping (String, String, GraphViewport) -> Void,
@@ -826,6 +1002,7 @@ struct GraphInteractiveSurface: View {
             canonicalStrokeObjects: canonicalStrokeObjects,
             pencilAnnotationEnabled: pencilAnnotationEnabled,
             pencilStyle: pencilStyle,
+            pencilPreferences: pencilPreferences,
             onPencilStroke: onPencilStroke,
             onPencilRequestsPassiveMode: onPencilRequestsPassiveMode,
             onCommitViewport: onCommitViewport,
@@ -840,6 +1017,7 @@ struct GraphInteractiveSurface: View {
          canonicalStrokeObjects: [CanvasObject] = [],
          pencilAnnotationEnabled: Bool,
          pencilStyle: CanvasStrokeStyle = .pen,
+         pencilPreferences: PencilPreferences = .defaults,
          onPencilStroke: @escaping (UserStroke) -> Void = { _ in },
          onPencilRequestsPassiveMode: @escaping () -> Void,
          onCommitViewport: @escaping (String, String, GraphViewport) -> Void,
@@ -854,6 +1032,7 @@ struct GraphInteractiveSurface: View {
         self.canonicalStrokeObjects = canonicalStrokeObjects
         self.pencilAnnotationEnabled = pencilAnnotationEnabled
         self.pencilStyle = pencilStyle
+        self.pencilPreferences = pencilPreferences
         self.onPencilStroke = onPencilStroke
         self.onPencilRequestsPassiveMode = onPencilRequestsPassiveMode
         self.onCommitViewport = onCommitViewport
@@ -870,6 +1049,7 @@ struct GraphInteractiveSurface: View {
                               canonicalStrokeObjects: canonicalStrokeObjects,
                               pencilAnnotationEnabled: pencilAnnotationEnabled,
                               pencilStyle: pencilStyle,
+                              pencilPreferences: pencilPreferences,
                               onPencilStroke: onPencilStroke,
                               onPencilRequestsPassiveMode: onPencilRequestsPassiveMode)
                 .opacity(session.representationState == .interactive ? 1 : 0)
@@ -886,16 +1066,49 @@ struct GraphInteractiveSurface: View {
                let providerError = session.providerError {
                 VStack {
                     Spacer()
-                    Label(providerError, systemImage: "chart.xyaxis.line")
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 9)
-                        .background(.regularMaterial, in: Capsule())
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label(providerError, systemImage: "exclamationmark.triangle")
+                            .font(.callout.weight(.semibold))
+                        Text("Your graph is still saved and usable.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 10) {
+                            Button("Retry") {
+                                session.retryInteractivePresentation()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("graph-interactive-retry")
+
+                            Button("Dismiss") {
+                                finish(editing: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .accessibilityIdentifier("graph-interactive-dismiss")
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(.regularMaterial,
+                                in: RoundedRectangle(cornerRadius: 14,
+                                                     style: .continuous))
                         .padding(.bottom, 58)
+                }
+            }
+
+            #if DEBUG
+            if session.representationState == .promoting
+                || session.representationState == .failed {
+                VStack {
+                    Spacer()
+                    HStack {
+                        GraphPromotionDebugStatus(session: session)
+                        Spacer()
+                    }
+                    .padding(10)
                 }
                 .allowsHitTesting(false)
             }
+            #endif
 
             VStack {
                 HStack(spacing: 10) {
@@ -978,6 +1191,30 @@ struct GraphInteractiveSurface: View {
     }
 }
 
+#if DEBUG
+private struct GraphPromotionDebugStatus: View {
+    @ObservedObject var session: GraphInteractiveSession
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+            VStack(alignment: .leading, spacing: 2) {
+                Text("State: \(session.representationState.rawValue.uppercased())")
+                Text("Stage: \(session.promotionStage.rawValue)")
+                Text("Elapsed: \(session.promotionElapsedSeconds, format: .number.precision(.fractionLength(1)))s")
+                Text("Generation: \(session.promotionGeneration)")
+                Text("Provider: \(session.providerIdentifier)")
+            }
+            .font(.caption2.monospaced())
+            .foregroundStyle(.secondary)
+            .padding(7)
+            .background(.thinMaterial,
+                        in: RoundedRectangle(cornerRadius: 8,
+                                             style: .continuous))
+        }
+    }
+}
+#endif
+
 @MainActor
 final class GraphProviderContainerView: UIView {
     weak var session: GraphInteractiveSession?
@@ -987,19 +1224,26 @@ final class GraphProviderContainerView: UIView {
     private var graph: GraphObject?
     private var pencilAnnotationEnabled = true
     private var pencilStyle: CanvasStrokeStyle = .pen
+    private var pencilPreferences: PencilPreferences = .defaults
+    private let pencilHoverLayer = CAShapeLayer()
     private var onPencilStroke: ((UserStroke) -> Void)?
     private var onPencilRequestsPassiveMode: (() -> Void)?
     private var activePencilPoints: [StrokePoint] = []
+    private var pencilAccumulator = PencilStrokeAccumulator()
     private var activePencilStyle: CanvasStrokeStyle?
     private var activePencilLayer: CAShapeLayer?
     private var completedPencilLayers: [String: CAShapeLayer] = [:]
     private var completedPencilStrokes: [String: UserStroke] = [:]
     private var completedPencilOrder: [String] = []
+    private var recentlyCommittedPencilStroke: UserStroke?
     private var canonicalPencilLayers: [String: CAShapeLayer] = [:]
     private var canonicalStrokeObjects: [String: CanvasObject] = [:]
     private var canonicalStrokeOrder: [String] = []
     private var configuredGraphID: String?
     private var rejectsCurrentPencilSequence = false
+    #if DEBUG
+    private let pencilRawMonitor = PencilRawEventMonitor(owner: "GraphProviderContainerView")
+    #endif
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1009,7 +1253,27 @@ final class GraphProviderContainerView: UIView {
         pencilRecognizer.cancelsTouchesInView = true
         pencilRecognizer.delaysTouchesBegan = false
         pencilRecognizer.requiresExclusiveTouchType = true
+        pencilRecognizer.estimatedCorrectionHandler = { [weak self] corrections in
+            self?.applyLateEstimatedCorrections(corrections)
+        }
         addGestureRecognizer(pencilRecognizer)
+        pencilHoverLayer.fillColor = UIColor.clear.cgColor
+        pencilHoverLayer.strokeColor = UIColor.label.withAlphaComponent(0.62).cgColor
+        pencilHoverLayer.lineWidth = 1
+        pencilHoverLayer.zPosition = 11_000
+        pencilHoverLayer.isHidden = true
+        layer.addSublayer(pencilHoverLayer)
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(handlePencilHover(_:)))
+        hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        hover.cancelsTouchesInView = false
+        addGestureRecognizer(hover)
+        #if DEBUG
+        pencilRecognizer.rawMonitor = pencilRawMonitor
+        // Graph lifecycle tests intentionally require the provider container
+        // to have no extra subviews. Keep this canvas-like responder visible
+        // in the shared PENCIL_RAW console stream without adding an overlay.
+        pencilRawMonitor.setContext(tool: "graph-annotation", state: "IDLE")
+        #endif
     }
 
     required init?(coder: NSCoder) {
@@ -1019,12 +1283,14 @@ final class GraphProviderContainerView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         subviews.forEach { $0.frame = bounds }
+        pencilHoverLayer.frame = bounds
         renderPencilLayers()
         session?.hostDidLayout(bounds)
     }
 
     func configure(graph: GraphObject, pencilAnnotationEnabled: Bool,
                    pencilStyle: CanvasStrokeStyle,
+                   pencilPreferences: PencilPreferences = .defaults,
                    canonicalStrokeObjects: [CanvasObject],
                    onPencilStroke: @escaping (UserStroke) -> Void,
                    onPencilRequestsPassiveMode: @escaping () -> Void) {
@@ -1034,6 +1300,7 @@ final class GraphProviderContainerView: UIView {
             completedPencilLayers.removeAll(keepingCapacity: false)
             completedPencilStrokes.removeAll(keepingCapacity: false)
             completedPencilOrder.removeAll(keepingCapacity: false)
+            recentlyCommittedPencilStroke = nil
             canonicalPencilLayers.values.forEach { $0.removeFromSuperlayer() }
             canonicalPencilLayers.removeAll(keepingCapacity: false)
             self.canonicalStrokeObjects.removeAll(keepingCapacity: false)
@@ -1078,9 +1345,61 @@ final class GraphProviderContainerView: UIView {
         self.graph = graph
         self.pencilAnnotationEnabled = pencilAnnotationEnabled
         self.pencilStyle = pencilStyle
+        self.pencilPreferences = pencilPreferences
         self.onPencilStroke = onPencilStroke
         self.onPencilRequestsPassiveMode = onPencilRequestsPassiveMode
+        #if DEBUG
+        pencilRawMonitor.setContext(
+            tool: pencilAnnotationEnabled ? "graph-annotation" : "graph-passive-request",
+            state: activePencilPoints.isEmpty ? "IDLE" : "DRAWING"
+        )
+        #endif
         renderPencilLayers()
+    }
+
+    @objc private func handlePencilHover(_ recognizer: UIHoverGestureRecognizer) {
+        #if DEBUG
+        pencilRawMonitor.recordHover(recognizer, in: self)
+        #endif
+        let showsPreview: Bool
+        switch pencilPreferences.hover {
+        case .off: showsPreview = false
+        case .on: showsPreview = true
+        case .followSystem:
+            if #available(iOS 17.5, *) { showsPreview = UIPencilInteraction.prefersHoverToolPreview }
+            else { showsPreview = true }
+        }
+        guard showsPreview, recognizer.state == .began || recognizer.state == .changed else {
+            pencilHoverLayer.path = nil
+            pencilHoverLayer.isHidden = true
+            return
+        }
+        let point = recognizer.location(in: self)
+        let path = UIBezierPath()
+        if pencilTool(for: pencilStyle) == .marker {
+            let roll: CGFloat?
+            if #available(iOS 17.5, *) { roll = recognizer.rollAngle } else { roll = nil }
+            let nib = PencilNibGeometry.marker(baseWidth: CGFloat(pencilStyle.width),
+                                               pressure: nil,
+                                               altitude: recognizer.altitudeAngle,
+                                               azimuth: recognizer.azimuthAngle(in: self),
+                                               roll: roll)
+            let stamp = UIBezierPath(ovalIn: CGRect(x: -nib.majorAxis / 2,
+                                                    y: -nib.minorAxis / 2,
+                                                    width: nib.majorAxis,
+                                                    height: nib.minorAxis))
+            var transform = CGAffineTransform(rotationAngle: nib.orientation)
+            transform = transform.concatenating(
+                CGAffineTransform(translationX: point.x, y: point.y)
+            )
+            stamp.apply(transform); path.append(stamp)
+        } else {
+            let radius = max(2.5, CGFloat(pencilStyle.width) / 2)
+            path.append(UIBezierPath(ovalIn: CGRect(x: point.x - radius, y: point.y - radius,
+                                                    width: radius * 2, height: radius * 2)))
+        }
+        pencilHoverLayer.path = path.cgPath
+        pencilHoverLayer.isHidden = false
     }
 
     func install(_ providerView: UIView) {
@@ -1126,29 +1445,25 @@ final class GraphProviderContainerView: UIView {
         }
         switch recognizer.state {
         case .began:
+            recentlyCommittedPencilStroke = nil
             activePencilPoints.removeAll(keepingCapacity: true)
+            pencilAccumulator.reset()
             activePencilStyle = pencilStyle
             let strokeLayer = CAShapeLayer()
             strokeLayer.frame = bounds
-            strokeLayer.fillColor = UIColor.clear.cgColor
-            strokeLayer.strokeColor = UIColor(svgHex: pencilStyle.colorHex)
+            strokeLayer.fillColor = UIColor(svgHex: pencilStyle.colorHex)
                 .withAlphaComponent(pencilStyle.opacity).cgColor
-            let xScale = bounds.width / CGFloat(max(graph.frame.width, 0.001))
-            let yScale = bounds.height / CGFloat(max(graph.frame.height, 0.001))
-            strokeLayer.lineWidth = CGFloat(pencilStyle.width) * min(xScale, yScale)
-            strokeLayer.lineCap = .round
-            strokeLayer.lineJoin = .round
             strokeLayer.zPosition = 10_000
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             layer.addSublayer(strokeLayer)
             CATransaction.commit()
             activePencilLayer = strokeLayer
-            appendPencilSamples(recognizer.samples, graph: graph)
+            consumePencilSamples(recognizer, graph: graph)
         case .changed:
-            appendPencilSamples(recognizer.samples, graph: graph)
+            consumePencilSamples(recognizer, graph: graph)
         case .ended:
-            appendPencilSamples(recognizer.samples, graph: graph)
+            consumePencilSamples(recognizer, graph: graph)
             finalizeActivePencilStroke()
         case .cancelled, .failed:
             cancelPencilStroke()
@@ -1157,14 +1472,42 @@ final class GraphProviderContainerView: UIView {
         }
     }
 
-    private func appendPencilSamples(_ samples: [GraphPencilSample], graph: GraphObject) {
-        for sample in samples {
-            guard sample.point.x.isFinite, sample.point.y.isFinite else { continue }
-            activePencilPoints.append(GraphPencilCoordinateMapper.strokePoint(
+    private func consumePencilSamples(_ recognizer: GraphPencilStrokeRecognizer,
+                                      graph: GraphObject) {
+        let confirmed = recognizer.samples.compactMap { sample -> StrokePoint? in
+            guard sample.point.x.isFinite, sample.point.y.isFinite else { return nil }
+            return GraphPencilCoordinateMapper.strokePoint(
                 localPoint: sample.point, in: bounds, graphFrame: graph.frame,
-                pressure: sample.pressure
-            ))
+                pressure: sample.pressure, altitude: sample.altitude,
+                azimuth: sample.azimuth, roll: sample.roll,
+                timestamp: sample.timestamp,
+                estimationUpdateIndex: sample.estimationUpdateIndex
+            )
         }
+        pencilAccumulator.appendConfirmed(confirmed)
+        let corrections = recognizer.estimatedCorrections.compactMap { sample -> StrokePoint? in
+            guard sample.point.x.isFinite, sample.point.y.isFinite else { return nil }
+            return GraphPencilCoordinateMapper.strokePoint(
+                localPoint: sample.point, in: bounds, graphFrame: graph.frame,
+                pressure: sample.pressure, altitude: sample.altitude,
+                azimuth: sample.azimuth, roll: sample.roll,
+                timestamp: sample.timestamp,
+                estimationUpdateIndex: sample.estimationUpdateIndex
+            )
+        }
+        pencilAccumulator.replaceEstimated(corrections)
+        let predicted = recognizer.predictedSamples.compactMap { sample -> StrokePoint? in
+            guard sample.point.x.isFinite, sample.point.y.isFinite else { return nil }
+            return GraphPencilCoordinateMapper.strokePoint(
+                localPoint: sample.point, in: bounds, graphFrame: graph.frame,
+                pressure: sample.pressure, altitude: sample.altitude,
+                azimuth: sample.azimuth, roll: sample.roll,
+                timestamp: sample.timestamp,
+                estimationUpdateIndex: sample.estimationUpdateIndex
+            )
+        }
+        pencilAccumulator.setPredicted(predicted)
+        activePencilPoints = pencilAccumulator.canonicalPoints
         renderActivePencilLayer()
     }
 
@@ -1172,6 +1515,7 @@ final class GraphProviderContainerView: UIView {
         activePencilLayer?.removeFromSuperlayer()
         activePencilLayer = nil
         activePencilPoints.removeAll(keepingCapacity: true)
+        pencilAccumulator.reset()
         activePencilStyle = nil
     }
 
@@ -1188,12 +1532,14 @@ final class GraphProviderContainerView: UIView {
         let strokeLayer = activePencilLayer
         activePencilLayer = nil
         activePencilPoints.removeAll(keepingCapacity: true)
+        pencilAccumulator.reset()
         activePencilStyle = nil
         let finalized = UserStroke(
             id: "stroke-" + UUID().uuidString.lowercased(),
             color: style.colorHex, width: style.width, opacity: style.opacity,
-            points: points
+            points: points, pencilTool: pencilTool(for: style)
         )
+        recentlyCommittedPencilStroke = finalized
         if let strokeLayer {
             strokeLayer.name = "graph-pencil:\(finalized.id)"
             completedPencilLayers[finalized.id] = strokeLayer
@@ -1201,6 +1547,29 @@ final class GraphProviderContainerView: UIView {
             completedPencilOrder.append(finalized.id)
         }
         onPencilStroke?(finalized)
+    }
+
+    private func applyLateEstimatedCorrections(_ samples: [GraphPencilSample]) {
+        guard let graph, let recent = recentlyCommittedPencilStroke else { return }
+        let corrections = samples.compactMap { sample -> StrokePoint? in
+            guard sample.point.x.isFinite, sample.point.y.isFinite else { return nil }
+            return GraphPencilCoordinateMapper.strokePoint(
+                localPoint: sample.point, in: bounds, graphFrame: graph.frame,
+                pressure: sample.pressure, altitude: sample.altitude,
+                azimuth: sample.azimuth, roll: sample.roll,
+                timestamp: sample.timestamp,
+                estimationUpdateIndex: sample.estimationUpdateIndex
+            )
+        }
+        guard let corrected = PencilStrokeCorrection.applying(corrections, to: recent) else {
+            return
+        }
+        recentlyCommittedPencilStroke = corrected
+        if completedPencilStrokes[corrected.id] != nil {
+            completedPencilStrokes[corrected.id] = corrected
+            renderPencilLayers()
+        }
+        onPencilStroke?(corrected)
     }
 
     private func renderPencilLayers() {
@@ -1227,7 +1596,8 @@ final class GraphProviderContainerView: UIView {
         let style = activePencilStyle ?? pencilStyle
         let stroke = UserStroke(
             id: "live", color: style.colorHex, width: style.width,
-            opacity: style.opacity, points: activePencilPoints
+            opacity: style.opacity, points: pencilAccumulator.livePoints,
+            pencilTool: pencilTool(for: style)
         )
         configure(activePencilLayer, for: stroke, graph: graph)
     }
@@ -1235,17 +1605,21 @@ final class GraphProviderContainerView: UIView {
     private func configure(_ strokeLayer: CAShapeLayer, for stroke: UserStroke,
                            graph: GraphObject) {
         strokeLayer.frame = bounds
-        strokeLayer.strokeColor = UIColor(svgHex: stroke.color)
-            .withAlphaComponent(stroke.opacity).cgColor
+        let color = UIColor(svgHex: stroke.color).withAlphaComponent(stroke.opacity).cgColor
         let xScale = bounds.width / CGFloat(max(graph.frame.width, 0.001))
         let yScale = bounds.height / CGFloat(max(graph.frame.height, 0.001))
-        strokeLayer.lineWidth = CGFloat(stroke.width) * min(xScale, yScale)
+        let renderScale = min(xScale, yScale)
         let path = UIBezierPath()
-        let localPoints = stroke.points.map {
-            GraphPencilCoordinateMapper.localPoint(
-                strokePoint: $0, in: bounds, graphFrame: graph.frame
+        let localSamples = stroke.points.map { sample -> StrokePoint in
+            let point = GraphPencilCoordinateMapper.localPoint(
+                strokePoint: sample, in: bounds, graphFrame: graph.frame
             )
+            return StrokePoint(x: point.x, y: point.y, pressure: sample.pressure,
+                               altitude: sample.altitude, azimuth: sample.azimuth,
+                               roll: sample.roll, timestamp: sample.timestamp,
+                               estimationUpdateIndex: sample.estimationUpdateIndex)
         }
+        let localPoints = localSamples.map { CGPoint(x: $0.x, y: $0.y) }
         if let first = localPoints.first {
             path.move(to: first)
             if localPoints.count == 1 {
@@ -1256,7 +1630,20 @@ final class GraphProviderContainerView: UIView {
         }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        strokeLayer.path = path.cgPath
+        if let pencilTool = stroke.pencilTool {
+            strokeLayer.path = PencilStrokeGeometry.path(points: localSamples,
+                                                         tool: pencilTool,
+                                                         baseWidth: CGFloat(stroke.width) * renderScale)
+            strokeLayer.fillColor = color
+            strokeLayer.strokeColor = nil
+        } else {
+            strokeLayer.path = path.cgPath
+            strokeLayer.fillColor = UIColor.clear.cgColor
+            strokeLayer.strokeColor = color
+            strokeLayer.lineWidth = CGFloat(stroke.width) * renderScale
+            strokeLayer.lineCap = .round
+            strokeLayer.lineJoin = .round
+        }
         CATransaction.commit()
     }
 
@@ -1269,7 +1656,9 @@ final class GraphProviderContainerView: UIView {
             StrokePoint(
                 x: $0.x * scaleX + translation.x,
                 y: $0.y * scaleY + translation.y,
-                pressure: $0.pressure
+                pressure: $0.pressure, altitude: $0.altitude, azimuth: $0.azimuth,
+                roll: $0.roll, timestamp: $0.timestamp,
+                estimationUpdateIndex: $0.estimationUpdateIndex
             )
         }
         configure(
@@ -1277,7 +1666,8 @@ final class GraphProviderContainerView: UIView {
             for: UserStroke(
                 id: object.id, color: object.color ?? "#183153",
                 width: (object.width ?? 4) * sqrt(abs(scaleX * scaleY)),
-                opacity: object.opacity ?? 1, points: points
+                opacity: object.opacity ?? 1, points: points,
+                pencilTool: object.pencilTool
             ),
             graph: graph
         )
@@ -1293,17 +1683,26 @@ final class GraphProviderContainerView: UIView {
         strokeLayer.zPosition = zPosition
         return strokeLayer
     }
+
+    private func pencilTool(for style: CanvasStrokeStyle) -> PencilStrokeTool {
+        style.opacity < 0.95 ? .marker : .pen
+    }
 }
 
 enum GraphPencilCoordinateMapper {
     static func strokePoint(localPoint: CGPoint, in bounds: CGRect,
-                            graphFrame: GraphFrame, pressure: Double) -> StrokePoint {
+                            graphFrame: GraphFrame, pressure: Double?,
+                            altitude: Double? = nil, azimuth: Double? = nil,
+                            roll: Double? = nil, timestamp: Double? = nil,
+                            estimationUpdateIndex: Int? = nil) -> StrokePoint {
         let width = max(bounds.width, 0.001)
         let height = max(bounds.height, 0.001)
         return StrokePoint(
             x: graphFrame.x + Double((localPoint.x - bounds.minX) / width) * graphFrame.width,
             y: graphFrame.y + Double((localPoint.y - bounds.minY) / height) * graphFrame.height,
-            pressure: min(1, max(0, pressure.isFinite ? pressure : 1))
+            pressure: pressure.map { min(1, max(0, $0.isFinite ? $0 : 0)) },
+            altitude: altitude, azimuth: azimuth, roll: roll, timestamp: timestamp,
+            estimationUpdateIndex: estimationUpdateIndex
         )
     }
 
@@ -1318,7 +1717,12 @@ enum GraphPencilCoordinateMapper {
 
 private struct GraphPencilSample {
     let point: CGPoint
-    let pressure: Double
+    let pressure: Double?
+    let altitude: Double?
+    let azimuth: Double?
+    let roll: Double?
+    let timestamp: Double
+    let estimationUpdateIndex: Int?
 }
 
 /// An ancestor recognizer sees Pencil events whose hit-tested descendant is
@@ -1327,19 +1731,41 @@ private struct GraphPencilSample {
 /// stay in V-Board's canonical `UserStroke` pipeline.
 private final class GraphPencilStrokeRecognizer: UIGestureRecognizer {
     private(set) var samples: [GraphPencilSample] = []
+    private(set) var predictedSamples: [GraphPencilSample] = []
+    private(set) var estimatedCorrections: [GraphPencilSample] = []
+    var estimatedCorrectionHandler: (([GraphPencilSample]) -> Void)?
+    #if DEBUG
+    weak var rawMonitor: PencilRawEventMonitor?
+    #endif
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         guard let touch = touches.first, touch.type == .pencil else {
             state = .failed
             return
         }
+        #if DEBUG
+        if let view {
+            rawMonitor?.recordTouch("BEGIN", touch: touch, event: event, in: view,
+                                    tool: "graph-annotation", state: "IDLE")
+        }
+        #endif
         samples = mappedSamples(for: touch, event: event)
+        predictedSamples = []
+        estimatedCorrections = []
         state = .began
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
         guard let touch = touches.first, touch.type == .pencil else { return }
+        #if DEBUG
+        if let view {
+            rawMonitor?.recordTouch("MOVE", touch: touch, event: event, in: view,
+                                    tool: "graph-annotation", state: "DRAWING")
+        }
+        #endif
         samples = mappedSamples(for: touch, event: event)
+        predictedSamples = (event.predictedTouches(for: touch) ?? []).map(mappedSample(for:))
+        estimatedCorrections = []
         state = .changed
     }
 
@@ -1348,31 +1774,66 @@ private final class GraphPencilStrokeRecognizer: UIGestureRecognizer {
             state = .cancelled
             return
         }
+        #if DEBUG
+        if let view {
+            rawMonitor?.recordTouch("END", touch: touch, event: event, in: view,
+                                    tool: "graph-annotation", state: "DRAWING")
+        }
+        #endif
         samples = mappedSamples(for: touch, event: event)
+        predictedSamples = []
+        estimatedCorrections = []
         state = .ended
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        #if DEBUG
+        if let touch = touches.first, let view {
+            rawMonitor?.recordTouch("CANCEL", touch: touch, event: event, in: view,
+                                    tool: "graph-annotation", state: "DRAWING")
+        }
+        #endif
         samples = []
+        predictedSamples = []
+        estimatedCorrections = []
         state = .cancelled
+    }
+
+    override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
+        #if DEBUG
+        if let view { rawMonitor?.recordEstimatedUpdates(touches, in: view) }
+        #endif
+        estimatedCorrections = touches.filter { $0.type == .pencil }.map(mappedSample(for:))
+        estimatedCorrectionHandler?(estimatedCorrections)
+        samples = []
+        predictedSamples = []
+        if state == .began || state == .changed { state = .changed }
+        super.touchesEstimatedPropertiesUpdated(touches)
     }
 
     override func reset() {
         super.reset()
         samples = []
+        predictedSamples = []
+        estimatedCorrections = []
     }
 
     private func mappedSamples(for touch: UITouch, event: UIEvent) -> [GraphPencilSample] {
         let source = event.coalescedTouches(for: touch) ?? [touch]
-        return source.map { sample in
-            let pressure: Double
-            if sample.maximumPossibleForce > 0 {
-                pressure = Double(min(1, max(0, sample.force / sample.maximumPossibleForce)))
-            } else {
-                pressure = 1
-            }
-            return GraphPencilSample(point: sample.location(in: view), pressure: pressure)
-        }
+        return source.map(mappedSample(for:))
+    }
+
+    private func mappedSample(for sample: UITouch) -> GraphPencilSample {
+        let pressure = PencilPressureResponse.normalized(force: sample.force,
+                                                         maximum: sample.maximumPossibleForce)
+        let roll: CGFloat?
+        if #available(iOS 17.5, *) { roll = sample.rollAngle } else { roll = nil }
+        return GraphPencilSample(point: sample.preciseLocation(in: view),
+                                 pressure: pressure.map { Double($0) },
+                                 altitude: Double(sample.altitudeAngle),
+                                 azimuth: Double(sample.azimuthAngle(in: view)),
+                                 roll: roll.map { Double($0) }, timestamp: sample.timestamp,
+                                 estimationUpdateIndex: sample.estimationUpdateIndex?.intValue)
     }
 }
 
@@ -1383,6 +1844,7 @@ private struct GraphProviderHost: UIViewRepresentable {
     let canonicalStrokeObjects: [CanvasObject]
     let pencilAnnotationEnabled: Bool
     let pencilStyle: CanvasStrokeStyle
+    let pencilPreferences: PencilPreferences
     let onPencilStroke: (UserStroke) -> Void
     let onPencilRequestsPassiveMode: () -> Void
 
@@ -1391,6 +1853,7 @@ private struct GraphProviderHost: UIViewRepresentable {
         view.session = session
         view.configure(graph: graph, pencilAnnotationEnabled: pencilAnnotationEnabled,
                        pencilStyle: pencilStyle,
+                       pencilPreferences: pencilPreferences,
                        canonicalStrokeObjects: canonicalStrokeObjects,
                        onPencilStroke: onPencilStroke,
                        onPencilRequestsPassiveMode: onPencilRequestsPassiveMode)
@@ -1402,6 +1865,7 @@ private struct GraphProviderHost: UIViewRepresentable {
         uiView.session = session
         uiView.configure(graph: graph, pencilAnnotationEnabled: pencilAnnotationEnabled,
                          pencilStyle: pencilStyle,
+                         pencilPreferences: pencilPreferences,
                          canonicalStrokeObjects: canonicalStrokeObjects,
                          onPencilStroke: onPencilStroke,
                          onPencilRequestsPassiveMode: onPencilRequestsPassiveMode)

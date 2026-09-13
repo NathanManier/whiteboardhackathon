@@ -1040,7 +1040,7 @@ def finite_number(
     return round(number, 4)
 
 
-def validate_world_point(value: Any, label: str) -> dict[str, float]:
+def validate_world_point(value: Any, label: str) -> dict[str, float | int]:
     if isinstance(value, dict):
         x_value, y_value = value.get("x"), value.get("y")
     elif isinstance(value, (list, tuple)) and len(value) == 2:
@@ -1065,10 +1065,38 @@ def validate_world_point(value: Any, label: str) -> dict[str, float]:
         pressure = value.get("p", value.get("pressure"))
         if pressure is not None and pressure != "":
             point["p"] = finite_number(pressure, f"{label}.p", minimum=0, maximum=1)
+        optional_angles = (
+            ("alt", "altitude", 0, float(np.pi / 2)),
+            ("azi", "azimuth", -float(np.pi * 4), float(np.pi * 4)),
+            ("r", "roll", -float(np.pi * 4), float(np.pi * 4)),
+        )
+        for compact, verbose, minimum, maximum in optional_angles:
+            raw = value.get(compact, value.get(verbose))
+            if raw is not None and raw != "":
+                point[compact] = finite_number(
+                    raw, f"{label}.{compact}", minimum=minimum, maximum=maximum
+                )
+        timestamp = value.get("t", value.get("timestamp"))
+        if timestamp is not None and timestamp != "":
+            point["t"] = finite_number(timestamp, f"{label}.t", minimum=0)
+        estimation_index = value.get(
+            "ei", value.get("estimation_update_index", value.get("estimationUpdateIndex"))
+        )
+        if estimation_index is not None and estimation_index != "":
+            if isinstance(estimation_index, bool):
+                raise ValueError(f"{label}.ei must be an integer.")
+            numeric_index = finite_number(
+                estimation_index, f"{label}.ei", minimum=0, maximum=2_147_483_647
+            )
+            if not numeric_index.is_integer():
+                raise ValueError(f"{label}.ei must be an integer.")
+            point["ei"] = int(numeric_index)
     return point
 
 
-def validate_point_list(value: Any, label: str, maximum: int) -> list[dict[str, float]]:
+def validate_point_list(
+    value: Any, label: str, maximum: int
+) -> list[dict[str, float | int]]:
     if not isinstance(value, list) or not 1 <= len(value) <= maximum:
         raise ValueError(f"{label} has an invalid point count.")
     return [
@@ -1826,6 +1854,11 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
                 ),
                 "erasures": erasures,
             }
+        pencil_tool = item.get("pencil_tool", item.get("pencilTool"))
+        if pencil_tool is not None:
+            if pencil_tool not in {"pen", "marker"}:
+                raise ValueError(f"Object {index}.pencil_tool is invalid.")
+            clean_stroke["pencil_tool"] = pencil_tool
         attach_object_source_fields(clean_stroke, item)
         clean_objects.append(clean_stroke)
     if board_id is not None:

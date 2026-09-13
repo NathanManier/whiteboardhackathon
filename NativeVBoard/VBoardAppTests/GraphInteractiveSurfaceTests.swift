@@ -3,6 +3,16 @@ import XCTest
 import UIKit
 @testable import VBoardApp
 
+private extension GraphProviderDeadlines {
+    static let test = GraphProviderDeadlines(
+        transitionNanoseconds: 40_000_000,
+        preemptionNanoseconds: 30_000_000,
+        mountNanoseconds: 40_000_000,
+        updateNanoseconds: 40_000_000,
+        activationNanoseconds: 40_000_000
+    )
+}
+
 @MainActor
 final class GraphInteractiveSurfaceTests: XCTestCase {
     private final class ProviderStub: GraphResizableRendererProvider {
@@ -69,6 +79,54 @@ final class GraphInteractiveSurfaceTests: XCTestCase {
         func unmount() {
             unmountCount += 1
             view.removeFromSuperview()
+        }
+    }
+
+    /// Deliberately violates cooperative cancellation to reproduce the class
+    /// of third-party provider failure that previously held the UI forever.
+    private final class NeverReturningProvider: GraphRendererProvider {
+        enum HangPoint { case mount, activation }
+
+        let identifier = "never-returning-stub"
+        let isAvailable = true
+        let view = UIView()
+        let hangPoint: HangPoint
+        private(set) var mountCount = 0
+        private(set) var activationCount = 0
+        private(set) var unmountCount = 0
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        init(hangPoint: HangPoint) { self.hangPoint = hangPoint }
+
+        func mount(graph: GraphObject, in frame: CGRect) async throws {
+            mountCount += 1
+            view.frame = frame
+            if hangPoint == .mount {
+                await withCheckedContinuation { continuation = $0 }
+            }
+        }
+
+        func update(graph: GraphObject) async throws { }
+
+        func setInteractive(_ interactive: Bool) async throws {
+            guard interactive else { return }
+            activationCount += 1
+            if hangPoint == .activation {
+                await withCheckedContinuation { continuation = $0 }
+            }
+        }
+
+        func readViewport() async -> GraphViewport? { .conventional }
+        func captureSnapshot() async throws -> UIImage { UIImage() }
+
+        func unmount() {
+            unmountCount += 1
+            view.removeFromSuperview()
+        }
+
+        func completeLate() {
+            continuation?.resume()
+            continuation = nil
         }
     }
 
@@ -145,6 +203,7 @@ final class GraphInteractiveSurfaceTests: XCTestCase {
         let host = host()
 
         await session.promoteNow(in: host)
+        provider.viewport = finalViewport
         XCTAssertEqual(session.representationState, .interactive)
         XCTAssertEqual(coordinator.activeProviderCount, 1)
         XCTAssertEqual(provider.mountCount, 1)
@@ -227,7 +286,7 @@ final class GraphInteractiveSurfaceTests: XCTestCase {
         XCTAssertEqual(session.representationState, .interactive)
         XCTAssertEqual(session.displayGraph, updated)
         XCTAssertEqual(provider.viewport, finalViewport)
-        XCTAssertEqual(provider.updateCount, 1)
+        XCTAssertEqual(provider.updateCount, 2)
     }
 
     func testActivatingSecondSessionDemotesFirstAndCommitsItsViewport() async {
@@ -246,6 +305,7 @@ final class GraphInteractiveSurfaceTests: XCTestCase {
         ) { secondProvider }
 
         await firstSession.promoteNow(in: host())
+        firstProvider.viewport = firstViewport
         await secondSession.promoteNow(in: host())
 
         XCTAssertEqual(firstSession.representationState, .proxy)
@@ -279,7 +339,7 @@ final class GraphInteractiveSurfaceTests: XCTestCase {
 
         XCTAssertEqual(session.displayGraph.viewport, expected)
         XCTAssertEqual(provider.viewport, expected)
-        XCTAssertEqual(provider.updateCount, 1)
+        XCTAssertEqual(provider.updateCount, 2)
     }
 
     func testRapidSameIdentityUpdatesAreSerializedAndLatestStateWins() async throws {
@@ -305,7 +365,7 @@ final class GraphInteractiveSurfaceTests: XCTestCase {
         XCTAssertEqual(provider.updatedGraphs.last, latest)
         XCTAssertEqual(provider.viewport, latest.viewport)
         XCTAssertEqual(provider.maximumConcurrentUpdates, 1)
-        XCTAssertLessThanOrEqual(provider.updateCount, 2)
+        XCTAssertLessThanOrEqual(provider.updateCount, 3)
     }
 
     func testResetViewImmediatelyFollowedByDoneKeepsCanonicalResetViewport() async {
@@ -334,6 +394,8 @@ final class GraphInteractiveSurfaceTests: XCTestCase {
         XCTAssertNil(DesmosConfiguration(apiKey: nil).apiKey)
         XCTAssertNil(DesmosConfiguration(apiKey: "placeholder-key").apiKey)
         XCTAssertNil(DesmosConfiguration(apiKey: "$(VBOARD_DESMOS_API_KEY)").apiKey)
+        XCTAssertNil(DesmosConfiguration(apiKey: "12345678").apiKey)
+        XCTAssertNil(DesmosConfiguration(apiKey: "secret key").apiKey)
 
         let configured = DesmosConfiguration(apiKey: "issued-key-123")
         XCTAssertEqual(configured.scriptURL?.path, "/api/v1.12/calculator.js")
@@ -343,6 +405,167 @@ final class GraphInteractiveSurfaceTests: XCTestCase {
         XCTAssertEqual(components.queryItems,
                        [URLQueryItem(name: "apiKey", value: "issued-key-123")])
         XCTAssertEqual(DesmosConfiguration.stableAPIVersion, "v1.12")
+    }
+
+    func testNeverReturningMountFailsWithinDeadlineAndCannotAutoRetry() async {
+        let provider = NeverReturningProvider(hangPoint: .mount)
+        var factoryCount = 0
+        let coordinator = GraphProviderCoordinator(deadlines: .test)
+        let session = GraphInteractiveSession(graph: graph(), coordinator: coordinator) {
+            factoryCount += 1
+            return provider
+        }
+        let host = host()
+        let startedAt = CACurrentMediaTime()
+
+        await session.promoteNow(in: host)
+        let elapsed = CACurrentMediaTime() - startedAt
+        for _ in 0..<5 {
+            session.hostDidLayout(host.bounds)
+            await Task.yield()
+        }
+
+        XCTAssertLessThan(elapsed, 0.5)
+        XCTAssertEqual(session.representationState, .failed)
+        XCTAssertEqual(session.promotionStage, .failed)
+        XCTAssertEqual(session.providerError, "Interactive graph couldn’t open.")
+        XCTAssertEqual(factoryCount, 1, "layout must not restart a failed promotion")
+        XCTAssertEqual(coordinator.activeProviderCount, 0)
+        XCTAssertFalse(session.hasLiveProviderView)
+        XCTAssertTrue(host.subviews.isEmpty)
+        XCTAssertEqual(provider.unmountCount, 1)
+        provider.completeLate()
+        await Task.yield()
+        XCTAssertEqual(session.representationState, .failed)
+        XCTAssertEqual(coordinator.activeProviderCount, 0)
+        XCTAssertEqual(provider.unmountCount, 1)
+    }
+
+    func testNeverReturningActivationFailsWithinDeadline() async {
+        let provider = NeverReturningProvider(hangPoint: .activation)
+        let coordinator = GraphProviderCoordinator(deadlines: .test)
+        let session = GraphInteractiveSession(graph: graph(), coordinator: coordinator) {
+            provider
+        }
+
+        await session.promoteNow(in: host())
+
+        XCTAssertEqual(provider.mountCount, 1)
+        XCTAssertEqual(provider.activationCount, 1)
+        XCTAssertEqual(session.representationState, .failed)
+        XCTAssertEqual(coordinator.activeProviderCount, 0)
+        XCTAssertEqual(provider.unmountCount, 1)
+        provider.completeLate()
+        await Task.yield()
+        XCTAssertEqual(session.representationState, .failed)
+    }
+
+    func testCancellationIgnoringMountCanBeDismissedPromptlyAndFinishesAsProxy() async {
+        let provider = NeverReturningProvider(hangPoint: .mount)
+        let coordinator = GraphProviderCoordinator(deadlines: .test)
+        let session = GraphInteractiveSession(graph: graph(), coordinator: coordinator) {
+            provider
+        }
+        let host = host()
+        let promotion = Task { @MainActor in await session.promoteNow(in: host) }
+        for _ in 0..<100 where provider.mountCount == 0 { await Task.yield() }
+        let startedAt = CACurrentMediaTime()
+
+        _ = await session.demote(reason: .done)
+        let elapsed = CACurrentMediaTime() - startedAt
+
+        XCTAssertLessThan(elapsed, 0.5)
+        XCTAssertEqual(session.representationState, .proxy)
+        XCTAssertEqual(coordinator.activeProviderCount, 0)
+        XCTAssertTrue(host.subviews.isEmpty)
+        XCTAssertEqual(provider.unmountCount, 1,
+                       "bounded demotion must finalize the provider once")
+        provider.completeLate()
+        await promotion.value
+        XCTAssertEqual(session.representationState, .proxy)
+        XCTAssertEqual(coordinator.activeProviderCount, 0)
+        XCTAssertEqual(provider.unmountCount, 1)
+    }
+
+    func testRetryUsesNewGenerationAndIgnoresLateFailedProviderCompletion() async {
+        let failedProvider = NeverReturningProvider(hangPoint: .mount)
+        let recoveredProvider = ProviderStub(identifier: "recovered")
+        var providers: [GraphRendererProvider] = [failedProvider, recoveredProvider]
+        let coordinator = GraphProviderCoordinator(deadlines: .test)
+        let session = GraphInteractiveSession(graph: graph(), coordinator: coordinator) {
+            providers.removeFirst()
+        }
+        let host = host()
+
+        await session.promoteNow(in: host)
+        let failedGeneration = session.promotionGeneration
+        XCTAssertEqual(session.representationState, .failed)
+
+        session.retryInteractivePresentation()
+        for _ in 0..<100 where session.representationState != .interactive {
+            await Task.yield()
+        }
+        XCTAssertEqual(session.representationState, .interactive)
+        XCTAssertGreaterThan(session.promotionGeneration, failedGeneration)
+        XCTAssertTrue(coordinator.activeProvider === recoveredProvider)
+
+        failedProvider.completeLate()
+        await Task.yield()
+        XCTAssertEqual(session.representationState, .interactive)
+        XCTAssertTrue(coordinator.activeProvider === recoveredProvider)
+        XCTAssertEqual(failedProvider.unmountCount, 1)
+        _ = await session.demote(reason: .done)
+    }
+
+    func testTwentyOpenCloseCyclesLeaveNoProviderOrMountedView() async {
+        var created: [ProviderStub] = []
+        let coordinator = GraphProviderCoordinator(deadlines: .test)
+        let session = GraphInteractiveSession(graph: graph(), coordinator: coordinator) {
+            let provider = ProviderStub(identifier: "cycle-\(created.count)")
+            created.append(provider)
+            return provider
+        }
+        let host = host()
+
+        for _ in 0..<20 {
+            await session.promoteNow(in: host)
+            XCTAssertEqual(session.representationState, .interactive)
+            XCTAssertEqual(coordinator.activeProviderCount, 1)
+            _ = await session.demote(reason: .done)
+            XCTAssertEqual(session.representationState, .proxy)
+            XCTAssertEqual(coordinator.activeProviderCount, 0)
+            XCTAssertTrue(host.subviews.isEmpty)
+        }
+
+        XCTAssertEqual(created.count, 20)
+        XCTAssertTrue(created.allSatisfy { $0.mountCount == 1 && $0.unmountCount == 1 })
+    }
+
+    func testConfiguredDesmosProviderIntegrationWhenExplicitlyRequested() async throws {
+        guard ProcessInfo.processInfo.environment["VBOARD_RUN_DESMOS_INTEGRATION"] == "1" else {
+            throw XCTSkip("Set VBOARD_RUN_DESMOS_INTEGRATION=1 for the networked provider check")
+        }
+        let configuration = DesmosConfiguration()
+        guard configuration.isConfigured else {
+            XCTFail("The explicit Desmos integration run requires a configured provider")
+            return
+        }
+        let provider = DesmosGraphRenderer(configuration: configuration)
+        let coordinator = GraphProviderCoordinator()
+        let session = GraphInteractiveSession(graph: graph(), coordinator: coordinator) {
+            provider
+        }
+        let host = host()
+
+        await session.promoteNow(in: host)
+
+        XCTAssertEqual(session.representationState, .interactive,
+                       "Provider stopped at stage \(session.promotionStage.rawValue)")
+        XCTAssertEqual(coordinator.activeProviderCount, 1)
+        XCTAssertTrue(session.hasLiveProviderView)
+        _ = await session.demote(reason: .done)
+        XCTAssertEqual(coordinator.activeProviderCount, 0)
+        XCTAssertTrue(host.subviews.isEmpty)
     }
 
     func testBridgeAcceptsOnlyExpectedGraphNonceAndFiniteViewport() {

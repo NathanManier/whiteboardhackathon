@@ -38,6 +38,13 @@ struct LectureWorkspaceView: View {
     @AppStorage("vboard.marker.color") private var markerColor = CanvasStrokeStyle.marker.colorHex
     @AppStorage("vboard.marker.width") private var markerWidth = CanvasStrokeStyle.marker.width
     @AppStorage("vboard.marker.opacity") private var markerOpacity = CanvasStrokeStyle.marker.opacity
+    @AppStorage("vboard.pencil.doubleTap") private var pencilDoubleTapRaw = PencilDoubleTapSetting.followSystem.rawValue
+    @AppStorage("vboard.pencil.squeeze") private var pencilSqueezeRaw = PencilSqueezeSetting.followSystem.rawValue
+    @AppStorage("vboard.pencil.hover") private var pencilHoverRaw = PencilHoverSetting.followSystem.rawValue
+    @AppStorage("vboard.developer.diagnostics") private var developerDiagnostics = false
+    #if DEBUG
+    @State private var showPencilValidation = false
+    #endif
 
     init(folder: LectureFolder, focusBoardID: String? = nil) {
         self.folder = folder
@@ -101,6 +108,15 @@ struct LectureWorkspaceView: View {
                         ForEach(WorkspaceBackgroundStyle.allCases) { style in Text(style.title).tag(style.rawValue) }
                     }
                     Toggle("Show Whiteboard Paper", isOn: $physicalBoardShowsPaper)
+                    PencilSettingsControls(doubleTapRaw: $pencilDoubleTapRaw,
+                                           squeezeRaw: $pencilSqueezeRaw,
+                                           hoverRaw: $pencilHoverRaw)
+                    #if DEBUG
+                    Toggle("Developer Diagnostics", isOn: $developerDiagnostics)
+                    Button { showPencilValidation = true } label: {
+                        Label("Apple Pencil Validation", systemImage: "pencil.and.scribble")
+                    }
+                    #endif
                     if activeBoard != nil {
                         Button(role: .destructive) { showDeleteBoard = true } label: { Label("Delete Whiteboard", systemImage: "trash") }
                     }
@@ -157,6 +173,9 @@ struct LectureWorkspaceView: View {
             }
         }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
+        #if DEBUG
+        .sheet(isPresented: $showPencilValidation) { PencilHardwareValidationView() }
+        #endif
         .alert("Delete class?", isPresented: $showDelete) {
             Button("Delete", role: .destructive) {
                 Task {
@@ -185,9 +204,7 @@ struct LectureWorkspaceView: View {
             if status == .conflict { showConflict = true }
         }
         .onChange(of: activeTool) { oldValue, newValue in
-            if newValue != .objectEraser && oldValue != newValue {
-                previousPencilTool = newValue
-            }
+            if oldValue != newValue && oldValue != .objectEraser { previousPencilTool = oldValue }
             if !GraphPencilInteractionPolicy.allowsAnnotation(for: newValue) {
                 interactiveGraph = nil
             }
@@ -263,6 +280,9 @@ struct LectureWorkspaceView: View {
                     physicalBoardShowsPaper: physicalBoardShowsPaper,
                     penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),
                     markerStyle: CanvasStrokeStyle(colorHex: markerColor, width: markerWidth, opacity: markerOpacity),
+                    pencilPreferences: pencilPreferences,
+                    isPencilPalettePresented: pencilQuickPalettePoint != nil,
+                    showsDeveloperDiagnostics: developerDiagnosticsIfAvailable,
                     thumbnailURLs: Dictionary(uniqueKeysWithValues: workspace.items.compactMap { item in
                         api.resolvedURL(item.thumbnailURL).map { (item.boardID, $0) }
                     }),
@@ -286,8 +306,9 @@ struct LectureWorkspaceView: View {
                     onMoveBoard: { boardID, delta in store.moveBoard(boardID: boardID, by: delta, api: api) },
                     onUndo: { store.undo(api: api) },
                     onRedo: { store.redo(api: api) },
-                    onPencilDoubleTap: { togglePencilEraser() },
-                    onPencilSqueeze: { point in showPencilQuickPalette(at: point) }
+                    onPencilAction: handlePencilAction,
+                    onPencilPaletteMoved: { pencilQuickPalettePoint = $0 },
+                    onPencilPaletteDismiss: { pencilQuickPalettePoint = nil }
                 )
                 .ignoresSafeArea(edges: .bottom)
 
@@ -315,6 +336,7 @@ struct LectureWorkspaceView: View {
                             ? CanvasStrokeStyle(colorHex: markerColor, width: markerWidth,
                                                 opacity: markerOpacity)
                             : CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),
+                        pencilPreferences: pencilPreferences,
                         onPencilStroke: {
                             store.applyStroke($0, boardID: graph.owningBoardID, api: api)
                         },
@@ -380,12 +402,25 @@ struct LectureWorkspaceView: View {
                 }
 
                 if let point = pencilQuickPalettePoint {
-                    PencilQuickPalette(activeTool: activeTool) { tool in
+                    let paletteSize = CGSize(width: 420, height: 56)
+                    let origin = PencilPalettePlacement.origin(
+                        anchor: point, paletteSize: paletteSize,
+                        safeBounds: CGRect(origin: .zero, size: proxy.size).insetBy(dx: 8, dy: 8)
+                    )
+                    PencilQuickPalette(activeTool: activeTool,
+                                       recentColors: [penColor, markerColor],
+                                       width: activeTool == .highlighter ? $markerWidth : $penWidth,
+                                       selectColor: { color in
+                                           if activeTool == .highlighter { markerColor = color }
+                                           else { penColor = color }
+                                       },
+                                       undo: { store.undo(api: api) },
+                                       redo: { store.redo(api: api) }) { tool in
                         activeTool = tool
                         pencilQuickPalettePoint = nil
                     }
-                    .position(x: min(max(point.x, 150), proxy.size.width - 150),
-                              y: min(max(point.y - 58, 42), proxy.size.height - 88))
+                    .position(x: origin.x + paletteSize.width / 2,
+                              y: origin.y + paletteSize.height / 2)
                     .transition(.opacity.combined(with: .scale(scale: 0.92)))
                     .zIndex(31)
                 }
@@ -405,6 +440,14 @@ struct LectureWorkspaceView: View {
             .onAppear { canvasSize = proxy.size }
             .onChange(of: proxy.size) { _, value in canvasSize = value }
         }
+    }
+
+    private var developerDiagnosticsIfAvailable: Bool {
+        #if DEBUG
+        developerDiagnostics
+        #else
+        false
+        #endif
     }
 
     @ViewBuilder
@@ -444,6 +487,28 @@ struct LectureWorkspaceView: View {
         } else {
             previousPencilTool = activeTool
             activeTool = .objectEraser
+        }
+    }
+
+    private var pencilPreferences: PencilPreferences {
+        PencilPreferences(
+            doubleTap: PencilDoubleTapSetting(rawValue: pencilDoubleTapRaw) ?? .followSystem,
+            squeeze: PencilSqueezeSetting(rawValue: pencilSqueezeRaw) ?? .followSystem,
+            hover: PencilHoverSetting(rawValue: pencilHoverRaw) ?? .followSystem
+        )
+    }
+
+    private func handlePencilAction(_ action: PencilLogicalAction, anchor: CGPoint?) {
+        switch action {
+        case .none, .runSystemShortcut: break
+        case .switchEraser: togglePencilEraser()
+        case .switchPrevious:
+            let next = previousPencilTool == activeTool ? .pen : previousPencilTool
+            previousPencilTool = activeTool
+            activeTool = next
+        case .showColorPalette, .showInkAttributes, .showToolPalette:
+            showPencilQuickPalette(at: anchor
+                ?? CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2))
         }
     }
 
@@ -1150,8 +1215,13 @@ private struct WorkspaceToolButton: View {
     }
 }
 
-private struct PencilQuickPalette: View {
+struct PencilQuickPalette: View {
     let activeTool: CanvasTool
+    let recentColors: [String]
+    @Binding var width: Double
+    let selectColor: (String) -> Void
+    let undo: () -> Void
+    let redo: () -> Void
     let select: (CanvasTool) -> Void
     private let tools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso]
 
@@ -1167,8 +1237,29 @@ private struct PencilQuickPalette: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(tool.rawValue.capitalized)
             }
+            Divider().frame(height: 26)
+            ForEach(Array(recentColors.prefix(2).enumerated()), id: \.offset) { _, color in
+                Button { selectColor(color) } label: {
+                    Circle().fill(Color(uiColor: UIColor(svgHex: color)))
+                        .frame(width: 24, height: 24)
+                        .overlay(Circle().stroke(.separator, lineWidth: 0.5))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Use recent color")
+            }
+            Menu {
+                Slider(value: $width, in: activeTool == .highlighter ? 10...40 : 1.5...14)
+                Text("Width \(width, specifier: "%.1f")")
+            } label: {
+                Image(systemName: "lineweight").frame(width: 30, height: 34)
+            }
+            Button(action: undo) { Image(systemName: "arrow.uturn.backward").frame(width: 30, height: 34) }
+                .buttonStyle(.plain).accessibilityLabel("Undo")
+            Button(action: redo) { Image(systemName: "arrow.uturn.forward").frame(width: 30, height: 34) }
+                .buttonStyle(.plain).accessibilityLabel("Redo")
         }
         .padding(7)
+        .frame(width: 420)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: 12).stroke(.separator.opacity(0.45), lineWidth: 0.5) }
         .shadow(color: .black.opacity(0.16), radius: 14, y: 5)

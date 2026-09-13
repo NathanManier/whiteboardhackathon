@@ -603,6 +603,47 @@ class EditorApiTests(unittest.TestCase):
         self.assertIn('id="path-one"', markup)
         self.assertIn("M 10 10 L 40 12 L 38 40 Z", markup)
 
+    def test_advanced_pencil_metadata_round_trips_without_affecting_legacy_points(self):
+        state = self.editor_state()
+        state["objects"][0]["pencil_tool"] = "marker"
+        state["objects"][0]["points"] = [
+            {
+                "x": -20,
+                "y": 15,
+                "p": 0.42,
+                "alt": 0.75,
+                "azi": 1.2,
+                "r": 6.27,
+                "t": 1234.5,
+                "ei": 7,
+            },
+            {"x": 25, "y": 30},
+        ]
+
+        saved = self.client.put(f"/api/boards/{self.board_id}/editor", json=state)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        stroke = saved.get_json()["editor"]["objects"][0]
+        self.assertEqual(stroke["pencil_tool"], "marker")
+        self.assertEqual(
+            stroke["points"][0],
+            {
+                "x": -20.0,
+                "y": 15.0,
+                "p": 0.42,
+                "alt": 0.75,
+                "azi": 1.2,
+                "r": 6.27,
+                "t": 1234.5,
+                "ei": 7,
+            },
+        )
+        self.assertEqual(stroke["points"][1], {"x": 25.0, "y": 30.0})
+
+        loaded = self.client.get(
+            f"/api/boards/{self.board_id}/editor"
+        ).get_json()["editor"]["objects"][0]
+        self.assertEqual(loaded, stroke)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,7 +56,8 @@ struct DesmosConfiguration: Equatable, Sendable {
         let lowered = value?.lowercased() ?? ""
         guard let value, value.count >= 8,
               !lowered.contains("placeholder"), !lowered.contains("replace"),
-              !lowered.contains("your_api_key"), !value.contains("$("), !value.isEmpty else {
+              !lowered.contains("your_api_key"), lowered != "secret key",
+              value != "12345678", !value.contains("$("), !value.isEmpty else {
             return nil
         }
         return value
@@ -66,6 +67,7 @@ struct DesmosConfiguration: Equatable, Sendable {
 struct DesmosBridgeMessage: Equatable, Sendable {
     enum Event: String, Sendable {
         case ready
+        case progress
         case viewportChanged
         case error
     }
@@ -75,6 +77,7 @@ struct DesmosBridgeMessage: Equatable, Sendable {
     let nonce: String
     let viewport: GraphViewport?
     let errorCode: String?
+    let stage: GraphPromotionStage?
 
     static func decode(_ body: Any, expectedGraphID: String,
                        expectedNonce: String) -> DesmosBridgeMessage? {
@@ -99,8 +102,9 @@ struct DesmosBridgeMessage: Equatable, Sendable {
             viewport = GraphViewport(xMin: xMin, xMax: xMax, yMin: yMin, yMax: yMax)
         }
         let errorCode = (value["code"] as? String).map { String($0.prefix(96)) }
+        let stage = (value["stage"] as? String).flatMap(GraphPromotionStage.init(rawValue:))
         return DesmosBridgeMessage(event: event, graphID: graphID, nonce: nonce,
-                                   viewport: viewport, errorCode: errorCode)
+                                   viewport: viewport, errorCode: errorCode, stage: stage)
     }
 
     private static func finite(_ value: Any?) -> Double? {
@@ -111,10 +115,16 @@ struct DesmosBridgeMessage: Equatable, Sendable {
 }
 
 @MainActor
-final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
+final class DesmosGraphRenderer: NSObject, GraphRendererProvider,
+                                 GraphProviderLifecycleReporting {
     let identifier = "desmos-v1.12"
     private(set) var view: UIView
     var isAvailable: Bool { configuration.isConfigured }
+    var lifecycleEventHandler: ((GraphPromotionStage) -> Void)? {
+        didSet {
+            if lifecycleEventHandler != nil { emit(.webViewCreated) }
+        }
+    }
 
     private let configuration: DesmosConfiguration
     private let webView: WKWebView
@@ -124,6 +134,10 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
     private var currentNonce = UUID().uuidString.lowercased()
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var readyTimeout: Task<Void, Never>?
+    private var pendingReadyResult: Result<Void, Error>?
+    private var readyGeneration = 0
+    private var readyIsResolved = false
+    private var bootstrapNavigation: WKNavigation?
     private var cachedViewport: GraphViewport?
     private var isMounted = false
     private var allowsBootstrapNavigation = false
@@ -169,11 +183,13 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
         webView.isUserInteractionEnabled = false
         isMounted = true
         allowsBootstrapNavigation = true
+        prepareToWaitUntilReady()
         let html = Self.wrapperHTML(scriptURL: scriptURL,
                                     graphID: graph.id, nonce: currentNonce)
-        webView.loadHTMLString(html, baseURL: URL(string: "https://www.desmos.com"))
+        bootstrapNavigation = webView.loadHTMLString(
+            html, baseURL: URL(string: "https://www.desmos.com")
+        )
         try await waitUntilReady()
-        try await update(graph: graph)
     }
 
     func update(graph: GraphObject) async throws {
@@ -259,29 +275,80 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
     }
 
     private func waitUntilReady() async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            readyContinuation = continuation
-            readyTimeout?.cancel()
-            readyTimeout = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 12_000_000_000)
-                guard let self, let continuation = self.readyContinuation else { return }
-                self.readyContinuation = nil
-                continuation.resume(throwing: GraphRendererError.unavailable)
+        if let result = pendingReadyResult {
+            pendingReadyResult = nil
+            return try result.get()
+        }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if let result = pendingReadyResult {
+                    pendingReadyResult = nil
+                    continuation.resume(with: result)
+                } else {
+                    readyContinuation = continuation
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.resolveReady(.failure(CancellationError()),
+                                  generation: self.readyGeneration)
             }
         }
     }
 
-    private func unmountRuntimeOnly() {
+    private func prepareToWaitUntilReady() {
         readyTimeout?.cancel()
         readyTimeout = nil
         if let continuation = readyContinuation {
             readyContinuation = nil
             continuation.resume(throwing: CancellationError())
         }
+        pendingReadyResult = nil
+        readyGeneration &+= 1
+        readyIsResolved = false
+        let expectedGeneration = readyGeneration
+        readyTimeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 7_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.resolveReady(
+                .failure(GraphRendererError.provider("provider_ready_timeout")),
+                generation: expectedGeneration
+            )
+        }
+    }
+
+    private func resolveReady(_ result: Result<Void, Error>, generation: Int? = nil) {
+        if let generation, generation != readyGeneration { return }
+        guard !readyIsResolved else { return }
+        readyIsResolved = true
+        readyTimeout?.cancel()
+        readyTimeout = nil
+        if let continuation = readyContinuation {
+            readyContinuation = nil
+            continuation.resume(with: result)
+        } else {
+            // JavaScript can complete before `mount` reaches its await. Retain
+            // that terminal result so the ready handshake cannot be lost.
+            pendingReadyResult = result
+        }
+    }
+
+    private func emit(_ stage: GraphPromotionStage) {
+        lifecycleEventHandler?(stage)
+    }
+
+    private func unmountRuntimeOnly() {
+        readyTimeout?.cancel()
+        readyTimeout = nil
+        resolveReady(.failure(CancellationError()))
+        pendingReadyResult = nil
+        readyIsResolved = true
         if isMounted {
             webView.evaluateJavaScript("window.vboardGraphAdapter && window.vboardGraphAdapter.destroy();")
         }
         webView.stopLoading()
+        bootstrapNavigation = nil
         webView.removeFromSuperview()
         webView.isUserInteractionEnabled = false
         isMounted = false
@@ -347,7 +414,7 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
         <!doctype html>
         <html><head>
         <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://www.desmos.com 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src https://www.desmos.com data:; connect-src https://www.desmos.com https://*.desmos.com;">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://www.desmos.com 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; img-src data: blob:; font-src https://www.desmos.com data:; connect-src https://www.desmos.com https://*.desmos.com; worker-src blob:;">
         <style>html,body,#calculator{margin:0;width:100%;height:100%;overflow:hidden;background:#fff}*{box-sizing:border-box}</style>
         <script src="\(escapedURL)"></script>
         </head><body><div id="calculator"></div><script>
@@ -356,6 +423,7 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
           const graphID = \(graphJSON);
           const nonce = \(nonceJSON);
           const send = (event, extra = {}) => window.webkit.messageHandlers.vboardGraph.postMessage(Object.assign({version:1,event,graphID,nonce}, extra));
+          const progress = stage => send('progress', {stage});
           let calculator = null;
           let knownIDs = new Set();
           let viewportTimer = null;
@@ -365,12 +433,15 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
             return {xMin:m.left,xMax:m.right,yMin:m.bottom,yMax:m.top};
           };
           try {
+            progress('javascript_boot_started');
             if (!window.Desmos || !window.Desmos.GraphingCalculator) throw new Error('provider_unavailable');
+            progress('desmos_script_ready');
             calculator = window.Desmos.GraphingCalculator(document.getElementById('calculator'), {
               autosize:false, expressions:false, settingsMenu:false, keypad:false,
               zoomButtons:true, expressionsTopbar:false, pointsOfInterest:true,
               trace:false, border:false, lockViewport:false
             });
+            progress('calculator_created');
             calculator.observe('graphpaperBounds', () => {
               clearTimeout(viewportTimer);
               viewportTimer = setTimeout(() => send('viewportChanged', {viewport:bounds()}), 100);
@@ -397,11 +468,13 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
                 const removed = [...knownIDs].filter(id => !next.has(id)).map(id => ({id}));
                 if (removed.length) calculator.removeExpressions(removed);
                 calculator.setExpressions(expressions);
+                progress('expressions_applied');
                 knownIDs = next;
                 const v = graph.viewport;
                 if (v && [v.xMin,v.xMax,v.yMin,v.yMax].every(Number.isFinite) && v.xMax > v.xMin && v.yMax > v.yMin) {
                   calculator.setMathBounds({left:v.xMin,right:v.xMax,bottom:v.yMin,top:v.yMax});
                 }
+                progress('viewport_applied');
                 const s = graph.settings || {};
                 calculator.updateSettings({
                   xAxisNumbers:!!s.showXAxis,
@@ -483,24 +556,85 @@ final class DesmosGraphRenderer: NSObject, GraphRendererProvider {
               ) else { return }
         switch event.event {
         case .ready:
-            readyTimeout?.cancel()
-            readyTimeout = nil
-            let continuation = readyContinuation
-            readyContinuation = nil
-            continuation?.resume()
+            resolveReady(.success(()))
+        case .progress:
+            if let stage = event.stage { emit(stage) }
         case .viewportChanged:
             if let viewport = event.viewport { cachedViewport = viewport }
         case .error:
-            readyTimeout?.cancel()
-            readyTimeout = nil
-            let continuation = readyContinuation
-            readyContinuation = nil
-            continuation?.resume(throwing: GraphRendererError.unavailable)
+            resolveReady(.failure(GraphRendererError.provider(
+                event.errorCode ?? "provider_unavailable"
+            )))
         }
     }
 }
 
 extension DesmosGraphRenderer: WKNavigationDelegate, WKUIDelegate {
+    nonisolated func webView(_ webView: WKWebView,
+                            didStartProvisionalNavigation navigation: WKNavigation!) {
+        Task { @MainActor [weak self] in
+            guard let self, webView === self.webView,
+                  let bootstrapNavigation = self.bootstrapNavigation,
+                  navigation === bootstrapNavigation else { return }
+            self.emit(.pageLoadStarted)
+        }
+    }
+
+    nonisolated func webView(_ webView: WKWebView,
+                            didCommit navigation: WKNavigation!) {
+        Task { @MainActor [weak self] in
+            guard let self, webView === self.webView,
+                  let bootstrapNavigation = self.bootstrapNavigation,
+                  navigation === bootstrapNavigation else { return }
+            self.emit(.pageLoadCommitted)
+        }
+    }
+
+    nonisolated func webView(_ webView: WKWebView,
+                            didFinish navigation: WKNavigation!) {
+        Task { @MainActor [weak self] in
+            guard let self, webView === self.webView,
+                  let bootstrapNavigation = self.bootstrapNavigation,
+                  navigation === bootstrapNavigation else { return }
+            self.emit(.pageLoadFinished)
+        }
+    }
+
+    nonisolated func webView(_ webView: WKWebView,
+                            didFail navigation: WKNavigation!,
+                            withError error: Error) {
+        Task { @MainActor [weak self] in
+            guard let self, webView === self.webView,
+                  let bootstrapNavigation = self.bootstrapNavigation,
+                  navigation === bootstrapNavigation else { return }
+            self.resolveReady(.failure(
+                GraphRendererError.provider("page_load_failed")
+            ))
+        }
+    }
+
+    nonisolated func webView(_ webView: WKWebView,
+                            didFailProvisionalNavigation navigation: WKNavigation!,
+                            withError error: Error) {
+        Task { @MainActor [weak self] in
+            guard let self, webView === self.webView,
+                  let bootstrapNavigation = self.bootstrapNavigation,
+                  navigation === bootstrapNavigation else { return }
+            self.resolveReady(.failure(
+                GraphRendererError.provider("page_load_failed")
+            ))
+        }
+    }
+
+    nonisolated func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        Task { @MainActor [weak self] in
+            guard let self, webView === self.webView else { return }
+            self.resolveReady(.failure(
+                GraphRendererError.provider("web_process_terminated")
+            ))
+        }
+    }
+
     nonisolated func webView(_ webView: WKWebView,
                             decidePolicyFor navigationAction: WKNavigationAction,
                             decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
