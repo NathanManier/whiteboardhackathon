@@ -87,6 +87,24 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertTrue((board_dir / metadata["assets"]["original"]).is_file())
         self.assertEqual(metadata["pipeline"]["status"], "needs_corners")
 
+    def test_upload_exposes_backward_compatible_detection_details(self):
+        detection = {
+            "corners": self.corners,
+            "confidence": 0.82,
+            "found": True,
+            "method": "edge",
+            "score": 0.77,
+        }
+        with patch("app.detect_corners", return_value=detection):
+            created = self.upload().get_json()
+        response = self.client.get(
+            f"/board/{created['id']}", headers={"Accept": "application/json"}
+        )
+        payload = response.get_json()
+        self.assertEqual(payload["detection_confidence"], 0.82)
+        self.assertEqual(payload["detection_mode"], "edge")
+        self.assertTrue(payload["detection_found"])
+
     def test_confident_detection_waits_for_user_confirmation(self):
         with patch("app.detect_corners", return_value=(self.corners, 0.9)), patch(
             "app.run_downstream", side_effect=self.fake_downstream

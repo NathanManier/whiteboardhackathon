@@ -522,6 +522,7 @@ struct ImportFlowView: View {
     @State private var boardID: String?
     @State private var sourcePixelSize = CGSize.zero
     @State private var corners: [CGPoint] = []
+    @State private var cornerDetectionWasConfident = false
     @State private var cornerPreviewRect = CGRect.zero
     @State private var cornerPreviewGlobalOrigin = CGPoint.zero
     @State private var error: String?
@@ -656,14 +657,23 @@ struct ImportFlowView: View {
                         .stroke(.yellow, lineWidth: 3)
                         .allowsHitTesting(false)
                         ForEach(corners.indices, id: \.self) { index in
-                            Circle()
-                                .fill(.yellow)
-                                .overlay(Text(CornerRole(index: index).label).font(.caption2.bold()).foregroundStyle(.black))
-                                .frame(width: 36, height: 36)
-                                .contentShape(Circle().inset(by: -12))
+                            ZStack {
+                                Circle().fill(.black.opacity(0.88)).frame(width: 42, height: 42)
+                                Circle().fill(.white).frame(width: 32, height: 32)
+                                Circle().fill(Color.accentColor).frame(width: 22, height: 22)
+                            }
+                                .frame(width: 54, height: 54)
+                                .contentShape(Circle())
                                 .position(mapper.sourcePixelToView(corners[index]))
                                 .gesture(DragGesture(coordinateSpace: .named("cornerPreview"))
-                                    .onChanged { value in corners[index] = mapper.viewToSourcePixel(value.location) })
+                                    .onChanged { value in
+                                        corners[index] = mapper.viewToSourcePixel(
+                                            mapper.clampViewPointToImage(value.location)
+                                        )
+                                    })
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel(CornerRole(index: index).accessibilityLabel)
+                                .accessibilityHint("Drag to adjust the whiteboard boundary.")
                         }
                     }
                     .coordinateSpace(name: "cornerPreview")
@@ -673,7 +683,11 @@ struct ImportFlowView: View {
                 .padding()
             }
             VStack(spacing: 8) {
-                Text("Drag the corners to fit the board").foregroundStyle(.secondary)
+                Text(cornerDetectionWasConfident
+                     ? "We found the board. Adjust the corners if needed."
+                     : "We couldn’t confidently find the edges. Adjust the corners.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
                 Button("Process Whiteboard") { beginCornerSubmission() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                     .disabled(importState.phase.isBusy)
@@ -757,6 +771,7 @@ struct ImportFlowView: View {
         previewImage = normalized.image
         sourcePixelSize = normalized.pixelSize
         corners = CornerGeometry.defaultCorners(sourceSize: normalized.pixelSize)
+        cornerDetectionWasConfident = false
         boardID = nil
         error = nil
         importState.sourceSelected()
@@ -833,11 +848,21 @@ struct ImportFlowView: View {
             print("[VBoard] IMAGE UPLOAD CONTRACT board=\(result.id) normalizedPixels=\(imageAsset.pixelSize) serverPixels=\(serverSize) uiOrientation=\(imageAsset.image.imageOrientation.rawValue) cgPixels=\(cgPixels)")
             #endif
             sourcePixelSize = serverSize
-            corners = record.suggestedCorners?.compactMap { point in
+            let suggested: [CGPoint] = record.suggestedCorners?.compactMap { point -> CGPoint? in
                 guard point.count == 2 else { return nil }
                 return CGPoint(x: point[0], y: point[1])
-            } ?? CornerGeometry.defaultCorners(sourceSize: serverSize)
-            if corners.count != 4 { corners = CornerGeometry.defaultCorners(sourceSize: serverSize) }
+            } ?? []
+            let serverSaysDetected = record.detectionFound
+                ?? record.detectionConfidence.map { $0 >= 0.55 }
+                ?? true // Backward compatibility with older servers.
+            if serverSaysDetected,
+               CornerGeometry.validationMessage(suggested, sourceSize: serverSize) == nil {
+                corners = suggested
+                cornerDetectionWasConfident = true
+            } else {
+                corners = CornerGeometry.defaultCorners(sourceSize: serverSize)
+                cornerDetectionWasConfident = false
+            }
             activeTask = nil
             _ = importState.requireCorners(after: operationID)
         } catch {
@@ -1026,21 +1051,46 @@ struct AspectFitImageTransform: Equatable {
                       width: size.width, height: size.height)
     }
 
+    var displayedImageRect: CGRect { imageRect }
+
     func sourcePixelToView(_ point: CGPoint) -> CGPoint {
         let rect = imageRect
         let maxX = max(sourcePixelSize.width - 1, 1)
         let maxY = max(sourcePixelSize.height - 1, 1)
-        return CGPoint(x: rect.minX + point.x / maxX * rect.width,
-                       y: rect.minY + point.y / maxY * rect.height)
+        let source = CGPoint(x: min(max(point.x, 0), maxX),
+                             y: min(max(point.y, 0), maxY))
+        return CGPoint(x: rect.minX + source.x / maxX * rect.width,
+                       y: rect.minY + source.y / maxY * rect.height)
     }
 
     func viewToSourcePixel(_ point: CGPoint) -> CGPoint {
         let rect = imageRect
         guard rect.width > 0, rect.height > 0 else { return .zero }
-        let x = min(max(point.x, rect.minX), rect.maxX)
-        let y = min(max(point.y, rect.minY), rect.maxY)
+        let clamped = clampViewPointToImage(point)
+        let x = clamped.x
+        let y = clamped.y
         return CGPoint(x: (x - rect.minX) / rect.width * max(sourcePixelSize.width - 1, 1),
                        y: (y - rect.minY) / rect.height * max(sourcePixelSize.height - 1, 1))
+    }
+
+
+    func clampViewPointToImage(_ point: CGPoint) -> CGPoint {
+        let rect = imageRect
+        guard !rect.isEmpty else { return .zero }
+        return CGPoint(x: min(max(point.x, rect.minX), rect.maxX),
+                       y: min(max(point.y, rect.minY), rect.maxY))
+    }
+
+    func normalizedToSource(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: min(max(point.x, 0), 1) * max(sourcePixelSize.width - 1, 0),
+                y: min(max(point.y, 0), 1) * max(sourcePixelSize.height - 1, 0))
+    }
+
+    func sourceToNormalized(_ point: CGPoint) -> CGPoint {
+        let maxX = max(sourcePixelSize.width - 1, 1)
+        let maxY = max(sourcePixelSize.height - 1, 1)
+        return CGPoint(x: min(max(point.x / maxX, 0), 1),
+                       y: min(max(point.y / maxY, 0), 1))
     }
 }
 
@@ -1084,10 +1134,10 @@ enum CornerGeometry {
     static func defaultCorners(sourceSize: CGSize) -> [CGPoint] {
         let maxX = max(sourceSize.width - 1, 0)
         let maxY = max(sourceSize.height - 1, 0)
-        return [CGPoint(x: maxX * 0.05, y: maxY * 0.05),
-                CGPoint(x: maxX * 0.95, y: maxY * 0.05),
-                CGPoint(x: maxX * 0.95, y: maxY * 0.95),
-                CGPoint(x: maxX * 0.05, y: maxY * 0.95)]
+        return [CGPoint(x: maxX * 0.06, y: maxY * 0.06),
+                CGPoint(x: maxX * 0.94, y: maxY * 0.06),
+                CGPoint(x: maxX * 0.94, y: maxY * 0.94),
+                CGPoint(x: maxX * 0.06, y: maxY * 0.94)]
     }
 
     static func validationMessage(_ points: [CGPoint], sourceSize: CGSize) -> String? {
@@ -1138,7 +1188,10 @@ enum CornerGeometry {
 
 private struct CornerRole {
     let index: Int
-    var label: String { ["TL", "TR", "BR", "BL"][min(max(index, 0), 3)] }
+    var accessibilityLabel: String {
+        let labels = ["Top-left corner", "Top-right corner", "Bottom-right corner", "Bottom-left corner"]
+        return labels[min(max(index, 0), labels.count - 1)]
+    }
 }
 
 private struct CameraCaptureView: UIViewControllerRepresentable {

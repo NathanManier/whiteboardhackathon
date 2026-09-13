@@ -159,6 +159,9 @@ struct BoardRecord: Codable, Identifiable, Sendable {
     let assets: BoardAssets?
     let suggestedCorners: [[Double]]?
     let normalizedCorners: [[String: Double]]?
+    let detectionConfidence: Double?
+    let detectionMode: String?
+    let detectionFound: Bool?
     let sourceKind: BoardSourceKind?
     let pdfURL: String?
     let pdfPageNumber: Int?
@@ -167,6 +170,9 @@ struct BoardRecord: Codable, Identifiable, Sendable {
         case id, name, dimensions, assets
         case suggestedCorners = "suggested_corners"
         case normalizedCorners = "normalized_corners"
+        case detectionConfidence = "detection_confidence"
+        case detectionMode = "detection_mode"
+        case detectionFound = "detection_found"
         case sourceKind = "source_kind"
         case pdfURL = "pdf_url"
         case pdfPageNumber = "pdf_page_number"

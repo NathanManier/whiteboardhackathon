@@ -2025,21 +2025,13 @@ def call_hook(function: Callable[..., Any], image: np.ndarray, **kwargs: Any) ->
 
 
 def order_corners(points: np.ndarray) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    sums = points.sum(axis=1)
-    differences = np.diff(points, axis=1).reshape(-1)
-    return np.array(
-        [
-            points[np.argmin(sums)],
-            points[np.argmin(differences)],
-            points[np.argmax(sums)],
-            points[np.argmax(differences)],
-        ],
-        dtype=np.float32,
-    )
+    """Use the processing pipeline's canonical TL/TR/BR/BL ordering helper."""
+    from processing.board_detection import order_corners as canonical_order_corners
+
+    return canonical_order_corners(points)
 
 
-def baseline_detect_corners(image: np.ndarray) -> tuple[np.ndarray | None, float]:
+def baseline_detect_corners(image: np.ndarray) -> dict[str, Any]:
     height, width = image.shape[:2]
     scale = min(1.0, 1400.0 / max(height, width))
     working = cv2.resize(image, None, fx=scale, fy=scale) if scale < 1 else image
@@ -2055,30 +2047,68 @@ def baseline_detect_corners(image: np.ndarray) -> tuple[np.ndarray | None, float
         area_ratio = cv2.contourArea(polygon) / image_area
         if len(polygon) == 4 and cv2.isContourConvex(polygon) and area_ratio >= 0.15:
             confidence = min(0.95, 0.35 + area_ratio * 0.75)
-            return order_corners(polygon[:, 0, :] / scale), confidence
-    return None, 0.0
+            return {
+                "corners": order_corners(polygon[:, 0, :] / scale),
+                "confidence": confidence,
+                "found": True,
+                "method": "baseline_edge",
+                "score": confidence,
+            }
+    from processing.board_detection import fallback_corners
+
+    return {
+        "corners": fallback_corners(width, height),
+        "confidence": 0.0,
+        "found": False,
+        "method": "fallback",
+        "score": 0.0,
+    }
 
 
-def detect_corners(image: np.ndarray) -> tuple[np.ndarray | None, float]:
+def normalize_corner_detection(result: Any, image: np.ndarray) -> dict[str, Any]:
+    """Normalize optional detector contracts without changing public API routes."""
+    height, width = image.shape[:2]
+    if isinstance(result, dict):
+        points = result.get("corners")
+        if points is None:
+            points = result.get("points")
+        confidence = float(result.get("confidence", 0.0))
+        found = bool(result.get("found", points is not None and confidence > 0))
+        method = str(result.get("method") or result.get("mode") or ("detected" if found else "fallback"))
+        score = float(result.get("score", confidence))
+    elif hasattr(result, "corners") and hasattr(result, "confidence"):
+        points = result.corners
+        confidence = float(result.confidence)
+        found = bool(getattr(result, "found", points is not None and confidence > 0))
+        method = str(getattr(result, "method", "detected" if found else "fallback"))
+        score = float(getattr(result, "score", confidence))
+    elif isinstance(result, tuple) and len(result) >= 2:
+        points, confidence = result[0], float(result[1])
+        found = points is not None and confidence > 0
+        method = "detected" if found else "fallback"
+        score = confidence
+    else:
+        points, confidence, found, method, score = result, 1.0, result is not None, "detected", 1.0
+    if points is None:
+        from processing.board_detection import fallback_corners
+
+        points = fallback_corners(width, height)
+        confidence, found, method = 0.0, False, "fallback"
+    return {
+        "corners": order_corners(np.asarray(points, dtype=np.float32)),
+        "confidence": float(np.clip(confidence, 0.0, 1.0)),
+        "found": found,
+        "method": method,
+        "score": score,
+    }
+
+
+def detect_corners(image: np.ndarray) -> dict[str, Any]:
     hook = processing_callable("detect_board", "detect_corners", "find_corners")
     if hook is None:
         return baseline_detect_corners(image)
     try:
-        result = call_hook(hook, image)
-        if isinstance(result, dict):
-            points = result.get("corners")
-            if points is None:
-                points = result.get("points")
-            confidence = float(result.get("confidence", 0.0))
-        elif hasattr(result, "corners") and hasattr(result, "confidence"):
-            points, confidence = result.corners, float(result.confidence)
-        elif isinstance(result, tuple) and len(result) >= 2:
-            points, confidence = result[0], float(result[1])
-        else:
-            points, confidence = result, 1.0
-        if points is None:
-            return None, confidence
-        return order_corners(np.asarray(points, dtype=np.float32)), confidence
+        return normalize_corner_detection(call_hook(hook, image), image)
     except Exception:
         return baseline_detect_corners(image)
 
@@ -2659,6 +2689,8 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
         assets.setdefault("enhanced", assets["master"])
     detection = metadata.get("detection", {})
     confidence = detection.get("confidence") if isinstance(detection, dict) else None
+    detection_mode = detection.get("mode") if isinstance(detection, dict) else None
+    detection_found = detection.get("found") if isinstance(detection, dict) else None
     strokes = metadata.get("user_strokes", [])
     if not isinstance(strokes, list):
         strokes = []
@@ -2691,6 +2723,8 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
         "svg_url": url_for("board_svg", board_id=board_id),
         "confidence": confidence,
         "detection_confidence": confidence,
+        "detection_mode": detection_mode,
+        "detection_found": detection_found,
         "user_strokes": strokes,
         "user_ink": strokes,
         "pipeline": metadata.get("pipeline", {}),
@@ -4088,7 +4122,9 @@ def upload() -> Response | tuple[str, int]:
         image.shape[0],
     )
     try:
-        corners, confidence = detect_corners(image)
+        detection = normalize_corner_detection(detect_corners(image), image)
+        corners = detection["corners"]
+        confidence = detection["confidence"]
     except Exception:
         LOGGER.exception("BOARD CREATE FAILED board=%s stage=detection", board_id)
         metadata.setdefault("pipeline", {})["status"] = "failed"
@@ -4106,6 +4142,9 @@ def upload() -> Response | tuple[str, int]:
     metadata["detection"] = {
         "confidence": round(float(confidence), 4),
         "threshold": DETECTION_CONFIDENCE_THRESHOLD,
+        "found": bool(detection["found"]),
+        "mode": detection["method"],
+        "score": round(float(detection["score"]), 4),
         "corners": corners.tolist() if corners is not None else None,
     }
     detection_overlay = image.copy()

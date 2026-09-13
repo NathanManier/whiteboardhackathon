@@ -469,6 +469,22 @@ final class NativeImportCoordinateTests: XCTestCase {
                        CGPoint(x: 4031, y: 3023))
         XCTAssertEqual(mapper.viewToSourcePixel(CGPoint(x: -10_000, y: -10_000)),
                        .zero)
+        XCTAssertEqual(mapper.clampViewPointToImage(CGPoint(x: -10_000, y: -10_000)),
+                       CGPoint(x: mapper.imageRect.minX, y: mapper.imageRect.minY))
+    }
+
+    func testNormalizedSourceConversionsClampAndRoundTrip() {
+        let mapper = AspectFitImageTransform(
+            sourcePixelSize: CGSize(width: 4032, height: 3024),
+            containerRect: CGRect(x: 0, y: 0, width: 1024, height: 1366)
+        )
+        let normalized = CGPoint(x: 0.37, y: 0.61)
+        let source = mapper.normalizedToSource(normalized)
+        let restored = mapper.sourceToNormalized(source)
+        XCTAssertEqual(restored.x, normalized.x, accuracy: 0.000_001)
+        XCTAssertEqual(restored.y, normalized.y, accuracy: 0.000_001)
+        XCTAssertEqual(mapper.normalizedToSource(CGPoint(x: -1, y: 2)),
+                       CGPoint(x: 0, y: 3023))
     }
 
     @MainActor
@@ -502,6 +518,24 @@ final class NativeImportCoordinateTests: XCTestCase {
              CGPoint(x: 4031, y: 0), CGPoint(x: 0, y: 3023)],
             sourceSize: size
         ))
+    }
+
+    func testBoardRecordDecodesOptionalDetectionContractAndOldPayload() throws {
+        let decoder = JSONDecoder()
+        let current = try decoder.decode(BoardRecord.self, from: Data(#"""
+        {
+            "id":"board-1","suggested_corners":[[1,2],[9,2],[9,8],[1,8]],
+            "detection_confidence":0.72,"detection_mode":"brightness","detection_found":true
+        }
+        """#.utf8))
+        XCTAssertEqual(current.detectionConfidence, 0.72)
+        XCTAssertEqual(current.detectionMode, "brightness")
+        XCTAssertEqual(current.detectionFound, true)
+
+        let legacy = try decoder.decode(BoardRecord.self, from: Data(#"{"id":"board-2"}"#.utf8))
+        XCTAssertNil(legacy.detectionConfidence)
+        XCTAssertNil(legacy.detectionMode)
+        XCTAssertNil(legacy.detectionFound)
     }
 }
 
