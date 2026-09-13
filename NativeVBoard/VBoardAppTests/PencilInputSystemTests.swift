@@ -280,6 +280,61 @@ final class PencilGeometryAndPressureTests: XCTestCase {
     }
 }
 
+final class ContinuousEraseTransactionTests: XCTestCase {
+    func testMovementHidesOnlyFreshHitsAndCommitReturnsOneGestureBatch() {
+        var transaction = ContinuousEraseTransaction<String>()
+        transaction.begin()
+
+        XCTAssertEqual(transaction.register(["stroke-a", "path-b"]),
+                       ["stroke-a", "path-b"])
+        XCTAssertEqual(transaction.register(["path-b", "note-c"]), ["note-c"])
+        XCTAssertEqual(transaction.erasedIDs, ["stroke-a", "path-b", "note-c"])
+
+        let oneUndoBatch = transaction.commit()
+        XCTAssertEqual(oneUndoBatch, ["stroke-a", "path-b", "note-c"])
+        XCTAssertFalse(transaction.isActive)
+        XCTAssertTrue(transaction.commit().isEmpty,
+                      "One physical gesture must not produce a second deletion batch")
+    }
+
+    func testCancellationReturnsEveryTransientHitForImmediateRestoration() {
+        var transaction = ContinuousEraseTransaction<Int>()
+        transaction.begin()
+        _ = transaction.register([1, 2, 3])
+
+        XCTAssertEqual(transaction.cancel(), [1, 2, 3])
+        XCTAssertTrue(transaction.erasedIDs.isEmpty)
+        XCTAssertFalse(transaction.isActive)
+        XCTAssertTrue(transaction.commit().isEmpty)
+        XCTAssertTrue(transaction.register([4]).isEmpty,
+                      "Hits outside an active gesture have no deletion authority")
+    }
+}
+
+@MainActor
+final class SelectionGenerationContractTests: XCTestCase {
+    func testEveryDifferentSelectionIncludingClearAdvancesGeneration() {
+        let store = LectureWorkspaceStore(folderID: "selection-generation-test")
+        let first = SelectionKey(boardID: "board-a", objectID: "stroke-a",
+                                 kind: .editorObject, objectType: "stroke")
+        let second = SelectionKey(boardID: "board-a", objectID: "path-b",
+                                  kind: .professorPath, objectType: "path")
+
+        XCTAssertEqual(store.selectionGeneration, 0)
+        store.setSelection([first])
+        XCTAssertEqual(store.selectionGeneration, 1)
+        store.setSelection([first])
+        XCTAssertEqual(store.selectionGeneration, 1,
+                       "A duplicate callback must not create a fake selection generation")
+        store.setSelection([first, second])
+        XCTAssertEqual(store.selectionGeneration, 2)
+        store.setSelection([])
+        XCTAssertEqual(store.selectionGeneration, 3,
+                       "Starting another tool or lasso invalidates the old toolbar epoch")
+        XCTAssertTrue(store.selectedKeys.isEmpty)
+    }
+}
+
 final class CanvasAppearanceContractTests: XCTestCase {
     func testCanvasTokensDoNotInvertWithSystemAppearance() {
         let light = UITraitCollection(userInterfaceStyle: .light)

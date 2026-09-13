@@ -468,7 +468,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var activeInputSource: InputSource = .touch
     private var activeInputOwner: CanvasInputOwner = .none
     private var activeInputContact: CanvasInputContact?
-    private var eraseIDs = Set<String>()
+    private var eraseTransaction = ContinuousEraseTransaction<String>()
     private var pinchStartCamera = CameraRect(x: 0, y: 0, width: 1, height: 1)
     private var pinchStartMidpoint = CGPoint.zero
     #if DEBUG
@@ -1473,7 +1473,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         cancelActiveContentInteraction()
         panStart = .zero
         pinchStartMidpoint = .zero
-        eraseIDs.removeAll()
+        _ = eraseTransaction.cancel()
         moveDelta = .zero
         moveActive = false
         resizeSession = nil
@@ -1731,7 +1731,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             }
             interactionState = .lassoing; lassoWorldPoints = [point]; debugInputOperation("LASSO BEGIN"); updateInteractionPath()
         } else if activeTool == .objectEraser {
-            interactionState = .erasing; eraseIDs.removeAll(); eraseSegment(from: point, to: point); debugInputOperation("ERASER BEGIN")
+            interactionState = .erasing; eraseTransaction.begin(); eraseSegment(from: point, to: point); debugInputOperation("ERASER BEGIN")
         } else if activeTool == .select {
             let hitIDs = hitTestIDs(at: point)
             // Clicking inside an already-selected member preserves the full
@@ -1822,17 +1822,16 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             return
         }
         if interactionState == .erasing {
-            if endpoint != nil, !eraseIDs.isEmpty {
-                let deleted = eraseIDs
+            if endpoint != nil, !eraseTransaction.erasedIDs.isEmpty {
+                let deleted = eraseTransaction.commit()
                 selectedIDs.subtract(deleted)
                 onSelectionRegionChanged(nil)
                 onDelete(deleted)
                 onSelectionChanged(selectedIDs)
                 debugInputOperation("ERASER COMMIT")
             } else {
-                setErasePreview(ids: eraseIDs, hidden: false)
+                setErasePreview(ids: eraseTransaction.cancel(), hidden: false)
             }
-            eraseIDs.removeAll()
             interactionState = .idle
             updateSelectionOverlay(); updateInputHUD()
             return
@@ -1990,13 +1989,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             return segmentBounds.intersects(objectBounds) ? object.id : nil
         })
         hit.formUnion(professor.ids(intersecting: segmentBounds))
-        let fresh = hit.subtracting(eraseIDs)
+        let fresh = eraseTransaction.register(hit)
         guard !fresh.isEmpty else { return }
         // Visual feedback is immediate, while canonical deletion remains one
         // batch at gesture end. Cancellation can therefore restore the exact
         // pre-gesture presentation without touching editor state.
         setErasePreview(ids: fresh, hidden: true)
-        eraseIDs.formUnion(fresh)
         #if DEBUG
         print("[VBoard] ERASER HITS ids=\(Array(fresh))")
         #endif
@@ -2016,8 +2014,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         case .lassoing:
             lassoWorldPoints.removeAll()
         case .erasing:
-            setErasePreview(ids: eraseIDs, hidden: false)
-            eraseIDs.removeAll()
+            setErasePreview(ids: eraseTransaction.cancel(), hidden: false)
         case .idle, .panning, .pinching, .selecting:
             break
         }

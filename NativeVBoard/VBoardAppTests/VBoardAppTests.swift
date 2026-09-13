@@ -25,14 +25,16 @@ final class WorkspaceAppearanceTests: XCTestCase {
         XCTAssertEqual(Set(WorkspaceBackgroundStyle.allCases), Set([.dots, .blank]))
     }
 
-    func testPencilPressureCurveIsGentleMonotonicAndSmoothed() {
+    func testPencilPressureCurveIsVisibleControlledMonotonicAndSmoothed() {
         let low = PencilPressureResponse.curved(0.1)
         let middle = PencilPressureResponse.curved(0.5)
         let high = PencilPressureResponse.curved(0.9)
         XCTAssertLessThan(low, middle)
         XCTAssertLessThan(middle, high)
-        XCTAssertGreaterThan(PencilPressureResponse.widthMultiplier(for: 0), 0.6)
-        XCTAssertLessThan(PencilPressureResponse.widthMultiplier(for: 1), 1.25)
+        XCTAssertEqual(PencilPressureResponse.widthMultiplier(for: 0), 0.55,
+                       accuracy: 0.000_01)
+        XCTAssertEqual(PencilPressureResponse.widthMultiplier(for: 1), 1.65,
+                       accuracy: 0.000_01)
         let smoothed = PencilPressureResponse.smoothed(previous: 0.2, sample: 1)
         XCTAssertGreaterThan(smoothed, 0.2)
         XCTAssertLessThan(smoothed, 1)

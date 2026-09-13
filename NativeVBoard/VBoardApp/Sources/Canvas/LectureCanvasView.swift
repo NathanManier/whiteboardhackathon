@@ -87,12 +87,12 @@ final class BoardVectorLoadingIndicator: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
-        backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.92)
+        backgroundColor = CanvasDesignTokens.toolbarSurface.withAlphaComponent(0.92)
         layer.cornerRadius = 12
         layer.borderWidth = 0.5
-        layer.borderColor = UIColor.separator.withAlphaComponent(0.35).cgColor
+        layer.borderColor = CanvasDesignTokens.boardBorder.withAlphaComponent(0.35).cgColor
         label.font = .systemFont(ofSize: 12, weight: .medium)
-        label.textColor = .secondaryLabel
+        label.textColor = CanvasDesignTokens.canvasSecondaryText
         let stack = UIStackView(arrangedSubviews: [spinner, label])
         stack.axis = .horizontal
         stack.spacing = 7
@@ -1681,7 +1681,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         updateSelectionOverlay()
         CATransaction.commit()
         #if DEBUG
-        print("[VBoard] LECTURE SELECTION PREVIEW sameFrame=true keys=\(selectedKeys.count) apply_ms=\(String(format: "%.3f", (CACurrentMediaTime() - started) * 1_000)) delta=(\(delta.x),\(delta.y))")
+        let elapsedMilliseconds = String(
+            format: "%.3f", (CACurrentMediaTime() - started) * 1_000
+        )
+        print("[VBoard] LECTURE SELECTION PREVIEW sameFrame=true keys=\(selectedKeys.count) apply_ms=\(elapsedMilliseconds) delta=(\(delta.x),\(delta.y))")
         #endif
     }
 

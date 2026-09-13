@@ -715,6 +715,42 @@ enum PencilFeedbackRequest: Equatable, Sendable {
     case action(CGPoint?)
 }
 
+/// Presentation-only object-erasure bookkeeping. Hits are exposed as a fresh
+/// set for immediate hiding, while commit returns the complete gesture as one
+/// canonical mutation/undo unit. Cancellation returns that same complete set
+/// so callers can restore every transiently hidden representation.
+struct ContinuousEraseTransaction<ID: Hashable> {
+    private(set) var erasedIDs = Set<ID>()
+    private(set) var isActive = false
+
+    mutating func begin() {
+        erasedIDs.removeAll(keepingCapacity: true)
+        isActive = true
+    }
+
+    @discardableResult
+    mutating func register(_ hits: Set<ID>) -> Set<ID> {
+        guard isActive else { return [] }
+        let fresh = hits.subtracting(erasedIDs)
+        erasedIDs.formUnion(fresh)
+        return fresh
+    }
+
+    mutating func commit() -> Set<ID> {
+        let committed = erasedIDs
+        erasedIDs.removeAll(keepingCapacity: true)
+        isActive = false
+        return committed
+    }
+
+    mutating func cancel() -> Set<ID> {
+        let restored = erasedIDs
+        erasedIDs.removeAll(keepingCapacity: true)
+        isActive = false
+        return restored
+    }
+}
+
 @MainActor
 protocol PencilFeedbackProviding: AnyObject {
     func request(_ feedback: PencilFeedbackRequest)
