@@ -436,6 +436,10 @@ private struct BoardEditorSurface: View {
 
     private var editorCanvas: some View {
         GeometryReader { proxy in
+            let canvasEditor = GraphEditingCanvasIsolation.editorForCanvas(
+                store.editor, hidingGraphID: interactiveGraph?.id
+            )
+            let canvasObjects = canvasEditor.objects
             ZStack(alignment: .bottom) {
             // Keep one UIKit input surface alive for the board. Tool changes
             // update that surface in place so recognizers, responder focus,
@@ -443,10 +447,10 @@ private struct BoardEditorSurface: View {
             NativeCanvasView(
                 boardID: board.id, document: document, previewImage: previewImage, pdfData: pdfData,
                 sourceKind: board.sourceKind,
-                camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects,
+                camera: liveCamera ?? store.editor.viewport, objects: canvasObjects,
                 importedTransforms: store.editor.importedTransforms,
                 composition: SceneComposition.build(boardID: board.id, document: document,
-                                                    editor: store.editor),
+                                                    editor: canvasEditor),
                 showsPaper: pdfData != nil || physicalBoardShowsPaper,
                 backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots,
                 penStyle: CanvasStrokeStyle(colorHex: penColor, width: penWidth, opacity: 1),

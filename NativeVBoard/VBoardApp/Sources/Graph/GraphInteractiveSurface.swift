@@ -94,6 +94,43 @@ enum GraphAnnotationOverlayPolicy {
     }
 }
 
+/// The expanded graph owns its own live raster. Hide that one object from the
+/// underlying board canvas so per-character canonical source updates do not
+/// rebuild unrelated stroke, text, image, or passive-graph layers.
+enum GraphEditingCanvasIsolation {
+    static func objectsForCanvas(_ objects: [CanvasObject],
+                                 hidingGraphID graphID: String?) -> [CanvasObject] {
+        guard let graphID else { return objects }
+        return objects.filter { !($0.id == graphID && $0.type == "graph") }
+    }
+
+    static func editorForCanvas(_ editor: EditorState,
+                                hidingGraphID graphID: String?) -> EditorState {
+        guard graphID != nil else { return editor }
+        var result = editor
+        result.objects = objectsForCanvas(editor.objects, hidingGraphID: graphID)
+        return result
+    }
+
+    static func scenesForCanvas(_ scenes: [String: WorkspaceBoardScene],
+                                hiding graph: GraphObject?)
+        -> [String: WorkspaceBoardScene] {
+        guard let graph, var scene = scenes[graph.owningBoardID] else { return scenes }
+        var editor = editorForCanvas(scene.editor, hidingGraphID: graph.id)
+        // A save acknowledgement can advance the revision while the visible
+        // canvas payload is otherwise identical. Revisions coordinate storage,
+        // not rendering, so normalize it in this presentation-only snapshot.
+        editor.revision = 0
+        scene.editor = editor
+        scene.composition = SceneComposition.build(
+            boardID: scene.boardID, document: scene.document, editor: editor
+        )
+        var result = scenes
+        result[graph.owningBoardID] = scene
+        return result
+    }
+}
+
 enum GraphAccessibility {
     static func label(for graph: GraphObject) -> String {
         let expressions = graph.expressions.filter(\.visible).prefix(2)

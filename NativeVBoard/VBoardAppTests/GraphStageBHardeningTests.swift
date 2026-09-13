@@ -963,6 +963,51 @@ final class GraphStageBHardeningTests: XCTestCase {
                        "Per-character edits and viewport movement must not create extra history entries")
     }
 
+    func testExpandedGraphEditsKeepUnderlyingBoardAndLectureCanvasPayloadStable() {
+        let active = makeGraph()
+        let passive = makeGraph(id: "graph-passive")
+        let edited = active.replacing(expressions: [
+            GraphExpression(id: "e1", latex: "f(x)=cos(x)",
+                            type: .explicitFunction)
+        ])
+        let beforeObjects = [CanvasObject(graph: active), CanvasObject(graph: passive)]
+        let afterObjects = [CanvasObject(graph: edited), CanvasObject(graph: passive)]
+
+        XCTAssertEqual(
+            GraphEditingCanvasIsolation.objectsForCanvas(
+                beforeObjects, hidingGraphID: active.id
+            ),
+            GraphEditingCanvasIsolation.objectsForCanvas(
+                afterObjects, hidingGraphID: active.id
+            )
+        )
+
+        let document = SVGDocument(viewBox: .zero, paths: [])
+        let beforeEditor = EditorState(
+            schemaVersion: 4, revision: 3, updatedAt: nil,
+            viewport: CameraRect(x: -400, y: -300, width: 1_200, height: 900),
+            objects: beforeObjects, groups: [],
+            importedTransforms: [:], sourceBoards: [], mergedBoardIDs: []
+        )
+        let afterEditor = EditorState(
+            schemaVersion: 4, revision: 4, updatedAt: nil,
+            viewport: CameraRect(x: -400, y: -300, width: 1_200, height: 900),
+            objects: afterObjects, groups: [],
+            importedTransforms: [:], sourceBoards: [], mergedBoardIDs: []
+        )
+        let beforeScenes = [boardID: makeScene(
+            boardID: boardID, document: document, editor: beforeEditor
+        )]
+        let afterScenes = [boardID: makeScene(
+            boardID: boardID, document: document, editor: afterEditor
+        )]
+
+        XCTAssertEqual(
+            GraphEditingCanvasIsolation.scenesForCanvas(beforeScenes, hiding: active),
+            GraphEditingCanvasIsolation.scenesForCanvas(afterScenes, hiding: edited)
+        )
+    }
+
     func testInvalidGraphDraftRestoresFromOutboxAfterDismissalWithoutNetworkSave() throws {
         let persistenceBoardID = UUID().uuidString
             .replacingOccurrences(of: "-", with: "").lowercased()

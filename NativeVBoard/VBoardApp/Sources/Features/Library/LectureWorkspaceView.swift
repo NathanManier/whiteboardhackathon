@@ -291,10 +291,13 @@ struct LectureWorkspaceView: View {
 
     private func canvasSurface(_ workspace: LectureWorkspace) -> some View {
         GeometryReader { proxy in
+            let canvasScenes = GraphEditingCanvasIsolation.scenesForCanvas(
+                store.scenes, hiding: interactiveGraph
+            )
             ZStack(alignment: .bottom) {
                 LectureCanvasView(
                     workspace: workspace,
-                    scenes: store.scenes,
+                    scenes: canvasScenes,
                     selectedKeys: store.selectedKeys,
                     tool: activeTool,
                     backgroundStyle: WorkspaceBackgroundStyle(rawValue: backgroundRaw) ?? .dots,
