@@ -170,42 +170,107 @@ enum PencilSqueezePhase: Sendable { case began, changed, ended, cancelled }
 struct PencilPaletteStateMachine: Equatable, Sendable {
     private(set) var isPresented = false
     private(set) var anchor: CGPoint?
+    private(set) var highlightedIndex = 0
+    private var lastRoll: CGFloat?
+    private var accumulatedRoll: CGFloat = 0
+    private var sectorOffset = 0
+    private var sectorCount = 4
+    private var initialSectorIndex = 0
 
     enum Effect: Equatable, Sendable {
         case none
-        case present(CGPoint?)
-        case update(CGPoint?)
+        case present(CGPoint?, highlightedIndex: Int)
+        case update(CGPoint?, highlightedIndex: Int, selectionChanged: Bool)
+        case commit(highlightedIndex: Int)
         case dismiss
     }
 
-    mutating func receive(_ phase: PencilSqueezePhase, anchor: CGPoint?) -> Effect {
+    /// Roll is already converted into VBoard screen-angle space: zero points
+    /// right and positive advances clockwise on the display.
+    mutating func receive(_ phase: PencilSqueezePhase, anchor: CGPoint?,
+                          roll: CGFloat? = nil, initialIndex: Int = 0,
+                          sectorCount requestedSectorCount: Int = 4,
+                          hysteresis: CGFloat = .pi / 24) -> Effect {
         switch phase {
         case .began:
             guard !isPresented else { return .none }
             isPresented = true
             self.anchor = anchor
-            return .present(anchor)
+            sectorCount = max(1, requestedSectorCount)
+            initialSectorIndex = Self.wrapped(initialIndex, count: sectorCount)
+            highlightedIndex = initialSectorIndex
+            lastRoll = roll
+            accumulatedRoll = 0
+            sectorOffset = 0
+            return .present(anchor, highlightedIndex: highlightedIndex)
         case .changed:
             guard isPresented else { return .none }
             if let anchor { self.anchor = anchor }
-            return .update(self.anchor)
+            var changed = false
+            if let roll {
+                if let lastRoll {
+                    accumulatedRoll += PencilAngleMath.shortestDelta(from: lastRoll, to: roll)
+                }
+                self.lastRoll = roll
+                let sectorAngle = PencilAngleMath.fullTurn / CGFloat(sectorCount)
+                let threshold = sectorAngle / 2 + max(0, hysteresis)
+                while accumulatedRoll - CGFloat(sectorOffset) * sectorAngle > threshold {
+                    sectorOffset += 1
+                    changed = true
+                }
+                while accumulatedRoll - CGFloat(sectorOffset) * sectorAngle < -threshold {
+                    sectorOffset -= 1
+                    changed = true
+                }
+                highlightedIndex = Self.wrapped(initialSectorIndex + sectorOffset,
+                                                count: sectorCount)
+            }
+            return .update(self.anchor, highlightedIndex: highlightedIndex,
+                           selectionChanged: changed)
         case .ended:
-            // Ending a squeeze must not create a second presentation. The
-            // palette remains until the user chooses an action or dismisses it.
-            return .none
+            guard isPresented else { return .none }
+            let committed = highlightedIndex
+            clear()
+            return .commit(highlightedIndex: committed)
         case .cancelled:
             guard isPresented else { return .none }
-            isPresented = false
-            self.anchor = nil
+            clear()
             return .dismiss
         }
     }
 
     mutating func dismiss() -> Effect {
         guard isPresented else { return .none }
+        clear()
+        return .dismiss
+    }
+
+    private mutating func clear() {
         isPresented = false
         anchor = nil
-        return .dismiss
+        lastRoll = nil
+        accumulatedRoll = 0
+        sectorOffset = 0
+        initialSectorIndex = 0
+    }
+
+    private static func wrapped(_ index: Int, count: Int) -> Int {
+        let remainder = index % count
+        return remainder < 0 ? remainder + count : remainder
+    }
+}
+
+enum PencilRadialPaletteModel {
+    static let tools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso]
+
+    static func index(for tool: CanvasTool) -> Int {
+        tools.firstIndex(of: tool) ?? 0
+    }
+
+    static func tool(at index: Int) -> CanvasTool {
+        let count = tools.count
+        let wrapped = ((index % count) + count) % count
+        return tools[wrapped]
     }
 }
 
@@ -221,6 +286,20 @@ enum PencilPalettePlacement {
         x = min(max(x, safeBounds.minX), max(safeBounds.minX, safeBounds.maxX - paletteSize.width))
         y = min(max(y, safeBounds.minY), max(safeBounds.minY, safeBounds.maxY - paletteSize.height))
         return CGPoint(x: x, y: y)
+    }
+
+    static func center(anchor: CGPoint?, radius: CGFloat, safeBounds: CGRect,
+                       spacing: CGFloat = 8) -> CGPoint {
+        let point = anchor ?? CGPoint(x: safeBounds.midX, y: safeBounds.midY)
+        let inset = radius + spacing
+        let minimumX = safeBounds.minX + inset
+        let maximumX = safeBounds.maxX - inset
+        let minimumY = safeBounds.minY + inset
+        let maximumY = safeBounds.maxY - inset
+        return CGPoint(
+            x: minimumX <= maximumX ? min(max(point.x, minimumX), maximumX) : safeBounds.midX,
+            y: minimumY <= maximumY ? min(max(point.y, minimumY), maximumY) : safeBounds.midY
+        )
     }
 }
 

@@ -27,6 +27,7 @@ struct LectureWorkspaceView: View {
     @State private var reopenedStudy: StudyInteraction?
     @State private var previousPencilTool: CanvasTool = .pen
     @State private var pencilQuickPalettePoint: CGPoint?
+    @State private var pencilQuickPaletteHighlight = 0
     @State private var graphCreationRequest: GraphCreationRequest?
     @State private var editingGraph: GraphObject?
     @State private var interactiveGraph: GraphObject?
@@ -215,6 +216,11 @@ struct LectureWorkspaceView: View {
         }
         .onChange(of: activeTool) { oldValue, newValue in
             if oldValue != newValue && oldValue != .objectEraser { previousPencilTool = oldValue }
+            if newValue != .select, newValue != .lasso, !store.selectedKeys.isEmpty {
+                store.setSelection([], pdfRegions: [:])
+                graphRecognition.clear()
+                selectionScreenBounds = nil
+            }
             if !GraphPencilInteractionPolicy.allowsAnnotation(for: newValue) {
                 interactiveGraph = nil
             }
@@ -320,6 +326,11 @@ struct LectureWorkspaceView: View {
                     onRedo: { store.redo(api: api) },
                     onPencilAction: handlePencilAction,
                     onPencilPaletteMoved: { pencilQuickPalettePoint = $0 },
+                    onPencilPaletteHighlight: { pencilQuickPaletteHighlight = $0 },
+                    onPencilPaletteCommit: { index in
+                        activeTool = PencilRadialPaletteModel.tool(at: index)
+                        pencilQuickPalettePoint = nil
+                    },
                     onPencilPaletteDismiss: { pencilQuickPalettePoint = nil }
                 )
                 .ignoresSafeArea(edges: .bottom)
@@ -377,13 +388,16 @@ struct LectureWorkspaceView: View {
                 WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
                                      penColor: $penColor, penWidth: $penWidth,
                                      markerColor: $markerColor, markerWidth: $markerWidth,
-                                     markerOpacity: $markerOpacity)
+                                     markerOpacity: $markerOpacity,
+                                     undo: { store.undo(api: api) },
+                                     redo: { store.redo(api: api) })
                     .padding(.bottom, 12)
                     .zIndex(30)
 
                 if interactiveGraph == nil, !store.selectedKeys.isEmpty, let selectionScreenBounds {
                     SelectionActionBar(
                         canCheckWork: selectionCanCheckWork,
+                        selectionGeneration: store.selectionGeneration,
                         graphPrimaryTitle: graphPrimaryTitle,
                         graphIsLoading: false,
                         explain: { openStudy(action: "explain") },
@@ -415,13 +429,14 @@ struct LectureWorkspaceView: View {
                 }
 
                 if let point = pencilQuickPalettePoint {
-                    let paletteSize = CGSize(width: 420, height: 56)
-                    let origin = PencilPalettePlacement.origin(
-                        anchor: point, paletteSize: paletteSize,
+                    let paletteRadius: CGFloat = 122
+                    let center = PencilPalettePlacement.center(
+                        anchor: point, radius: paletteRadius,
                         safeBounds: CGRect(origin: .zero, size: proxy.size).insetBy(dx: 8, dy: 8)
                     )
                     PencilQuickPalette(activeTool: activeTool,
                                        recentColors: [penColor, markerColor],
+                                       highlightedIndex: pencilQuickPaletteHighlight,
                                        width: activeTool == .highlighter ? $markerWidth : $penWidth,
                                        selectColor: { color in
                                            if activeTool == .highlighter { markerColor = color }
@@ -432,8 +447,7 @@ struct LectureWorkspaceView: View {
                         activeTool = tool
                         pencilQuickPalettePoint = nil
                     }
-                    .position(x: origin.x + paletteSize.width / 2,
-                              y: origin.y + paletteSize.height / 2)
+                    .position(center)
                     .transition(.opacity.combined(with: .scale(scale: 0.92)))
                     .zIndex(31)
                 }
@@ -546,6 +560,7 @@ struct LectureWorkspaceView: View {
             previousPencilTool = activeTool
             activeTool = next
         case .showColorPalette, .showInkAttributes, .showToolPalette:
+            pencilQuickPaletteHighlight = PencilRadialPaletteModel.index(for: activeTool)
             showPencilQuickPalette(at: anchor
                 ?? CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2))
         }
@@ -553,11 +568,6 @@ struct LectureWorkspaceView: View {
 
     private func showPencilQuickPalette(at point: CGPoint) {
         withAnimation(.easeOut(duration: 0.16)) { pencilQuickPalettePoint = point }
-        Task {
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeInOut(duration: 0.16)) { pencilQuickPalettePoint = nil }
-        }
     }
 
     @ViewBuilder private func studyContent(compact: Bool) -> some View {
@@ -836,7 +846,10 @@ struct WorkspaceToolPalette: View {
     @Binding var markerColor: String
     @Binding var markerWidth: Double
     @Binding var markerOpacity: Double
+    let undo: () -> Void
+    let redo: () -> Void
     @State private var showOptions = false
+    @State private var showStatus = false
 
     var body: some View {
         HStack(spacing: 4) {
@@ -862,15 +875,82 @@ struct WorkspaceToolPalette: View {
                     }
             }
             Divider().frame(height: 24).padding(.horizontal, 3)
-            Text(status)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .frame(minWidth: 42)
+            Button { showStatus.toggle() } label: {
+                HStack(spacing: 5) {
+                    Circle().fill(statusColor).frame(width: 7, height: 7)
+                    Text(compactStatus)
+                        .font(.caption2.weight(.medium))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 7)
+                .frame(height: 28)
+                .background(Color.black.opacity(0.045), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Save status: \(status)")
+            .popover(isPresented: $showStatus, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label(status, systemImage: statusIcon)
+                        .font(.callout.weight(.semibold))
+                    Label(toolName, systemImage: toolIcon)
+                        .font(.callout)
+                    HStack {
+                        Button("Undo", systemImage: "arrow.uturn.backward", action: undo)
+                        Button("Redo", systemImage: "arrow.uturn.forward", action: redo)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(14)
+                .frame(minWidth: 210, alignment: .leading)
+                .presentationCompactAdaptation(.popover)
+                .environment(\.colorScheme, .light)
+            }
         }
         .padding(6)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .background(Color(uiColor: CanvasDesignTokens.toolbarSurface), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.separator.opacity(0.45), lineWidth: 0.5) }
+        .environment(\.colorScheme, .light)
+    }
+
+    private var compactStatus: String {
+        let value = status.lowercased()
+        if value.contains("saving") { return "Saving" }
+        if value.contains("unsaved") { return "Unsaved" }
+        if value.contains("locally") || value.contains("offline") { return "Offline" }
+        if value.contains("fail") || value.contains("review") || value.contains("couldn") { return "Error" }
+        if value.contains("loading") { return "Loading" }
+        return "Saved"
+    }
+
+    private var statusColor: Color {
+        switch compactStatus {
+        case "Saving", "Loading": return .blue
+        case "Unsaved": return .orange
+        case "Offline": return .yellow
+        case "Error": return .red
+        default: return .green
+        }
+    }
+
+    private var statusIcon: String {
+        compactStatus == "Error" ? "exclamationmark.triangle" :
+            (compactStatus == "Offline" ? "icloud.slash" : "checkmark.circle")
+    }
+
+    private var toolName: String {
+        activeTool == .highlighter ? "Marker" :
+            (activeTool == .objectEraser ? "Eraser" : activeTool.rawValue.capitalized)
+    }
+
+    private var toolIcon: String {
+        switch activeTool {
+        case .navigation: return "hand.draw"
+        case .pen: return "pencil.tip"
+        case .highlighter: return "highlighter"
+        case .select: return "cursorarrow"
+        case .lasso: return "lasso"
+        case .objectEraser: return "eraser"
+        }
     }
 }
 
@@ -914,6 +994,7 @@ private struct CanvasToolOptions: View {
 
 struct SelectionActionBar: View {
     let canCheckWork: Bool
+    var selectionGeneration: Int = 0
     let graphPrimaryTitle: String?
     let graphIsLoading: Bool
     let explain: () -> Void
@@ -925,26 +1006,32 @@ struct SelectionActionBar: View {
     let resetGraph: (() -> Void)?
     let duplicateGraph: (() -> Void)?
     let delete: () -> Void
+    @State private var showsLearningLabels = false
 
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(alignment: .top, spacing: 4) {
             action("Explain", "text.magnifyingglass", explain)
             action("Practice", "list.bullet.clipboard", practice)
             if canCheckWork { action("Check", "checkmark.circle", check) }
-            Group {
-                if graphIsLoading {
-                    ProgressView().controlSize(.small)
-                } else if let graphPrimaryTitle {
-                    action(graphPrimaryTitle,
-                           graphPrimaryTitle == "Interact" ? "hand.tap" : "function",
-                           graphPrimary)
-                } else {
-                    Color.clear
+            if graphIsLoading {
+                ProgressView().controlSize(.small).frame(width: 38, height: 38)
+            } else {
+                action(graphPrimaryTitle ?? "Graph",
+                       graphPrimaryTitle == "Interact" ? "hand.tap" : "function",
+                       graphPrimaryTitle == nil ? graphSelection : graphPrimary)
+            }
+            action("Delete", "trash", delete, destructive: true)
+            Button { showsLearningLabels.toggle() } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: showsLearningLabels ? "ellipsis.circle.fill" : "ellipsis")
+                        .frame(width: 34, height: 30)
+                    if showsLearningLabels { Text("Labels").font(.caption2) }
                 }
             }
-            .frame(width: 70, height: 30)
-            Menu {
-                if editGraph != nil {
+            .buttonStyle(.plain)
+            .accessibilityLabel(showsLearningLabels ? "Hide action labels" : "Show action labels")
+            if showsLearningLabels, editGraph != nil {
+                Menu {
                     Button(action: { editGraph?() }) {
                         Label("Edit Equations", systemImage: "function")
                     }
@@ -954,33 +1041,37 @@ struct SelectionActionBar: View {
                     Button(action: { duplicateGraph?() }) {
                         Label("Duplicate Graph", systemImage: "plus.square.on.square")
                     }
-                    Divider()
-                } else {
-                    Button(action: graphSelection) {
-                        Label("Graph Selection", systemImage: "function")
-                    }
-                    Divider()
+                } label: {
+                    Image(systemName: "gearshape")
+                        .frame(width: 34, height: 30)
                 }
-                Button(role: .destructive, action: delete) { Label("Erase Selection", systemImage: "trash") }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .frame(width: 32, height: 30)
+                .buttonStyle(.plain)
+                .accessibilityLabel("Graph options")
             }
-            .buttonStyle(.plain)
         }
+        .id(selectionGeneration)
         .font(.caption.weight(.semibold))
-        .padding(5)
+        .padding(6)
         .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(.separator.opacity(0.55), lineWidth: 0.5) }
     }
 
-    private func action(_ title: String, _ icon: String, _ action: @escaping () -> Void) -> some View {
+    private func action(_ title: String, _ icon: String, _ action: @escaping () -> Void,
+                        destructive: Bool = false) -> some View {
         Button(action: action) {
-            Label(title, systemImage: icon)
-                .padding(.horizontal, 7)
-                .frame(height: 30)
+            VStack(spacing: 3) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 30)
+                if showsLearningLabels {
+                    Text(title).font(.caption2).lineLimit(1)
+                }
+            }
+            .foregroundStyle(destructive ? Color.red : Color.primary)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .help(title)
     }
 }
 
@@ -1302,51 +1393,108 @@ private struct WorkspaceToolButton: View {
 struct PencilQuickPalette: View {
     let activeTool: CanvasTool
     let recentColors: [String]
+    let highlightedIndex: Int
     @Binding var width: Double
     let selectColor: (String) -> Void
     let undo: () -> Void
     let redo: () -> Void
     let select: (CanvasTool) -> Void
-    private let tools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso]
+    private let tools = PencilRadialPaletteModel.tools
 
     var body: some View {
-        HStack(spacing: 6) {
-            ForEach(tools, id: \.rawValue) { tool in
-                Button { select(tool) } label: {
-                    Image(systemName: icon(for: tool))
-                        .frame(width: 38, height: 34)
-                        .background(activeTool == tool ? Color.accentColor.opacity(0.18) : .clear,
-                                    in: RoundedRectangle(cornerRadius: 8))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(tool.rawValue.capitalized)
+        ZStack {
+            Circle()
+                .fill(.regularMaterial)
+                .frame(width: 224, height: 224)
+                .overlay { Circle().stroke(.separator.opacity(0.5), lineWidth: 0.5) }
+                .shadow(color: .black.opacity(0.17), radius: 16, y: 6)
+
+            ForEach(Array(tools.enumerated()), id: \.offset) { index, tool in
+                radialToolButton(tool, index: index)
+                    .offset(radialOffset(index: index, radius: 66))
             }
-            Divider().frame(height: 26)
-            ForEach(Array(recentColors.prefix(2).enumerated()), id: \.offset) { _, color in
+
+            ForEach(Array(recentColors.prefix(2).enumerated()), id: \.offset) { index, color in
                 Button { selectColor(color) } label: {
                     Circle().fill(Color(uiColor: UIColor(svgHex: color)))
-                        .frame(width: 24, height: 24)
-                        .overlay(Circle().stroke(.separator, lineWidth: 0.5))
+                        .frame(width: 27, height: 27)
+                        .overlay(Circle().stroke(.white.opacity(0.85), lineWidth: 1.5))
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Use recent color")
+                .accessibilityLabel("Use recent color \(index + 1)")
+                .offset(radialOffset(angle: index == 0 ? .pi / 4 : .pi * 3 / 4,
+                                     radius: 99))
             }
+
+            Button(action: undo) {
+                Image(systemName: "arrow.uturn.backward")
+                    .frame(width: 30, height: 30)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Undo")
+            .offset(radialOffset(angle: .pi * 5 / 4, radius: 99))
+
+            Button(action: redo) {
+                Image(systemName: "arrow.uturn.forward")
+                    .frame(width: 30, height: 30)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Redo")
+            .offset(radialOffset(angle: .pi * 7 / 4, radius: 99))
+
             Menu {
                 Slider(value: $width, in: activeTool == .highlighter ? 10...40 : 1.5...14)
                 Text("Width \(width, specifier: "%.1f")")
             } label: {
-                Image(systemName: "lineweight").frame(width: 30, height: 34)
+                Image(systemName: "lineweight")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 42, height: 42)
+                    .background(.thinMaterial, in: Circle())
+                    .overlay { Circle().stroke(.separator.opacity(0.5), lineWidth: 0.5) }
             }
-            Button(action: undo) { Image(systemName: "arrow.uturn.backward").frame(width: 30, height: 34) }
-                .buttonStyle(.plain).accessibilityLabel("Undo")
-            Button(action: redo) { Image(systemName: "arrow.uturn.forward").frame(width: 30, height: 34) }
-                .buttonStyle(.plain).accessibilityLabel("Redo")
+            .accessibilityLabel("Stroke width")
         }
-        .padding(7)
-        .frame(width: 420)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay { RoundedRectangle(cornerRadius: 12).stroke(.separator.opacity(0.45), lineWidth: 0.5) }
-        .shadow(color: .black.opacity(0.16), radius: 14, y: 5)
+        .frame(width: 244, height: 244)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func radialToolButton(_ tool: CanvasTool, index: Int) -> some View {
+        let highlighted = highlightedIndex == index
+        return Button { select(tool) } label: {
+            Image(systemName: icon(for: tool))
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(highlighted ? Color.white : Color.primary)
+                .frame(width: 48, height: 48)
+                .background(highlighted ? Color.accentColor : Color.primary.opacity(0.07),
+                            in: Circle())
+                .overlay {
+                    Circle().stroke(activeTool == tool ? Color.accentColor : .clear,
+                                    lineWidth: highlighted ? 0 : 2)
+                }
+                .scaleEffect(highlighted ? 1.08 : 1)
+                .animation(.easeOut(duration: 0.1), value: highlighted)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityName(for: tool))
+        .accessibilityValue(highlighted ? "Highlighted" : "")
+    }
+
+    private func radialOffset(index: Int, radius: CGFloat) -> CGSize {
+        radialOffset(angle: -.pi / 2 + CGFloat(index) * .pi / 2, radius: radius)
+    }
+
+    private func radialOffset(angle: CGFloat, radius: CGFloat) -> CGSize {
+        CGSize(width: cos(angle) * radius, height: sin(angle) * radius)
+    }
+
+    private func accessibilityName(for tool: CanvasTool) -> String {
+        switch tool {
+        case .highlighter: return "Marker"
+        case .objectEraser: return "Eraser"
+        case .lasso: return "Lasso"
+        case .pen: return "Pen"
+        default: return tool.rawValue.capitalized
+        }
     }
 
     private func icon(for tool: CanvasTool) -> String {

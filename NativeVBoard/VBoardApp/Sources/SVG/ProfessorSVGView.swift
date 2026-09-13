@@ -192,7 +192,10 @@ final class ProfessorSVGView: UIView {
     /// is cancelled.
     func previewTranslation(ids: Set<String>, delta: CGPoint) {
         let transform = CGAffineTransform(translationX: delta.x, y: delta.y)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         for id in ids { entries[id]?.layer.setAffineTransform(transform) }
+        CATransaction.commit()
     }
 
     /// Keeps the GPU-composited gesture result visible while the canonical

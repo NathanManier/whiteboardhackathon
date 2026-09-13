@@ -509,8 +509,8 @@ enum GraphFallbackRenderer {
         let container = CALayer()
         container.frame = frame
         container.name = "graph:\(graph.id):proxy"
-        container.backgroundColor = UIColor.secondarySystemBackground.cgColor
-        container.borderColor = UIColor.separator.withAlphaComponent(0.42).cgColor
+        container.backgroundColor = CanvasDesignTokens.boardSurface.cgColor
+        container.borderColor = CanvasDesignTokens.boardBorder.withAlphaComponent(0.42).cgColor
         container.borderWidth = 1 / max(contentsScale, 1)
         container.cornerRadius = 10
         container.masksToBounds = true
@@ -574,7 +574,7 @@ enum GraphFallbackRenderer {
         grid.frame = frame
         grid.path = gridPath.cgPath
         grid.fillColor = UIColor.clear.cgColor
-        grid.strokeColor = UIColor.separator.withAlphaComponent(0.22).cgColor
+        grid.strokeColor = CanvasDesignTokens.canvasSecondaryText.withAlphaComponent(0.18).cgColor
         grid.lineWidth = 1 / max(contentsScale, 1)
         grid.contentsScale = contentsScale
         container.addSublayer(grid)

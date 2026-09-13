@@ -30,6 +30,14 @@ enum CanvasDesignTokens {
     static let dotColor = UIColor(red: 0.18, green: 0.25, blue: 0.32, alpha: 1)
 }
 
+/// Canvas content has an intentional appearance independent of app chrome.
+/// Graphs, paper, ink controls, and selection chrome all follow this value;
+/// system Dark Mode remains free to style the library and navigation UI.
+enum VBoardCanvasTheme {
+    static let interfaceStyle: UIUserInterfaceStyle = .light
+    static let colorScheme: ColorScheme = .light
+}
+
 private enum InputSource: String { case pencil, touch, indirectPointer, mouse, trackpad }
 private enum InteractionState: String { case idle = "IDLE", drawing = "DRAWING", panning = "PANNING", pinching = "PINCHING", lassoing = "LASSOING", erasing = "ERASING", selecting = "SELECTING", movingSelection = "MOVING_SELECTION", resizingSelection = "RESIZING_SELECTION" }
 
@@ -332,6 +340,8 @@ struct NativeCanvasView: UIViewRepresentable {
     var onRedo: () -> Void = {}
     var onPencilAction: (PencilLogicalAction, CGPoint?) -> Void = { _, _ in }
     var onPencilPaletteMoved: (CGPoint) -> Void = { _ in }
+    var onPencilPaletteHighlight: (Int) -> Void = { _ in }
+    var onPencilPaletteCommit: (Int) -> Void = { _ in }
     var onPencilPaletteDismiss: () -> Void = {}
 
     func makeUIView(context: Context) -> InfiniteCanvasUIView {
@@ -346,6 +356,8 @@ struct NativeCanvasView: UIViewRepresentable {
                              onStroke: onStroke, tool: tool,
                              onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo,
                              onPencilAction: onPencilAction, onPencilPaletteMoved: onPencilPaletteMoved,
+                             onPencilPaletteHighlight: onPencilPaletteHighlight,
+                             onPencilPaletteCommit: onPencilPaletteCommit,
                              onPencilPaletteDismiss: onPencilPaletteDismiss)
     }
 
@@ -361,6 +373,8 @@ struct NativeCanvasView: UIViewRepresentable {
                       onStroke: onStroke, tool: tool,
                       onSelectionChanged: onSelectionChanged, onSelectionRegionChanged: onSelectionRegionChanged, onMove: onMove, onResize: onResize, onDelete: onDelete, onCameraChanged: onCameraChanged, onUndo: onUndo, onRedo: onRedo,
                       onPencilAction: onPencilAction, onPencilPaletteMoved: onPencilPaletteMoved,
+                      onPencilPaletteHighlight: onPencilPaletteHighlight,
+                      onPencilPaletteCommit: onPencilPaletteCommit,
                       onPencilPaletteDismiss: onPencilPaletteDismiss)
     }
 }
@@ -405,6 +419,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var pencilPreferences: PencilPreferences
     private var onPencilAction: (PencilLogicalAction, CGPoint?) -> Void
     private var onPencilPaletteMoved: (CGPoint) -> Void
+    private var onPencilPaletteHighlight: (Int) -> Void
+    private var onPencilPaletteCommit: (Int) -> Void
     private var onPencilPaletteDismiss: () -> Void
     private var pencilInteraction: UIPencilInteraction!
     private var pencilHoverRecognizer: UIHoverGestureRecognizer!
@@ -481,6 +497,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
          onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {},
          onPencilAction: @escaping (PencilLogicalAction, CGPoint?) -> Void = { _, _ in },
          onPencilPaletteMoved: @escaping (CGPoint) -> Void = { _ in },
+         onPencilPaletteHighlight: @escaping (Int) -> Void = { _ in },
+         onPencilPaletteCommit: @escaping (Int) -> Void = { _ in },
          onPencilPaletteDismiss: @escaping () -> Void = {}) {
         self.boardID = boardID; self.document = document; self.previewImage = previewImage
         self.pdfData = pdfData; self.sourceKind = sourceKind; self.objects = objects
@@ -495,6 +513,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         self.onMove = onMove; self.onResize = onResize; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
         self.onPencilAction = onPencilAction
         self.onPencilPaletteMoved = onPencilPaletteMoved
+        self.onPencilPaletteHighlight = onPencilPaletteHighlight
+        self.onPencilPaletteCommit = onPencilPaletteCommit
         self.onPencilPaletteDismiss = onPencilPaletteDismiss
         controller = CameraController(camera: camera)
         persistedCamera = camera
@@ -722,6 +742,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         pencilRawMonitor.recordSqueeze(squeeze)
         #endif
         let point = squeeze.hoverPose?.location
+        let roll = squeeze.hoverPose.map {
+            PencilScreenAngle.roll(fromAppleRaw: $0.rollAngle)
+        }
         let phase: PencilSqueezePhase
         switch squeeze.phase {
         case .began: phase = .began
@@ -738,8 +761,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             )
             if activeSqueezeAction == .showToolPalette || activeSqueezeAction == .showInkAttributes
                 || activeSqueezeAction == .showColorPalette {
-                if case .present(let anchor) = squeezeState.receive(.began, anchor: point) {
+                if case .present(let anchor, let index) = squeezeState.receive(
+                    .began, anchor: point, roll: roll,
+                    initialIndex: PencilRadialPaletteModel.index(for: activeTool)
+                ) {
                     routePencilAction(activeSqueezeAction, anchor: anchor)
+                    onPencilPaletteHighlight(index)
                     pencilFeedback.request(.paletteActivation(anchor
                         ?? CGPoint(x: bounds.midX, y: bounds.midY)))
                 }
@@ -749,9 +776,21 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             return
         }
 
-        let effect = squeezeState.receive(phase, anchor: point)
-        if case .update(let anchor?) = effect { onPencilPaletteMoved(anchor) }
-        if effect == .dismiss { onPencilPaletteDismiss() }
+        let effect = squeezeState.receive(phase, anchor: point, roll: roll)
+        switch effect {
+        case .update(let anchor, let index, let selectionChanged):
+            if let anchor { onPencilPaletteMoved(anchor) }
+            onPencilPaletteHighlight(index)
+            if selectionChanged { pencilFeedback.request(.toolSelection(point)) }
+        case .commit(let index):
+            onPencilPaletteCommit(index)
+            onPencilPaletteDismiss()
+            pencilFeedback.request(.action(point))
+        case .dismiss:
+            onPencilPaletteDismiss()
+        case .none, .present:
+            break
+        }
         if phase == .ended || phase == .cancelled { activeSqueezeAction = .none }
     }
 
@@ -888,6 +927,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                 onDelete: @escaping (Set<String>) -> Void = { _ in }, onCameraChanged: @escaping (CameraRect) -> Void = { _ in }, onUndo: @escaping () -> Void = {}, onRedo: @escaping () -> Void = {},
                 onPencilAction: @escaping (PencilLogicalAction, CGPoint?) -> Void = { _, _ in },
                 onPencilPaletteMoved: @escaping (CGPoint) -> Void = { _ in },
+                onPencilPaletteHighlight: @escaping (Int) -> Void = { _ in },
+                onPencilPaletteCommit: @escaping (Int) -> Void = { _ in },
                 onPencilPaletteDismiss: @escaping () -> Void = {}) {
         let boardChanged = self.boardID != boardID
         let documentChanged = self.document != document || self.importedTransforms != importedTransforms
@@ -927,12 +968,20 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             #if DEBUG
             print("[VBoard] TOOL CHANGED \(self.activeTool.rawValue) -> \(tool.rawValue) board=\(boardID)")
             #endif
+            if tool != .select, tool != .lasso, !selectedIDs.isEmpty {
+                selectedIDs.removeAll()
+                onSelectionRegionChanged(nil)
+                onSelectionChanged([])
+                updateSelectionOverlay()
+            }
         }
         self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
         self.onMove = onMove; self.onResize = onResize; self.onDelete = onDelete; self.onCameraChanged = onCameraChanged; self.onUndo = onUndo; self.onRedo = onRedo
         self.onPencilAction = onPencilAction
         self.onPencilPaletteMoved = onPencilPaletteMoved
+        self.onPencilPaletteHighlight = onPencilPaletteHighlight
+        self.onPencilPaletteCommit = onPencilPaletteCommit
         self.onPencilPaletteDismiss = onPencilPaletteDismiss
         panGesture.minimumNumberOfTouches = CanvasInputArbitrationPolicy
             .minimumDirectNavigationTouches(tool: tool)
@@ -1674,6 +1723,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                 interactionState = .movingSelection
                 return
             }
+            if !selectedIDs.isEmpty {
+                selectedIDs.removeAll()
+                onSelectionRegionChanged(nil)
+                onSelectionChanged([])
+                updateSelectionOverlay()
+            }
             interactionState = .lassoing; lassoWorldPoints = [point]; debugInputOperation("LASSO BEGIN"); updateInteractionPath()
         } else if activeTool == .objectEraser {
             interactionState = .erasing; eraseIDs.removeAll(); eraseSegment(from: point, to: point); debugInputOperation("ERASER BEGIN")
@@ -1817,11 +1872,18 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     }
 
     private func previewMove(_ delta: CGPoint) {
+        let started = CACurrentMediaTime()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         for id in selectedIDs {
             userObjectLayers[id]?.setAffineTransform(CGAffineTransform(translationX: delta.x, y: delta.y))
         }
         professor.previewTranslation(ids: selectedIDs, delta: delta)
         updateSelectionOverlay()
+        CATransaction.commit()
+        #if DEBUG
+        print("[VBoard] SELECTION PREVIEW sameFrame=true ids=\(selectedIDs.count) apply_ms=\(String(format: "%.3f", (CACurrentMediaTime() - started) * 1_000)) delta=(\(delta.x),\(delta.y))")
+        #endif
     }
 
     private func clearMovePreview() {
@@ -2137,7 +2199,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         if object.type == "graph", let graph = object.graph {
             let layer = GraphFallbackRenderer.cachedProxyLayer(
                 for: graph, contentsScale: window?.screen.scale ?? UIScreen.main.scale,
-                appearance: traitCollection.userInterfaceStyle
+                appearance: VBoardCanvasTheme.interfaceStyle
             )
             applyProvenance(object.id, to: layer)
             return layer

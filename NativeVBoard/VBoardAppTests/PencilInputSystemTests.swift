@@ -319,14 +319,15 @@ final class PencilPaletteAndArbitrationTests: XCTestCase {
     func testOneSqueezeProducesOnePaletteLifecycle() {
         var state = PencilPaletteStateMachine()
         XCTAssertEqual(state.receive(.began, anchor: CGPoint(x: 10, y: 20)),
-                       .present(CGPoint(x: 10, y: 20)))
+                       .present(CGPoint(x: 10, y: 20), highlightedIndex: 0))
         XCTAssertEqual(state.receive(.began, anchor: CGPoint(x: 11, y: 21)), .none)
         XCTAssertEqual(state.receive(.changed, anchor: CGPoint(x: 12, y: 22)),
-                       .update(CGPoint(x: 12, y: 22)))
-        XCTAssertEqual(state.receive(.ended, anchor: CGPoint(x: 13, y: 23)), .none)
-        XCTAssertTrue(state.isPresented)
-        XCTAssertEqual(state.dismiss(), .dismiss)
+                       .update(CGPoint(x: 12, y: 22), highlightedIndex: 0,
+                               selectionChanged: false))
+        XCTAssertEqual(state.receive(.ended, anchor: CGPoint(x: 13, y: 23)),
+                       .commit(highlightedIndex: 0))
         XCTAssertFalse(state.isPresented)
+        XCTAssertEqual(state.dismiss(), .none)
     }
 
     func testSqueezeCancellationDismissesAndClearsHitBlockingState() {
@@ -348,6 +349,61 @@ final class PencilPaletteAndArbitrationTests: XCTestCase {
         let corner = PencilPalettePlacement.origin(anchor: CGPoint(x: 0, y: 0),
                                                    paletteSize: size, safeBounds: bounds)
         XCTAssertTrue(bounds.contains(CGRect(origin: corner, size: size)))
+        let center = PencilPalettePlacement.center(
+            anchor: CGPoint(x: 0, y: 0), radius: 112, safeBounds: bounds
+        )
+        XCTAssertGreaterThanOrEqual(center.x - 112, bounds.minX)
+        XCTAssertGreaterThanOrEqual(center.y - 112, bounds.minY)
+    }
+
+    func testClockwiseRollAdvancesRadialSectorAcrossWraparound() {
+        var state = PencilPaletteStateMachine()
+        _ = state.receive(.began, anchor: .zero,
+                          roll: CGFloat(350.0 * .pi / 180), initialIndex: 1)
+        XCTAssertEqual(
+            state.receive(.changed, anchor: .zero,
+                          roll: CGFloat(50.0 * .pi / 180)),
+            .update(.zero, highlightedIndex: 2, selectionChanged: true)
+        )
+    }
+
+    func testCounterclockwiseRollMovesRadialSectorCounterclockwise() {
+        var state = PencilPaletteStateMachine()
+        _ = state.receive(.began, anchor: .zero, roll: 0, initialIndex: 0)
+        XCTAssertEqual(
+            state.receive(.changed, anchor: .zero, roll: -.pi / 3),
+            .update(.zero, highlightedIndex: 3, selectionChanged: true)
+        )
+    }
+
+    func testRadialSectorHysteresisPreventsBoundaryJitter() {
+        var state = PencilPaletteStateMachine()
+        _ = state.receive(.began, anchor: .zero, roll: 0, initialIndex: 0)
+        let underForwardThreshold = CGFloat(52.0 * .pi / 180)
+        XCTAssertEqual(
+            state.receive(.changed, anchor: .zero, roll: underForwardThreshold),
+            .update(.zero, highlightedIndex: 0, selectionChanged: false)
+        )
+        XCTAssertEqual(
+            state.receive(.changed, anchor: .zero, roll: CGFloat(54.0 * .pi / 180)),
+            .update(.zero, highlightedIndex: 1, selectionChanged: true)
+        )
+        XCTAssertEqual(
+            state.receive(.changed, anchor: .zero, roll: CGFloat(38.0 * .pi / 180)),
+            .update(.zero, highlightedIndex: 1, selectionChanged: false)
+        )
+        XCTAssertEqual(
+            state.receive(.changed, anchor: .zero, roll: CGFloat(36.0 * .pi / 180)),
+            .update(.zero, highlightedIndex: 0, selectionChanged: true)
+        )
+    }
+
+    func testCancelledSqueezeNeverCommitsHighlightedSector() {
+        var state = PencilPaletteStateMachine()
+        _ = state.receive(.began, anchor: .zero, roll: 0, initialIndex: 2)
+        _ = state.receive(.changed, anchor: .zero, roll: .pi / 2)
+        XCTAssertEqual(state.receive(.cancelled, anchor: .zero), .dismiss)
+        XCTAssertFalse(state.isPresented)
     }
 
     func testToolContactMatrixHasOneDeterministicOwner() {

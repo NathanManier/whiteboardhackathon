@@ -594,7 +594,7 @@ final class GraphInteractiveSession: ObservableObject {
            let snapshot, let hostView {
             GraphProxyCache.shared.storeProviderSnapshot(
                 snapshot, for: finalizedGraph,
-                appearance: hostView.traitCollection.userInterfaceStyle,
+                appearance: VBoardCanvasTheme.interfaceStyle,
                 accountNamespace: proxyAccountNamespace,
                 expectedGeneration: proxyCacheGeneration
             )
@@ -1155,8 +1155,9 @@ struct GraphInteractiveSurface: View {
                 Spacer()
             }
         }
-        .background(Color(uiColor: .secondarySystemBackground))
+        .background(Color(uiColor: CanvasDesignTokens.boardSurface))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .environment(\.colorScheme, VBoardCanvasTheme.colorScheme)
         .animation(.easeInOut(duration: 0.16), value: session.representationState)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(GraphAccessibility.label(for: session.displayGraph))
@@ -1276,8 +1277,9 @@ private struct LightweightGraphSurface: View {
                 }
             }
         }
-        .background(Color(uiColor: .secondarySystemBackground))
+        .background(Color(uiColor: CanvasDesignTokens.boardSurface))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .environment(\.colorScheme, VBoardCanvasTheme.colorScheme)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(GraphAccessibility.label(for: graph))
         .onChange(of: graph) { _, value in viewport = value.viewport }
@@ -2049,19 +2051,15 @@ struct GraphNativeFallbackSurface: UIViewRepresentable {
 final class GraphFallbackHostView: UIView {
     private var graph: GraphObject
     private var renderedSize = CGSize.zero
-    private var renderedAppearance: UIUserInterfaceStyle = .unspecified
     private var graphLayer: CALayer?
 
     init(graph: GraphObject) {
         self.graph = graph
         super.init(frame: .zero)
-        backgroundColor = .secondarySystemBackground
+        overrideUserInterfaceStyle = VBoardCanvasTheme.interfaceStyle
+        backgroundColor = CanvasDesignTokens.boardSurface
         isUserInteractionEnabled = false
         clipsToBounds = true
-        registerForTraitChanges([UITraitUserInterfaceStyle.self]) {
-            (view: GraphFallbackHostView, _: UITraitCollection) in
-            view.rebuild()
-        }
     }
 
     required init?(coder: NSCoder) {
@@ -2071,8 +2069,7 @@ final class GraphFallbackHostView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         guard bounds.width > 1, bounds.height > 1,
-              renderedSize != bounds.size
-                || renderedAppearance != traitCollection.userInterfaceStyle else { return }
+              renderedSize != bounds.size else { return }
         rebuild()
     }
 
@@ -2085,11 +2082,10 @@ final class GraphFallbackHostView: UIView {
     private func rebuild() {
         guard bounds.width > 1, bounds.height > 1 else { return }
         renderedSize = bounds.size
-        renderedAppearance = traitCollection.userInterfaceStyle
         let scale = window?.screen.scale ?? UIScreen.main.scale
         let image = GraphProxyCache.shared.nativeImage(
             for: graph, size: bounds.size, scale: scale,
-            appearance: renderedAppearance
+            appearance: VBoardCanvasTheme.interfaceStyle
         )
         let replacement = CALayer()
         replacement.name = "graph:\(graph.id):cached-proxy"

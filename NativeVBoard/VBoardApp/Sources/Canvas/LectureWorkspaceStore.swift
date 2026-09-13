@@ -128,6 +128,7 @@ final class LectureWorkspaceStore: ObservableObject {
     @Published private(set) var scenes: [String: WorkspaceBoardScene] = [:]
     @Published private(set) var status: WorkspacePersistenceStatus = .loading
     @Published private(set) var selectedKeys = Set<SelectionKey>()
+    @Published private(set) var selectionGeneration = 0
     @Published private(set) var selectedPDFRegions: [String: CGRect] = [:]
     @Published private(set) var focusRequest: WorkspaceFocusRequest?
     @Published private(set) var conflictServerWorkspace: LectureWorkspace?
@@ -314,12 +315,16 @@ final class LectureWorkspaceStore: ObservableObject {
     }
 
     func setSelection(_ keys: Set<SelectionKey>, pdfRegions: [String: CGRect] = [:]) {
-        selectedKeys = keys
-        selectedPDFRegions = pdfRegions.filter { boardID, rect in
+        let filteredRegions = pdfRegions.filter { boardID, rect in
             keys.contains(where: {
                 $0.boardID == boardID && $0.objectID == PDFBoardSource.logicalID
             }) && !rect.isNull && !rect.isInfinite
         }
+        if selectedKeys != keys || selectedPDFRegions != filteredRegions {
+            selectionGeneration &+= 1
+        }
+        selectedKeys = keys
+        selectedPDFRegions = filteredRegions
     }
 
     func studySelection(for boardID: String) -> BoardStudySelection? {

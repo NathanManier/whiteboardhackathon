@@ -247,6 +247,8 @@ struct LectureCanvasView: UIViewRepresentable {
     var onRedo: () -> Void
     var onPencilAction: (PencilLogicalAction, CGPoint?) -> Void
     var onPencilPaletteMoved: (CGPoint) -> Void
+    var onPencilPaletteHighlight: (Int) -> Void = { _ in }
+    var onPencilPaletteCommit: (Int) -> Void = { _ in }
     var onPencilPaletteDismiss: () -> Void
 
     func makeUIView(context: Context) -> LectureCanvasUIView {
@@ -296,6 +298,8 @@ struct LectureCanvasView: UIViewRepresentable {
                                onRedo: onRedo,
                                onPencilAction: onPencilAction,
                                onPencilPaletteMoved: onPencilPaletteMoved,
+                               onPencilPaletteHighlight: onPencilPaletteHighlight,
+                               onPencilPaletteCommit: onPencilPaletteCommit,
                                onPencilPaletteDismiss: onPencilPaletteDismiss)
     }
 }
@@ -315,6 +319,8 @@ struct LectureCanvasCallbacks {
     var onRedo: () -> Void
     var onPencilAction: (PencilLogicalAction, CGPoint?) -> Void
     var onPencilPaletteMoved: (CGPoint) -> Void
+    var onPencilPaletteHighlight: (Int) -> Void = { _ in }
+    var onPencilPaletteCommit: (Int) -> Void = { _ in }
     var onPencilPaletteDismiss: () -> Void
 }
 
@@ -544,6 +550,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         pencilRawMonitor.recordSqueeze(squeeze)
         #endif
         let point = squeeze.hoverPose?.location
+        let roll = squeeze.hoverPose.map {
+            PencilScreenAngle.roll(fromAppleRaw: $0.rollAngle)
+        }
         let phase: PencilSqueezePhase
         switch squeeze.phase {
         case .began: phase = .began
@@ -559,8 +568,12 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             )
             if activeSqueezeAction == .showToolPalette || activeSqueezeAction == .showInkAttributes
                 || activeSqueezeAction == .showColorPalette {
-                if case .present(let anchor) = squeezeState.receive(.began, anchor: point) {
+                if case .present(let anchor, let index) = squeezeState.receive(
+                    .began, anchor: point, roll: roll,
+                    initialIndex: PencilRadialPaletteModel.index(for: activeTool)
+                ) {
                     routePencilAction(activeSqueezeAction, anchor: anchor)
+                    callbacks.onPencilPaletteHighlight(index)
                     pencilFeedback.request(.paletteActivation(anchor
                         ?? CGPoint(x: bounds.midX, y: bounds.midY)))
                 }
@@ -569,9 +582,21 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             }
             return
         }
-        let effect = squeezeState.receive(phase, anchor: point)
-        if case .update(let anchor?) = effect { callbacks.onPencilPaletteMoved(anchor) }
-        if effect == .dismiss { callbacks.onPencilPaletteDismiss() }
+        let effect = squeezeState.receive(phase, anchor: point, roll: roll)
+        switch effect {
+        case .update(let anchor, let index, let selectionChanged):
+            if let anchor { callbacks.onPencilPaletteMoved(anchor) }
+            callbacks.onPencilPaletteHighlight(index)
+            if selectionChanged { pencilFeedback.request(.toolSelection(point)) }
+        case .commit(let index):
+            callbacks.onPencilPaletteCommit(index)
+            callbacks.onPencilPaletteDismiss()
+            pencilFeedback.request(.action(point))
+        case .dismiss:
+            callbacks.onPencilPaletteDismiss()
+        case .none, .present:
+            break
+        }
         if phase == .ended || phase == .cancelled { activeSqueezeAction = .none }
     }
 
@@ -693,6 +718,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         if self.activeTool != tool {
             if isInteracting { clearTransientInput() }
             pencilFeedback.request(.toolSelection(nil))
+            if tool != .select, tool != .lasso, !self.selectedKeys.isEmpty {
+                self.selectedKeys.removeAll()
+                callbacks.onSelectionChanged([], [:])
+                updateSelectionOverlay()
+            }
         }
         self.activeTool = tool
         panRecognizer.minimumNumberOfTouches = CanvasInputArbitrationPolicy
@@ -1211,6 +1241,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             return
         }
         if owner == .lasso {
+            if !selectedKeys.isEmpty {
+                selectedKeys.removeAll()
+                callbacks.onSelectionChanged([], [:])
+                updateSelectionOverlay()
+            }
             lassoPoints = [world]
             interaction = .lassoing
             updateInteractionOverlay()
@@ -1636,11 +1671,18 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     }
 
     private func previewSelectionMove(_ delta: CGPoint) {
+        let started = CACurrentMediaTime()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         let grouped = Dictionary(grouping: selectedKeys, by: \.boardID)
         for (boardID, keys) in grouped {
             boardViews[boardID]?.previewMove(keys: Set(keys), delta: delta)
         }
         updateSelectionOverlay()
+        CATransaction.commit()
+        #if DEBUG
+        print("[VBoard] LECTURE SELECTION PREVIEW sameFrame=true keys=\(selectedKeys.count) apply_ms=\(String(format: "%.3f", (CACurrentMediaTime() - started) * 1_000)) delta=(\(delta.x),\(delta.y))")
+        #endif
     }
 
     private func clearSelectionMovePreview() {
@@ -2176,6 +2218,8 @@ private final class LectureBoardRenderView: UIView {
     }
 
     func previewMove(keys: Set<SelectionKey>, delta: CGPoint) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         let professorIDs = Set(keys.filter { $0.kind == .professorPath }.map(\.objectID))
         professor.previewTranslation(ids: professorIDs, delta: delta)
         if keys.contains(where: { $0.objectID == PDFBoardSource.imageLogicalID }) {
@@ -2184,6 +2228,7 @@ private final class LectureBoardRenderView: UIView {
         for key in keys where key.kind == .editorObject {
             objectLayers[key.objectID]?.setAffineTransform(CGAffineTransform(translationX: delta.x, y: delta.y))
         }
+        CATransaction.commit()
     }
 
     func clearMovePreview(keys: Set<SelectionKey>) {
@@ -2333,7 +2378,7 @@ private final class LectureBoardRenderView: UIView {
             if object.type == "graph", let graph = object.graph {
                 layer = GraphFallbackRenderer.cachedProxyLayer(
                     for: graph, contentsScale: window?.screen.scale ?? UIScreen.main.scale,
-                    appearance: traitCollection.userInterfaceStyle
+                    appearance: VBoardCanvasTheme.interfaceStyle
                 )
             } else if object.type == "text", object.text != nil || object.sourceMarkdown != nil {
                 layer = CompactStudyPresentation.layer(

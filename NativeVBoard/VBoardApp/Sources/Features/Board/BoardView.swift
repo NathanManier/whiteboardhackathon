@@ -233,8 +233,10 @@ private struct BoardEditorSurface: View {
     @State private var activeTool: CanvasTool = .pen
     @State private var previousPencilTool: CanvasTool = .pen
     @State private var pencilQuickPalettePoint: CGPoint?
+    @State private var pencilQuickPaletteHighlight = 0
     @State private var selectedIDs = Set<String>()
     @State private var selectedPDFRegion: CGRect?
+    @State private var selectionGeneration = 0
     @State private var liveCamera: CameraRect?
     @State private var studyInitialAction: String?
     @State private var studyInteractions: [StudyInteraction] = []
@@ -356,6 +358,13 @@ private struct BoardEditorSurface: View {
         .onChange(of: store.status) { _, status in if status == .conflict { showConflict = true } }
         .onChange(of: activeTool) { oldTool, tool in
             if oldTool != tool && oldTool != .objectEraser { previousPencilTool = oldTool }
+            if tool != .select, tool != .lasso,
+               !selectedIDs.isEmpty || selectedPDFRegion != nil {
+                selectedIDs.removeAll()
+                selectedPDFRegion = nil
+                selectionGeneration &+= 1
+                graphRecognition.clear()
+            }
             if !GraphPencilInteractionPolicy.allowsAnnotation(for: tool) {
                 interactiveGraph = nil
             }
@@ -398,7 +407,10 @@ private struct BoardEditorSurface: View {
                 isPencilPalettePresented: pencilQuickPalettePoint != nil,
                 showsDeveloperDiagnostics: developerDiagnosticsIfAvailable,
                 onStroke: { stroke in store.applyStroke(stroke, api: api) }, tool: activeTool,
-                onSelectionChanged: { selectedIDs = $0 },
+                onSelectionChanged: { ids in
+                    if selectedIDs != ids { selectionGeneration &+= 1 }
+                    selectedIDs = ids
+                },
                 onSelectionRegionChanged: { selectedPDFRegion = $0 },
                 onMove: { ids, delta in selectedPDFRegion = nil; store.moveObjects(ids: ids, by: delta, api: api) },
                 onResize: { ids, anchor, factor in selectedPDFRegion = nil; store.scaleObjects(ids: ids, around: anchor, by: factor, api: api) },
@@ -407,6 +419,11 @@ private struct BoardEditorSurface: View {
                 onUndo: { store.undo(api: api) }, onRedo: { store.redo(api: api) },
                 onPencilAction: handlePencilAction,
                 onPencilPaletteMoved: { pencilQuickPalettePoint = $0 },
+                onPencilPaletteHighlight: { pencilQuickPaletteHighlight = $0 },
+                onPencilPaletteCommit: { index in
+                    activeTool = PencilRadialPaletteModel.tool(at: index)
+                    pencilQuickPalettePoint = nil
+                },
                 onPencilPaletteDismiss: { pencilQuickPalettePoint = nil }
             )
                 .ignoresSafeArea(edges: .bottom)
@@ -475,17 +492,20 @@ private struct BoardEditorSurface: View {
             WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
                                  penColor: $penColor, penWidth: $penWidth,
                                  markerColor: $markerColor, markerWidth: $markerWidth,
-                                 markerOpacity: $markerOpacity)
+                                 markerOpacity: $markerOpacity,
+                                 undo: { store.undo(api: api) },
+                                 redo: { store.redo(api: api) })
             .padding(.bottom, 12)
             .zIndex(30)
 
             if let point = pencilQuickPalettePoint {
-                let paletteSize = CGSize(width: 420, height: 56)
-                let origin = PencilPalettePlacement.origin(
-                    anchor: point, paletteSize: paletteSize,
+                let paletteRadius: CGFloat = 122
+                let center = PencilPalettePlacement.center(
+                    anchor: point, radius: paletteRadius,
                     safeBounds: CGRect(origin: .zero, size: proxy.size).insetBy(dx: 8, dy: 8)
                 )
                 PencilQuickPalette(activeTool: activeTool, recentColors: [penColor, markerColor],
+                                   highlightedIndex: pencilQuickPaletteHighlight,
                                    width: activeTool == .highlighter ? $markerWidth : $penWidth,
                                    selectColor: { color in
                                        if activeTool == .highlighter { markerColor = color }
@@ -495,14 +515,14 @@ private struct BoardEditorSurface: View {
                     activeTool = $0
                     pencilQuickPalettePoint = nil
                 }
-                .position(x: origin.x + paletteSize.width / 2,
-                          y: origin.y + paletteSize.height / 2)
+                .position(center)
                 .transition(.opacity.combined(with: .scale(scale: 0.92)))
                 .zIndex(31)
             }
 
             if interactiveGraph == nil, let rect = selectionScreenRect(viewport: proxy.size) {
                 SelectionActionBar(canCheckWork: selectionCanCheckWork,
+                                   selectionGeneration: selectionGeneration,
                                    graphPrimaryTitle: graphPrimaryTitle,
                                    graphIsLoading: false,
                                    explain: { openStudy("explain") },
@@ -582,6 +602,7 @@ private struct BoardEditorSurface: View {
             previousPencilTool = activeTool
             activeTool = next
         case .showColorPalette, .showInkAttributes, .showToolPalette:
+            pencilQuickPaletteHighlight = PencilRadialPaletteModel.index(for: activeTool)
             withAnimation(.easeOut(duration: 0.16)) {
                 pencilQuickPalettePoint = anchor ?? CGPoint(x: canvasSize.width / 2,
                                                             y: canvasSize.height / 2)
