@@ -58,18 +58,12 @@
     <section id="corner-workspace" class="corner-workspace" hidden aria-labelledby="corner-title">
       <div class="instruction-panel">
         <p class="step-label">Automatic detection</p>
-        <h1 id="corner-title">Confirm the four board corners</h1>
-        <p>We placed the handles automatically. Check that each one is on the real board corner, drag any that need adjustment, then confirm.</p>
-        <ol class="corner-order">
-          <li><span>1</span>Top left</li>
-          <li><span>2</span>Top right</li>
-          <li><span>3</span>Bottom right</li>
-          <li><span>4</span>Bottom left</li>
-        </ol>
+        <h1 id="corner-title">Confirm corners</h1>
+        <p>Adjust the four corners, then confirm. Automatic placement is only a suggestion.</p>
         <div class="panel-actions">
           <button class="button button-ghost" id="reset-corners" type="button">Use detected</button>
           <button class="button button-primary" id="submit-corners" type="button">
-            Confirm &amp; process
+            Confirm Corners
           </button>
         </div>
         <p class="inline-error" id="corner-error" role="alert" hidden></p>
@@ -81,10 +75,10 @@
             <polygon id="corner-polygon" points=""></polygon>
             <polyline id="corner-lines" points=""></polyline>
           </svg>
-          <button class="corner-handle" data-corner="0" type="button" aria-label="Top-left corner">1</button>
-          <button class="corner-handle" data-corner="1" type="button" aria-label="Top-right corner">2</button>
-          <button class="corner-handle" data-corner="2" type="button" aria-label="Bottom-right corner">3</button>
-          <button class="corner-handle" data-corner="3" type="button" aria-label="Bottom-left corner">4</button>
+          <button class="corner-handle" data-corner="0" type="button" aria-label="Top-left corner"></button>
+          <button class="corner-handle" data-corner="1" type="button" aria-label="Top-right corner"></button>
+          <button class="corner-handle" data-corner="2" type="button" aria-label="Bottom-right corner"></button>
+          <button class="corner-handle" data-corner="3" type="button" aria-label="Bottom-left corner"></button>
         </div>
         <p class="stage-help">Tip: zoom your browser if a corner is difficult to place.</p>
       </div>

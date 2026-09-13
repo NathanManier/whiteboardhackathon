@@ -177,7 +177,8 @@ struct BoardStudySelection: Equatable, Sendable {
                                   y: CGFloat(transform.scaleY ?? 1))
                 }
                 let transformed = parsed.copy(using: &affine) ?? parsed
-                let candidate = key.objectID == PDFBoardSource.logicalID
+                let candidate = (key.objectID == PDFBoardSource.logicalID
+                                 || key.objectID == PDFBoardSource.imageLogicalID)
                     ? preferredLocalBBox ?? transformed.boundingBoxOfPath
                     : transformed.boundingBoxOfPath
                 guard let validBounds = finiteBounds(candidate) else { continue }

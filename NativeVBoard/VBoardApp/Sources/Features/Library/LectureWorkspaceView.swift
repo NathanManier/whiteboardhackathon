@@ -23,6 +23,8 @@ struct LectureWorkspaceView: View {
     @State private var actionError: String?
     @State private var selectionScreenBounds: CGRect?
     @State private var studyInitialAction: String?
+    @State private var studyInteractionsByBoard: [String: [StudyInteraction]] = [:]
+    @State private var reopenedStudy: StudyInteraction?
     @State private var previousPencilTool: CanvasTool = .pen
     @State private var pencilQuickPalettePoint: CGPoint?
     @State private var graphCreationRequest: GraphCreationRequest?
@@ -153,6 +155,12 @@ struct LectureWorkspaceView: View {
                                    boardID: graph.owningBoardID, api: api)
             }
         }
+        .sheet(item: $reopenedStudy) { interaction in
+            SavedStudyInteractionView(interaction: interaction) {
+                reopenedStudy = nil
+                DispatchQueue.main.async { openStudy(action: "explain", forceNew: true) }
+            }
+        }
         .sheet(isPresented: $showNote) {
             LectureNoteSheet(unitLabel: activeUnitLabel) { markdown in
                 store.addNote(markdown, api: api)
@@ -211,15 +219,17 @@ struct LectureWorkspaceView: View {
         }
         .onChange(of: store.selectedKeys) { _, _ in
             let target = graphRecognitionTarget
-            graphRecognition.selectionChanged(
-                target, api: api,
-                prepareSelection: { if let target { await prepareGraphRecognition(target) } }
-            )
+            graphRecognition.clear()
             if target?.primarySelection.canonicalObjectIDs != interactiveGraph.map({ [$0.id] }) {
                 interactiveGraph = nil
             }
         }
-        .task { await store.load(api: api, focusBoardID: initialFocusBoardID) }
+        .task(id: workspaceStudySignature) {
+            if store.workspace == nil {
+                await store.load(api: api, focusBoardID: initialFocusBoardID)
+            }
+            await loadStudyInteractions()
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             store.persistForBackgrounding()
         }
@@ -313,6 +323,7 @@ struct LectureWorkspaceView: View {
                 .ignoresSafeArea(edges: .bottom)
 
                 graphAccessibilityOverlays(workspace, viewport: proxy.size)
+                studyMarkerOverlays(workspace, viewport: proxy.size)
 
                 if interactiveGraph != nil {
                     GraphOutsideInteractionShield { interactiveGraph = nil }
@@ -372,7 +383,7 @@ struct LectureWorkspaceView: View {
                     SelectionActionBar(
                         canCheckWork: selectionCanCheckWork,
                         graphPrimaryTitle: graphPrimaryTitle,
-                        graphIsLoading: selectedGraph == nil && graphRecognition.isClassifying,
+                        graphIsLoading: false,
                         explain: { openStudy(action: "explain") },
                         practice: { openStudy(action: "practice_problems") },
                         check: { openStudy(action: "check_my_work") },
@@ -481,6 +492,32 @@ struct LectureWorkspaceView: View {
         store.deleteSelection(Set([key]), api: api)
     }
 
+    @ViewBuilder
+    private func studyMarkerOverlays(_ workspace: LectureWorkspace,
+                                     viewport: CGSize) -> some View {
+        let transform = WorldScreenTransform(camera: workspace.camera, viewport: viewport)
+        ForEach(workspace.items, id: \.boardID) { item in
+            let interactions = studyInteractionsByBoard[item.boardID] ?? []
+            ForEach(Array(interactions.enumerated()), id: \.offset) { index, interaction in
+                if let scene = store.scenes[item.boardID],
+                   let localAnchor = StudyMarkerGeometry.boardLocalAnchor(
+                       for: interaction, document: scene.document, editor: scene.editor
+                   ) {
+                    let lecturePoint = LectureCoordinateTransform.boardLocalToLectureWorld(
+                        localAnchor, board: item
+                    )
+                    let screenPoint = transform.screenPoint(for: lecturePoint)
+                    StudyMarkerButton(interaction: interaction) {
+                        reopenedStudy = interaction
+                    }
+                    .position(x: screenPoint.x + StudyMarkerGeometry.screenOffset(index: index).x,
+                              y: screenPoint.y + StudyMarkerGeometry.screenOffset(index: index).y)
+                    .zIndex(11)
+                }
+            }
+        }
+    }
+
     private func togglePencilEraser() {
         if activeTool == .objectEraser {
             activeTool = previousPencilTool == .objectEraser ? .pen : previousPencilTool
@@ -531,20 +568,63 @@ struct LectureWorkspaceView: View {
             StudyActionsView(selection: selection,
                              prepareSelection: { await store.saveBoardNow(boardID, api: api) },
                              initialAction: studyInitialAction,
-                             compact: compact) { problems, interactionID in
-                store.applyPracticeProblems(problems, interactionID: interactionID,
-                                            boardID: boardID, api: api)
-            }
+                             compact: compact,
+                             onInteractionSaved: { upsertStudyInteraction($0, boardID: boardID) },
+                             onPracticeProblems: { problems, interactionID in
+                                 store.applyPracticeProblems(problems, interactionID: interactionID,
+                                                             boardID: boardID, api: api)
+                             })
         } else {
             ContentUnavailableView("Select ink to study", systemImage: "lasso",
                                    description: Text("Use Select or Lasso, then choose an action beside the selection."))
         }
     }
 
-    private func openStudy(action: String?) {
-        studyInitialAction = action
+    private func openStudy(action: String?, forceNew: Bool = false) {
+        if action == "explain", !forceNew, let boardID = studyBoardID,
+           let selection = store.studySelection(for: boardID),
+           let existing = studyInteractionsByBoard[boardID]?.first(where: {
+               Set($0.selectedObjectIDs ?? []) == Set(selection.canonicalObjectIDs)
+           }) {
+            reopenedStudy = existing
+            return
+        }
+        studyInitialAction = action == "explain" ? nil : action
         studyPanelCollapsed = false
         showStudy = true
+    }
+
+    private var workspaceStudySignature: String {
+        store.workspace?.items.map(\.boardID).sorted().joined(separator: "|") ?? "unloaded"
+    }
+
+    @MainActor
+    private func loadStudyInteractions() async {
+        guard let boardIDs = store.workspace?.items.map(\.boardID) else { return }
+        await withTaskGroup(of: (String, [StudyInteraction]).self) { group in
+            for boardID in boardIDs {
+                group.addTask {
+                    let interactions = (try? await api.studyInteractions(boardID: boardID)) ?? []
+                    return (boardID, interactions)
+                }
+            }
+            var loaded: [String: [StudyInteraction]] = [:]
+            for await (boardID, interactions) in group {
+                loaded[boardID] = interactions
+            }
+            studyInteractionsByBoard = loaded
+        }
+    }
+
+    private func upsertStudyInteraction(_ interaction: StudyInteraction, boardID: String) {
+        guard let id = interaction.id else { return }
+        var interactions = studyInteractionsByBoard[boardID] ?? []
+        if let index = interactions.firstIndex(where: { $0.id == id }) {
+            interactions[index] = interaction
+        } else {
+            interactions.append(interaction)
+        }
+        studyInteractionsByBoard[boardID] = interactions
     }
 
     private var studyBoardID: String? {
@@ -580,8 +660,7 @@ struct LectureWorkspaceView: View {
 
     private var graphPrimaryTitle: String? {
         if selectedGraph != nil { return "Interact" }
-        return GraphabilityPolicy.showsPrimaryAction(result: graphRecognition.result)
-            ? "Graph" : nil
+        return graphRecognitionTarget == nil ? nil : "Graph"
     }
 
     private func performPrimaryGraphAction() {
@@ -1131,7 +1210,7 @@ private struct LectureSelectionStudyView: View {
                 if loading {
                     ProgressView("Connecting the selected whiteboards…")
                 } else if let interaction = result?.interaction {
-                    Text(interaction.title ?? "Across this class").font(.title2.bold())
+                    StudyRichHeading(source: interaction.title ?? "Across this class")
                     ScrollView {
                         StudyContentView(source: interaction.answer ?? "No explanation was returned.",
                                          maximumWidth: 700)

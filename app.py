@@ -778,15 +778,21 @@ def read_library() -> dict[str, Any]:
     if not isinstance(value, dict):
         abort(500, description="Board library is invalid.")
     folders = value.get("folders") if isinstance(value.get("folders"), list) else []
-    return {
-        "schema_version": 1,
-        "folders": [
-            normalize_folder(folder)
-            for folder in folders
-            if isinstance(folder, dict)
-        ],
-        "boards": value.get("boards") if isinstance(value.get("boards"), dict) else {},
-    }
+    # Keep additive catalog fields written by newer clients/servers. The
+    # library is rewritten by several ordinary operations (rename, move,
+    # import), so reconstructing only today's known keys would silently erase
+    # forward-compatible data on the next write.
+    result = dict(value)
+    result["schema_version"] = int(value.get("schema_version") or 1)
+    result["folders"] = [
+        normalize_folder(folder)
+        for folder in folders
+        if isinstance(folder, dict)
+    ]
+    result["boards"] = (
+        value.get("boards") if isinstance(value.get("boards"), dict) else {}
+    )
+    return result
 
 
 def write_library(value: dict[str, Any]) -> None:
@@ -1254,6 +1260,16 @@ def _bounded_graph_json(value: Any, label: str, maximum_bytes: int) -> Any:
     if len(json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > maximum_bytes:
         raise ValueError(f"{label} is too large.")
     return clean
+
+
+def preserve_editor_extensions(
+    clean: dict[str, Any], original: dict[str, Any], reserved: set[str],
+    label: str, maximum_bytes: int = 16 * 1024,
+) -> None:
+    """Retain additive editor JSON without bypassing bounded JSON validation."""
+    extensions = {key: value for key, value in original.items() if key not in reserved}
+    if extensions:
+        clean.update(_bounded_graph_json(extensions, f"{label} extensions", maximum_bytes))
 
 
 def _optional_graph_style(value: Any, label: str) -> dict[str, Any] | None:
@@ -1744,6 +1760,10 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
             viewport.get("height"), "viewport.height", minimum=1, maximum=MAX_WORLD_COORDINATE
         ),
     }
+    preserve_editor_extensions(
+        clean_viewport, viewport, {"x", "y", "width", "height"},
+        "viewport", 8 * 1024,
+    )
     objects = value.get("objects")
     if not isinstance(objects, list) or len(objects) > MAX_EDITOR_OBJECTS:
         raise ValueError(f"objects must contain at most {MAX_EDITOR_OBJECTS} items.")
@@ -1841,6 +1861,16 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
                     generated_at, f"Object {index}.generated_at"
                 )
             attach_object_source_fields(clean_text, item)
+            preserve_editor_extensions(clean_text, item, {
+                "id", "type", "text", "source_markdown", "sourceMarkdown",
+                "x", "y", "width", "height", "font_size", "fontSize", "color",
+                "translation", "translate", "role", "kind", "wrap_width", "wrapWidth",
+                "practice_problem_id", "practiceProblemId",
+                "source_study_interaction_id", "sourceStudyInteractionId",
+                "generated_at", "generatedAt", "board_id", "boardId",
+                "origin", "source_kind", "sourceKind", "created_at", "createdAt",
+                "unit_label", "unitLabel",
+            }, f"Object {index}")
             clean_objects.append(clean_text)
             continue
         if object_type == "path":
@@ -1876,6 +1906,12 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
                 ),
             }
             attach_object_source_fields(clean_path, item)
+            preserve_editor_extensions(clean_path, item, {
+                "id", "type", "d", "color", "fill", "opacity", "translation",
+                "translate", "scaleX", "scaleY", "board_id", "boardId", "origin",
+                "source_kind", "sourceKind", "created_at", "createdAt", "unit_label",
+                "unitLabel",
+            }, f"Object {index}")
             clean_objects.append(clean_path)
             continue
         points = validate_point_list(
@@ -1948,6 +1984,13 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
                 raise ValueError(f"Object {index}.pencil_tool is invalid.")
             clean_stroke["pencil_tool"] = pencil_tool
         attach_object_source_fields(clean_stroke, item)
+        preserve_editor_extensions(clean_stroke, item, {
+            "id", "type", "color", "width", "size", "opacity", "points",
+            "translation", "translate", "scaleX", "scaleY", "erasures",
+            "pencil_tool", "pencilTool", "board_id", "boardId", "origin",
+            "source_kind", "sourceKind", "created_at", "createdAt", "unit_label",
+            "unitLabel",
+        }, f"Object {index}")
         clean_objects.append(clean_stroke)
     if board_id is not None:
         if not BOARD_ID_RE.fullmatch(board_id):
@@ -1985,23 +2028,34 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
         transform = group.get("transform", {})
         if not isinstance(transform, dict):
             raise ValueError(f"Group {index} transform must be an object.")
-        clean_groups.append({
+        clean_group_transform = {
+            "x": finite_number(transform.get("x", 0), f"Group {index}.transform.x",
+                               minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
+            "y": finite_number(transform.get("y", 0), f"Group {index}.transform.y",
+                               minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
+            "scaleX": finite_number(transform.get("scaleX", 1), f"Group {index}.transform.scaleX",
+                                     minimum=0.01, maximum=100),
+            "scaleY": finite_number(transform.get("scaleY", 1), f"Group {index}.transform.scaleY",
+                                     minimum=0.01, maximum=100),
+            "rotation": finite_number(transform.get("rotation", 0), f"Group {index}.transform.rotation",
+                                       minimum=-360, maximum=360),
+        }
+        preserve_editor_extensions(
+            clean_group_transform, transform,
+            {"x", "y", "scaleX", "scaleY", "rotation"},
+            f"Group {index}.transform", 8 * 1024,
+        )
+        clean_group = {
             "id": group_id,
             "type": "group",
             "children": clean_children,
-            "transform": {
-                "x": finite_number(transform.get("x", 0), f"Group {index}.transform.x",
-                                  minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
-                "y": finite_number(transform.get("y", 0), f"Group {index}.transform.y",
-                                  minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
-                "scaleX": finite_number(transform.get("scaleX", 1), f"Group {index}.transform.scaleX",
-                                        minimum=0.01, maximum=100),
-                "scaleY": finite_number(transform.get("scaleY", 1), f"Group {index}.transform.scaleY",
-                                        minimum=0.01, maximum=100),
-                "rotation": finite_number(transform.get("rotation", 0), f"Group {index}.transform.rotation",
-                                          minimum=-360, maximum=360),
-            },
-        })
+            "transform": clean_group_transform,
+        }
+        preserve_editor_extensions(
+            clean_group, group, {"id", "type", "children", "transform"},
+            f"Group {index}", 16 * 1024,
+        )
+        clean_groups.append(clean_group)
         seen_group_ids.add(group_id)
         known_ids.add(group_id)
     imported_transforms = value.get("imported_transforms", {})
@@ -2011,13 +2065,13 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
         raise ValueError(
             f"imported_transforms must be an object with at most {MAX_IMPORTED_TRANSFORMS} entries."
         )
-    clean_imported_transforms: dict[str, dict[str, float]] = {}
+    clean_imported_transforms: dict[str, dict[str, Any]] = {}
     for object_id, transform in imported_transforms.items():
         if not isinstance(object_id, str) or not STROKE_ID_RE.fullmatch(object_id):
             raise ValueError("Imported object transform id is invalid.")
         if not isinstance(transform, dict):
             raise ValueError("Imported object transform must be an object.")
-        clean_imported_transforms[object_id] = {
+        clean_transform: dict[str, Any] = {
             "x": finite_number(transform.get("x", 0), "imported transform x",
                               minimum=-MAX_WORLD_COORDINATE, maximum=MAX_WORLD_COORDINATE),
             "y": finite_number(transform.get("y", 0), "imported transform y",
@@ -2028,7 +2082,13 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
                                     minimum=0.01, maximum=100),
             "deleted": bool(transform.get("deleted", False)),
         }
-    return {
+        preserve_editor_extensions(
+            clean_transform, transform,
+            {"x", "y", "scaleX", "scaleY", "deleted"},
+            f"Imported transform {object_id}", 8 * 1024,
+        )
+        clean_imported_transforms[object_id] = clean_transform
+    clean_editor = {
         "schema_version": 4,
         "viewport": clean_viewport,
         "objects": clean_objects,
@@ -2045,6 +2105,13 @@ def validate_editor_state(value: Any, *, board_id: str | None = None) -> dict[st
             else []
         ),
     }
+    preserve_editor_extensions(clean_editor, value, {
+        "editor", "schema_version", "schemaVersion", "revision", "updated_at",
+        "updatedAt", "viewport", "objects", "groups", "imported_transforms",
+        "importedTransforms", "source_boards", "sourceBoards", "merged_board_ids",
+        "mergedBoardIDs",
+    }, "Editor state", 64 * 1024)
+    return clean_editor
 
 
 def attach_object_source_fields(clean: dict[str, Any], item: dict[str, Any]) -> None:
@@ -3363,6 +3430,8 @@ def _new_static_graph_budget() -> dict[str, int]:
 def _bounded_graph_label(
     expressions: list[dict[str, Any]], budget: dict[str, int] | None
 ) -> str:
+    from study.graph_export import plain_math_label
+
     first = next(
         (
             str(item.get("latex") or "").strip()
@@ -3371,7 +3440,8 @@ def _bounded_graph_label(
         ),
         "",
     )
-    candidate = f"Graph: {first[:180]}" if first else "Graph"
+    readable = plain_math_label(first)[:180]
+    candidate = f"Graph: {readable}" if readable else "Graph"
     if budget is None:
         return candidate
     remaining = max(0, budget.get("label_chars", 0))
@@ -3429,7 +3499,7 @@ def append_static_graph_svg(
     budget: dict[str, int] | None = None,
 ) -> None:
     """Export a safe provider-independent graph card without embedding provider HTML/state."""
-    from study.graph_export import static_graph_primitives
+    from study.graph_export import plain_math_label, static_graph_primitives
 
     frame = item.get("frame") if isinstance(item.get("frame"), dict) else {}
     try:
@@ -3624,7 +3694,7 @@ def append_static_graph_svg(
                 "font-family": "Arial, sans-serif",
             },
         )
-        label.text = str(expression.get("latex") or "")
+        label.text = plain_math_label(str(expression.get("latex") or ""))
 
 
 def _editor_object_transform(item: dict[str, Any]) -> str:
@@ -4014,6 +4084,24 @@ def upload_failure(message: str, status: int) -> tuple[str, int] | tuple[Respons
     return render_template("index.html", upload_error=message), status
 
 
+def discard_incomplete_board(
+    board_id: str, board_dir: Path, library: dict[str, Any], folder_id: str | None,
+) -> None:
+    """Best-effort rollback for an import that never reached corner review."""
+    library.get("boards", {}).pop(board_id, None)
+    if folder_id:
+        sync_folder_board_order(library, folder_id)
+    try:
+        write_library(library)
+    except Exception:
+        LOGGER.exception("BOARD ROLLBACK FAILED board=%s stage=library", board_id)
+    if board_dir.is_dir() and not board_dir.is_symlink():
+        shutil.rmtree(board_dir)
+    user = current_user()
+    if not user.is_test_user:
+        AUTH_DB.delete_board_record(user.id, board_id)
+
+
 def board_destination(board_id: str, metadata: dict[str, Any]) -> tuple[str, str]:
     # The lecture is metadata only. A completed import opens its own scene.
     return board_id, url_for("board", board_id=board_id)
@@ -4317,67 +4405,75 @@ def upload() -> Response | tuple[str, int]:
     persist_started = time.perf_counter()
     board_id = secrets.token_hex(16)
     LOGGER.info("BOARD CREATE START board=%s lecture=%s", board_id, requested_folder or "none")
-    board_dir = board_directory(board_id, create=True)
-    original_name = f"original{extension}"
-    atomic_bytes(board_dir / original_name, data)
-    LOGGER.info("BOARD IMAGE SAVED board=%s bytes=%d", board_id, len(data))
-    metadata: dict[str, Any] = {
-        "schema_version": 1,
-        "id": board_id,
-        "name": board_name,
-        "folder_id": requested_folder,
-        "workspace_board_id": workspace_board_id,
-        "created_at": time.time(),
-        "updated_at": time.time(),
-        "source": {
-            "filename": Path(uploaded.filename).name[:255],
-            "content_type": content_type,
-            "bytes": len(data),
-            "width": int(image.shape[1]),
-            "height": int(image.shape[0]),
-        },
-        "assets": {"original": original_name},
-        "pipeline": {
-            "status": "detecting",
-            "timings_ms": {},
-            "errors": [],
-            "processing_stage": "finding_whiteboard",
-            "processing_stage_index": 0,
-            "processing_stage_count": 1,
-            "processing_progress": 0.0,
-            "processing_message": "Finding whiteboard",
-            "processing_started_at": time.time(),
-            "processing_updated_at": time.time(),
-        },
-    }
-    update_metadata(board_dir, metadata)
-    library["boards"][board_id] = {
-        "name": board_name,
-        "folder_id": requested_folder,
-        "created_at": metadata["created_at"],
-        "updated_at": metadata["updated_at"],
-    }
-    if requested_folder:
-        folder = folder_by_id(library, requested_folder)
-        if folder:
-            sync_folder_board_order(library, requested_folder)
-            host = folder.get("workspace_board_id")
-            if (
-                not workspace_board_id
-                and isinstance(host, str)
-                and BOARD_ID_RE.fullmatch(host)
-                and host != board_id
-            ):
-                workspace_board_id = host
-                metadata["workspace_board_id"] = host
-            mark_study_guide_stale(folder)
-            folder["lecture_context"] = None
-    write_library(library)
-    claim_board_for_current_user(
-        board_id,
-        folder_id=requested_folder,
-        title=board_name,
-    )
+    board_dir = BOARDS_DIR / board_id
+    try:
+        board_dir = board_directory(board_id, create=True)
+        original_name = f"original{extension}"
+        atomic_bytes(board_dir / original_name, data)
+        LOGGER.info("BOARD IMAGE SAVED board=%s bytes=%d", board_id, len(data))
+        metadata: dict[str, Any] = {
+            "schema_version": 1,
+            "id": board_id,
+            "name": board_name,
+            "folder_id": requested_folder,
+            "workspace_board_id": workspace_board_id,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "source": {
+                "filename": Path(uploaded.filename).name[:255],
+                "content_type": content_type,
+                "bytes": len(data),
+                "width": int(image.shape[1]),
+                "height": int(image.shape[0]),
+            },
+            "assets": {"original": original_name},
+            "pipeline": {
+                "status": "detecting",
+                "timings_ms": {},
+                "errors": [],
+                "processing_stage": "finding_whiteboard",
+                "processing_stage_index": 0,
+                "processing_stage_count": 1,
+                "processing_progress": 0.0,
+                "processing_message": "Finding whiteboard",
+                "processing_started_at": time.time(),
+                "processing_updated_at": time.time(),
+            },
+        }
+        update_metadata(board_dir, metadata)
+        library["boards"][board_id] = {
+            "name": board_name,
+            "folder_id": requested_folder,
+            "created_at": metadata["created_at"],
+            "updated_at": metadata["updated_at"],
+        }
+        if requested_folder:
+            folder = folder_by_id(library, requested_folder)
+            if folder:
+                sync_folder_board_order(library, requested_folder)
+                host = folder.get("workspace_board_id")
+                if (
+                    not workspace_board_id
+                    and isinstance(host, str)
+                    and BOARD_ID_RE.fullmatch(host)
+                    and host != board_id
+                ):
+                    workspace_board_id = host
+                    metadata["workspace_board_id"] = host
+                mark_study_guide_stale(folder)
+                folder["lecture_context"] = None
+        write_library(library)
+        claim_board_for_current_user(
+            board_id,
+            folder_id=requested_folder,
+            title=board_name,
+        )
+    except Exception:
+        LOGGER.exception("BOARD CREATE FAILED board=%s stage=persist", board_id)
+        discard_incomplete_board(board_id, board_dir, library, requested_folder)
+        return upload_failure(
+            "We couldn't save that whiteboard photo. Try importing it again.", 500,
+        )
     record_performance_stage(
         "upload_persist", (time.perf_counter() - persist_started) * 1000
     )
@@ -4394,11 +4490,10 @@ def upload() -> Response | tuple[str, int]:
         confidence = detection["confidence"]
     except Exception:
         LOGGER.exception("BOARD CREATE FAILED board=%s stage=detection", board_id)
-        set_processing_stage(
-            board_dir, metadata, "failed", 0, count=1,
-            message="Whiteboard processing failed", status="failed",
-            error_code="whiteboard_detection_failed",
-        )
+        # Detection happens before the user can confirm corners. A failed
+        # upload is therefore not a recoverable board and must not remain as a
+        # catalog entry pointing at a partial directory.
+        discard_incomplete_board(board_id, board_dir, library, requested_folder)
         return upload_failure(
             "We couldn't analyze that whiteboard photo. Try another image.",
             500,
@@ -4890,6 +4985,12 @@ def get_library() -> Response:
                 "status": metadata.get("pipeline", {}).get("status", "unknown"),
                 "created_at": metadata.get("created_at"),
                 "updated_at": metadata.get("updated_at"),
+                "last_activity_at": max(
+                    float(catalog.get("last_activity_at") or 0),
+                    float(catalog.get("updated_at") or 0),
+                    float(metadata.get("updated_at") or 0),
+                    float(metadata.get("created_at") or 0),
+                ),
                 "width": dimensions.get("width") if isinstance(dimensions, dict) else None,
                 "height": dimensions.get("height") if isinstance(dimensions, dict) else None,
                 "thumbnail_url": thumbnail_url,
@@ -4938,6 +5039,30 @@ def get_library() -> Response:
             }
         )
     return jsonify(schema_version=1, folders=folders, boards=boards)
+
+
+@app.post("/api/boards/<board_id>/activity")
+@locked_board_operation
+@require_authenticated
+def record_board_activity(board_id: str) -> Response:
+    """Persist a real board open without pretending it is an editor change."""
+    require_board_owner(board_id)
+    board_dir = require_board_id(board_id)
+    library = read_library()
+    entry = library["boards"].get(board_id)
+    if not isinstance(entry, dict):
+        metadata = read_metadata(board_dir)
+        entry = {
+            "name": metadata.get("name") or "Whiteboard",
+            "folder_id": metadata.get("folder_id"),
+            "created_at": metadata.get("created_at"),
+            "updated_at": metadata.get("updated_at"),
+        }
+    activity_at = time.time()
+    entry["last_activity_at"] = activity_at
+    library["boards"][board_id] = entry
+    write_library(library)
+    return jsonify(id=board_id, last_activity_at=activity_at)
 
 
 @app.post("/api/folders")

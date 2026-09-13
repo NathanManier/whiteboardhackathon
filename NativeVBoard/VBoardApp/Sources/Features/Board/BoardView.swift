@@ -98,6 +98,7 @@ struct BoardView: View {
                 return
             }
             state = .ready(document, pdfData, editor, composition)
+            try? await api.recordBoardActivity(id: board.id)
             debug("BOARD OPEN FIRST SCENE READY id=\(board.id)")
             trace.event("scene_installed", fields: ["paths": document.paths.count])
         } catch let error as APIError {
@@ -236,6 +237,8 @@ private struct BoardEditorSurface: View {
     @State private var selectedPDFRegion: CGRect?
     @State private var liveCamera: CameraRect?
     @State private var studyInitialAction: String?
+    @State private var studyInteractions: [StudyInteraction] = []
+    @State private var reopenedStudy: StudyInteraction?
     @State private var graphCreationRequest: GraphCreationRequest?
     @State private var editingGraph: GraphObject?
     @State private var interactiveGraph: GraphObject?
@@ -333,6 +336,12 @@ private struct BoardEditorSurface: View {
                 store.replaceGraph(graph.replacing(expressions: expressions), api: api)
             }
         }
+        .sheet(item: $reopenedStudy) { interaction in
+            SavedStudyInteractionView(interaction: interaction) {
+                reopenedStudy = nil
+                DispatchQueue.main.async { openStudy("explain", forceNew: true) }
+            }
+        }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
         #if DEBUG
         .sheet(isPresented: $showPencilValidation) { PencilHardwareValidationView() }
@@ -350,16 +359,18 @@ private struct BoardEditorSurface: View {
             }
         }
         .onChange(of: studySelection) { _, selection in
-            graphRecognition.selectionChanged(
-                selection.map(GraphRecognitionTarget.board),
-                api: api,
-                prepareSelection: { await store.saveNow(api: api) }
-            )
+            // Graph recognition begins only after the explicit Graph action.
+            // Selection changes must not spend AI work or leave an unexplained
+            // spinner beside the study actions.
+            graphRecognition.clear()
             if selection?.canonicalObjectIDs != interactiveGraph.map({ [$0.id] }) {
                 interactiveGraph = nil
             }
         }
-        .task { store.restoreLocalIfPresent(server: store.editor) }
+        .task {
+            store.restoreLocalIfPresent(server: store.editor)
+            studyInteractions = (try? await api.studyInteractions(boardID: board.id)) ?? []
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in store.persistForBackgrounding() }
     }
 
@@ -371,6 +382,7 @@ private struct BoardEditorSurface: View {
             // and the live camera cannot be reset by SwiftUI identity churn.
             NativeCanvasView(
                 boardID: board.id, document: document, previewImage: previewImage, pdfData: pdfData,
+                sourceKind: board.sourceKind,
                 camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects,
                 importedTransforms: store.editor.importedTransforms,
                 composition: SceneComposition.build(boardID: board.id, document: document,
@@ -490,7 +502,7 @@ private struct BoardEditorSurface: View {
             if interactiveGraph == nil, let rect = selectionScreenRect(viewport: proxy.size) {
                 SelectionActionBar(canCheckWork: selectionCanCheckWork,
                                    graphPrimaryTitle: graphPrimaryTitle,
-                                   graphIsLoading: selectedGraph == nil && graphRecognition.isClassifying,
+                                   graphIsLoading: false,
                                    explain: { openStudy("explain") },
                                    practice: { openStudy("practice_problems") },
                                    check: { openStudy("check_my_work") },
@@ -509,6 +521,23 @@ private struct BoardEditorSurface: View {
                                    },
                                    delete: { store.deleteObjects(ids: selectedIDs, api: api) })
                     .position(SelectionToolbarLayout.position(for: rect, viewport: proxy.size))
+            }
+            ForEach(Array(studyInteractions.enumerated()), id: \.offset) { index, interaction in
+                if interaction.boardID == nil || interaction.boardID == board.id,
+                   let anchor = StudyMarkerGeometry.boardLocalAnchor(
+                       for: interaction, document: document, editor: store.editor
+                   ) {
+                    let transform = WorldScreenTransform(
+                        camera: liveCamera ?? store.editor.viewport, viewport: proxy.size
+                    )
+                    let point = transform.screenPoint(for: anchor)
+                    StudyMarkerButton(interaction: interaction) {
+                        reopenedStudy = interaction
+                    }
+                    .position(x: point.x + StudyMarkerGeometry.screenOffset(index: index).x,
+                              y: point.y + StudyMarkerGeometry.screenOffset(index: index).y)
+                    .zIndex(25)
+                }
             }
             // SwiftUI's command system is the reliable keyboard path when the
             // simulator captures the Mac keyboard; the canvas also exposes
@@ -572,19 +601,37 @@ private struct BoardEditorSurface: View {
             StudyActionsView(selection: selection,
                              prepareSelection: { await store.saveNow(api: api) },
                              initialAction: studyInitialAction,
-                             compact: compact) { problems, interactionID in
-                store.applyPracticeProblems(problems, interactionID: interactionID, api: api)
-            }
+                             compact: compact,
+                             onInteractionSaved: upsertStudyInteraction,
+                             onPracticeProblems: { problems, interactionID in
+                                 store.applyPracticeProblems(problems, interactionID: interactionID, api: api)
+                             })
         } else {
             ContentUnavailableView("Select ink first", systemImage: "lasso",
                                    description: Text("Use Select or Lasso, then choose a study action."))
         }
     }
 
-    private func openStudy(_ action: String) {
-        studyInitialAction = action
+    private func openStudy(_ action: String, forceNew: Bool = false) {
+        if action == "explain", !forceNew, let selection = studySelection,
+           let existing = studyInteractions.first(where: {
+               Set($0.selectedObjectIDs ?? []) == Set(selection.canonicalObjectIDs)
+           }) {
+            reopenedStudy = existing
+            return
+        }
+        studyInitialAction = action == "explain" ? nil : action
         studyPanelCollapsed = false
         showStudy = true
+    }
+
+    private func upsertStudyInteraction(_ interaction: StudyInteraction) {
+        guard let id = interaction.id else { return }
+        if let index = studyInteractions.firstIndex(where: { $0.id == id }) {
+            studyInteractions[index] = interaction
+        } else {
+            studyInteractions.append(interaction)
+        }
     }
 
     private func selectionScreenRect(viewport: CGSize) -> CGRect? {
@@ -617,8 +664,7 @@ private struct BoardEditorSurface: View {
     }
     private var graphPrimaryTitle: String? {
         if selectedGraph != nil { return "Interact" }
-        return GraphabilityPolicy.showsPrimaryAction(result: graphRecognition.result)
-            ? "Graph" : nil
+        return studySelection == nil ? nil : "Graph"
     }
 
     private func performPrimaryGraphAction() {
@@ -689,12 +735,14 @@ struct StudyActionsView: View {
     let prepareSelection: () async -> Void
     var initialAction: String? = nil
     var compact = false
+    var onInteractionSaved: (StudyInteraction) -> Void = { _ in }
     let onPracticeProblems: ([PracticeProblem], String?) -> Void
     @StateObject private var submissionGate = StudySubmissionGate()
     @State private var loading = false
     @State private var loadingStage: LoadingStage = .preparingSelection
     @State private var result: StudyInteractionResponse?
     @State private var error: String?
+    @State private var initialQuestion = ""
     @State private var followUpQuestion = ""
     @State private var launchedInitialAction: String?
 
@@ -733,8 +781,10 @@ struct StudyActionsView: View {
                             .foregroundStyle(.secondary)
                     }
                 } else if let result {
-                    Text(result.interaction?.title ?? (result.problems == nil ? "Board explanation" : "Practice Problems"))
-                        .font(.title2.bold())
+                    StudyRichHeading(
+                        source: result.interaction?.title
+                            ?? (result.problems == nil ? "Board explanation" : "Practice Problems")
+                    )
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
                             StudyContentView(source: displayAnswer(result), maximumWidth: 700)
@@ -770,7 +820,12 @@ struct StudyActionsView: View {
                     Text("Study the selected ink").font(compact ? .headline : .title2.bold())
                     Text("Explain a selected concept, create two practice problems, or check a handwritten solution.")
                         .multilineTextAlignment(.center).foregroundStyle(.secondary)
-                    Button("Explain") { submitInitial() }.buttonStyle(.borderedProminent)
+                    TextField("Optional question or focus", text: $initialQuestion)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: compact ? .infinity : 700)
+                        .onSubmit { submitInitial(question: initialQuestion) }
+                    Button("Explain") { submitInitial(question: initialQuestion) }
+                        .buttonStyle(.borderedProminent)
                     Button("Practice Problems") { submitInitial(followUpAction: "practice_problems") }.buttonStyle(.bordered)
                     Button("Check My Work") { submitInitial(action: "check_my_work") }.buttonStyle(.bordered)
                 }
@@ -788,8 +843,14 @@ struct StudyActionsView: View {
             ?? "No study response was returned."
     }
 
-    private func submitInitial(action: String = "explain", followUpAction: String? = nil) {
-        let request = BoardStudyExplainRequest.make(selection: selection, action: action)
+    private func submitInitial(action: String = "explain", followUpAction: String? = nil,
+                               question: String? = nil) {
+        let trimmedQuestion = question?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = BoardStudyExplainRequest.make(
+            selection: selection,
+            action: action,
+            question: trimmedQuestion?.isEmpty == false ? trimmedQuestion : nil
+        )
         guard submissionGate.begin(requestID: request.requestId) else {
             #if DEBUG
             print("[VBoard] STUDY REQUEST REJECTED reason=already-in-flight activeRequestID=\(submissionGate.activeRequestID ?? "<none>") attemptedRequestID=\(request.requestId)")
@@ -827,7 +888,7 @@ struct StudyActionsView: View {
                     )
                     apply(response)
                 } else {
-                    result = initial
+                    apply(initial)
                 }
             } catch {
                 self.error = "AI is temporarily unavailable."
@@ -836,7 +897,7 @@ struct StudyActionsView: View {
     }
 
     private func followUp(action: String = "followup") {
-        guard let interactionID = result?.interaction?.id else { return }
+        guard !loading, let interactionID = result?.interaction?.id else { return }
         let question = followUpQuestion
         loading = true
         loadingStage = action == "practice_problems" ? .requestingPractice : .requestingExplanation
@@ -856,10 +917,134 @@ struct StudyActionsView: View {
 
     private func apply(_ response: StudyInteractionResponse) {
         result = response
+        if let interaction = response.interaction {
+            onInteractionSaved(interaction)
+        }
         if let problems = response.problems, !problems.isEmpty {
             onPracticeProblems(Array(problems.prefix(2)), response.interaction?.id)
         }
         loading = false
+    }
+}
+
+struct StudyRichHeading: View {
+    let source: String
+
+    var body: some View {
+        StudyContentView(source: "## \(source)", maximumWidth: 700)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+struct StudyMarkerButton: View {
+    let interaction: StudyInteraction
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "info.circle.fill")
+                .font(.system(size: 19, weight: .semibold))
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, Color.accentColor)
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Open saved explanation")
+        .accessibilityHint(CompactStudyPresentation.readableText(
+            from: interaction.title ?? "Study note"
+        ))
+    }
+}
+
+enum StudyMarkerGeometry {
+    static func screenOffset(index: Int) -> CGPoint {
+        guard index > 0 else { return .zero }
+        let slot = (index - 1) % 8
+        let ring = CGFloat((index - 1) / 8 + 1)
+        let angle = CGFloat(slot) * (.pi / 4)
+        return CGPoint(x: cos(angle) * 18 * ring, y: sin(angle) * 18 * ring)
+    }
+
+    static func boardLocalAnchor(for interaction: StudyInteraction,
+                                 document: SVGDocument,
+                                 editor: EditorState) -> CGPoint? {
+        guard let fallbackX = interaction.anchorX, let fallbackY = interaction.anchorY,
+              fallbackX.isFinite, fallbackY.isFinite else { return nil }
+        guard let ids = interaction.selectedObjectIDs, !ids.isEmpty,
+              let current = BoardStudySelection.isolated(
+                  boardID: interaction.boardID ?? "study-marker",
+                  selectedIDs: Set(ids), document: document, editor: editor
+              )?.localBBox,
+              let original = interaction.selectionBBox else {
+            return CGPoint(x: fallbackX, y: fallbackY)
+        }
+        let nx = interaction.anchorOffsetNX
+            ?? ((fallbackX - original.x) / max(original.width, 0.001))
+        let ny = interaction.anchorOffsetNY
+            ?? ((fallbackY - original.y) / max(original.height, 0.001))
+        let x = current.x + nx * current.width
+        let y = current.y + ny * current.height
+        guard x.isFinite, y.isFinite else { return CGPoint(x: fallbackX, y: fallbackY) }
+        return CGPoint(x: x, y: y)
+    }
+}
+
+struct SavedStudyInteractionView: View {
+    @Environment(\.dismiss) private var dismiss
+    let interaction: StudyInteraction
+    let onNewExplanation: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    StudyRichHeading(source: interaction.title ?? "Saved explanation")
+                    if let question = interaction.question,
+                       !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Label(CompactStudyPresentation.readableText(from: question),
+                              systemImage: "quote.bubble")
+                            .foregroundStyle(.secondary)
+                    }
+                    StudyContentView(
+                        source: interaction.answer ?? "No explanation was saved.",
+                        maximumWidth: 760
+                    )
+                    ForEach(interaction.followUps ?? []) { followUp in
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let question = followUp.question, !question.isEmpty {
+                                StudyContentView(source: "### \(question)", maximumWidth: 760)
+                            }
+                            if let answer = followUp.answer, !answer.isEmpty {
+                                StudyContentView(source: answer, maximumWidth: 760)
+                            }
+                            ForEach(followUp.problems ?? []) { problem in
+                                StudyContentView(source: problem.text, maximumWidth: 720)
+                                    .padding(12)
+                                    .background(.secondary.opacity(0.08),
+                                                in: RoundedRectangle(cornerRadius: 12))
+                            }
+                        }
+                    }
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .navigationTitle("Saved Study Note")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("New Explanation") {
+                        dismiss()
+                        onNewExplanation()
+                    }
+                }
+            }
+        }
     }
 }
 

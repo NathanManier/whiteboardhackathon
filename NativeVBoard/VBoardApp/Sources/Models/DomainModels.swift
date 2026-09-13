@@ -66,6 +66,7 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
     let url: String?
     let createdAt: Double?
     let updatedAt: Double?
+    let lastActivityAt: Double?
     let sourceKind: BoardSourceKind
     let pdfURL: String?
 
@@ -79,6 +80,7 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
         case thumbnailURL = "thumbnail_url"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+        case lastActivityAt = "last_activity_at"
         case sourceKind = "source_kind"
         case pdfURL = "pdf_url"
     }
@@ -98,10 +100,12 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
     init(id: String, name: String, folderID: String?, status: String,
          width: Double?, height: Double?, thumbnailURL: String?, url: String?,
          createdAt: Double?, updatedAt: Double?,
+         lastActivityAt: Double? = nil,
          sourceKind: BoardSourceKind = .physicalWhiteboard, pdfURL: String? = nil) {
         self.id = id; self.name = name; self.folderID = folderID; self.status = status
         self.width = width; self.height = height; self.thumbnailURL = thumbnailURL
         self.url = url; self.createdAt = createdAt; self.updatedAt = updatedAt
+        self.lastActivityAt = lastActivityAt
         self.sourceKind = sourceKind; self.pdfURL = pdfURL
     }
 
@@ -138,6 +142,7 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
         createdAt = try container.decodeIfPresent(Double.self, forKey: .createdAt)
             ?? lectureBoards.first(where: { $0.boardID == decodedID })?.createdAt
         updatedAt = try container.decodeIfPresent(Double.self, forKey: .updatedAt)
+        lastActivityAt = try container.decodeIfPresent(Double.self, forKey: .lastActivityAt)
         sourceKind = try container.decodeIfPresent(BoardSourceKind.self, forKey: .sourceKind) ?? .physicalWhiteboard
         pdfURL = try container.decodeIfPresent(String.self, forKey: .pdfURL)
     }
@@ -154,6 +159,7 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
         try container.encodeIfPresent(url, forKey: .url)
         try container.encodeIfPresent(createdAt, forKey: .createdAt)
         try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
+        try container.encodeIfPresent(lastActivityAt, forKey: .lastActivityAt)
         try container.encode(sourceKind, forKey: .sourceKind)
         try container.encodeIfPresent(pdfURL, forKey: .pdfURL)
     }
@@ -281,20 +287,43 @@ struct StudyGuide: Codable, Sendable {
     }
 }
 
+struct StudyInteractionListResponse: Codable, Sendable {
+    let interactions: [StudyInteraction]
+}
+
 struct StudyInteractionResponse: Codable, Sendable {
     let interaction: StudyInteraction?
     let problems: [PracticeProblem]?
     let problem: String?
 }
 
-struct StudyInteraction: Codable, Sendable {
+struct StudyInteraction: Codable, Identifiable, Equatable, Sendable {
     let title: String?
     let answer: String?
     let id: String?
     let followUps: [StudyFollowUp]?
+    let boardID: String?
+    let selectedObjectIDs: [String]?
+    let selectionBBox: StudySelectionBBox?
+    let anchorX: Double?
+    let anchorY: Double?
+    let anchorOffsetNX: Double?
+    let anchorOffsetNY: Double?
+    let question: String?
+    let createdAt: Double?
+    let action: String?
+
+    enum CodingKeys: String, CodingKey {
+        case title, answer, id, followUps, selectionBBox, anchorX, anchorY
+        case question, createdAt, action
+        case boardID = "boardId"
+        case selectedObjectIDs = "selectedObjectIds"
+        case anchorOffsetNX = "anchorOffsetNx"
+        case anchorOffsetNY = "anchorOffsetNy"
+    }
 }
 
-struct StudyFollowUp: Codable, Identifiable, Sendable {
+struct StudyFollowUp: Codable, Identifiable, Equatable, Sendable {
     let id: String
     let kind: String?
     let question: String?
@@ -302,7 +331,7 @@ struct StudyFollowUp: Codable, Identifiable, Sendable {
     let problems: [PracticeProblem]?
 }
 
-struct PracticeProblem: Codable, Identifiable, Sendable {
+struct PracticeProblem: Codable, Identifiable, Equatable, Sendable {
     let id: String
     let text: String
     let solution: String?
@@ -335,8 +364,9 @@ struct EditorState: Codable, Equatable, Sendable {
     var importedTransforms: [String: ObjectTransform]
     var sourceBoards: [SourceBoard]
     var mergedBoardIDs: [String]
+    var additionalFields: [String: JSONValue]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case schemaVersion = "schema_version", revision
         case updatedAt = "updated_at", viewport, objects, groups
         case importedTransforms = "imported_transforms"
@@ -344,8 +374,8 @@ struct EditorState: Codable, Equatable, Sendable {
         case mergedBoardIDs = "merged_board_ids"
     }
 
-    init(schemaVersion: Int, revision: Int, updatedAt: Double?, viewport: CameraRect, objects: [CanvasObject], groups: [EditorGroup], importedTransforms: [String: ObjectTransform], sourceBoards: [SourceBoard], mergedBoardIDs: [String]) {
-        self.schemaVersion = schemaVersion; self.revision = revision; self.updatedAt = updatedAt; self.viewport = viewport; self.objects = objects; self.groups = groups; self.importedTransforms = importedTransforms; self.sourceBoards = sourceBoards; self.mergedBoardIDs = mergedBoardIDs
+    init(schemaVersion: Int, revision: Int, updatedAt: Double?, viewport: CameraRect, objects: [CanvasObject], groups: [EditorGroup], importedTransforms: [String: ObjectTransform], sourceBoards: [SourceBoard], mergedBoardIDs: [String], additionalFields: [String: JSONValue] = [:]) {
+        self.schemaVersion = schemaVersion; self.revision = revision; self.updatedAt = updatedAt; self.viewport = viewport; self.objects = objects; self.groups = groups; self.importedTransforms = importedTransforms; self.sourceBoards = sourceBoards; self.mergedBoardIDs = mergedBoardIDs; self.additionalFields = additionalFields
     }
 
     init(from decoder: Decoder) throws {
@@ -359,12 +389,128 @@ struct EditorState: Codable, Equatable, Sendable {
         importedTransforms = try c.decodeIfPresent([String: ObjectTransform].self, forKey: .importedTransforms) ?? [:]
         sourceBoards = try c.decodeIfPresent([SourceBoard].self, forKey: .sourceBoards) ?? []
         mergedBoardIDs = try c.decodeIfPresent([String].self, forKey: .mergedBoardIDs) ?? []
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let knownKeys = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: knownKeys, to: encoder)
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(schemaVersion, forKey: .schemaVersion)
+        try c.encode(revision, forKey: .revision)
+        try c.encodeIfPresent(updatedAt, forKey: .updatedAt)
+        try c.encode(viewport, forKey: .viewport)
+        try c.encode(objects, forKey: .objects)
+        try c.encode(groups, forKey: .groups)
+        try c.encode(importedTransforms, forKey: .importedTransforms)
+        try c.encode(sourceBoards, forKey: .sourceBoards)
+        try c.encode(mergedBoardIDs, forKey: .mergedBoardIDs)
     }
 }
 
-struct SourceBoard: Codable, Equatable, Sendable { let boardID: String; enum CodingKeys: String, CodingKey { case boardID = "board_id" } }
-struct EditorGroup: Codable, Equatable, Sendable { let id: String?; let children: [String]? }
-struct ObjectTransform: Codable, Equatable, Sendable { let x: Double; let y: Double; let scaleX: Double?; let scaleY: Double?; let deleted: Bool? }
+struct SourceBoard: Codable, Equatable, Sendable {
+    let boardID: String
+    let additionalFields: [String: JSONValue]
+
+    enum CodingKeys: String, CodingKey, CaseIterable { case boardID = "board_id" }
+
+    init(boardID: String, additionalFields: [String: JSONValue] = [:]) {
+        self.boardID = boardID
+        self.additionalFields = additionalFields
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        boardID = try container.decode(String.self, forKey: .boardID)
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let known = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: known, to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(boardID, forKey: .boardID)
+    }
+}
+
+struct EditorGroup: Codable, Equatable, Sendable {
+    let id: String?
+    let children: [String]?
+    let additionalFields: [String: JSONValue]
+
+    enum CodingKeys: String, CodingKey, CaseIterable { case id, children }
+
+    init(id: String?, children: [String]?, additionalFields: [String: JSONValue] = [:]) {
+        self.id = id
+        self.children = children
+        self.additionalFields = additionalFields
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
+        children = try container.decodeIfPresent([String].self, forKey: .children)
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let known = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: known, to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(id, forKey: .id)
+        try container.encodeIfPresent(children, forKey: .children)
+    }
+}
+
+struct ObjectTransform: Codable, Equatable, Sendable {
+    let x: Double
+    let y: Double
+    let scaleX: Double?
+    let scaleY: Double?
+    let deleted: Bool?
+    let additionalFields: [String: JSONValue]
+
+    enum CodingKeys: String, CodingKey, CaseIterable { case x, y, scaleX, scaleY, deleted }
+
+    init(x: Double, y: Double, scaleX: Double?, scaleY: Double?, deleted: Bool?,
+         additionalFields: [String: JSONValue] = [:]) {
+        self.x = x
+        self.y = y
+        self.scaleX = scaleX
+        self.scaleY = scaleY
+        self.deleted = deleted
+        self.additionalFields = additionalFields
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        x = try container.decodeIfPresent(Double.self, forKey: .x) ?? 0
+        y = try container.decodeIfPresent(Double.self, forKey: .y) ?? 0
+        scaleX = try container.decodeIfPresent(Double.self, forKey: .scaleX)
+        scaleY = try container.decodeIfPresent(Double.self, forKey: .scaleY)
+        deleted = try container.decodeIfPresent(Bool.self, forKey: .deleted)
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let known = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: known, to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(x, forKey: .x)
+        try container.encode(y, forKey: .y)
+        try container.encodeIfPresent(scaleX, forKey: .scaleX)
+        try container.encodeIfPresent(scaleY, forKey: .scaleY)
+        try container.encodeIfPresent(deleted, forKey: .deleted)
+    }
+}
 
 /// Lossless JSON storage for provider metadata and additive graph fields that
 /// this client does not understand yet. Graph semantics never depend on this
@@ -1021,8 +1167,9 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
     /// Optional advanced Pencil rendering metadata. Its absence preserves the
     /// exact legacy round-stroke behavior.
     let pencilTool: PencilStrokeTool?
+    let additionalFields: [String: JSONValue]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case id, type, color, width, opacity, points, translation
         case sourceMarkdown = "source_markdown", text, x, y, height
         case fontSize = "font_size", scaleX, scaleY, d, fill, role
@@ -1039,7 +1186,8 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
          scaleX: Double? = nil, scaleY: Double? = nil, d: String? = nil, fill: String? = nil,
          role: String? = nil, sourceStudyInteractionID: String? = nil,
          createdAt: Double? = nil, unitLabel: String? = nil, origin: String? = nil,
-         graph: GraphObject? = nil, pencilTool: PencilStrokeTool? = nil) {
+         graph: GraphObject? = nil, pencilTool: PencilStrokeTool? = nil,
+         additionalFields: [String: JSONValue] = [:]) {
         self.id = id; self.type = type; self.color = color; self.width = width
         self.opacity = opacity; self.points = points; self.translation = translation
         self.sourceMarkdown = sourceMarkdown; self.text = text; self.x = x; self.y = y
@@ -1049,6 +1197,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         self.createdAt = createdAt; self.unitLabel = unitLabel; self.origin = origin
         self.graph = graph
         self.pencilTool = pencilTool
+        self.additionalFields = additionalFields
     }
 
     init(graph: GraphObject) {
@@ -1059,6 +1208,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         createdAt = graph.createdAt; unitLabel = nil; origin = nil
         self.graph = graph
         pencilTool = nil
+        additionalFields = graph.additionalFields
     }
 
     init(from decoder: Decoder) throws {
@@ -1073,6 +1223,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
             role = nil; sourceStudyInteractionID = nil; createdAt = value.createdAt
             unitLabel = nil; origin = nil; graph = value
             pencilTool = nil
+            additionalFields = value.additionalFields
             return
         }
         color = try container.decodeIfPresent(String.self, forKey: .color)
@@ -1099,6 +1250,9 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
         origin = try container.decodeIfPresent(String.self, forKey: .origin)
         pencilTool = try container.decodeIfPresent(PencilStrokeTool.self, forKey: .pencilTool)
         graph = nil
+        additionalFields = try decodeAdditionalFields(
+            from: decoder, excluding: Set(CodingKeys.allCases.map(\.stringValue))
+        )
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1106,6 +1260,8 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
             try graph.encode(to: encoder)
             return
         }
+        let knownKeys = Set(CodingKeys.allCases.map(\.stringValue))
+        try encodeAdditionalFields(additionalFields, excluding: knownKeys, to: encoder)
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(type, forKey: .type)
@@ -1143,7 +1299,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                            scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
                            sourceStudyInteractionID: sourceStudyInteractionID,
                            createdAt: createdAt, unitLabel: unitLabel, origin: origin,
-                           pencilTool: pencilTool)
+                           pencilTool: pencilTool, additionalFields: additionalFields)
     }
 
     func resized(to size: CGSize) -> CanvasObject {
@@ -1156,7 +1312,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                             scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
                             sourceStudyInteractionID: sourceStudyInteractionID,
                             createdAt: createdAt, unitLabel: unitLabel, origin: origin,
-                            pencilTool: pencilTool)
+                            pencilTool: pencilTool, additionalFields: additionalFields)
     }
 
     /// Scales the displayed object uniformly around a board-local anchor.
@@ -1188,7 +1344,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
                 scaleX: scaleX, scaleY: scaleY, d: d, fill: fill, role: role,
                 sourceStudyInteractionID: sourceStudyInteractionID,
                 createdAt: createdAt, unitLabel: unitLabel, origin: origin,
-                pencilTool: pencilTool
+                pencilTool: pencilTool, additionalFields: additionalFields
             )
         }
 
@@ -1202,7 +1358,7 @@ struct CanvasObject: Codable, Equatable, Identifiable, Sendable {
             d: d, fill: fill, role: role,
             sourceStudyInteractionID: sourceStudyInteractionID,
             createdAt: createdAt, unitLabel: unitLabel, origin: origin,
-            pencilTool: pencilTool
+            pencilTool: pencilTool, additionalFields: additionalFields
         )
     }
 }

@@ -196,7 +196,11 @@ enum EditorThreeWayMerger {
                 scaleY: resolve(baseValue.scaleY, localValue.scaleY, serverValue.scaleY,
                                 conflict: &fieldConflict),
                 deleted: resolve(baseValue.deleted, localValue.deleted, serverValue.deleted,
-                                 conflict: &fieldConflict)
+                                 conflict: &fieldConflict),
+                additionalFields: resolve(baseValue.additionalFields,
+                                          localValue.additionalFields,
+                                          serverValue.additionalFields,
+                                          conflict: &fieldConflict)
             )
             if fieldConflict { unresolved.insert(id) }
             if local.importedTransforms[id] != nil || server.importedTransforms[id] != nil {
@@ -296,7 +300,11 @@ enum EditorThreeWayMerger {
                 unitLabel: resolve(base.unitLabel, local.unitLabel, server.unitLabel,
                                    conflict: &conflict),
                 origin: resolve(base.origin, local.origin, server.origin, conflict: &conflict),
-                graph: resolve(base.graph, local.graph, server.graph, conflict: &conflict)
+                graph: resolve(base.graph, local.graph, server.graph, conflict: &conflict),
+                pencilTool: resolve(base.pencilTool, local.pencilTool, server.pencilTool,
+                                    conflict: &conflict),
+                additionalFields: resolve(base.additionalFields, local.additionalFields,
+                                          server.additionalFields, conflict: &conflict)
             )
             if conflict { unresolved.insert(id) }
             return merged
@@ -762,7 +770,8 @@ final class BoardDocumentStore: ObservableObject {
             if let imported = next.importedTransforms[id] {
                 next.importedTransforms[id] = ObjectTransform(x: imported.x + delta.x, y: imported.y + delta.y,
                                                               scaleX: imported.scaleX, scaleY: imported.scaleY,
-                                                              deleted: imported.deleted)
+                                                              deleted: imported.deleted,
+                                                              additionalFields: imported.additionalFields)
             } else {
                 // A selected untransformed professor path is promoted to the
                 // live layer by adding its first translation without touching board.svg.
@@ -821,7 +830,8 @@ final class BoardDocumentStore: ObservableObject {
                 y: Double(anchor.y) + factor * (existing.y - Double(anchor.y)),
                 scaleX: (existing.scaleX ?? 1) * factor,
                 scaleY: (existing.scaleY ?? 1) * factor,
-                deleted: existing.deleted
+                deleted: existing.deleted,
+                additionalFields: existing.additionalFields
             )
         }
         guard next != editor else { return nil }
@@ -857,7 +867,9 @@ final class BoardDocumentStore: ObservableObject {
         for id in professorPathIDs {
             if let imported = next.importedTransforms[id] {
                 next.importedTransforms[id] = ObjectTransform(x: imported.x, y: imported.y,
-                                                               scaleX: imported.scaleX, scaleY: imported.scaleY, deleted: true)
+                                                               scaleX: imported.scaleX, scaleY: imported.scaleY,
+                                                               deleted: true,
+                                                               additionalFields: imported.additionalFields)
             } else {
                 next.importedTransforms[id] = ObjectTransform(x: 0, y: 0, scaleX: 1, scaleY: 1, deleted: true)
             }

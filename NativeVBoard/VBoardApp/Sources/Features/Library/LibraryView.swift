@@ -24,20 +24,19 @@ struct LibraryView: View {
         NavigationStack {
             Group {
                 if let library {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 22) {
-                            LibraryHeader { showImporter = true }
-                            if library.folders.isEmpty && library.boards.isEmpty {
-                                EmptyLibraryView { showImporter = true }
-                            } else {
-                                libraryControls
-                                if section == .lectures {
-                                    lectureCollection(library)
+                    GeometryReader { proxy in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 22) {
+                                LibraryHeader { showImporter = true }
+                                if library.folders.isEmpty && library.boards.isEmpty {
+                                    EmptyLibraryView { showImporter = true }
                                 } else {
-                                    boardCollection(library)
+                                    libraryContent(library, availableWidth: proxy.size.width - 48)
                                 }
                             }
-                        }.padding(.horizontal, 24).padding(.vertical, 18).frame(maxWidth: 1200, alignment: .leading)
+                            .padding(.horizontal, 24).padding(.vertical, 18)
+                            .frame(maxWidth: 1200, alignment: .leading)
+                        }
                     }
                 } else if let error {
                     ContentUnavailableView("Couldn’t load your library", systemImage: "exclamationmark.triangle", description: Text(error)).overlay(alignment: .bottom) { Button("Retry") { load() }.buttonStyle(.borderedProminent).padding(.bottom, 32) }
@@ -53,7 +52,12 @@ struct LibraryView: View {
                     Button { showAccount = true } label: { Image(systemName: "person.crop.circle") }.accessibilityLabel("Account")
                 }
             }
-            .sheet(isPresented: $showImporter) { ImportFlowView { board in launchBoard = board; showImporter = false; load() } }
+            .sheet(isPresented: $showImporter) {
+                ImportFlowView { board in
+                    showImporter = false
+                    refreshAndLaunch(board)
+                }
+            }
             .sheet(isPresented: $showNewLecture) { NewLectureView { showNewLecture = false; load() } }
             .sheet(isPresented: $showAccount) { AccountView(user: account) }
             .sheet(item: $renameTarget) { target in
@@ -70,8 +74,7 @@ struct LibraryView: View {
                 ImportFlowView(pendingImport: item) { board in
                     PendingImportStore.remove(item)
                     pendingImport = nil
-                    launchBoard = board
-                    load()
+                    refreshAndLaunch(board)
                 }
             }
             .navigationDestination(item: $launchBoard) { board in
@@ -89,6 +92,43 @@ struct LibraryView: View {
         }
     }
 
+    @ViewBuilder
+    private func libraryContent(_ library: LibraryResponse,
+                                availableWidth: CGFloat) -> some View {
+        if availableWidth >= 850 {
+            let contentWidth = min(max(availableWidth, 0), 1200)
+            let lectureWidth = max(240, min(320, contentWidth * 0.25))
+            HStack(alignment: .top, spacing: 24) {
+                VStack(alignment: .leading, spacing: 14) {
+                    LibrarySectionHeader(title: "Classes",
+                                         detail: "Organized class boards")
+                    lectureCollection(library, compactPane: true)
+                }
+                .frame(width: lectureWidth, alignment: .topLeading)
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(alignment: .firstTextBaseline) {
+                        LibrarySectionHeader(title: "Recent",
+                                             detail: "Recently opened or edited")
+                        Spacer()
+                        layoutPicker
+                    }
+                    boardCollection(library)
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        } else {
+            libraryControls
+            if section == .lectures {
+                lectureCollection(library)
+            } else {
+                boardCollection(library)
+            }
+        }
+    }
+
     private var libraryControls: some View {
         HStack {
             Picker("Library Section", selection: $section) {
@@ -97,31 +137,71 @@ struct LibraryView: View {
             .pickerStyle(.segmented)
             .frame(maxWidth: 340)
             Spacer()
-            Picker("Layout", selection: $layoutRaw) {
-                Label("Grid", systemImage: "square.grid.2x2").tag(LibraryLayout.grid.rawValue)
-                Label("List", systemImage: "list.bullet").tag(LibraryLayout.list.rawValue)
-            }
-            .pickerStyle(.menu)
+            layoutPicker
         }
     }
 
-    @ViewBuilder private func lectureCollection(_ library: LibraryResponse) -> some View {
-        if library.folders.isEmpty {
+    private var layoutPicker: some View {
+        Picker("Layout", selection: $layoutRaw) {
+            Label("Grid", systemImage: "square.grid.2x2").tag(LibraryLayout.grid.rawValue)
+            Label("List", systemImage: "list.bullet").tag(LibraryLayout.list.rawValue)
+        }
+        .pickerStyle(.menu)
+    }
+
+    @ViewBuilder private func lectureCollection(_ library: LibraryResponse,
+                                                compactPane: Bool = false) -> some View {
+        let unfiled = library.boards.filter { $0.folderID == nil }.sorted {
+            ($0.lastActivityAt ?? $0.updatedAt ?? $0.createdAt ?? 0)
+                > ($1.lastActivityAt ?? $1.updatedAt ?? $1.createdAt ?? 0)
+        }
+        if library.folders.isEmpty && unfiled.isEmpty {
             ContentUnavailableView("No classes yet", systemImage: "books.vertical",
                                    description: Text("Create a class to keep related whiteboards together."))
-        } else if layoutRaw == LibraryLayout.list.rawValue {
+        } else if compactPane || layoutRaw == LibraryLayout.list.rawValue {
             LazyVStack(spacing: 0) {
-                ForEach(library.folders) { folder in lectureLink(folder, library: library, list: true) }
+                ForEach(library.folders) { folder in
+                    lectureLink(folder, library: library, list: true,
+                                compact: compactPane)
+                }
+                if !unfiled.isEmpty {
+                    Text("Unfiled")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, library.folders.isEmpty ? 4 : 20)
+                        .padding(.bottom, 4)
+                    ForEach(unfiled) { board in
+                        boardLink(board, library: library, list: true)
+                    }
+                }
             }
         } else {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 280, maximum: 380), spacing: 18)], spacing: 18) {
-                ForEach(library.folders) { folder in lectureLink(folder, library: library, list: false) }
+            VStack(alignment: .leading, spacing: 18) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 280, maximum: 380), spacing: 18)], spacing: 18) {
+                    ForEach(library.folders) { folder in
+                        lectureLink(folder, library: library, list: false, compact: false)
+                    }
+                }
+                if !unfiled.isEmpty {
+                    Text("Unfiled")
+                        .font(.headline)
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 18)], spacing: 18) {
+                        ForEach(unfiled) { board in
+                            boardLink(board, library: library, list: false)
+                        }
+                    }
+                }
             }
         }
     }
 
     @ViewBuilder private func boardCollection(_ library: LibraryResponse) -> some View {
-        let recent = library.boards.sorted { ($0.updatedAt ?? $0.createdAt ?? 0) > ($1.updatedAt ?? $1.createdAt ?? 0) }
+        let recent = Array(library.boards.sorted {
+            ($0.lastActivityAt ?? $0.updatedAt ?? $0.createdAt ?? 0)
+                > ($1.lastActivityAt ?? $1.updatedAt ?? $1.createdAt ?? 0)
+        }.prefix(24))
         if recent.isEmpty {
             ContentUnavailableView("No recent whiteboards", systemImage: "rectangle.on.rectangle")
         } else if layoutRaw == LibraryLayout.list.rawValue {
@@ -135,11 +215,12 @@ struct LibraryView: View {
         }
     }
 
-    private func lectureLink(_ folder: LectureFolder, library: LibraryResponse, list: Bool) -> some View {
+    private func lectureLink(_ folder: LectureFolder, library: LibraryResponse,
+                             list: Bool, compact: Bool) -> some View {
         NavigationLink { LectureWorkspaceView(folder: folder) } label: {
             LectureCard(folder: folder,
                         boards: folder.boardOrder.compactMap { id in library.boards.first(where: { $0.id == id }) },
-                        list: list)
+                        list: list, compact: compact)
         }
         .buttonStyle(.plain)
         .contextMenu {
@@ -149,7 +230,12 @@ struct LibraryView: View {
     }
 
     private func boardLink(_ board: LibraryBoard, library: LibraryResponse, list: Bool) -> some View {
-        NavigationLink { destination(for: board, in: library) } label: { BoardCard(board: board, list: list) }
+        let className = board.folderID.flatMap { folderID in
+            library.folders.first(where: { $0.id == folderID })?.name
+        }
+        return NavigationLink { destination(for: board, in: library) } label: {
+            BoardCard(board: board, classLabel: className ?? "Unfiled", list: list)
+        }
             .buttonStyle(.plain)
             .contextMenu {
                 Button("Rename") { renameTarget = .board(board) }
@@ -228,6 +314,23 @@ struct LibraryView: View {
         }
     }
 
+    private func refreshAndLaunch(_ completedBoard: LibraryBoard) {
+        Task {
+            do {
+                let result = try await api.library()
+                library = result
+                launchBoard = result.boards.first(where: { $0.id == completedBoard.id })
+                    ?? completedBoard
+                error = nil
+            } catch {
+                // The canonical import already completed. Opening the returned
+                // isolated board is safer than losing the user's destination;
+                // the normal Refresh action can recover catalog presentation.
+                launchBoard = completedBoard
+            }
+        }
+    }
+
     private func discoverPendingImport() {
         guard !showImporter, pendingImport == nil else { return }
         pendingImport = PendingImportStore.current()
@@ -292,6 +395,18 @@ private struct LibraryHeader: View {
     }
 }
 
+private struct LibrarySectionHeader: View {
+    let title: String
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.title2.weight(.bold))
+            Text(detail).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
 private struct EmptyLibraryView: View {
     let add: () -> Void
     var body: some View { VStack(spacing: 14) { Image(systemName: "photo.on.rectangle.angled").font(.system(size: 48)).foregroundStyle(.tint); Text("No whiteboards yet").font(.title2.weight(.semibold)); Text("Photograph or import a physical whiteboard to create an editable study canvas.").multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 430); Button("Add Whiteboard", action: add).buttonStyle(.borderedProminent).controlSize(.large) }.frame(maxWidth: .infinity).padding(.vertical, 64) }
@@ -301,12 +416,15 @@ private struct LectureCard: View {
     let folder: LectureFolder
     let boards: [LibraryBoard]
     let list: Bool
+    let compact: Bool
 
     var body: some View {
         Group {
             if list {
                 HStack(spacing: 16) {
-                    LectureMontage(boards: boards).frame(width: 150, height: 82)
+                    LectureMontage(boards: boards)
+                        .frame(width: compact ? 72 : 150,
+                               height: compact ? 54 : 82)
                     labels
                     Spacer()
                     Image(systemName: "chevron.right").foregroundStyle(.tertiary)
@@ -337,6 +455,7 @@ private struct LectureCard: View {
 
 private struct BoardCard: View {
     let board: LibraryBoard
+    let classLabel: String
     let list: Bool
 
     var body: some View {
@@ -365,8 +484,20 @@ private struct BoardCard: View {
     private var labels: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(board.name).font(.headline).lineLimit(2)
-            Text(boardDate)
-                .font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 5) {
+                Label(classLabel,
+                      systemImage: board.folderID == nil ? "tray" : "books.vertical")
+                    .lineLimit(1)
+                Text("·")
+                Text(boardDate).lineLimit(1)
+                if board.status != "ready" {
+                    Text("·")
+                    Text(board.status.replacingOccurrences(of: "_", with: " ").capitalized)
+                        .lineLimit(1)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -652,7 +783,29 @@ struct ImportFlowView: View {
         .frame(minHeight: 58)
     }
     private var previewView: some View { ScrollView { VStack(spacing: 18) { if let previewImage { Image(uiImage: previewImage).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: 16)).padding(.horizontal) }; if pdfData != nil { Label(pdfPageCount == 1 ? "1 PDF page" : "\(pdfPageCount) PDF pages", systemImage: "doc.richtext").font(.headline); if pdfPageCount > 1 { Text("Each page will become a separate board in source order.").font(.subheadline).foregroundStyle(.secondary) } }; TextField("Board name (optional)", text: $name).textFieldStyle(.roundedBorder).padding(.horizontal); destinationControls; Button(pdfData == nil ? "Use This Photo" : "Import PDF") { pdfData == nil ? beginImageUpload() : beginPDFUpload() }.buttonStyle(.borderedProminent).controlSize(.large).disabled(importState.phase.isBusy); if let error { Text(error).foregroundStyle(.red).multilineTextAlignment(.center) } }.padding(.vertical, 20).frame(maxWidth: 700) }.frame(maxWidth: .infinity) }
-    @ViewBuilder private var destinationControls: some View { if folderID == nil { VStack(alignment: .leading, spacing: 10) { Toggle("Create a new class", isOn: $createLecture); if createLecture { TextField("Class name", text: $newLectureName).textFieldStyle(.roundedBorder) } else if !availableLectures.isEmpty { Picker("Add to class", selection: $selectedFolderID) { Text("No class").tag(String?.none); ForEach(availableLectures) { lecture in Text(lecture.name).tag(Optional(lecture.id)) } }.pickerStyle(.menu) } }.padding(.horizontal) } }
+    @ViewBuilder private var destinationControls: some View {
+        if folderID == nil {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle("Create a new class", isOn: $createLecture)
+                if createLecture {
+                    TextField("Class name", text: $newLectureName)
+                        .textFieldStyle(.roundedBorder)
+                } else {
+                    Picker("Add to class", selection: $selectedFolderID) {
+                        Text("Automatic · Imported Whiteboards").tag(String?.none)
+                        ForEach(availableLectures) { lecture in
+                            Text(lecture.name).tag(Optional(lecture.id))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Text("With no class selected, V-Board creates or reuses Imported Whiteboards so this board cannot become orphaned.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal)
+        }
+    }
     private var cornerView: some View {
         VStack(spacing: 0) {
             if let imageAsset {
@@ -671,15 +824,17 @@ struct ImportFlowView: View {
                             }
                             if corners.count == 4 { path.closeSubpath() }
                         }
-                        .stroke(.yellow, lineWidth: 3)
+                        .stroke(.white.opacity(0.88), style: StrokeStyle(lineWidth: 1.5,
+                                                                       lineJoin: .round))
+                        .shadow(color: .black.opacity(0.55), radius: 1)
                         .allowsHitTesting(false)
                         ForEach(corners.indices, id: \.self) { index in
                             ZStack {
-                                Circle().fill(.black.opacity(0.88)).frame(width: 42, height: 42)
-                                Circle().fill(.white).frame(width: 32, height: 32)
-                                Circle().fill(Color.accentColor).frame(width: 22, height: 22)
+                                Circle().fill(.black.opacity(0.72)).frame(width: 18, height: 18)
+                                Circle().fill(.white).frame(width: 12, height: 12)
+                                Circle().fill(Color.accentColor).frame(width: 7, height: 7)
                             }
-                                .frame(width: 54, height: 54)
+                                .frame(width: 48, height: 48)
                                 .contentShape(Circle())
                                 .position(mapper.sourcePixelToView(corners[index]))
                                 .gesture(DragGesture(coordinateSpace: .named("cornerPreview"))
@@ -700,12 +855,16 @@ struct ImportFlowView: View {
                 .padding()
             }
             VStack(spacing: 8) {
-                Text(cornerDetectionWasConfident
-                     ? "We found the board. Adjust the corners if needed."
-                     : "We couldn’t confidently find the edges. Adjust the corners.")
+                Text("Adjust the four corners, then confirm.")
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Process Whiteboard") { beginCornerSubmission() }
+                if !cornerDetectionWasConfident {
+                    Text("The edge suggestion was uncertain; check each handle before continuing.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                Button("Confirm Corners") { beginCornerSubmission() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                     .disabled(importState.phase.isBusy)
                 if let error { Text(error).foregroundStyle(.red).multilineTextAlignment(.center) }
@@ -908,7 +1067,35 @@ struct ImportFlowView: View {
             self.error = "The selected file could not be opened."
         }
     }
-    private func resolvedFolderID() async throws -> String? { if let folderID { return folderID }; if createLecture { let trimmed = newLectureName.trimmingCharacters(in: .whitespacesAndNewlines); guard !trimmed.isEmpty else { throw ImportUIError.missingLectureName }; return try await api.createLecture(name: trimmed).id }; return selectedFolderID }
+    private func resolvedFolderID() async throws -> String? {
+        if let folderID { return folderID }
+        if createLecture {
+            let trimmed = newLectureName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { throw ImportUIError.missingLectureName }
+            return try await api.createLecture(name: trimmed).id
+        }
+        if let selectedFolderID { return selectedFolderID }
+        let automaticName = "Imported Whiteboards"
+        if let existing = availableLectures.first(where: {
+            $0.name.caseInsensitiveCompare(automaticName) == .orderedSame
+        }) {
+            return existing.id
+        }
+        do {
+            let created = try await api.createLecture(name: automaticName)
+            availableLectures.append(created)
+            selectedFolderID = created.id
+            return created.id
+        } catch APIError.server(let status, _, _) where status == 409 {
+            let refreshed = try await api.library()
+            availableLectures = refreshed.folders
+            guard let existing = refreshed.folders.first(where: {
+                $0.name.caseInsensitiveCompare(automaticName) == .orderedSame
+            }) else { throw ImportUIError.automaticLectureUnavailable }
+            selectedFolderID = existing.id
+            return existing.id
+        }
+    }
     private func beginImageUpload() {
         guard imageAsset != nil, pdfData == nil else { return }
         let operationID = UUID()
@@ -1153,8 +1340,15 @@ struct ImportFlowView: View {
 
 private enum ImportFileKind { case image, pdf }
 private enum ImportUIError: LocalizedError {
-    case missingLectureName, emptyImport
-    var errorDescription: String? { switch self { case .missingLectureName: return "Enter a name for the new class."; case .emptyImport: return "The PDF did not contain an importable page." } }
+    case missingLectureName, emptyImport, automaticLectureUnavailable
+    var errorDescription: String? {
+        switch self {
+        case .missingLectureName: return "Enter a name for the new class."
+        case .emptyImport: return "The PDF did not contain an importable page."
+        case .automaticLectureUnavailable:
+            return "The destination class could not be prepared. Choose a class and try again."
+        }
+    }
 }
 
 enum ImportFlowPhase: Equatable {

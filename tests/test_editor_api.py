@@ -182,6 +182,79 @@ class EditorApiTests(unittest.TestCase):
         self.assertEqual(reloaded["source_markdown"], source)
         self.assertEqual(reloaded["practice_problem_id"], "prob-one")
 
+    def test_additive_editor_and_object_fields_survive_round_trip(self):
+        state = self.editor_state()
+        state["future_editor_state"] = {"layout_mode": "spatial", "version": 7}
+        state["objects"][0]["future_stroke_metadata"] = {
+            "brush": "future-brush",
+            "samples": [1, 2, 3],
+        }
+        state["objects"][1]["future_text_metadata"] = {"semantic_role": "derivation"}
+
+        response = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=state
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        saved = response.get_json()["editor"]
+        self.assertEqual(saved["future_editor_state"]["layout_mode"], "spatial")
+        self.assertEqual(saved["objects"][0]["future_stroke_metadata"]["samples"], [1, 2, 3])
+        self.assertEqual(
+            saved["objects"][1]["future_text_metadata"]["semantic_role"],
+            "derivation",
+        )
+
+        reloaded = self.client.get(
+            f"/api/boards/{self.board_id}/editor"
+        ).get_json()["editor"]
+        self.assertEqual(reloaded["future_editor_state"]["version"], 7)
+        self.assertEqual(reloaded["objects"][0]["future_stroke_metadata"]["brush"],
+                         "future-brush")
+
+    def test_additive_nested_editor_fields_survive_validation(self):
+        state = self.editor_state()
+        state["viewport"]["future_grid"] = {"snap": 12}
+        state["groups"] = [{
+            "id": "group-one",
+            "type": "group",
+            "children": ["stroke-one"],
+            "transform": {
+                "x": 10, "y": -20, "scaleX": 1, "scaleY": 1, "rotation": 0,
+                "future_anchor": "center",
+            },
+            "future_layout": {"locked": False},
+        }]
+        state["imported_transforms"] = {
+            "image-source-1": {
+                "x": -400, "y": 75, "scaleX": 0.5, "scaleY": 0.5,
+                "deleted": False, "future_crop": {"mode": "contain"},
+            }
+        }
+
+        clean = board_app.validate_editor_state(state, board_id=self.board_id)
+        self.assertEqual(clean["viewport"]["future_grid"]["snap"], 12)
+        self.assertFalse(clean["groups"][0]["future_layout"]["locked"])
+        self.assertEqual(clean["groups"][0]["transform"]["future_anchor"], "center")
+        self.assertEqual(
+            clean["imported_transforms"]["image-source-1"]["future_crop"]["mode"],
+            "contain",
+        )
+
+        lecture_state = dict(state)
+        lecture_state["source_boards"] = [{
+            "board_id": self.board_id,
+            "board_order": 1,
+            "x": -20,
+            "y": 40,
+            "width": 1200,
+            "height": 800,
+            "label": "Whiteboard 1",
+            "future_placement": {"lane": 2},
+        }]
+        lecture_clean = board_app.validate_editor_state(lecture_state)
+        self.assertEqual(
+            lecture_clean["source_boards"][0]["future_placement"]["lane"], 2
+        )
+
     def test_combined_svg_renders_new_objects_and_eraser_masks(self):
         saved = self.client.put(
             f"/api/boards/{self.board_id}/editor", json=self.editor_state()

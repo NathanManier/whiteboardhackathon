@@ -384,17 +384,38 @@ def validate_source_boards(value: Any) -> list[dict[str, Any]]:
             board_order = int(order)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"source_boards[{index}] has an invalid board_order.") from exc
-        clean.append(
-            {
-                "board_id": board_id,
-                "board_order": max(1, board_order),
-                "x": float(item.get("x") or 0),
-                "y": float(item.get("y") or 0),
-                "width": max(1.0, float(item.get("width") or 1)),
-                "height": max(1.0, float(item.get("height") or 1)),
-                "label": str(item.get("label") or f"Whiteboard {max(1, board_order)}")[:80],
-            }
-        )
+        clean_item = {
+            "board_id": board_id,
+            "board_order": max(1, board_order),
+            "x": float(item.get("x") or 0),
+            "y": float(item.get("y") or 0),
+            "width": max(1.0, float(item.get("width") or 1)),
+            "height": max(1.0, float(item.get("height") or 1)),
+            "label": str(item.get("label") or f"Whiteboard {max(1, board_order)}")[:80],
+        }
+        reserved = {
+            "board_id", "boardId", "board_order", "boardOrder",
+            "x", "y", "width", "height", "label",
+        }
+        extensions = {
+            key: extension for key, extension in item.items()
+            if key not in reserved
+        }
+        if extensions:
+            if any(
+                not isinstance(key, str)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", key)
+                for key in extensions
+            ):
+                raise ValueError(f"source_boards[{index}] contains an invalid field name.")
+            try:
+                encoded = json.dumps(extensions, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError, RecursionError) as exc:
+                raise ValueError(f"source_boards[{index}] extensions are invalid.") from exc
+            if len(encoded.encode("utf-8")) > 16 * 1024:
+                raise ValueError(f"source_boards[{index}] extensions are too large.")
+            clean_item.update(extensions)
+        clean.append(clean_item)
     clean.sort(key=lambda item: (item["board_order"], item["x"]))
     return clean
 

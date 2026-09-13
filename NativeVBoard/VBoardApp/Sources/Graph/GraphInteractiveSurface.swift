@@ -980,6 +980,7 @@ struct GraphInteractiveSurface: View {
     let onCommitViewport: (String, String, GraphViewport) -> Void
     let onEdit: () -> Void
     let onDone: () -> Void
+    private let usesLightweightRenderer: Bool
 
     @StateObject private var session: GraphInteractiveSession
     @State private var isClosing = false
@@ -999,6 +1000,7 @@ struct GraphInteractiveSurface: View {
             graph: graph,
             coordinator: GraphProviderEnvironment.sharedCoordinator,
             providerFactory: { GraphProviderEnvironment.makeConfiguredProvider() },
+            usesLightweightRenderer: true,
             canonicalStrokeObjects: canonicalStrokeObjects,
             pencilAnnotationEnabled: pencilAnnotationEnabled,
             pencilStyle: pencilStyle,
@@ -1014,6 +1016,7 @@ struct GraphInteractiveSurface: View {
     init(graph: GraphObject,
          coordinator: GraphProviderCoordinator,
          providerFactory: @escaping GraphInteractiveSession.ProviderFactory,
+         usesLightweightRenderer: Bool = false,
          canonicalStrokeObjects: [CanvasObject] = [],
          pencilAnnotationEnabled: Bool,
          pencilStyle: CanvasStrokeStyle = .pen,
@@ -1038,9 +1041,26 @@ struct GraphInteractiveSurface: View {
         self.onCommitViewport = onCommitViewport
         self.onEdit = onEdit
         self.onDone = onDone
+        self.usesLightweightRenderer = usesLightweightRenderer
     }
 
+    @ViewBuilder
     var body: some View {
+        if usesLightweightRenderer {
+            LightweightGraphSurface(
+                graph: graph,
+                onCommitViewport: { viewport in
+                    onCommitViewport(graph.owningBoardID, graph.id, viewport)
+                },
+                onEdit: onEdit,
+                onDone: onDone
+            )
+        } else {
+            providerSurface
+        }
+    }
+
+    private var providerSurface: some View {
         ZStack {
             GraphNativeFallbackSurface(graph: session.displayGraph)
                 .opacity(session.representationState == .interactive ? 0 : 1)
@@ -1189,6 +1209,137 @@ struct GraphInteractiveSurface: View {
             }
         }
     }
+}
+
+/// Provider-free graph navigation for the primary classroom workflow. The
+/// graph remains a normal persisted GraphObject; this surface only edits its
+/// canonical viewport and never creates a WKWebView or an AI explanation.
+private struct LightweightGraphSurface: View {
+    let graph: GraphObject
+    let onCommitViewport: (GraphViewport) -> Void
+    let onEdit: () -> Void
+    let onDone: () -> Void
+
+    @State private var viewport: GraphViewport
+    @State private var dragStart: GraphViewport?
+    @State private var magnificationStart: GraphViewport?
+
+    init(graph: GraphObject, onCommitViewport: @escaping (GraphViewport) -> Void,
+         onEdit: @escaping () -> Void, onDone: @escaping () -> Void) {
+        self.graph = graph
+        self.onCommitViewport = onCommitViewport
+        self.onEdit = onEdit
+        self.onDone = onDone
+        _viewport = State(initialValue: graph.viewport)
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                GraphNativeFallbackSurface(graph: graph.replacing(viewport: viewport))
+                    .contentShape(Rectangle())
+                    .gesture(panGesture(size: proxy.size))
+                    .simultaneousGesture(zoomGesture)
+
+                VStack(spacing: 0) {
+                    HStack(spacing: 8) {
+                        StudyContentView(source: expressionSource, maximumWidth: 320)
+                            .frame(maxHeight: 44)
+                            .clipped()
+                        Spacer()
+                        Button("Edit", systemImage: "pencil", action: onEdit)
+                            .buttonStyle(.bordered)
+                        Button("Done", action: onDone)
+                            .buttonStyle(.borderedProminent)
+                    }
+                    .padding(10)
+                    .background(.ultraThinMaterial)
+                    Spacer()
+                    HStack(spacing: 8) {
+                        Text(viewportSummary)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button { zoom(by: 1.35) } label: {
+                            Image(systemName: "minus.magnifyingglass")
+                        }
+                        Button { viewport = graph.viewport; commit() } label: {
+                            Image(systemName: "scope")
+                        }
+                        Button { zoom(by: 0.74) } label: {
+                            Image(systemName: "plus.magnifyingglass")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(10)
+                    .background(.ultraThinMaterial)
+                }
+            }
+        }
+        .background(Color(uiColor: .secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(GraphAccessibility.label(for: graph))
+        .onChange(of: graph) { _, value in viewport = value.viewport }
+    }
+
+    private var expressionSource: String {
+        let expressions = graph.expressions.filter(\.visible).prefix(2).map {
+            "\\(\($0.latex)\\)"
+        }
+        return expressions.isEmpty ? "Graph" : expressions.joined(separator: " · ")
+    }
+
+    private var viewportSummary: String {
+        "x \(viewport.xMin.formatted(.number.precision(.fractionLength(1))))…\(viewport.xMax.formatted(.number.precision(.fractionLength(1))))  y \(viewport.yMin.formatted(.number.precision(.fractionLength(1))))…\(viewport.yMax.formatted(.number.precision(.fractionLength(1))))"
+    }
+
+    private func panGesture(size: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 2)
+            .onChanged { value in
+                let start = dragStart ?? viewport
+                if dragStart == nil { dragStart = start }
+                let xRange = start.xMax - start.xMin
+                let yRange = start.yMax - start.yMin
+                let dx = -Double(value.translation.width / max(size.width, 1)) * xRange
+                let dy = Double(value.translation.height / max(size.height, 1)) * yRange
+                viewport = start.replacingBounds(with: GraphViewport(
+                    xMin: start.xMin + dx, xMax: start.xMax + dx,
+                    yMin: start.yMin + dy, yMax: start.yMax + dy
+                ))
+            }
+            .onEnded { _ in dragStart = nil; commit() }
+    }
+
+    private var zoomGesture: some Gesture {
+        MagnificationGesture()
+            .onChanged { value in
+                let start = magnificationStart ?? viewport
+                if magnificationStart == nil { magnificationStart = start }
+                let scale = min(20, max(0.05, Double(value)))
+                viewport = scaled(start, by: 1 / scale)
+            }
+            .onEnded { _ in magnificationStart = nil; commit() }
+    }
+
+    private func zoom(by factor: Double) {
+        viewport = scaled(viewport, by: factor)
+        commit()
+    }
+
+    private func scaled(_ source: GraphViewport, by factor: Double) -> GraphViewport {
+        let safe = min(4, max(0.25, factor))
+        let centerX = (source.xMin + source.xMax) / 2
+        let centerY = (source.yMin + source.yMax) / 2
+        let halfX = min(500_000, max(0.0005, (source.xMax - source.xMin) * safe / 2))
+        let halfY = min(500_000, max(0.0005, (source.yMax - source.yMin) * safe / 2))
+        return source.replacingBounds(with: GraphViewport(
+            xMin: centerX - halfX, xMax: centerX + halfX,
+            yMin: centerY - halfY, yMax: centerY + halfY
+        ))
+    }
+
+    private func commit() { onCommitViewport(viewport) }
 }
 
 #if DEBUG

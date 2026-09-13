@@ -117,6 +117,21 @@ def _plain_math(value: str, *, depth: int = 0) -> str:
     return "".join(output)
 
 
+def plain_math_label(value: str) -> str:
+    """Return a readable, non-HTML label for static graph cards and exports."""
+    try:
+        return _plain_math(value)
+    except StaticGraphParseError:
+        # Keep unsupported content visible and escaped by the eventual SVG
+        # serializer. Only remove balanced presentation delimiters here.
+        raw = value.strip()
+        if len(raw) >= 2 and raw.startswith("$") and raw.endswith("$"):
+            return raw[1:-1]
+        if raw.startswith(r"\(") and raw.endswith(r"\)"):
+            return raw[2:-2]
+        return raw
+
+
 def _tokenize(value: str) -> list[_Token]:
     tokens: list[_Token] = []
     index = 0

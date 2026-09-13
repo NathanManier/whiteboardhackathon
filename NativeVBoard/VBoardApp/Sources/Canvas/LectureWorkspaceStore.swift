@@ -274,10 +274,14 @@ final class LectureWorkspaceStore: ObservableObject {
     func setActiveBoard(_ boardID: String, api: APIClient, requestFocus: Bool = false) {
         guard var current = workspace,
               current.items.contains(where: { $0.boardID == boardID }) else { return }
+        let becameActive = current.activeBoardID != boardID
         if current.activeBoardID != boardID {
             current.activeBoardID = boardID
             workspace = current
             markDirty(api: api)
+        }
+        if becameActive || requestFocus {
+            Task { try? await api.recordBoardActivity(id: boardID) }
         }
         if requestFocus { focusRequest = WorkspaceFocusRequest(boardID: boardID) }
         requestDetail(for: desiredFullDetail.union([boardID]), api: api)

@@ -446,6 +446,73 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertEqual(listed[host_id]["url"], f"/board/{host_id}")
         self.assertEqual(listed[new_id]["url"], f"/board/{new_id}")
 
+    def test_board_activity_is_persisted_separately_from_editor_updates(self):
+        folder = self.client.post("/api/folders", json={"name": "Chemistry"}).get_json()["folder"]
+        board_id = "c" * 32
+        self.ready_board(board_id, folder["id"])
+        library = board_app.read_library()
+        library["boards"][board_id] = {
+            "name": "Reactions",
+            "folder_id": folder["id"],
+            "created_at": 10,
+            "updated_at": 20,
+        }
+        board_app.write_library(library)
+
+        response = self.client.post(f"/api/boards/{board_id}/activity")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        activity = response.get_json()["last_activity_at"]
+        self.assertGreater(activity, 20)
+
+        persisted = board_app.read_library()["boards"][board_id]
+        self.assertEqual(persisted["updated_at"], 20)
+        self.assertEqual(persisted["last_activity_at"], activity)
+        listed = next(
+            item for item in self.client.get("/api/library").get_json()["boards"]
+            if item["id"] == board_id
+        )
+        self.assertEqual(listed["last_activity_at"], activity)
+
+    def test_library_normalization_preserves_future_top_level_fields(self):
+        board_app.atomic_json(
+            board_app.BOARDS_DIR / "library.json",
+            {
+                "schema_version": 3,
+                "folders": [],
+                "boards": {},
+                "future_catalog_state": {"sort_policy": "activity"},
+            },
+        )
+        library = board_app.read_library()
+        self.assertEqual(
+            library["future_catalog_state"], {"sort_policy": "activity"}
+        )
+
+    def test_detection_failure_removes_partial_board_and_catalog_entry(self):
+        with patch("app.detect_corners", side_effect=RuntimeError("detector failed")):
+            response = self.upload()
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("Try another image", response.get_json()["error"])
+        library = board_app.read_library()
+        self.assertEqual(library["boards"], {})
+        board_directories = [
+            path for path in board_app.BOARDS_DIR.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+        ]
+        self.assertEqual(board_directories, [])
+
+    def test_persistence_failure_removes_partial_board_and_catalog_entry(self):
+        with patch("app.update_metadata", side_effect=OSError("disk unavailable")):
+            response = self.upload()
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("Try importing it again", response.get_json()["error"])
+        self.assertEqual(board_app.read_library()["boards"], {})
+        board_directories = [
+            path for path in board_app.BOARDS_DIR.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+        ]
+        self.assertEqual(board_directories, [])
+
     def test_board_frontend_uses_only_the_canonical_corner_route_and_separate_pickers(self):
         source = (Path(__file__).parents[1] / "static" / "board.js").read_text(encoding="utf-8")
         template = (Path(__file__).parents[1] / "templates" / "board.html").read_text(

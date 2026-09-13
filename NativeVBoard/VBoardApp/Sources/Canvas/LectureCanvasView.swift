@@ -360,7 +360,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private var twoTouchStartMidpoint = CGPoint.zero
     private var twoTouchCurrentMidpoint = CGPoint.zero
     private var twoTouchMagnification: CGFloat = 1
+    private var twoTouchWasCancelled = false
+    private var wheelStartCamera = CameraRect(x: 0, y: 0, width: 1, height: 1)
     private var panRecognizer: UIPanGestureRecognizer!
+    private var scrollPanRecognizer: UIPanGestureRecognizer!
+    private var wheelZoomRecognizer: UIPanGestureRecognizer!
     private var pinchRecognizer: UIPinchGestureRecognizer!
     private var pencilInteraction: UIPencilInteraction!
     private var pencilHoverRecognizer: UIHoverGestureRecognizer!
@@ -437,13 +441,30 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         layer.addSublayer(pencilHoverLayer)
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(twoFingerPan(_:)))
-        pan.minimumNumberOfTouches = 2
+        pan.minimumNumberOfTouches = 1
         pan.maximumNumberOfTouches = 2
         pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        pan.allowedScrollTypesMask = []
         pan.cancelsTouchesInView = false
         pan.delegate = self
         addGestureRecognizer(pan)
         panRecognizer = pan
+
+        let scrollPan = UIPanGestureRecognizer(target: self, action: #selector(twoFingerPan(_:)))
+        scrollPan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        scrollPan.allowedScrollTypesMask = .continuous
+        scrollPan.cancelsTouchesInView = false
+        scrollPan.delegate = self
+        addGestureRecognizer(scrollPan)
+        scrollPanRecognizer = scrollPan
+
+        let wheelZoom = UIPanGestureRecognizer(target: self, action: #selector(wheelZoom(_:)))
+        wheelZoom.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        wheelZoom.allowedScrollTypesMask = .discrete
+        wheelZoom.cancelsTouchesInView = false
+        wheelZoom.delegate = self
+        addGestureRecognizer(wheelZoom)
+        wheelZoomRecognizer = wheelZoom
 
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinch(_:)))
         pinch.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue),
@@ -976,7 +997,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                                                   y: twoTouchStartMidpoint.y + translation.y)
             }
             updateTwoTouchNavigation()
-        case .ended, .cancelled, .failed:
+        case .ended:
+            finishTwoTouchNavigationIfPossible()
+        case .cancelled, .failed:
+            twoTouchWasCancelled = true
             finishTwoTouchNavigationIfPossible()
         default: break
         }
@@ -992,8 +1016,39 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             twoTouchCurrentMidpoint = midpoint
             twoTouchMagnification = recognizer.scale
             updateTwoTouchNavigation()
-        case .ended, .cancelled, .failed:
+        case .ended:
             finishTwoTouchNavigationIfPossible()
+        case .cancelled, .failed:
+            twoTouchWasCancelled = true
+            finishTwoTouchNavigationIfPossible()
+        default: break
+        }
+    }
+
+    @objc private func wheelZoom(_ recognizer: UIPanGestureRecognizer) {
+        let focalPoint = recognizer.location(in: self)
+        switch recognizer.state {
+        case .began:
+            wheelStartCamera = controller.camera
+            boardViews.values.forEach { $0.beginNavigation() }
+        case .changed:
+            let delta = recognizer.translation(in: self).y
+            recognizer.setTranslation(.zero, in: self)
+            guard delta.isFinite, abs(delta) > 0.001 else { return }
+            let factor = min(1.8, max(0.55, exp(-delta * 0.006)))
+            controller.zoom(by: factor, anchoredAt: focalPoint, viewport: bounds.size)
+            applyCamera(interacting: true)
+        case .ended:
+            boardViews.values.forEach { $0.endNavigation() }
+            applyCamera(interacting: false)
+            refineRepresentations(force: true)
+            callbacks.onCameraChanged(controller.camera)
+        case .cancelled, .failed:
+            controller.setCamera(wheelStartCamera)
+            boardViews.values.forEach { $0.endNavigation() }
+            applyCamera(interacting: false)
+            refineRepresentations(force: true)
+            callbacks.onCameraChanged(controller.camera)
         default: break
         }
     }
@@ -1008,6 +1063,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         twoTouchStartMidpoint = midpoint
         twoTouchCurrentMidpoint = midpoint
         twoTouchMagnification = 1
+        twoTouchWasCancelled = false
         boardViews.values.forEach { $0.beginNavigation() }
     }
 
@@ -1023,10 +1079,15 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     private func finishTwoTouchNavigationIfPossible() {
         let panActive = panRecognizer.state == .began || panRecognizer.state == .changed
+            || scrollPanRecognizer.state == .began || scrollPanRecognizer.state == .changed
         let pinchActive = pinchRecognizer.state == .began || pinchRecognizer.state == .changed
         guard !panActive, !pinchActive, twoTouchStartCamera != nil else { return }
+        if twoTouchWasCancelled, let start = twoTouchStartCamera {
+            controller.setCamera(start)
+        }
         twoTouchStartCamera = nil
         twoTouchMagnification = 1
+        twoTouchWasCancelled = false
         boardViews.values.forEach { $0.endNavigation() }
         applyCamera(interacting: false)
         refineRepresentations(force: true)
@@ -1035,8 +1096,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-        (gestureRecognizer === panRecognizer && otherGestureRecognizer === pinchRecognizer)
-            || (gestureRecognizer === pinchRecognizer && otherGestureRecognizer === panRecognizer)
+        let navigationPans = [panRecognizer, scrollPanRecognizer].compactMap { $0 }
+        return navigationPans.contains(where: {
+            (gestureRecognizer === $0 && otherGestureRecognizer === pinchRecognizer)
+                || (otherGestureRecognizer === $0 && gestureRecognizer === pinchRecognizer)
+        })
     }
 
     // MARK: - Pointer, Pencil, and tool routing
@@ -1313,6 +1377,15 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                                          tool: activeTool.rawValue, state: interactionLabel)
         }
         #endif
+        if case .panning(_, let startCamera) = interaction {
+            controller.setCamera(startCamera)
+            boardViews.values.forEach { $0.endNavigation() }
+            applyCamera(interacting: false)
+            refineRepresentations(force: true)
+            callbacks.onCameraChanged(controller.camera)
+            interaction = .idle
+            return
+        }
         cancelContentInteraction()
     }
 
@@ -1726,6 +1799,7 @@ private final class LectureBoardRenderView: UIView {
         layer.addSublayer(paperLayer)
         thumbnail.contentMode = .scaleAspectFill
         thumbnail.clipsToBounds = true
+        thumbnail.layer.anchorPoint = .zero
         addSubview(thumbnail)
         addSubview(pdfSource)
         addSubview(professor)
@@ -1771,7 +1845,8 @@ private final class LectureBoardRenderView: UIView {
         super.layoutSubviews()
         paperLayer.frame = bounds
         paperLayer.path = UIBezierPath(rect: bounds).cgPath
-        thumbnail.frame = bounds
+        thumbnail.bounds = CGRect(origin: .zero, size: bounds.size)
+        thumbnail.layer.position = .zero
         pdfSource.bounds = CGRect(origin: .zero, size: bounds.size)
         pdfSource.layer.position = .zero
         professor.frame = bounds
@@ -1800,6 +1875,15 @@ private final class LectureBoardRenderView: UIView {
         self.scene = scene
         header.text = "  \(item.title)   ·   \(dateLabel(item.createdAt))   ·   \(item.unitLabel)"
         let showPaper = item.sourceKind.isPDF || physicalBoardShowsPaper
+        if item.sourceKind == .image {
+            PDFBoardSource.apply(
+                transform: scene.map { PDFBoardSource.imageTransform($0.editor.importedTransforms) }
+                    ?? nil,
+                to: thumbnail
+            )
+        } else {
+            thumbnail.layer.setAffineTransform(.identity)
+        }
         paperLayer.fillColor = showPaper
             ? UIColor.systemBackground.withAlphaComponent(item.sourceKind.isPDF ? 1 : 0.9).cgColor
             : UIColor.clear.cgColor
@@ -1938,6 +2022,9 @@ private final class LectureBoardRenderView: UIView {
     func previewMove(keys: Set<SelectionKey>, delta: CGPoint) {
         let professorIDs = Set(keys.filter { $0.kind == .professorPath }.map(\.objectID))
         professor.previewTranslation(ids: professorIDs, delta: delta)
+        if keys.contains(where: { $0.objectID == PDFBoardSource.imageLogicalID }) {
+            applyImageSourcePreview(delta: delta)
+        }
         for key in keys where key.kind == .editorObject {
             objectLayers[key.objectID]?.setAffineTransform(CGAffineTransform(translationX: delta.x, y: delta.y))
         }
@@ -1945,6 +2032,9 @@ private final class LectureBoardRenderView: UIView {
 
     func clearMovePreview(keys: Set<SelectionKey>) {
         professor.clearPreviewTranslation(ids: Set(keys.filter { $0.kind == .professorPath }.map(\.objectID)))
+        if keys.contains(where: { $0.objectID == PDFBoardSource.imageLogicalID }) {
+            applyCanonicalImageSourceTransform()
+        }
         for key in keys where key.kind == .editorObject { objectLayers[key.objectID]?.setAffineTransform(.identity) }
     }
 
@@ -1953,6 +2043,9 @@ private final class LectureBoardRenderView: UIView {
             ids: Set(keys.filter { $0.kind == .professorPath }.map(\.objectID)),
             delta: delta
         )
+        if keys.contains(where: { $0.objectID == PDFBoardSource.imageLogicalID }) {
+            applyImageSourcePreview(delta: delta)
+        }
         // Editor-object layers intentionally keep their cheap presentation
         // transform until the synchronously updated scene rebuilds them.
     }
@@ -1960,6 +2053,9 @@ private final class LectureBoardRenderView: UIView {
     func previewResize(keys: Set<SelectionKey>, anchor: CGPoint, scale: CGFloat) {
         professor.previewScale(ids: Set(keys.filter { $0.kind == .professorPath }.map(\.objectID)),
                                anchor: anchor, scale: scale)
+        if keys.contains(where: { $0.objectID == PDFBoardSource.imageLogicalID }) {
+            applyImageSourcePreview(anchor: anchor, scale: scale)
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for key in keys where key.kind == .editorObject {
@@ -1975,6 +2071,9 @@ private final class LectureBoardRenderView: UIView {
 
     func clearResizePreview(keys: Set<SelectionKey>) {
         professor.clearPreviewScale(ids: Set(keys.filter { $0.kind == .professorPath }.map(\.objectID)))
+        if keys.contains(where: { $0.objectID == PDFBoardSource.imageLogicalID }) {
+            applyCanonicalImageSourceTransform()
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for key in keys where key.kind == .editorObject {
@@ -1993,8 +2092,43 @@ private final class LectureBoardRenderView: UIView {
             anchor: anchor,
             scale: scale
         )
+        if keys.contains(where: { $0.objectID == PDFBoardSource.imageLogicalID }) {
+            applyImageSourcePreview(anchor: anchor, scale: scale)
+        }
         // As with move, exact editor layers replace the transient transform
         // when the canonical mutation reaches this view.
+    }
+
+    private func applyCanonicalImageSourceTransform() {
+        PDFBoardSource.apply(
+            transform: scene.map { PDFBoardSource.imageTransform($0.editor.importedTransforms) }
+                ?? nil,
+            to: thumbnail
+        )
+    }
+
+    private func applyImageSourcePreview(delta: CGPoint) {
+        let existing = scene.map { PDFBoardSource.imageTransform($0.editor.importedTransforms) }
+            ?? nil
+        thumbnail.layer.setAffineTransform(CGAffineTransform(
+            a: CGFloat(existing?.scaleX ?? 1), b: 0, c: 0,
+            d: CGFloat(existing?.scaleY ?? 1),
+            tx: CGFloat(existing?.x ?? 0) + delta.x,
+            ty: CGFloat(existing?.y ?? 0) + delta.y
+        ))
+    }
+
+    private func applyImageSourcePreview(anchor: CGPoint, scale: CGFloat) {
+        let existing = scene.map { PDFBoardSource.imageTransform($0.editor.importedTransforms) }
+            ?? nil
+        let oldX = CGFloat(existing?.x ?? 0)
+        let oldY = CGFloat(existing?.y ?? 0)
+        thumbnail.layer.setAffineTransform(CGAffineTransform(
+            a: CGFloat(existing?.scaleX ?? 1) * scale, b: 0, c: 0,
+            d: CGFloat(existing?.scaleY ?? 1) * scale,
+            tx: anchor.x + scale * (oldX - anchor.x),
+            ty: anchor.y + scale * (oldY - anchor.y)
+        ))
     }
 
     func showLiveStroke(points: [StrokePoint], color: String, width: Double,

@@ -438,6 +438,30 @@ final class PDFBoardContractTests: XCTestCase {
         XCTAssertEqual(result, source)
     }
 
+    func testImageSourceGetsOneFiniteSelectableGeometryProxy() throws {
+        let source = try SVGDocument.parse("<svg viewBox='-800 -400 4000 12000'><image width='4000' height='12000'/></svg>")
+        let first = PDFBoardSource.selectableDocument(source, sourceKind: .image)
+        let second = PDFBoardSource.selectableDocument(first, sourceKind: .image)
+        XCTAssertEqual(first.paths.map(\.id).compactMap { $0 }, [PDFBoardSource.imageLogicalID])
+        XCTAssertEqual(second.paths.map(\.id).compactMap { $0 }, [PDFBoardSource.imageLogicalID])
+        XCTAssertEqual(first.viewBox, CGRect(x: -800, y: -400, width: 4000, height: 12000))
+    }
+
+    func testTransformedImageProxySupportsNegativeWorldSelectionAndRegionalStudyBBox() throws {
+        let source = try SVGDocument.parse("<svg viewBox='0 0 400 1200'><image width='400' height='1200'/></svg>")
+        let document = PDFBoardSource.selectableDocument(source, sourceKind: .image)
+        let editor = try JSONDecoder().decode(EditorState.self, from: Data("""
+        {"schema_version":4,"revision":0,"viewport":{"x":-900,"y":-700,"width":1200,"height":900},"objects":[],"groups":[],"imported_transforms":{"image-source-1":{"x":-650,"y":-425,"scale_x":0.5,"scale_y":0.5}},"source_boards":[],"merged_board_ids":[]}
+        """.utf8))
+        let region = CGRect(x: -620, y: -390, width: 80, height: 110)
+        let selection = BoardStudySelection.isolated(
+            boardID: "image-board", selectedIDs: [PDFBoardSource.imageLogicalID],
+            document: document, editor: editor, preferredLocalBBox: region
+        )
+        XCTAssertEqual(selection?.canonicalObjectIDs, [PDFBoardSource.imageLogicalID])
+        XCTAssertEqual(selection?.localBBox.cgRect, region)
+    }
+
     func testPDFLassoUsesSelectedRegionInsteadOfWholePageForStudyRequest() throws {
         let source = try SVGDocument.parse("<svg viewBox='0 0 612 792'/>")
         let document = PDFBoardSource.selectableDocument(source, sourceKind: .freeformPDF)
@@ -1692,11 +1716,50 @@ final class ServerContractDecodingTests: XCTestCase {
 
     func testUnknownObjectTypeAndUnknownFieldsDoNotDropObject() throws {
         let json = """
-        {"editor":{"schema_version":4,"revision":1,"viewport":{"x":0,"y":0,"width":100,"height":100},"objects":[{"id":"future-1","type":"ai_practice_problem","color":"#183153","points":[],"future_field":{"answer":42}}]}}
+        {"editor":{"schema_version":4,"revision":1,"viewport":{"x":0,"y":0,"width":100,"height":100},"objects":[{"id":"future-1","type":"ai_practice_problem","color":"#183153","points":[],"future_field":{"answer":42}}],"future_editor":{"layout":"spatial"}}}
         """.data(using: .utf8)!
         let decoded = try JSONDecoder().decode(EditorEnvelope.self, from: json).editor
         XCTAssertEqual(decoded.objects.count, 1)
         XCTAssertEqual(decoded.objects[0].type, "ai_practice_problem")
+        XCTAssertEqual(decoded.objects[0].additionalFields["future_field"],
+                       .object(["answer": .integer(42)]))
+        XCTAssertEqual(decoded.additionalFields["future_editor"],
+                       .object(["layout": .string("spatial")]))
+
+        let roundTripped = try JSONDecoder().decode(
+            EditorState.self, from: JSONEncoder().encode(decoded)
+        )
+        XCTAssertEqual(roundTripped.objects[0].additionalFields,
+                       decoded.objects[0].additionalFields)
+        XCTAssertEqual(roundTripped.additionalFields, decoded.additionalFields)
+    }
+
+    func testNestedEditorExtensionsSurviveNativeRoundTrip() throws {
+        let json = Data(#"""
+        {"schema_version":4,"revision":1,
+         "viewport":{"x":-20,"y":-10,"width":800,"height":600},
+         "objects":[],
+         "groups":[{"id":"group-one","children":["future-1"],"transform":{"x":4,"future_anchor":"center"},"future_layout":{"locked":false}}],
+         "imported_transforms":{"image-source-1":{"x":-400,"y":75,"scaleX":0.5,"scaleY":0.5,"deleted":false,"future_crop":{"mode":"contain"}}},
+         "source_boards":[{"board_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","board_order":1,"x":0,"y":0,"width":1200,"height":800,"future_placement":{"lane":2}}],
+         "merged_board_ids":[]}
+        """#.utf8)
+        let decoded = try JSONDecoder().decode(EditorState.self, from: json)
+        XCTAssertEqual(decoded.groups[0].additionalFields["future_layout"],
+                       .object(["locked": .bool(false)]))
+        XCTAssertEqual(decoded.groups[0].additionalFields["transform"],
+                       .object(["x": .integer(4), "future_anchor": .string("center")]))
+        XCTAssertEqual(decoded.importedTransforms[PDFBoardSource.imageLogicalID]?
+            .additionalFields["future_crop"], .object(["mode": .string("contain")]))
+        XCTAssertEqual(decoded.sourceBoards[0].additionalFields["future_placement"],
+                       .object(["lane": .integer(2)]))
+
+        let roundTripped = try JSONDecoder().decode(
+            EditorState.self, from: JSONEncoder().encode(decoded)
+        )
+        XCTAssertEqual(roundTripped.groups, decoded.groups)
+        XCTAssertEqual(roundTripped.importedTransforms, decoded.importedTransforms)
+        XCTAssertEqual(roundTripped.sourceBoards, decoded.sourceBoards)
     }
 
     func testPracticeProblemAcceptsServerProblemKeyAndCanvasMetadataRoundTrips() throws {
@@ -2477,6 +2540,48 @@ final class LectureWorkspacePersistenceTests: XCTestCase {
 
 @MainActor
 final class GraphDomainModelTests: XCTestCase {
+    func testLocalGraphExtractionUsesSemanticMathWithoutAI() throws {
+        let bbox = try XCTUnwrap(StudySelectionBBox(
+            rect: CGRect(x: -140, y: 30, width: 260, height: 80)
+        ))
+        let selection = BoardStudySelection(
+            boardID: "board-local",
+            canonicalObjectIDs: ["formula-1"],
+            localBBox: bbox,
+            selectedTextObjects: [StudySelectedTextObject(
+                id: "formula-1", type: "text", role: "text",
+                text: #"Trigonometric Function $f(x)=\sin(x)$"#,
+                fontSize: 28, x: -140, y: 30, width: 260, height: 80,
+                practiceProblemId: nil, sourceStudyInteractionId: nil
+            )],
+            lectureWorldBBox: nil
+        )
+
+        let expressions = GraphLocalExpressionExtractor.expressions(from: .board(selection))
+        XCTAssertEqual(expressions.count, 1)
+        XCTAssertEqual(expressions[0].latex, #"f(x)=\sin(x)"#)
+        XCTAssertEqual(expressions[0].type, .explicitFunction)
+    }
+
+    func testLocalGraphExtractionDoesNotTreatCurrencyOrChemistryAsGraph() throws {
+        let bbox = try XCTUnwrap(StudySelectionBBox(
+            rect: CGRect(x: 0, y: 0, width: 320, height: 100)
+        ))
+        let selection = BoardStudySelection(
+            boardID: "board-local",
+            canonicalObjectIDs: ["note-1"],
+            localBBox: bbox,
+            selectedTextObjects: [StudySelectedTextObject(
+                id: "note-1", type: "text", role: "text",
+                text: #"The sample costs $20 and contains $C_8H_{10}N_4O_2$."#,
+                fontSize: 24, x: 0, y: 0, width: 320, height: 100,
+                practiceProblemId: nil, sourceStudyInteractionId: nil
+            )],
+            lectureWorldBBox: nil
+        )
+
+        XCTAssertTrue(GraphLocalExpressionExtractor.expressions(from: .board(selection)).isEmpty)
+    }
     private let boardID = "603f5213ab0a249716833214c5ab88da"
 
     private func graph(owningBoardID: String? = nil,

@@ -521,6 +521,8 @@ enum GraphFallbackRenderer {
                           contentsScale: contentsScale)
         appendExpressions(to: container, graph: graph, frame: plotFrame,
                           contentsScale: contentsScale)
+        appendReadableMetadata(to: container, graph: graph, frame: plotFrame,
+                               contentsScale: contentsScale)
         return container
     }
 
@@ -647,6 +649,45 @@ enum GraphFallbackRenderer {
                 + unsupported.prefix(2).joined(separator: "\n")
             container.addSublayer(label)
         }
+    }
+
+    private static func appendReadableMetadata(to container: CALayer, graph: GraphObject,
+                                                frame: CGRect, contentsScale: CGFloat) {
+        let visible = graph.expressions.filter(\.visible)
+        let readable = visible.prefix(2).map {
+            CompactStudyPresentation.readableText(from: $0.latex)
+        }.filter { !$0.isEmpty }.joined(separator: "  ·  ")
+        if !readable.isEmpty {
+            let background = CALayer()
+            background.frame = CGRect(x: 7, y: 7, width: max(1, frame.width - 14), height: 25)
+            background.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.86).cgColor
+            background.cornerRadius = 6
+            container.addSublayer(background)
+
+            let label = CATextLayer()
+            label.frame = background.bounds.insetBy(dx: 7, dy: 4)
+            label.string = readable
+            label.fontSize = 11
+            label.foregroundColor = UIColor.label.cgColor
+            label.truncationMode = .end
+            label.contentsScale = contentsScale
+            background.addSublayer(label)
+        }
+
+        let range = String(
+            format: "x %.1f…%.1f   y %.1f…%.1f",
+            graph.viewport.xMin, graph.viewport.xMax,
+            graph.viewport.yMin, graph.viewport.yMax
+        )
+        let rangeLabel = CATextLayer()
+        rangeLabel.frame = CGRect(x: 9, y: max(0, frame.height - 20),
+                                  width: max(1, frame.width - 18), height: 14)
+        rangeLabel.string = range
+        rangeLabel.fontSize = 9
+        rangeLabel.foregroundColor = UIColor.secondaryLabel.cgColor
+        rangeLabel.alignmentMode = .right
+        rangeLabel.contentsScale = contentsScale
+        container.addSublayer(rangeLabel)
     }
 
     private static func map(x: Double, y: Double, viewport: GraphViewport,

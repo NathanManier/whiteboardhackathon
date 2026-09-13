@@ -137,6 +137,58 @@ enum GraphAutomaticRecognitionPolicy {
     }
 }
 
+/// Extracts already-semantic equations without an AI request. Visual
+/// handwriting still uses explicit recognition after the user chooses Graph.
+enum GraphLocalExpressionExtractor {
+    static func expressions(from target: GraphRecognitionTarget) -> [GraphExpression] {
+        var seen = Set<String>()
+        var result: [GraphExpression] = []
+        for item in target.selections.flatMap(\.selectedTextObjects) {
+            for candidate in candidates(in: item.text) {
+                let normalized = GraphLatexNormalizer.normalize(candidate)
+                guard isGraphable(normalized), seen.insert(normalized).inserted else { continue }
+                let expression = GraphExpression(
+                    id: "expression-" + UUID().uuidString.lowercased(),
+                    latex: candidate,
+                    type: GraphExpressionInference.type(for: candidate)
+                )
+                if let clean = try? GraphPersistenceValidator.sanitized(expression) {
+                    result.append(clean)
+                }
+                if result.count == GraphRecognitionController.maximumExpressions { return result }
+            }
+        }
+        return result
+    }
+
+    private static func candidates(in source: String) -> [String] {
+        var values: [String] = []
+        for pattern in [#"\$([^$\n]+)\$"#, #"\\\(([\s\S]*?)\\\)"#] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(source.startIndex..<source.endIndex, in: source)
+            for match in regex.matches(in: source, range: range) where match.numberOfRanges > 1 {
+                guard let swiftRange = Range(match.range(at: 1), in: source) else { continue }
+                values.append(String(source[swiftRange]).trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        if values.isEmpty {
+            values = source.split(whereSeparator: \.isNewline)
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
+        return values.filter { !$0.isEmpty && $0.count <= GraphRecognitionController.maximumLatexLength }
+    }
+
+    private static func isGraphable(_ value: String) -> Bool {
+        GraphEquationClassifier.point(in: value) != nil
+            || GraphEquationClassifier.explicitRightHandSide(value) != nil
+            || GraphEquationClassifier.constant(after: "x", in: value) != nil
+            || GraphEquationClassifier.originCircleRadius(in: value) != nil
+            || (value.contains("=") && value.contains("x") && value.contains("y"))
+            || ((value.contains(">") || value.contains("<"))
+                && (value.contains("x") || value.contains("y")))
+    }
+}
+
 struct GraphCreationRequest: Identifiable {
     let id = UUID()
     let target: GraphRecognitionTarget
@@ -296,6 +348,15 @@ struct GraphCreationSheet: View {
     private func recognizeIfNeeded(force: Bool = false) async {
         phase = .reading
         error = nil
+        if !force {
+            let local = GraphLocalExpressionExtractor.expressions(from: target)
+            if !local.isEmpty {
+                recognitionRequestID = nil
+                drafts = local.map(GraphExpressionDraft.init(expression:))
+                phase = .confirm
+                return
+            }
+        }
         do {
             if force { recognition.clear() }
             let result = try await recognition.recognize(
@@ -474,7 +535,7 @@ enum GraphObjectFactory {
                     width: selection.localBBox.width, height: selection.localBBox.height
                 )
             ),
-            providerMetadata: GraphProviderMetadata(preference: "desmos",
+            providerMetadata: GraphProviderMetadata(preference: "native-lightweight",
                                                     semanticContentHash: nil,
                                                     renderVersion: 1),
             createdAt: now, updatedAt: now, version: 1

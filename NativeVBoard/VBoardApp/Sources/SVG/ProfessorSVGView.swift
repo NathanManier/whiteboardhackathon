@@ -110,7 +110,14 @@ final class ProfessorSVGView: UIView {
     func hitTest(_ point: CGPoint, tolerance: CGFloat = 12) -> String? {
         let candidates = index.query(CGRect(x: point.x - tolerance, y: point.y - tolerance,
                                             width: tolerance * 2, height: tolerance * 2))
-        return candidates.first(where: { entries[$0]?.layer.path?.contains(point, using: .winding, transform: .identity) == true })
+        // Prefer actual vector ink where it exists; the transparent PDF/image
+        // surface is the selectable fallback for otherwise empty source area.
+        return candidates.sorted {
+            (entries[$0]?.isRegionSurface == true ? 1 : 0)
+                < (entries[$1]?.isRegionSurface == true ? 1 : 0)
+        }.first(where: {
+            entries[$0]?.layer.path?.contains(point, using: .winding, transform: .identity) == true
+        })
     }
 
     func ids(intersecting rect: CGRect) -> Set<String> { index.query(rect) }
@@ -316,8 +323,12 @@ final class ProfessorSVGView: UIView {
                     self.applyProvenance(node, to: shape)
                     #endif
                     let bounds = path.boundingBoxOfPath
-                    nextEntries[id] = Entry(bounds: bounds, layer: shape,
-                                            isRegionSurface: item.dataInk == "pdf-source")
+                    nextEntries[id] = Entry(
+                        bounds: bounds,
+                        layer: shape,
+                        isRegionSurface: item.dataInk == "pdf-source"
+                            || item.dataInk == "image-source"
+                    )
                     nextIndex.insert(id: id, bounds: bounds)
                     staging.addSublayer(shape)
                 }

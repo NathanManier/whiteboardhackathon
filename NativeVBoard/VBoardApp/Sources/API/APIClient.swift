@@ -215,6 +215,11 @@ final class APIClient: ObservableObject {
     func library(trace: VBoardPerformanceTrace? = nil) async throws -> LibraryResponse {
         try await get("/api/library", trace: trace)
     }
+    func recordBoardActivity(id: String) async throws {
+        let request = try request(path: "/api/boards/\(id)/activity", method: "POST")
+        let (data, response) = try await data(for: request)
+        try validate(response, data: data)
+    }
     func lecture(id: String) async throws -> LectureResponse { try await get("/api/folders/\(id)/lecture", label: "class") }
     func lectureWorkspace(id: String) async throws -> LectureWorkspace {
         let envelope: LectureWorkspaceEnvelope = try await get("/api/folders/\(id)/workspace", label: "class workspace")
@@ -314,7 +319,6 @@ final class APIClient: ObservableObject {
     func cachedProfessorSVG(id: String, version: String? = nil,
                             trace: VBoardPerformanceTrace? = nil) async throws -> String {
         let namespace = LocalAccountNamespace.value
-        let path = "/boards/\(id)/board.svg"
         let lookupKey = SourceAssetCache.key(
             accountNamespace: namespace, boardID: id,
             path: "professor-svg-lookup", version: version ?? "immutable"
@@ -513,6 +517,13 @@ final class APIClient: ObservableObject {
         try validate(response, data: data)
         do { return try decoder.decode(StudyInteractionResponse.self, from: data) }
         catch { throw APIError.decoding("Could not decode the study response.") }
+    }
+
+    func studyInteractions(boardID: String) async throws -> [StudyInteraction] {
+        let response: StudyInteractionListResponse = try await get(
+            "/api/boards/\(boardID)/study", label: "saved explanations"
+        )
+        return response.interactions
     }
 
     func recognizeGraph(request payload: GraphRecognitionRequest) async throws

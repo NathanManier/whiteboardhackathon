@@ -278,6 +278,7 @@ struct NativeCanvasView: UIViewRepresentable {
     let document: SVGDocument
     var previewImage: UIImage? = nil
     let pdfData: Data?
+    var sourceKind: BoardSourceKind = .physicalWhiteboard
     let camera: CameraRect
     let objects: [CanvasObject]
     let importedTransforms: [String: ObjectTransform]
@@ -305,7 +306,7 @@ struct NativeCanvasView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> InfiniteCanvasUIView {
         InfiniteCanvasUIView(boardID: boardID, document: document, previewImage: previewImage,
-                             pdfData: pdfData, camera: camera,
+                             pdfData: pdfData, sourceKind: sourceKind, camera: camera,
                              objects: objects, importedTransforms: importedTransforms,
                              composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
                              penStyle: penStyle, markerStyle: markerStyle,
@@ -320,7 +321,7 @@ struct NativeCanvasView: UIViewRepresentable {
 
     func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) {
         uiView.update(boardID: boardID, document: document, previewImage: previewImage,
-                      pdfData: pdfData, camera: camera,
+                      pdfData: pdfData, sourceKind: sourceKind, camera: camera,
                       objects: objects, importedTransforms: importedTransforms,
                       composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
                       penStyle: penStyle, markerStyle: markerStyle,
@@ -395,6 +396,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var document: SVGDocument
     private var previewImage: UIImage?
     private var pdfData: Data?
+    private var sourceKind: BoardSourceKind
     private var controller: CameraController
     private var cameraInitializedForBoardID: String?
     private var persistedCamera: CameraRect
@@ -410,7 +412,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var previousViewportSize: CGSize = .zero
     private var panStart = CGPoint.zero
     private var panStartCamera = CameraRect(x: 0, y: 0, width: 1, height: 1)
+    private var wheelStartCamera = CameraRect(x: 0, y: 0, width: 1, height: 1)
     private var panGesture: UIPanGestureRecognizer!
+    private var scrollPanGesture: UIPanGestureRecognizer!
+    private var wheelZoomGesture: UIPanGestureRecognizer!
     private var pinchGesture: UIPinchGestureRecognizer!
     private var isSpacePressed = false
     private var interactionState: InteractionState = .idle
@@ -427,7 +432,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     #endif
 
     init(boardID: String, document: SVGDocument, previewImage: UIImage? = nil,
-         pdfData: Data? = nil, camera: CameraRect,
+         pdfData: Data? = nil, sourceKind: BoardSourceKind = .physicalWhiteboard,
+         camera: CameraRect,
          objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:],
          composition: SceneComposition, showsPaper: Bool = true,
          backgroundStyle: WorkspaceBackgroundStyle = .dots,
@@ -445,7 +451,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
          onPencilPaletteMoved: @escaping (CGPoint) -> Void = { _ in },
          onPencilPaletteDismiss: @escaping () -> Void = {}) {
         self.boardID = boardID; self.document = document; self.previewImage = previewImage
-        self.pdfData = pdfData; self.objects = objects
+        self.pdfData = pdfData; self.sourceKind = sourceKind; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
         self.pencilPreferences = pencilPreferences
@@ -518,7 +524,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         professor.onProgress = { [weak self] progress in
             guard let self else { return }
             let ready = progress >= 0.999
-            self.previewSource.isHidden = ready || self.previewImage == nil || self.pdfData != nil
+            self.previewSource.isHidden = (ready && self.sourceKind != .image)
+                || self.previewImage == nil || self.pdfData != nil
             self.vectorIndicator.transition(to: ready
                                             ? .vectorReady
                                             : (progress > 0 ? .vectorPartial : .vectorLoading))
@@ -537,6 +544,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         previewSource.image = previewImage
         previewSource.contentMode = .scaleToFill
         previewSource.clipsToBounds = true
+        previewSource.layer.anchorPoint = .zero
         previewSource.isHidden = previewImage == nil || pdfData != nil
         previewSource.isUserInteractionEnabled = false
         worldContainer.addSubview(previewSource)
@@ -554,10 +562,14 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         if pdfData != nil {
             PDFBoardSource.apply(transform: importedTransforms[PDFBoardSource.logicalID], to: pdfSource)
         }
+        if sourceKind == .image {
+            PDFBoardSource.apply(transform: PDFBoardSource.imageTransform(importedTransforms),
+                                 to: previewSource)
+        }
         let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
-        pan.minimumNumberOfTouches = 2; pan.maximumNumberOfTouches = 2
-        pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue), NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
-        pan.allowedScrollTypesMask = .all
+        pan.minimumNumberOfTouches = 1; pan.maximumNumberOfTouches = 2
+        pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        pan.allowedScrollTypesMask = []
         pan.cancelsTouchesInView = false
         pan.delegate = self; panGesture = pan; addGestureRecognizer(pan)
         #if targetEnvironment(simulator)
@@ -567,6 +579,16 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         // pan. Physical-device gesture routing remains available.
         panGesture.isEnabled = false
         #endif
+        let scrollPan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
+        scrollPan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        scrollPan.allowedScrollTypesMask = .continuous
+        scrollPan.cancelsTouchesInView = false
+        scrollPan.delegate = self; scrollPanGesture = scrollPan; addGestureRecognizer(scrollPan)
+        let wheelZoom = UIPanGestureRecognizer(target: self, action: #selector(didWheelZoom(_:)))
+        wheelZoom.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        wheelZoom.allowedScrollTypesMask = .discrete
+        wheelZoom.cancelsTouchesInView = false
+        wheelZoom.delegate = self; wheelZoomGesture = wheelZoom; addGestureRecognizer(wheelZoom)
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(didPinch(_:)))
         // Camera gestures must never compete with a Pencil stroke. Finger and
         // trackpad pinch share the same authoritative CameraController path.
@@ -788,7 +810,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         worldContainer.bounds = CGRect(origin: .zero, size: bounds.size)
         worldContainer.layer.position = .zero
         professor.frame = worldContainer.bounds
-        previewSource.frame = document.viewBox
+        previewSource.bounds = CGRect(origin: .zero, size: document.viewBox.size)
+        previewSource.layer.position = document.viewBox.origin
         pdfSource.bounds = CGRect(origin: .zero, size: document.viewBox.size)
         pdfSource.layer.position = document.viewBox.origin
         userLayer.bounds = worldContainer.bounds
@@ -814,7 +837,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     }
 
     func update(boardID: String, document: SVGDocument, previewImage: UIImage? = nil,
-                pdfData: Data? = nil, camera: CameraRect,
+                pdfData: Data? = nil, sourceKind: BoardSourceKind = .physicalWhiteboard,
+                camera: CameraRect,
                 objects: [CanvasObject], importedTransforms: [String: ObjectTransform],
                 composition: SceneComposition, showsPaper: Bool = true,
                 backgroundStyle: WorkspaceBackgroundStyle = .dots,
@@ -837,7 +861,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         let pdfChanged = self.pdfData != pdfData
         let objectsChanged = self.objects != objects
         self.boardID = boardID; self.document = document; self.previewImage = previewImage
-        self.pdfData = pdfData; self.objects = objects
+        self.pdfData = pdfData; self.sourceKind = sourceKind; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
         self.pencilPreferences = pencilPreferences
@@ -878,7 +902,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         #if targetEnvironment(simulator)
         panGesture.isEnabled = false
         #else
-        panGesture.isEnabled = tool != .navigation
+        // Direct fingers always navigate on hardware, independent of the
+        // selected Pencil/content tool. Pencil touches are excluded by the
+        // recognizer's allowedTouchTypes and continue through the edit path.
+        panGesture.isEnabled = true
         #endif
         updateInputHUD()
         // `camera` is the store's persisted snapshot. It is consumed only
@@ -887,8 +914,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         if documentChanged { professor.display(document, transform: worldTransform, importedTransforms: importedTransforms, composition: composition) }
         if previewChanged || documentChanged || pdfChanged {
             previewSource.image = previewImage
-            previewSource.frame = document.viewBox
-            previewSource.isHidden = (!documentChanged && professor.hasVisiblePresentation)
+            previewSource.bounds = CGRect(origin: .zero, size: document.viewBox.size)
+            previewSource.layer.position = document.viewBox.origin
+            previewSource.isHidden = (sourceKind != .image
+                && !documentChanged && professor.hasVisiblePresentation)
                 || previewImage == nil || pdfData != nil
         }
         if pdfChanged {
@@ -899,6 +928,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             PDFBoardSource.apply(transform: importedTransforms[PDFBoardSource.logicalID], to: pdfSource)
         } else {
             pdfSource.isHidden = true
+        }
+        if sourceKind == .image {
+            PDFBoardSource.apply(transform: PDFBoardSource.imageTransform(importedTransforms),
+                                 to: previewSource)
         }
         if objectsChanged { rebuildUserLayers() }
         resolveInitialCameraIfNeeded()
@@ -1060,8 +1093,6 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         let translation = gesture.translation(in: self)
         switch gesture.state {
         case .began:
-            let twoFingerNavigation = gesture.numberOfTouches >= 2
-            guard activeTool == .navigation || twoFingerNavigation || (isSpacePressed && activeStrokeLayer == nil) else { return }
             interactionState = .panning; debugInputOperation("PAN BEGIN")
             panStart = translation; panStartCamera = controller.camera; professor.beginNavigation(); debugPan("BEGIN", screen: translation); updateInputHUD()
         case .changed:
@@ -1069,12 +1100,47 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             setCamera(panStartCamera, reason: .handPan)
             mutateCamera(reason: .handPan) { $0.pan(screenTranslation: CGPoint(x: translation.x - panStart.x, y: translation.y - panStart.y), viewport: bounds.size) }
             applyCamera(interacting: true); debugInputOperation("PAN UPDATE"); debugPan("UPDATE", screen: translation)
-        case .ended, .cancelled, .failed:
+        case .ended:
             guard interactionState == .panning else { return }
             professor.endNavigation(worldTransform); applyCamera(interacting: false)
             onCameraChanged(controller.camera)
             interactionState = .idle; debugInputOperation("PAN END"); debugPan("END"); updateInputHUD()
             panStart = .zero
+        case .cancelled, .failed:
+            guard interactionState == .panning else { return }
+            setCamera(panStartCamera, reason: .handPan)
+            professor.endNavigation(worldTransform); applyCamera(interacting: false)
+            onCameraChanged(controller.camera)
+            interactionState = .idle; debugInputOperation("PAN CANCEL"); debugPan("CANCEL"); updateInputHUD()
+            panStart = .zero
+        default: break
+        }
+    }
+
+    @objc private func didWheelZoom(_ gesture: UIPanGestureRecognizer) {
+        let focalPoint = gesture.location(in: self)
+        switch gesture.state {
+        case .began:
+            wheelStartCamera = controller.camera
+            professor.beginNavigation()
+        case .changed:
+            let delta = gesture.translation(in: self).y
+            gesture.setTranslation(.zero, in: self)
+            guard delta.isFinite, abs(delta) > 0.001 else { return }
+            let factor = min(1.8, max(0.55, exp(-delta * 0.006)))
+            mutateCamera(reason: .pinch) {
+                $0.zoom(by: factor, anchoredAt: focalPoint, viewport: bounds.size)
+            }
+            applyCamera(interacting: true)
+        case .ended:
+            professor.endNavigation(worldTransform)
+            applyCamera(interacting: false)
+            onCameraChanged(controller.camera)
+        case .cancelled, .failed:
+            setCamera(wheelStartCamera, reason: .pinch)
+            professor.endNavigation(worldTransform)
+            applyCamera(interacting: false)
+            onCameraChanged(controller.camera)
         default: break
         }
     }
@@ -1095,26 +1161,34 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                                                      magnification: gesture.scale,
                                                      viewport: bounds.size) }
             applyCamera(interacting: true)
-        case .ended, .cancelled, .failed:
+        case .ended:
             guard interactionState == .pinching else { return }
             professor.endNavigation(worldTransform); applyCamera(interacting: false)
             onCameraChanged(controller.camera)
             interactionState = .idle; pinchStartMidpoint = .zero; debugInputOperation("PINCH END"); updateInputHUD()
+        case .cancelled, .failed:
+            guard interactionState == .pinching else { return }
+            setCamera(pinchStartCamera, reason: .pinch)
+            professor.endNavigation(worldTransform); applyCamera(interacting: false)
+            onCameraChanged(controller.camera)
+            interactionState = .idle; pinchStartMidpoint = .zero; debugInputOperation("PINCH CANCEL"); updateInputHUD()
         default: break
         }
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-        let pair = Set([ObjectIdentifier(gestureRecognizer),
-                        ObjectIdentifier(otherGestureRecognizer)])
-        return pair == Set([ObjectIdentifier(panGesture),
-                            ObjectIdentifier(pinchGesture)])
+        let navigationPans = [panGesture, scrollPanGesture].compactMap { $0 }
+        return navigationPans.contains(where: {
+            (gestureRecognizer === $0 && otherGestureRecognizer === pinchGesture)
+                || (otherGestureRecognizer === $0 && gestureRecognizer === pinchGesture)
+        })
     }
 
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard gestureRecognizer === panGesture else { return true }
-        return activeTool == .navigation || panGesture.numberOfTouches >= 2 || (isSpacePressed && activeStrokeLayer == nil)
+        if gestureRecognizer === panGesture || gestureRecognizer === scrollPanGesture
+            || gestureRecognizer === wheelZoomGesture { return true }
+        return true
     }
 
     // Pencil owns direct drawing. Simulator mouse/touch uses the same
@@ -1385,7 +1459,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         }
         #endif
         if interactionState == .panning {
-            professor.endNavigation(worldTransform); interactionState = .idle; panStart = .zero; updateInputHUD(); return
+            setCamera(panStartCamera, reason: .handPan)
+            professor.endNavigation(worldTransform); applyCamera(interacting: false)
+            onCameraChanged(controller.camera)
+            interactionState = .idle; panStart = .zero; updateInputHUD(); return
         }
         if activeTool != .pen && activeTool != .highlighter { finishEditing(at: nil); return }
         if touches.contains(where: { isDrawingTouch($0) }) {
@@ -1587,16 +1664,26 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private func clearMovePreview() {
         for id in selectedIDs { userObjectLayers[id]?.setAffineTransform(.identity) }
         professor.clearPreviewTranslation(ids: selectedIDs)
+        if selectedIDs.contains(PDFBoardSource.imageLogicalID) {
+            PDFBoardSource.apply(transform: PDFBoardSource.imageTransform(importedTransforms),
+                                 to: previewSource)
+        }
     }
 
     private func retainMovePreview(_ delta: CGPoint) {
         professor.retainPreviewTranslation(ids: selectedIDs, delta: delta)
+        if selectedIDs.contains(PDFBoardSource.imageLogicalID) {
+            applyImageSourcePreview(delta: delta)
+        }
         // User-object layers retain the same presentation transform until the
         // canonical object update rebuilds them on the next SwiftUI pass.
     }
 
     private func previewResize(anchor: CGPoint, scale: CGFloat) {
         professor.previewScale(ids: selectedIDs, anchor: anchor, scale: scale)
+        if selectedIDs.contains(PDFBoardSource.imageLogicalID) {
+            applyImageSourcePreview(anchor: anchor, scale: scale)
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for id in selectedIDs {
@@ -1612,6 +1699,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
 
     private func clearResizePreview() {
         professor.clearPreviewScale(ids: selectedIDs)
+        if selectedIDs.contains(PDFBoardSource.imageLogicalID) {
+            PDFBoardSource.apply(transform: PDFBoardSource.imageTransform(importedTransforms),
+                                 to: previewSource)
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for id in selectedIDs {
@@ -1626,6 +1717,31 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
 
     private func retainResizePreview(anchor: CGPoint, scale: CGFloat) {
         professor.retainPreviewScale(ids: selectedIDs, anchor: anchor, scale: scale)
+        if selectedIDs.contains(PDFBoardSource.imageLogicalID) {
+            applyImageSourcePreview(anchor: anchor, scale: scale)
+        }
+    }
+
+    private func applyImageSourcePreview(delta: CGPoint) {
+        let existing = PDFBoardSource.imageTransform(importedTransforms)
+        previewSource.layer.setAffineTransform(CGAffineTransform(
+            a: CGFloat(existing?.scaleX ?? 1), b: 0, c: 0,
+            d: CGFloat(existing?.scaleY ?? 1),
+            tx: CGFloat(existing?.x ?? 0) + delta.x,
+            ty: CGFloat(existing?.y ?? 0) + delta.y
+        ))
+    }
+
+    private func applyImageSourcePreview(anchor: CGPoint, scale: CGFloat) {
+        let existing = PDFBoardSource.imageTransform(importedTransforms)
+        let oldX = CGFloat(existing?.x ?? 0)
+        let oldY = CGFloat(existing?.y ?? 0)
+        previewSource.layer.setAffineTransform(CGAffineTransform(
+            a: CGFloat(existing?.scaleX ?? 1) * scale, b: 0, c: 0,
+            d: CGFloat(existing?.scaleY ?? 1) * scale,
+            tx: anchor.x + scale * (oldX - anchor.x),
+            ty: anchor.y + scale * (oldY - anchor.y)
+        ))
     }
 
     /// The visual proxy must use the same factor as the document mutation.

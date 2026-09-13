@@ -108,18 +108,29 @@ struct PDFPageBoardTransform: Equatable {
 
 enum PDFBoardSource {
     static let logicalID = "pdf-page-1"
+    static let imageLogicalID = "image-source-1"
 
     /// The SVG reader deliberately ignores image nodes. Add one transparent
     /// geometry proxy to the native scene so selection, lasso, transforms,
     /// and study bbox construction use the same stable ID as the server-side
     /// PDF image node without rasterizing the PDF into professor ink.
     static func selectableDocument(_ document: SVGDocument, sourceKind: BoardSourceKind) -> SVGDocument {
-        guard sourceKind.isPDF,
-              !document.paths.contains(where: { $0.id == logicalID }) else { return document }
+        let sourceID: String
+        let sourceTag: String
+        if sourceKind.isPDF {
+            sourceID = logicalID
+            sourceTag = "pdf-source"
+        } else if sourceKind == .image {
+            sourceID = imageLogicalID
+            sourceTag = "image-source"
+        } else {
+            return document
+        }
+        guard !document.paths.contains(where: { $0.id == sourceID }) else { return document }
         let box = document.viewBox
         let d = "M \(box.minX) \(box.minY) L \(box.maxX) \(box.minY) L \(box.maxX) \(box.maxY) L \(box.minX) \(box.maxY) Z"
-        let proxy = SVGPath(id: logicalID, d: d, fill: .clear, fillRule: .nonZero,
-                            dataInk: "pdf-source")
+        let proxy = SVGPath(id: sourceID, d: d, fill: .clear, fillRule: .nonZero,
+                            dataInk: sourceTag)
         return SVGDocument(viewBox: box, paths: document.paths + [proxy],
                            performanceTrace: document.performanceTrace)
     }
@@ -134,5 +145,9 @@ enum PDFBoardSource {
         view.layer.setAffineTransform(CGAffineTransform.identity
             .translatedBy(x: CGFloat(transform.x), y: CGFloat(transform.y))
             .scaledBy(x: CGFloat(transform.scaleX ?? 1), y: CGFloat(transform.scaleY ?? 1)))
+    }
+
+    static func imageTransform(_ transforms: [String: ObjectTransform]) -> ObjectTransform? {
+        transforms[imageLogicalID]
     }
 }
