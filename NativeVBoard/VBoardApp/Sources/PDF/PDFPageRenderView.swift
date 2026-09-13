@@ -120,7 +120,8 @@ enum PDFBoardSource {
         let d = "M \(box.minX) \(box.minY) L \(box.maxX) \(box.minY) L \(box.maxX) \(box.maxY) L \(box.minX) \(box.maxY) Z"
         let proxy = SVGPath(id: logicalID, d: d, fill: .clear, fillRule: .nonZero,
                             dataInk: "pdf-source")
-        return SVGDocument(viewBox: box, paths: document.paths + [proxy])
+        return SVGDocument(viewBox: box, paths: document.paths + [proxy],
+                           performanceTrace: document.performanceTrace)
     }
 
     static func apply(transform: ObjectTransform?, to view: UIView) {

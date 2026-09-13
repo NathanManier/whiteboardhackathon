@@ -539,6 +539,7 @@ struct ImportFlowView: View {
     @State private var showsProcessingTip = false
     @State private var showsOperationProgress = false
     @State private var progressBecameVisibleAt: Date?
+    @State private var performanceTrace: VBoardPerformanceTrace?
     private let processingTips = [
         "Lasso an equation and tap Explain.",
         "Two fingers pan and zoom without changing your Pencil tool.",
@@ -824,6 +825,10 @@ struct ImportFlowView: View {
         }
     }
     private func loadImageData(_ data: Data) async {
+        let trace = performanceTrace ?? VBoardPerformanceTrace(operation: "image_import")
+        performanceTrace = trace
+        trace.event("source_selected", fields: ["encoded_bytes": data.count])
+        let started = ProcessInfo.processInfo.systemUptime
         let normalized = await Task.detached(priority: .userInitiated) {
             NormalizedImageAsset.make(data: data)
         }.value
@@ -831,9 +836,20 @@ struct ImportFlowView: View {
             error = "That image could not be read."
             return
         }
+        trace.event("source_normalized", durationMilliseconds:
+            (ProcessInfo.processInfo.systemUptime - started) * 1_000,
+            fields: [
+                "upload_bytes": normalized.uploadData.count,
+                "width": Int(normalized.pixelSize.width),
+                "height": Int(normalized.pixelSize.height),
+            ])
         install(normalized)
     }
     private func loadCapturedImage(_ image: UIImage) async {
+        let trace = performanceTrace ?? VBoardPerformanceTrace(operation: "camera_import")
+        performanceTrace = trace
+        trace.event("camera_capture_received")
+        let started = ProcessInfo.processInfo.systemUptime
         let normalized = await Task.detached(priority: .userInitiated) {
             NormalizedImageAsset.make(image: image)
         }.value
@@ -841,6 +857,9 @@ struct ImportFlowView: View {
             error = "That photo could not be prepared."
             return
         }
+        trace.event("source_normalized", durationMilliseconds:
+            (ProcessInfo.processInfo.systemUptime - started) * 1_000,
+            fields: ["upload_bytes": normalized.uploadData.count])
         install(normalized)
     }
     private func install(_ normalized: NormalizedImageAsset) {
@@ -897,6 +916,7 @@ struct ImportFlowView: View {
         error = nil
         uploadByteProgress = UploadByteProgress(bytesSent: 0,
                                                 totalBytes: Int64(imageAsset?.uploadData.count ?? 0))
+        performanceTrace?.event("upload_requested")
         activeTask = Task { await upload(operationID: operationID) }
     }
     private func beginPDFUpload() {
@@ -931,6 +951,7 @@ struct ImportFlowView: View {
                 mimeType: "image/jpeg",
                 folderID: target,
                 name: name.isEmpty ? nil : name,
+                trace: performanceTrace,
                 onProgress: { progress in
                     guard importState.phase == .uploading(operationID) else { return }
                     uploadByteProgress = progress
@@ -938,7 +959,11 @@ struct ImportFlowView: View {
             )
             guard importState.phase == .uploading(operationID), !Task.isCancelled else { return }
             boardID = result.id
-            let record = try await api.board(id: result.id)
+            if let performanceTrace {
+                VBoardPerformanceTraceRegistry.shared.bind(performanceTrace, to: result.id)
+                performanceTrace.event("board_created", fields: ["board": result.id])
+            }
+            let record = try await api.board(id: result.id, trace: performanceTrace)
             guard importState.phase == .uploading(operationID), !Task.isCancelled else { return }
             let serverSize = record.dimensions.map { CGSize(width: $0.width, height: $0.height) } ?? imageAsset.pixelSize
             #if DEBUG
@@ -1016,15 +1041,20 @@ struct ImportFlowView: View {
             statusTask = nil
         }
         do {
-            _ = try await api.processCorners(boardID: boardID, corners: pixels, normalizedCorners: normalized)
+            performanceTrace?.event("corners_submitted", fields: ["board": boardID])
+            _ = try await api.processCorners(boardID: boardID, corners: pixels,
+                                             normalizedCorners: normalized,
+                                             trace: performanceTrace)
             guard importState.isCornerOperation(operationID), !Task.isCancelled else { return }
-            let result = try await api.library()
+            performanceTrace?.event("server_ready", fields: ["board": boardID])
+            let result = try await api.library(trace: performanceTrace)
             guard importState.isCornerOperation(operationID), !Task.isCancelled else { return }
             if let board = result.boards.first(where: { $0.id == boardID }) {
                 await maintainPerceivableProgressIfShown()
                 guard importState.isCornerOperation(operationID), !Task.isCancelled else { return }
                 activeTask = nil
                 _ = importState.complete(operationID)
+                performanceTrace?.event("navigation_requested", fields: ["board": boardID])
                 onComplete(board)
             } else {
                 activeTask = nil
@@ -1046,7 +1076,15 @@ struct ImportFlowView: View {
         var delay: UInt64 = 700_000_000
         while !Task.isCancelled, importState.isCornerOperation(operationID) {
             do {
-                let record = try await api.board(id: boardID)
+                let pollStarted = ProcessInfo.processInfo.systemUptime
+                let record = try await api.board(id: boardID, trace: performanceTrace)
+                performanceTrace?.event("status_poll", durationMilliseconds:
+                    (ProcessInfo.processInfo.systemUptime - pollStarted) * 1_000,
+                    fields: [
+                        "board": boardID,
+                        "status": record.status ?? "unknown",
+                        "delay_ms": Double(delay) / 1_000_000,
+                    ])
                 guard !Task.isCancelled, importState.isCornerOperation(operationID) else { return }
                 processingRecord = record
                 if record.status == "processing"

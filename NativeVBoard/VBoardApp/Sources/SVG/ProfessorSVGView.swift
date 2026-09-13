@@ -234,6 +234,8 @@ final class ProfessorSVGView: UIView {
             guard let id = $0.id else { return false }
             return importedTransforms[id]?.deleted != true
         }
+        let trace = document.performanceTrace
+        trace?.event("vector_rebuild_start", fields: ["paths": paths.count])
         guard !paths.isEmpty else {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
@@ -258,12 +260,12 @@ final class ProfessorSVGView: UIView {
         CATransaction.commit()
         stagingContentLayer = staging
 
-        #if DEBUG
         let started = CACurrentMediaTime()
-        #endif
         rebuildTask = Task { [weak self] in
             let batchSize = 128
             var completed = 0
+            var parseMilliseconds = 0.0
+            var stagingMilliseconds = 0.0
             var nextEntries: [String: Entry] = [:]
             var nextIndex = SpatialIndex(cellSize: max(document.viewBox.width, document.viewBox.height) / 32)
             var nextSourceBounds = self?.sourceBounds ?? [:]
@@ -277,6 +279,7 @@ final class ProfessorSVGView: UIView {
                         .scaledBy(x: CGFloat(imported.scaleX ?? 1),
                                   y: CGFloat(imported.scaleY ?? 1))
                 }
+                let parseStarted = CACurrentMediaTime()
                 let parsed: [(displayPath: CGPath?, sourceBounds: CGRect)] = await Task.detached(priority: .userInitiated) {
                     zip(definitions, transforms).map { definition, transform in
                         guard let source = try? SVGPathParser.cachedPath(from: definition) else {
@@ -286,10 +289,12 @@ final class ProfessorSVGView: UIView {
                         return (source.copy(using: &transform), source.boundingBoxOfPath)
                     }
                 }.value
+                parseMilliseconds += (CACurrentMediaTime() - parseStarted) * 1_000
                 guard let self, !Task.isCancelled,
                       self.rebuildGeneration == generation else { return }
 
                 let displayScale = self.window?.screen.scale ?? UIScreen.main.scale
+                let stagingStarted = CACurrentMediaTime()
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
                 for (offset, parsedPath) in parsed.enumerated() {
@@ -317,11 +322,19 @@ final class ProfessorSVGView: UIView {
                     staging.addSublayer(shape)
                 }
                 CATransaction.commit()
+                stagingMilliseconds += (CACurrentMediaTime() - stagingStarted) * 1_000
                 completed = end
                 // 1.0 is reserved for the atomic visual promotion below.
                 // Emitting it for the last computational batch would let UI
                 // hide its preview before the staged group is committed.
                 self.onProgress?(min(0.998, Double(completed) / Double(paths.count)))
+                if completed <= batchSize {
+                    trace?.event("first_geometry_batch_staged", fields: [
+                        "paths": parsed.count,
+                        "cgpath_ms": String(format: "%.2f", parseMilliseconds),
+                        "layer_index_ms": String(format: "%.2f", stagingMilliseconds),
+                    ], once: true)
+                }
                 await Task.yield()
             }
             guard let self, !Task.isCancelled,
@@ -333,6 +346,7 @@ final class ProfessorSVGView: UIView {
 
             // Resolve the initial visible set before revealing the group. No
             // partially prepared layer is ever presented to Core Animation.
+            let viewportStarted = CACurrentMediaTime()
             var nextVisibleIDs = Set<String>()
             if let transform = self.currentTransform {
                 let preloadMargin = max(transform.camera.width, transform.camera.height) * 0.15
@@ -340,6 +354,8 @@ final class ProfessorSVGView: UIView {
             } else {
                 nextVisibleIDs = Set(nextEntries.keys)
             }
+            let viewportMilliseconds = (CACurrentMediaTime() - viewportStarted) * 1_000
+            let promotionStarted = CACurrentMediaTime()
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             for (id, entry) in nextEntries {
@@ -356,7 +372,22 @@ final class ProfessorSVGView: UIView {
             self.visibleIDs = nextVisibleIDs
             previous?.removeFromSuperlayer()
             CATransaction.commit()
+            let promotionMilliseconds = (CACurrentMediaTime() - promotionStarted) * 1_000
             self.onProgress?(1)
+            trace?.event("all_exact_paths_installed", durationMilliseconds:
+                (CACurrentMediaTime() - started) * 1_000,
+                fields: [
+                    "paths": self.entries.count,
+                    "visible_paths": nextVisibleIDs.count,
+                    "cgpath_ms": String(format: "%.2f", parseMilliseconds),
+                    "layer_index_ms": String(format: "%.2f", stagingMilliseconds),
+                    "viewport_query_ms": String(format: "%.2f", viewportMilliseconds),
+                    "promotion_ms": String(format: "%.2f", promotionMilliseconds),
+                ], once: true)
+            trace?.event("first_exact_pixels", fields: [
+                "visible_paths": nextVisibleIDs.count
+            ], once: true)
+            trace?.event("all_paths_editable", fields: ["paths": self.entries.count], once: true)
             #if DEBUG
             var stats = RenderPerformance.shared.last
             stats.indexedObjects = self.entries.count

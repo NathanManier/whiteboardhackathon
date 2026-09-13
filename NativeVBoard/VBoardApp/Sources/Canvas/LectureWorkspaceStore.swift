@@ -697,29 +697,37 @@ final class LectureWorkspaceStore: ObservableObject {
         let token = UUID()
         sceneLoadTokens[boardID] = token
         sceneLoadTasks[boardID] = Task { [weak self] in
-            let loadStarted = Date().timeIntervalSinceReferenceDate
+            let loadStarted = ProcessInfo.processInfo.systemUptime
+            let trace = VBoardPerformanceTraceRegistry.shared.takeBoundTrace(
+                for: boardID, operation: "lecture_board_open"
+            )
+            trace.event("lecture_detail_requested", fields: ["board": boardID])
             do {
-                async let editorRequest = api.editor(id: boardID)
-                async let svgRequest = api.professorSVG(id: boardID)
+                let board = self?.boards.first(where: { $0.id == boardID })
+                async let editorRequest = api.editor(id: boardID, trace: trace)
+                async let svgRequest = api.cachedProfessorSVG(
+                    id: boardID,
+                    version: board?.updatedAt.map { String($0) },
+                    trace: trace
+                )
                 let (editor, source) = try await (editorRequest, svgRequest)
                 #if DEBUG
-                let downloadFinished = Date().timeIntervalSinceReferenceDate
+                let downloadFinished = ProcessInfo.processInfo.systemUptime
                 print("[VBoard] VECTOR TIMELINE board=\(boardID) stage=download editorObjects=\(editor.objects.count) svgBytes=\(source.utf8.count) milliseconds=\((downloadFinished - loadStarted) * 1_000)")
                 #endif
-                let board = self?.boards.first(where: { $0.id == boardID })
                 let sourceKind = board?.sourceKind ?? .physicalWhiteboard
-                let parseStarted = Date().timeIntervalSinceReferenceDate
-                let parsedDocument = try SVGDocument.parse(source)
+                let parseStarted = ProcessInfo.processInfo.systemUptime
+                let parsedDocument = try await SVGDocument.parseOffMain(source, trace: trace)
                 let document = PDFBoardSource.selectableDocument(parsedDocument, sourceKind: sourceKind)
                 #if DEBUG
-                print("[VBoard] VECTOR TIMELINE board=\(boardID) stage=manifestParse paths=\(document.paths.count) milliseconds=\((Date().timeIntervalSinceReferenceDate - parseStarted) * 1_000)")
+                print("[VBoard] VECTOR TIMELINE board=\(boardID) stage=manifestParse paths=\(document.paths.count) milliseconds=\((ProcessInfo.processInfo.systemUptime - parseStarted) * 1_000)")
                 #endif
                 let pdfData: Data?
                 if sourceKind.isPDF, let path = board?.pdfURL {
                     pdfData = try await api.cachedBoardAsset(
                         boardID: boardID,
                         path: path,
-                        version: board?.updatedAt.map { String($0) }
+                        version: board?.updatedAt.map { String($0) }, trace: trace
                     )
                 } else {
                     pdfData = nil
@@ -744,8 +752,9 @@ final class LectureWorkspaceStore: ObservableObject {
                 self.sceneLoadTokens.removeValue(forKey: boardID)
                 self.evictScenesIfNeeded()
                 #if DEBUG
-                print("[VBoard] VECTOR TIMELINE board=\(boardID) stage=sceneInstalled previewRetained=true milliseconds=\((Date().timeIntervalSinceReferenceDate - loadStarted) * 1_000)")
+                print("[VBoard] VECTOR TIMELINE board=\(boardID) stage=sceneInstalled previewRetained=true milliseconds=\((ProcessInfo.processInfo.systemUptime - loadStarted) * 1_000)")
                 #endif
+                trace.event("lecture_scene_installed", fields: ["paths": document.paths.count])
             } catch {
                 guard let self, self.sceneLoadTokens[boardID] == token else { return }
                 self.sceneLoadTasks.removeValue(forKey: boardID)

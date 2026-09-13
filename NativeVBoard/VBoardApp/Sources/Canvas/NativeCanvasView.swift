@@ -276,6 +276,7 @@ final class PencilRawEventMonitor: NSObject {
 struct NativeCanvasView: UIViewRepresentable {
     let boardID: String
     let document: SVGDocument
+    var previewImage: UIImage? = nil
     let pdfData: Data?
     let camera: CameraRect
     let objects: [CanvasObject]
@@ -303,7 +304,8 @@ struct NativeCanvasView: UIViewRepresentable {
     var onPencilPaletteDismiss: () -> Void = {}
 
     func makeUIView(context: Context) -> InfiniteCanvasUIView {
-        InfiniteCanvasUIView(boardID: boardID, document: document, pdfData: pdfData, camera: camera,
+        InfiniteCanvasUIView(boardID: boardID, document: document, previewImage: previewImage,
+                             pdfData: pdfData, camera: camera,
                              objects: objects, importedTransforms: importedTransforms,
                              composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
                              penStyle: penStyle, markerStyle: markerStyle,
@@ -317,7 +319,8 @@ struct NativeCanvasView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: InfiniteCanvasUIView, context: Context) {
-        uiView.update(boardID: boardID, document: document, pdfData: pdfData, camera: camera,
+        uiView.update(boardID: boardID, document: document, previewImage: previewImage,
+                      pdfData: pdfData, camera: camera,
                       objects: objects, importedTransforms: importedTransforms,
                       composition: composition, showsPaper: showsPaper, backgroundStyle: backgroundStyle,
                       penStyle: penStyle, markerStyle: markerStyle,
@@ -341,6 +344,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     /// Every world-space layer is a descendant of this single container so a
     /// CameraRect change moves the visible pixels, not just the culling set.
     private let worldContainer = UIView()
+    private let previewSource = UIImageView()
     private let pdfSource = PDFPageRenderView()
     private let professor = ProfessorSVGView()
     private let vectorIndicator = BoardVectorLoadingIndicator()
@@ -389,6 +393,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private let interactionLayer = CAShapeLayer()
     private var boardID: String
     private var document: SVGDocument
+    private var previewImage: UIImage?
     private var pdfData: Data?
     private var controller: CameraController
     private var cameraInitializedForBoardID: String?
@@ -421,7 +426,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var lastCameraMutationReason: CameraMutationReason?
     #endif
 
-    init(boardID: String, document: SVGDocument, pdfData: Data? = nil, camera: CameraRect,
+    init(boardID: String, document: SVGDocument, previewImage: UIImage? = nil,
+         pdfData: Data? = nil, camera: CameraRect,
          objects: [CanvasObject] = [], importedTransforms: [String: ObjectTransform] = [:],
          composition: SceneComposition, showsPaper: Bool = true,
          backgroundStyle: WorkspaceBackgroundStyle = .dots,
@@ -438,7 +444,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
          onPencilAction: @escaping (PencilLogicalAction, CGPoint?) -> Void = { _, _ in },
          onPencilPaletteMoved: @escaping (CGPoint) -> Void = { _ in },
          onPencilPaletteDismiss: @escaping () -> Void = {}) {
-        self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
+        self.boardID = boardID; self.document = document; self.previewImage = previewImage
+        self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
         self.pencilPreferences = pencilPreferences
@@ -484,6 +491,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         paperLayer.strokeColor = boardBoundaryColor().cgColor
         paperLayer.lineWidth = 1.25
         paperLayer.name = "VBoardPaper"
+        previewSource.layer.name = "VBoardPreviewSource"
         pdfSource.layer.name = "VBoardPDFSource"
         professor.layer.name = "VBoardProfessorSource"
         userLayer.name = "VBoardUserContent"
@@ -508,9 +516,17 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         }
         #endif
         professor.onProgress = { [weak self] progress in
-            self?.vectorIndicator.transition(to: progress >= 0.999
-                                             ? .vectorReady
-                                             : (progress > 0 ? .vectorPartial : .vectorLoading))
+            guard let self else { return }
+            let ready = progress >= 0.999
+            self.previewSource.isHidden = ready || self.previewImage == nil || self.pdfData != nil
+            self.vectorIndicator.transition(to: ready
+                                            ? .vectorReady
+                                            : (progress > 0 ? .vectorPartial : .vectorLoading))
+            if ready {
+                self.document.performanceTrace?.event(
+                    "current_viewport_editable", fields: ["board": self.boardID], once: true
+                )
+            }
         }
         addSubview(worldContainer)
         // The paper is the bottom-most board source. Keeping it inside the
@@ -518,6 +534,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         // which explained why reopened imported boards showed annotations but
         // not their source page.
         worldContainer.layer.addSublayer(paperLayer)
+        previewSource.image = previewImage
+        previewSource.contentMode = .scaleToFill
+        previewSource.clipsToBounds = true
+        previewSource.isHidden = previewImage == nil || pdfData != nil
+        previewSource.isUserInteractionEnabled = false
+        worldContainer.addSubview(previewSource)
         worldContainer.addSubview(pdfSource)
         worldContainer.addSubview(professor)
         worldContainer.layer.addSublayer(userLayer)
@@ -612,6 +634,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     var pencilInteractionCountForTesting: Int {
         interactions.filter { $0 is UIPencilInteraction }.count
     }
+
+    var previewIsVisibleForTesting: Bool { !previewSource.isHidden }
 
     func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
         #if DEBUG
@@ -764,6 +788,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         worldContainer.bounds = CGRect(origin: .zero, size: bounds.size)
         worldContainer.layer.position = .zero
         professor.frame = worldContainer.bounds
+        previewSource.frame = document.viewBox
         pdfSource.bounds = CGRect(origin: .zero, size: document.viewBox.size)
         pdfSource.layer.position = document.viewBox.origin
         userLayer.bounds = worldContainer.bounds
@@ -788,7 +813,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         applyCamera(interacting: false)
     }
 
-    func update(boardID: String, document: SVGDocument, pdfData: Data? = nil, camera: CameraRect,
+    func update(boardID: String, document: SVGDocument, previewImage: UIImage? = nil,
+                pdfData: Data? = nil, camera: CameraRect,
                 objects: [CanvasObject], importedTransforms: [String: ObjectTransform],
                 composition: SceneComposition, showsPaper: Bool = true,
                 backgroundStyle: WorkspaceBackgroundStyle = .dots,
@@ -807,9 +833,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                 onPencilPaletteDismiss: @escaping () -> Void = {}) {
         let boardChanged = self.boardID != boardID
         let documentChanged = self.document != document || self.importedTransforms != importedTransforms
+        let previewChanged = self.previewImage !== previewImage
         let pdfChanged = self.pdfData != pdfData
         let objectsChanged = self.objects != objects
-        self.boardID = boardID; self.document = document; self.pdfData = pdfData; self.objects = objects
+        self.boardID = boardID; self.document = document; self.previewImage = previewImage
+        self.pdfData = pdfData; self.objects = objects
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
         self.pencilPreferences = pencilPreferences
@@ -857,6 +885,12 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         // when a board identity changes; ordinary SwiftUI refreshes must not
         // overwrite the live camera after a pan or zoom.
         if documentChanged { professor.display(document, transform: worldTransform, importedTransforms: importedTransforms, composition: composition) }
+        if previewChanged || documentChanged || pdfChanged {
+            previewSource.image = previewImage
+            previewSource.frame = document.viewBox
+            previewSource.isHidden = (!documentChanged && professor.hasVisiblePresentation)
+                || previewImage == nil || pdfData != nil
+        }
         if pdfChanged {
             if let pdfData { pdfSource.display(data: pdfData); pdfSource.isHidden = false }
             else { pdfSource.clear(); pdfSource.isHidden = true }

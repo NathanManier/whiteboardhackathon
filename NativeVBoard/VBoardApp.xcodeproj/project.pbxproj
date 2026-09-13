@@ -50,6 +50,7 @@
 		O001 /* GraphStageBHardeningTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = O101 /* GraphStageBHardeningTests.swift */; };
 		Q001 /* Sources/Canvas/PencilInputSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = Q101 /* Sources/Canvas/PencilInputSystem.swift */; };
 		R001 /* PencilInputSystemTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = R101 /* PencilInputSystemTests.swift */; };
+		S001 /* Sources/API/VBoardPerformanceTrace.swift in Sources */ = {isa = PBXBuildFile; fileRef = S101 /* Sources/API/VBoardPerformanceTrace.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -128,6 +129,7 @@
 		O101 /* GraphStageBHardeningTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphStageBHardeningTests.swift; sourceTree = "<group>"; };
 		Q101 /* Sources/Canvas/PencilInputSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/PencilInputSystem.swift; sourceTree = "<group>"; };
 		R101 /* PencilInputSystemTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilInputSystemTests.swift; sourceTree = "<group>"; };
+		S101 /* Sources/API/VBoardPerformanceTrace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/API/VBoardPerformanceTrace.swift; sourceTree = "<group>"; };
 		B001 /* VBoardApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B002 /* VBoardAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B003 /* VBoardShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; path = VBoardShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -182,6 +184,7 @@
 				A102 /* Sources/Models/DomainModels.swift */,
 				A114 /* Sources/Models/LectureWorkspaceModels.swift */,
 				A103 /* Sources/API/APIClient.swift */,
+				S101 /* Sources/API/VBoardPerformanceTrace.swift */,
 				A104 /* Sources/Canvas/WorldScreenTransform.swift */,
 				A105 /* Sources/Canvas/NativeCanvasView.swift */,
 				Q101 /* Sources/Canvas/PencilInputSystem.swift */,
@@ -396,6 +399,7 @@
 				A002 /* Sources/Models/DomainModels.swift in Sources */,
 				A014 /* Sources/Models/LectureWorkspaceModels.swift in Sources */,
 				A003 /* Sources/API/APIClient.swift in Sources */,
+				S001 /* Sources/API/VBoardPerformanceTrace.swift in Sources */,
 				A004 /* Sources/Canvas/WorldScreenTransform.swift in Sources */,
 				A005 /* Sources/Canvas/NativeCanvasView.swift in Sources */,
 				Q001 /* Sources/Canvas/PencilInputSystem.swift in Sources */,

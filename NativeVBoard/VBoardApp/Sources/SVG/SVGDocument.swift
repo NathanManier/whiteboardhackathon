@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-struct SVGPath: Equatable {
+struct SVGPath: Equatable, @unchecked Sendable {
     let id: String?
     let d: String                 // Canonical, untouched server geometry.
     let fill: UIColor
@@ -9,15 +9,33 @@ struct SVGPath: Equatable {
     let dataInk: String?
 }
 
-struct SVGDocument: Equatable {
+struct SVGDocument: Equatable, @unchecked Sendable {
     let viewBox: CGRect
     let paths: [SVGPath]
+    var performanceTrace: VBoardPerformanceTrace? = nil
+
+    static func == (lhs: SVGDocument, rhs: SVGDocument) -> Bool {
+        lhs.viewBox == rhs.viewBox && lhs.paths == rhs.paths
+    }
 
     static func parse(_ source: String) throws -> SVGDocument {
         let reader = SVGReader()
         guard let data = source.data(using: .utf8) else { throw SVGError.invalidDocument }
         let parser = XMLParser(data: data); parser.delegate = reader
         guard parser.parse(), let document = reader.document else { throw SVGError.invalidDocument }
+        return document
+    }
+
+    static func parseOffMain(_ source: String,
+                             trace: VBoardPerformanceTrace? = nil) async throws -> SVGDocument {
+        let started = ProcessInfo.processInfo.systemUptime
+        var document = try await Task.detached(priority: .userInitiated) {
+            try parse(source)
+        }.value
+        document.performanceTrace = trace
+        trace?.event("svg_manifest_parsed", durationMilliseconds:
+            (ProcessInfo.processInfo.systemUptime - started) * 1_000,
+            fields: ["bytes": source.utf8.count, "paths": document.paths.count])
         return document
     }
 }

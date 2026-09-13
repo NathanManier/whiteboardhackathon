@@ -47,9 +47,17 @@ struct UploadByteProgress: Equatable, Sendable {
 
 private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     let onProgress: @MainActor @Sendable (UploadByteProgress) -> Void
+    let trace: VBoardPerformanceTrace?
+    let endpoint: String
+    let attempt: String
 
-    init(onProgress: @escaping @MainActor @Sendable (UploadByteProgress) -> Void) {
+    init(onProgress: @escaping @MainActor @Sendable (UploadByteProgress) -> Void,
+         trace: VBoardPerformanceTrace? = nil, endpoint: String = "upload",
+         attempt: String = "first") {
         self.onProgress = onProgress
+        self.trace = trace
+        self.endpoint = endpoint
+        self.attempt = attempt
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -58,6 +66,16 @@ private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate, @u
         let progress = UploadByteProgress(bytesSent: totalBytesSent,
                                           totalBytes: totalBytesExpectedToSend)
         Task { @MainActor in onProgress(progress) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didFinishCollecting metrics: URLSessionTaskMetrics) {
+        trace?.event("urlsession_upload_metrics", fields: [
+            "endpoint": endpoint,
+            "attempt": attempt,
+            "redirects": metrics.redirectCount,
+            "transactions": metrics.transactionMetrics.count,
+        ])
     }
 }
 
@@ -194,7 +212,9 @@ final class APIClient: ObservableObject {
         install(credentials: nil, reason: .logout)
     }
 
-    func library() async throws -> LibraryResponse { try await get("/api/library") }
+    func library(trace: VBoardPerformanceTrace? = nil) async throws -> LibraryResponse {
+        try await get("/api/library", trace: trace)
+    }
     func lecture(id: String) async throws -> LectureResponse { try await get("/api/folders/\(id)/lecture", label: "class") }
     func lectureWorkspace(id: String) async throws -> LectureWorkspace {
         let envelope: LectureWorkspaceEnvelope = try await get("/api/folders/\(id)/workspace", label: "class workspace")
@@ -265,26 +285,76 @@ final class APIClient: ObservableObject {
         struct Envelope: Decodable { let board: LibraryBoard }
         return try decoder.decode(Envelope.self, from: data).board
     }
-    func board(id: String) async throws -> BoardRecord { try await get("/board/\(id)") }
-    func editor(id: String) async throws -> EditorState {
+    func board(id: String, trace: VBoardPerformanceTrace? = nil) async throws -> BoardRecord {
+        try await get("/board/\(id)", trace: trace)
+    }
+    func editor(id: String, trace: VBoardPerformanceTrace? = nil) async throws -> EditorState {
         // Flask deliberately wraps this response as {"editor": {...}}.
         // Decode the envelope first; decoding EditorState at the root produces
         // keyNotFound(schema_version), which was the native board blocker.
-        let envelope: EditorEnvelope = try await get("/api/boards/\(id)/editor", label: "editor")
+        let envelope: EditorEnvelope = try await get("/api/boards/\(id)/editor", label: "editor", trace: trace)
         debugLog("EDITOR DECODE SUCCEEDED endpoint=/api/boards/\(id)/editor objects=\(envelope.editor.objects.count) revision=\(envelope.editor.revision)")
         return envelope.editor
     }
 
-    func professorSVG(id: String) async throws -> String {
+    func professorSVG(id: String, trace: VBoardPerformanceTrace? = nil) async throws -> String {
         // `/board/<id>/svg` is the combined/export route and embeds user ink.
         // The editor must load only immutable pipeline geometry.
         let path = "/boards/\(id)/board.svg"
-        let request = try request(path: path, accept: "image/svg+xml")
-        let (data, response) = try await data(for: request)
+        let request = try request(path: path, accept: "image/svg+xml", trace: trace)
+        let (data, response) = try await data(for: request, trace: trace)
         debugResponse(path: path, method: "GET", response: response, data: data)
         try validate(response, data: data)
         guard let svg = String(data: data, encoding: .utf8) else { throw APIError.decoding("The professor SVG was not UTF-8.") }
         return svg
+    }
+
+    /// Immutable professor geometry cache. A small board/version lookup points
+    /// to content-addressed bytes keyed by the SVG SHA-256 and parser version.
+    func cachedProfessorSVG(id: String, version: String? = nil,
+                            trace: VBoardPerformanceTrace? = nil) async throws -> String {
+        let namespace = LocalAccountNamespace.value
+        let path = "/boards/\(id)/board.svg"
+        let lookupKey = SourceAssetCache.key(
+            accountNamespace: namespace, boardID: id,
+            path: "professor-svg-lookup", version: version ?? "immutable"
+        )
+        if let checksumData = try await sourceAssetCache.data(
+            forKey: lookupKey, accountNamespace: namespace, boardID: id
+        ), let checksum = String(data: checksumData, encoding: .utf8), checksum.count == 64 {
+            let contentKey = SourceAssetCache.key(
+                accountNamespace: namespace, boardID: id,
+                path: "professor-svg:\(checksum)", version: "svg-parser-v1"
+            )
+            if let cached = try await sourceAssetCache.data(
+                forKey: contentKey, accountNamespace: namespace, boardID: id
+            ), Self.sha256(cached) == checksum,
+               let source = String(data: cached, encoding: .utf8) {
+                trace?.event("svg_cache_hit", fields: [
+                    "board": id, "bytes": cached.count, "checksum": String(checksum.prefix(12))
+                ])
+                return source
+            }
+            trace?.event("svg_cache_invalid", fields: ["board": id])
+        } else {
+            trace?.event("svg_cache_miss", fields: ["board": id])
+        }
+
+        let source = try await professorSVG(id: id, trace: trace)
+        let bytes = Data(source.utf8)
+        let checksum = Self.sha256(bytes)
+        let contentKey = SourceAssetCache.key(
+            accountNamespace: namespace, boardID: id,
+            path: "professor-svg:\(checksum)", version: "svg-parser-v1"
+        )
+        try await sourceAssetCache.store(bytes, forKey: contentKey,
+                                         accountNamespace: namespace, boardID: id)
+        try await sourceAssetCache.store(Data(checksum.utf8), forKey: lookupKey,
+                                         accountNamespace: namespace, boardID: id)
+        trace?.event("svg_cache_store", fields: [
+            "board": id, "bytes": bytes.count, "checksum": String(checksum.prefix(12))
+        ])
+        return source
     }
 
     func asset(boardID: String, name: String) async throws -> Data {
@@ -295,14 +365,15 @@ final class APIClient: ObservableObject {
         return data
     }
 
-    func authorizedAsset(path: String) async throws -> Data {
-        let request = try request(path: path, accept: "image/*,application/pdf")
-        let (data, response) = try await data(for: request)
+    func authorizedAsset(path: String, trace: VBoardPerformanceTrace? = nil) async throws -> Data {
+        let request = try request(path: path, accept: "image/*,application/pdf", trace: trace)
+        let (data, response) = try await data(for: request, trace: trace)
         try validate(response, data: data)
         return data
     }
 
-    func cachedBoardAsset(boardID: String, path: String, version: String? = nil) async throws -> Data {
+    func cachedBoardAsset(boardID: String, path: String, version: String? = nil,
+                          trace: VBoardPerformanceTrace? = nil) async throws -> Data {
         let namespace = LocalAccountNamespace.value
         let key = SourceAssetCache.key(accountNamespace: namespace, boardID: boardID,
                                        path: path, version: version)
@@ -312,12 +383,13 @@ final class APIClient: ObservableObject {
             #if DEBUG
             debugLog("SOURCE ASSET CACHE HIT board=\(boardID) path=\(path) bytes=\(cached.count)")
             #endif
+            trace?.event("preview_cache_hit", fields: ["board": boardID, "bytes": cached.count])
             return cached
         }
         if let task = sourceAssetTasks[key] { return try await task.value }
         let task = Task<Data, Error> { @MainActor [weak self] in
             guard let self else { throw APIError.transport("The asset request was cancelled.") }
-            return try await self.authorizedAsset(path: path)
+            return try await self.authorizedAsset(path: path, trace: trace)
         }
         sourceAssetTasks[key] = task
         defer { sourceAssetTasks.removeValue(forKey: key) }
@@ -328,6 +400,7 @@ final class APIClient: ObservableObject {
         #if DEBUG
         debugLog("SOURCE ASSET CACHE STORE board=\(boardID) path=\(path) bytes=\(data.count)")
         #endif
+        trace?.event("preview_cache_store", fields: ["board": boardID, "bytes": data.count])
         return data
     }
 
@@ -352,9 +425,10 @@ final class APIClient: ObservableObject {
 
     func upload(imageData: Data, filename: String, mimeType: String,
                 folderID: String? = nil, name: String? = nil,
+                trace: VBoardPerformanceTrace? = nil,
                 onProgress: (@MainActor @Sendable (UploadByteProgress) -> Void)? = nil) async throws -> UploadResponse {
         let boundary = "VBoard-\(UUID().uuidString)"
-        var request = try request(path: "/upload", method: "POST", accept: "application/json")
+        var request = try request(path: "/upload", method: "POST", accept: "application/json", trace: trace)
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         var body = Data()
         func field(_ key: String, _ value: String) {
@@ -365,7 +439,8 @@ final class APIClient: ObservableObject {
         body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"image\"; filename=\"\(filename)\"\r\nContent-Type: \(mimeType)\r\n\r\n".utf8))
         body.append(imageData)
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-        let (data, response) = try await uploadData(for: request, body: body,
+        trace?.event("upload_body_ready", fields: ["bytes": body.count])
+        let (data, response) = try await uploadData(for: request, body: body, trace: trace,
                                                     onProgress: onProgress)
         try validate(response, data: data)
         do { return try decoder.decode(UploadResponse.self, from: data) }
@@ -398,15 +473,16 @@ final class APIClient: ObservableObject {
     }
 
     func processCorners(boardID: String, corners: [[Double]],
-                        normalizedCorners: [[String: Double]]? = nil) async throws -> UploadResponse {
-        var request = try request(path: "/board/\(boardID)/corners", method: "POST")
+                        normalizedCorners: [[String: Double]]? = nil,
+                        trace: VBoardPerformanceTrace? = nil) async throws -> UploadResponse {
+        var request = try request(path: "/board/\(boardID)/corners", method: "POST", trace: trace)
         var payload: [String: Any] = ["corners": corners]
         if let normalizedCorners { payload["normalized_corners"] = normalizedCorners }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         #if DEBUG
         debugLog("CORNER REQUEST START board=\(boardID) sourcePixels=\(corners) normalized=\(normalizedCorners ?? [])")
         #endif
-        let (data, response) = try await data(for: request)
+        let (data, response) = try await data(for: request, trace: trace)
         #if DEBUG
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let body = String(data: data.prefix(8_192), encoding: .utf8)?
@@ -571,10 +647,11 @@ final class APIClient: ObservableObject {
         catch { throw APIError.decoding("Could not decode the generated study guide.") }
     }
 
-    private func get<T: Decodable>(_ path: String, label: String = "JSON") async throws -> T {
+    private func get<T: Decodable>(_ path: String, label: String = "JSON",
+                                   trace: VBoardPerformanceTrace? = nil) async throws -> T {
         debugLog("BOARD REQUEST START label=\(label) method=GET endpoint=\(path)")
-        let request = try request(path: path)
-        let (data, response) = try await data(for: request)
+        let request = try request(path: path, trace: trace)
+        let (data, response) = try await data(for: request, trace: trace)
         debugResponse(path: path, method: "GET", response: response, data: data)
         try validate(response, data: data)
         do { return try decoder.decode(T.self, from: data) }
@@ -587,19 +664,24 @@ final class APIClient: ObservableObject {
         }
     }
 
-    private func request(path: String, method: String = "GET", accept: String = "application/json") throws -> URLRequest {
+    private func request(path: String, method: String = "GET", accept: String = "application/json",
+                         trace: VBoardPerformanceTrace? = nil) throws -> URLRequest {
         guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else { throw APIError.invalidBaseURL }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue(accept, forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        #if DEBUG
+        if let trace { request.setValue(trace.id, forHTTPHeaderField: VBoardPerformanceTrace.header) }
+        #endif
         request.timeoutInterval = 30
         return request
     }
 
     private func data(for request: URLRequest,
                       authenticated: Bool = true,
-                      refreshOnUnauthorized: Bool = true) async throws -> (Data, URLResponse) {
+                      refreshOnUnauthorized: Bool = true,
+                      trace: VBoardPerformanceTrace? = nil) async throws -> (Data, URLResponse) {
         do {
             // A URLRequest is only a metadata template. Authentication is applied
             // immediately before transmission so a request created before a login
@@ -607,7 +689,26 @@ final class APIClient: ObservableObject {
             let firstRequest = try rebuiltRequest(from: request, authenticated: authenticated,
                                                   isRetry: false)
             let firstGeneration = accessTokenGeneration
-            let first = try await session.data(for: firstRequest)
+            let endpoint = firstRequest.url?.path ?? "missing"
+            let firstStarted = ProcessInfo.processInfo.systemUptime
+            trace?.event("request_start", fields: ["endpoint": endpoint, "attempt": "first"])
+            let first = if let trace {
+                try await session.data(for: firstRequest,
+                                       delegate: trace.metricsDelegate(endpoint: endpoint,
+                                                                       attempt: "first"))
+            } else {
+                try await session.data(for: firstRequest)
+            }
+            trace?.event("response_end", durationMilliseconds:
+                (ProcessInfo.processInfo.systemUptime - firstStarted) * 1_000,
+                fields: [
+                    "endpoint": endpoint,
+                    "attempt": "first",
+                    "status": (first.1 as? HTTPURLResponse)?.statusCode ?? -1,
+                    "bytes": first.0.count,
+                    "server_timing": (first.1 as? HTTPURLResponse)?
+                        .value(forHTTPHeaderField: "Server-Timing") ?? "missing",
+                ])
             logAuthResponse(for: firstRequest, response: first.1)
             guard refreshOnUnauthorized,
                   authenticated,
@@ -626,7 +727,23 @@ final class APIClient: ObservableObject {
             let retryRequest = try rebuiltRequest(from: request, authenticated: true,
                                                   isRetry: true)
             let retryGeneration = accessTokenGeneration
-            let retry = try await session.data(for: retryRequest)
+            let retryStarted = ProcessInfo.processInfo.systemUptime
+            trace?.event("request_start", fields: ["endpoint": endpoint, "attempt": "auth_retry"])
+            let retry = if let trace {
+                try await session.data(for: retryRequest,
+                                       delegate: trace.metricsDelegate(endpoint: endpoint,
+                                                                       attempt: "auth_retry"))
+            } else {
+                try await session.data(for: retryRequest)
+            }
+            trace?.event("response_end", durationMilliseconds:
+                (ProcessInfo.processInfo.systemUptime - retryStarted) * 1_000,
+                fields: [
+                    "endpoint": endpoint,
+                    "attempt": "auth_retry",
+                    "status": (retry.1 as? HTTPURLResponse)?.statusCode ?? -1,
+                    "bytes": retry.0.count,
+                ])
             logAuthResponse(for: retryRequest, response: retry.1)
             if (retry.1 as? HTTPURLResponse)?.statusCode == 401,
                accessTokenGeneration == retryGeneration {
@@ -643,6 +760,7 @@ final class APIClient: ObservableObject {
     private func uploadData(
         for request: URLRequest,
         body: Data,
+        trace: VBoardPerformanceTrace? = nil,
         onProgress: (@MainActor @Sendable (UploadByteProgress) -> Void)?
     ) async throws -> (Data, URLResponse) {
         let callback: @MainActor @Sendable (UploadByteProgress) -> Void = onProgress ?? { _ in }
@@ -650,9 +768,22 @@ final class APIClient: ObservableObject {
             let firstRequest = try rebuiltRequest(from: request, authenticated: true,
                                                   isRetry: false)
             let firstGeneration = accessTokenGeneration
-            let firstDelegate = UploadProgressDelegate(onProgress: callback)
+            let endpoint = firstRequest.url?.path ?? "missing"
+            let firstStarted = ProcessInfo.processInfo.systemUptime
+            trace?.event("upload_start", fields: ["endpoint": endpoint, "bytes": body.count])
+            let firstDelegate = UploadProgressDelegate(onProgress: callback, trace: trace,
+                                                       endpoint: endpoint, attempt: "first")
             let first = try await session.upload(for: firstRequest, from: body,
                                                  delegate: firstDelegate)
+            trace?.event("upload_response_end", durationMilliseconds:
+                (ProcessInfo.processInfo.systemUptime - firstStarted) * 1_000,
+                fields: [
+                    "endpoint": endpoint,
+                    "status": (first.1 as? HTTPURLResponse)?.statusCode ?? -1,
+                    "response_bytes": first.0.count,
+                    "server_timing": (first.1 as? HTTPURLResponse)?
+                        .value(forHTTPHeaderField: "Server-Timing") ?? "missing",
+                ])
             logAuthResponse(for: firstRequest, response: first.1)
             guard (first.1 as? HTTPURLResponse)?.statusCode == 401,
                   !isNonRefreshingAuthPath(request.url?.path) else {
@@ -664,9 +795,19 @@ final class APIClient: ObservableObject {
             let retryRequest = try rebuiltRequest(from: request, authenticated: true,
                                                   isRetry: true)
             let retryGeneration = accessTokenGeneration
-            let retryDelegate = UploadProgressDelegate(onProgress: callback)
+            let retryStarted = ProcessInfo.processInfo.systemUptime
+            let retryDelegate = UploadProgressDelegate(onProgress: callback, trace: trace,
+                                                       endpoint: endpoint, attempt: "auth_retry")
             let retry = try await session.upload(for: retryRequest, from: body,
                                                  delegate: retryDelegate)
+            trace?.event("upload_response_end", durationMilliseconds:
+                (ProcessInfo.processInfo.systemUptime - retryStarted) * 1_000,
+                fields: [
+                    "endpoint": endpoint,
+                    "attempt": "auth_retry",
+                    "status": (retry.1 as? HTTPURLResponse)?.statusCode ?? -1,
+                    "response_bytes": retry.0.count,
+                ])
             logAuthResponse(for: retryRequest, response: retry.1)
             if (retry.1 as? HTTPURLResponse)?.statusCode == 401,
                accessTokenGeneration == retryGeneration {
@@ -814,6 +955,10 @@ final class APIClient: ObservableObject {
         #if DEBUG
         print("[VBoard] \(message)")
         #endif
+    }
+
+    nonisolated private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }
 

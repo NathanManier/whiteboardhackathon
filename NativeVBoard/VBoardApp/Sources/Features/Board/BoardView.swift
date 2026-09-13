@@ -4,14 +4,28 @@ import UIKit
 struct BoardView: View {
     @EnvironmentObject private var api: APIClient
     let board: LibraryBoard
-    @State private var state: BoardLoadState = .loading
+    @State private var state: BoardLoadState = .loading(nil)
     @State private var activeLoadID: UUID?
+    @State private var loadedPreview: UIImage?
 
     var body: some View {
         Group {
             switch state {
-            case .loading: ProgressView("Opening board…")
-            case .ready(let document, let pdfData, let editor, let composition): BoardEditorSurface(board: board, document: document, pdfData: pdfData, editor: editor, composition: composition)
+            case .loading(let preview):
+                ZStack {
+                    if let preview {
+                        Image(uiImage: preview)
+                            .resizable()
+                            .scaledToFit()
+                            .accessibilityLabel("Board preview")
+                    }
+                    ProgressView("Opening editable board…")
+                        .padding(14)
+                        .background(.regularMaterial, in: Capsule())
+                }
+            case .ready(let document, let pdfData, let editor, let composition):
+                BoardEditorSurface(board: board, document: document, previewImage: loadedPreview,
+                                   pdfData: pdfData, editor: editor, composition: composition)
             case .failed(let message): ContentUnavailableView("Couldn’t open board", systemImage: "exclamationmark.triangle", description: Text(message))
             }
         }
@@ -23,26 +37,52 @@ struct BoardView: View {
     private func load() async {
         let loadID = UUID()
         activeLoadID = loadID
-        state = .loading
+        state = .loading(nil)
+        loadedPreview = nil
+        let trace = VBoardPerformanceTraceRegistry.shared.takeBoundTrace(
+            for: board.id, operation: "board_open"
+        )
+        trace.event("board_open_requested", fields: ["board": board.id])
+        let previewTask = Task { @MainActor () -> UIImage? in
+            guard let path = board.thumbnailURL else { return nil }
+            let started = ProcessInfo.processInfo.systemUptime
+            guard let data = try? await api.cachedBoardAsset(
+                boardID: board.id, path: path,
+                version: board.updatedAt.map { String($0) }, trace: trace
+            ), let image = UIImage(data: data), !Task.isCancelled,
+                  activeLoadID == loadID else { return nil }
+            loadedPreview = image
+            if case .loading = state { state = .loading(image) }
+            trace.event("first_useful_pixels", durationMilliseconds:
+                (ProcessInfo.processInfo.systemUptime - started) * 1_000,
+                fields: ["source": "thumbnail", "bytes": data.count], once: true)
+            return image
+        }
         do {
             debug("BOARD OPEN START id=\(board.id)")
-            // Validate the canonical board metadata route first. The SVG and
-            // editor routes remain separate so the board stays isolated.
-            let record = try await api.board(id: board.id)
+            // These immutable/isolated resources are independent. Starting
+            // them together removes two avoidable production round trips.
+            async let recordRequest = api.board(id: board.id, trace: trace)
+            async let editorRequest = api.editor(id: board.id, trace: trace)
+            async let sourceRequest = api.cachedProfessorSVG(
+                id: board.id, version: board.updatedAt.map { String($0) }, trace: trace
+            )
+            let (record, editor, source) = try await (recordRequest, editorRequest, sourceRequest)
+            trace.event("board_resources_ready", fields: [
+                "editor_objects": editor.objects.count, "svg_bytes": source.utf8.count
+            ])
             debug("BOARD OPEN METADATA SUCCEEDED id=\(board.id)")
-            let editor = try await api.editor(id: board.id)
             debug("BOARD OPEN EDITOR SUCCEEDED id=\(board.id) objects=\(editor.objects.count)")
-            let source = try await api.professorSVG(id: board.id)
             debug("BOARD OPEN SVG RESPONSE SUCCEEDED id=\(board.id) chars=\(source.utf8.count)")
             let sourceKind = record.sourceKind ?? board.sourceKind
-            let parsedDocument = try SVGDocument.parse(source)
+            let parsedDocument = try await SVGDocument.parseOffMain(source, trace: trace)
             let document = PDFBoardSource.selectableDocument(parsedDocument, sourceKind: sourceKind)
             let pdfData: Data?
             if sourceKind.isPDF, let path = record.pdfURL ?? board.pdfURL {
                 pdfData = try await api.cachedBoardAsset(
                     boardID: board.id,
                     path: path,
-                    version: board.updatedAt.map { String($0) }
+                    version: board.updatedAt.map { String($0) }, trace: trace
                 )
             } else {
                 pdfData = nil
@@ -53,12 +93,15 @@ struct BoardView: View {
             let textObjects = editor.objects.filter { $0.type == "text" }.count
             debug("BOARD SCENE BUILD board=\(board.id) professorSVGPaths=\(document.paths.count) editorObjects=\(editor.objects.count) groups=\(editor.groups.count) importedTransforms=\(editor.importedTransforms.count) softDeletedImports=\(editor.importedTransforms.values.filter { $0.deleted == true }.count) textObjects=\(textObjects) renderNodes=\(composition.nodes.count) uniqueLogicalIDs=\(uniqueIDs) duplicateLogicalIDs=\(composition.duplicateLogicalIDs)")
             guard !Task.isCancelled, activeLoadID == loadID else {
+                previewTask.cancel()
                 debug("BOARD OPEN RESULT DISCARDED id=\(board.id) reason=stale-load")
                 return
             }
             state = .ready(document, pdfData, editor, composition)
             debug("BOARD OPEN FIRST SCENE READY id=\(board.id)")
+            trace.event("scene_installed", fields: ["paths": document.paths.count])
         } catch let error as APIError {
+            previewTask.cancel()
             guard !Task.isCancelled, activeLoadID == loadID else { return }
             let message: String
             switch error {
@@ -74,6 +117,7 @@ struct BoardView: View {
             }
             state = .failed(message); debug("BOARD OPEN FAILED id=\(board.id) userMessage=\(message) technical=\(error.localizedDescription)")
         } catch {
+            previewTask.cancel()
             guard !Task.isCancelled, activeLoadID == loadID else { return }
             state = .failed("Couldn’t parse board artwork."); debug("BOARD OPEN FAILED id=\(board.id) stage=svgParse technical=\(error)")
         }
@@ -163,13 +207,18 @@ struct EditorNavigationGestureGuard: UIViewControllerRepresentable {
     }
 }
 
-private enum BoardLoadState { case loading, ready(SVGDocument, Data?, EditorState, SceneComposition), failed(String) }
+private enum BoardLoadState {
+    case loading(UIImage?)
+    case ready(SVGDocument, Data?, EditorState, SceneComposition)
+    case failed(String)
+}
 
 private struct BoardEditorSurface: View {
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
     let board: LibraryBoard
     let document: SVGDocument
+    let previewImage: UIImage?
     let pdfData: Data?
     let composition: SceneComposition
     @StateObject private var store: BoardDocumentStore
@@ -208,8 +257,9 @@ private struct BoardEditorSurface: View {
     @State private var showPencilValidation = false
     #endif
 
-    init(board: LibraryBoard, document: SVGDocument, pdfData: Data?, editor: EditorState, composition: SceneComposition) {
-        self.board = board; self.document = document; self.pdfData = pdfData; self.composition = composition
+    init(board: LibraryBoard, document: SVGDocument, previewImage: UIImage?, pdfData: Data?, editor: EditorState, composition: SceneComposition) {
+        self.board = board; self.document = document; self.previewImage = previewImage
+        self.pdfData = pdfData; self.composition = composition
         _store = StateObject(wrappedValue: BoardDocumentStore(boardID: board.id, editor: editor))
     }
 
@@ -320,7 +370,7 @@ private struct BoardEditorSurface: View {
             // update that surface in place so recognizers, responder focus,
             // and the live camera cannot be reset by SwiftUI identity churn.
             NativeCanvasView(
-                boardID: board.id, document: document, pdfData: pdfData,
+                boardID: board.id, document: document, previewImage: previewImage, pdfData: pdfData,
                 camera: liveCamera ?? store.editor.viewport, objects: store.editor.objects,
                 importedTransforms: store.editor.importedTransforms,
                 composition: SceneComposition.build(boardID: board.id, document: document,
