@@ -56,3 +56,9 @@ status at 0.7 seconds with modest backoff, and resumes that polling when the app
 returns to the foreground. Cancelling the import view stops the local request
 and polling; it does not claim to cancel server work already underway. The
 in-progress board remains in the library for status recovery.
+
+Production processing does not emit masks, SVG rasterizations, or comparison
+images. Set `VBOARD_PROCESSING_DEBUG=1` to enable those diagnostics explicitly.
+The initial thumbnail is resized from the already-resident Enhanced Master;
+later editor saves can still regenerate a combined-content thumbnail when user
+objects must be included.

@@ -159,9 +159,9 @@ class BoardWorkflowTests(unittest.TestCase):
                 {},
                 object(),
             ),
-        ), patch("app.write_debug_artifacts"), patch(
+        ), patch("app.write_debug_artifacts") as debug_artifacts, patch(
             "study.service.persist_thumbnail"
-        ):
+        ), patch.dict(board_app.os.environ, {"VBOARD_PROCESSING_DEBUG": ""}):
             board_app.run_downstream(board_dir, metadata, image, self.corners)
 
         self.assertEqual(
@@ -179,6 +179,35 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertEqual(metadata["pipeline"]["status"], "ready")
         self.assertEqual(metadata["pipeline"]["processing_progress"], 1.0)
         self.assertEqual(metadata["pipeline"]["processing_stage_index"], 6)
+        debug_artifacts.assert_not_called()
+
+    def test_processing_debug_artifacts_require_explicit_environment_opt_in(self):
+        with patch.dict(board_app.os.environ, {"VBOARD_PROCESSING_DEBUG": ""}):
+            self.assertFalse(board_app.processing_debug_enabled())
+        for enabled in ("1", "true", "YES", "on"):
+            with self.subTest(enabled=enabled), patch.dict(
+                board_app.os.environ, {"VBOARD_PROCESSING_DEBUG": enabled}
+            ):
+                self.assertTrue(board_app.processing_debug_enabled())
+
+    def test_pipeline_thumbnail_reuses_master_pixels_without_mutating_master(self):
+        board_id = "c" * 32
+        board_dir = board_app.board_directory(board_id, create=True)
+        master = np.zeros((1200, 800, 3), dtype=np.uint8)
+        master[:, :] = (17, 91, 203)
+        before = master.copy()
+        metadata = {"id": board_id, "assets": {}, "pipeline": {"status": "processing"}}
+
+        board_app.persist_pipeline_thumbnail(board_dir, metadata, master)
+
+        thumbnail = cv2.imread(str(board_dir / "thumbnail.png"), cv2.IMREAD_COLOR)
+        self.assertIsNotNone(thumbnail)
+        self.assertEqual(thumbnail.shape[:2], (640, 427))
+        np.testing.assert_array_equal(master, before)
+        self.assertEqual(metadata["assets"]["thumbnail"], "thumbnail.png")
+        self.assertLessEqual(
+            np.abs(thumbnail.astype(np.int16) - np.array([17, 91, 203])).max(), 1
+        )
 
     def test_confident_detection_waits_for_user_confirmation(self):
         with patch("app.detect_corners", return_value=(self.corners, 0.9)), patch(

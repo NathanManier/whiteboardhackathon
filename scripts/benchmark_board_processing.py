@@ -24,7 +24,6 @@ if str(ROOT) not in sys.path:
 import app as board_app  # noqa: E402
 import processing  # noqa: E402
 from processing import conservative_vectorization, ink_detection  # noqa: E402
-from study import service as study_service  # noqa: E402
 
 
 FIXTURES = {
@@ -109,6 +108,7 @@ def measure_fixture(label: str, encoded: bytes, artifact_root: Path) -> dict[str
         (board_app, "analyze_image", "analysis_proxy"),
         (board_app, "vectorize_image", "vectorization_total"),
         (board_app, "write_debug_artifacts", "debug_artifacts"),
+        (board_app, "persist_pipeline_thumbnail", "thumbnail_generation"),
         (board_app, "atomic_image", "raster_encode_and_write"),
         (board_app, "atomic_bytes", "byte_writes"),
         (board_app, "atomic_json", "json_writes"),
@@ -121,7 +121,6 @@ def measure_fixture(label: str, encoded: bytes, artifact_root: Path) -> dict[str
         (conservative_vectorization, "_simplify", "adaptive_simplification"),
         (conservative_vectorization, "_closed_bezier", "bezier_path_generation"),
         (conservative_vectorization, "_median_fill", "color_estimation"),
-        (study_service, "persist_thumbnail", "thumbnail_generation"),
     ]
 
     try:

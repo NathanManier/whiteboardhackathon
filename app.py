@@ -2417,6 +2417,44 @@ def write_debug_artifacts(
         )
 
 
+def processing_debug_enabled() -> bool:
+    return os.getenv("VBOARD_PROCESSING_DEBUG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def persist_pipeline_thumbnail(
+    board_dir: Path,
+    metadata: dict[str, Any],
+    master: np.ndarray,
+    max_dimension: int = 640,
+) -> None:
+    """Create the initial library preview from the in-memory Enhanced Master.
+
+    This import-time thumbnail has no user edits to composite. Reusing the
+    canonical raster avoids reopening, parsing, cropping, and rasterizing the
+    just-written SVG while preserving the full visual source in the preview.
+    Later editor saves may still use the combined-SVG thumbnail path.
+    """
+
+    height, width = master.shape[:2]
+    scale = min(1.0, max_dimension / max(width, height, 1))
+    if scale < 1.0:
+        thumbnail = cv2.resize(
+            master,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        thumbnail = master
+    atomic_image(board_dir / "thumbnail.png", thumbnail)
+    metadata.setdefault("assets", {})["thumbnail"] = "thumbnail.png"
+    update_metadata(board_dir, metadata)
+
+
 def set_stage(metadata: dict[str, Any], stage: str, started: float) -> None:
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     metadata.setdefault("pipeline", {}).setdefault("timings_ms", {})[stage] = elapsed_ms
@@ -2556,7 +2594,8 @@ def run_downstream(
             "metrics": vector_metrics,
             "svg_bytes": len(svg),
         }
-        write_debug_artifacts(board_dir, metadata, master, svg, ink)
+        if processing_debug_enabled():
+            write_debug_artifacts(board_dir, metadata, master, svg, ink)
     except Exception as exc:
         errors.append({"stage": "vectorization", "message": str(exc)})
         try:
@@ -2576,14 +2615,7 @@ def run_downstream(
         metadata.get("id", "unknown"),
     )
     try:
-        from study.service import persist_thumbnail
-
-        persist_thumbnail(
-            metadata,
-            board_dir,
-            combined_svg=combined_svg,
-            update_metadata=update_metadata,
-        )
+        persist_pipeline_thumbnail(board_dir, metadata, master)
     except Exception:
         LOGGER.info("THUMBNAIL SKIPPED board=%s", metadata.get("id", "unknown"))
 

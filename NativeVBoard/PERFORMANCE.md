@@ -107,4 +107,39 @@ path ordering, IDs, or Enhanced Master algorithm.
 
 ## Before/after results
 
-To be filled only after the identical fixture run and visual quality gate.
+The post-change run used the same source, generated JPEG bytes, detector
+results, machine, and benchmark command. Negative deltas are faster.
+
+| Stage | Before Small | After Small | Delta | Before Medium | After Medium | Delta | Before Large | After Large | Delta |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Debug masks/raster/comparison | 93.3 | 0.0 | -100.0% | 54.3 | 0.0 | -100.0% | 111.2 | 0.0 | -100.0% |
+| Initial thumbnail | 114.5 | 10.3 | -91.0% | 212.2 | 15.6 | -92.7% | 293.2 | 20.5 | -93.0% |
+| Raster encoding and writes | 40.8 | 36.2 | -11.3% | 144.1 | 119.1 | -17.3% | 310.5 | 264.7 | -14.7% |
+| Complete vectorization | 120.5 | 129.0 | +7.1% | 302.1 | 285.7 | -5.4% | 511.6 | 484.8 | -5.2% |
+| Downstream total | 400.5 | 205.1 | -48.8% | 757.9 | 486.0 | -35.9% | 1321.7 | 924.5 | -30.1% |
+| Decode + orientation check + detection + downstream | 455.8 | 246.2 | -46.0% | 814.8 | 541.8 | -33.5% | 1413.8 | 1018.9 | -27.9% |
+
+The final end-to-end reduction is 46.0% small, 33.5% medium, and 27.9% large.
+The large fixture remains under the 10-second stretch target at 1.019 seconds
+on this machine. The small vectorization increase is normal single-run timing
+noise; that code and its byte output are unchanged.
+
+## Quality gate
+
+For all three sizes, SHA-256 hashes of `master.png` match before and after, and
+SHA-256 hashes of `board.svg` match before and after. On the large fixture, the
+old and optimized SVG rasterizations have zero changed pixels and maximum
+absolute channel difference 0. Visual inspection of the Master, both SVG
+rasterizations, a 50/50 overlay, and the zero-difference image confirms no loss
+in tiny writing, dots and punctuation, thin strokes, closed-loop holes, marker
+thickness, angular diagrams, arrows, or small components. The synthetic vector
+quality suite separately exercises mutually exclusive red, blue, and green
+masks plus loop/small-detail retention.
+
+The intentionally changed initial thumbnail now shows the Enhanced Master
+instead of only the extracted vector paths. Visual inspection confirms it
+retains surface context, thin writing, hatching, and red/blue separation that
+the old vector-only thumbnail omitted. The Master itself is never modified.
+
+No contour/vector fidelity setting was changed. Expensive diagnostics remain
+available with `VBOARD_PROCESSING_DEBUG=1`; production defaults to off.
