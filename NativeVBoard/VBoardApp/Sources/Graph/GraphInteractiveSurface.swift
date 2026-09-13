@@ -2058,33 +2058,57 @@ private final class GraphIndirectNavigationView: UIView, UIGestureRecognizerDele
 /// Launch-only visual acceptance fixture. It is excluded from Release and
 /// keeps screenshots deterministic without requiring an account or server.
 struct GraphWorkspaceReviewView: View {
-    let state: String
+    @State private var graph: GraphObject
+    @State private var isOpen = true
+
+    init(state: String) {
+        _graph = State(initialValue: Self.makeGraph(state: state))
+    }
 
     var body: some View {
-        GraphInteractiveSurface(
-            graph: graph,
-            pencilAnnotationEnabled: false,
-            onPencilRequestsPassiveMode: {},
-            onCommitViewport: { _, _, _ in },
-            onCommitGraph: { _ in },
-            onEdit: {},
-            onDone: {}
-        )
+        Group {
+            if isOpen {
+                GraphInteractiveSurface(
+                    graph: graph,
+                    pencilAnnotationEnabled: false,
+                    onPencilRequestsPassiveMode: {},
+                    onCommitViewport: { owningBoardID, graphID, viewport in
+                        guard owningBoardID == graph.owningBoardID,
+                              graphID == graph.id else { return }
+                        graph = graph.replacing(viewport: viewport)
+                    },
+                    onCommitGraph: { updated in
+                        guard updated.id == graph.id,
+                              updated.owningBoardID == graph.owningBoardID else { return }
+                        graph = updated
+                    },
+                    onEdit: {},
+                    onDone: { isOpen = false }
+                )
+            } else {
+                Button("Reopen Graph", systemImage: "chart.xyaxis.line") {
+                    isOpen = true
+                }
+                .buttonStyle(.borderedProminent)
+                .frame(minWidth: 160, minHeight: 52)
+            }
+        }
         .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(uiColor: CanvasDesignTokens.canvasBackground))
     }
 
-    private var graph: GraphObject {
+    private static func makeGraph(state: String) -> GraphObject {
         GraphObject(
             id: "graph-review", owningBoardID: "603f5213ab0a249716833214c5ab88da",
             frame: GraphFrame(x: 0, y: 0, width: 900, height: 620),
-            expressions: expressions,
+            expressions: expressions(for: state),
             viewport: GraphViewport(xMin: -10, xMax: 10, yMin: -8, yMax: 12),
             settings: GraphSettings(showXAxis: true, showYAxis: true, showGrid: true)
         )
     }
 
-    private var expressions: [GraphExpression] {
+    private static func expressions(for state: String) -> [GraphExpression] {
         switch state {
         case "multiple":
             return [expression("f(x)=sin(x)", id: "f", color: "#2d70b3"),
@@ -2106,7 +2130,8 @@ struct GraphWorkspaceReviewView: View {
         }
     }
 
-    private func expression(_ source: String, id: String, color: String) -> GraphExpression {
+    private static func expression(_ source: String, id: String,
+                                   color: String) -> GraphExpression {
         GraphExpression(
             id: id, latex: source, type: GraphExpressionInference.type(for: source),
             displayStyle: GraphExpressionDisplayStyle(color: color, lineWidth: 2.5)
