@@ -40,7 +40,18 @@ struct LibraryView: View {
                     }
                 } else if let error {
                     ContentUnavailableView("Couldn’t load your library", systemImage: "exclamationmark.triangle", description: Text(error)).overlay(alignment: .bottom) { Button("Retry") { load() }.buttonStyle(.borderedProminent).padding(.bottom, 32) }
-                } else { ProgressView("Loading your library…") }
+                } else {
+                    VStack(alignment: .leading, spacing: 20) {
+                        LibraryHeader { showImporter = true }
+                        HStack(spacing: 12) {
+                            ProgressView()
+                            Text("Loading your classes…").foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 24).padding(.vertical, 18)
+                    .frame(maxWidth: 1_200, maxHeight: .infinity, alignment: .topLeading)
+                }
             }
             .navigationTitle("V-Board")
             .toolbar {
@@ -82,6 +93,7 @@ struct LibraryView: View {
                 else { BoardView(board: board) }
             }
             .task { load(); discoverPendingImport() }
+            .overlay { LibraryFirstFrameProbe().allowsHitTesting(false) }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in discoverPendingImport() }
             .confirmationDialog(deleteTarget?.title ?? "Delete?", isPresented: Binding(
                 get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } }
@@ -286,6 +298,9 @@ struct LibraryView: View {
         Task {
             do {
                 let result = try await api.library(); library = result; error = nil
+                VBoardColdLaunchTrace.shared.libraryMetadataReady(
+                    boardCount: result.boards.count, folderCount: result.folders.count
+                )
                 if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-VBoardOpenID"), index + 1 < ProcessInfo.processInfo.arguments.count { launchBoard = result.boards.first(where: { $0.id == ProcessInfo.processInfo.arguments[index + 1] }) }
             } catch let apiError as APIError {
                 switch apiError {
@@ -553,7 +568,33 @@ private struct RemoteBoardThumbnail: View {
         .clipped()
         .task(id: board.thumbnailURL) {
             guard let path = board.thumbnailURL else { return }
-            thumbnail = (try? await api.authorizedAsset(path: path)).flatMap(UIImage.init(data:))
+            let started = VBoardColdLaunchTrace.shared.thumbnailStarted(path: path)
+            let data = try? await api.authorizedAsset(path: path)
+            let rawImage = data.flatMap(UIImage.init(data:))
+            thumbnail = await rawImage?.byPreparingForDisplay() ?? rawImage
+            VBoardColdLaunchTrace.shared.thumbnailFinished(
+                startedAt: started, byteCount: data?.count ?? 0, decoded: thumbnail != nil
+            )
+        }
+    }
+}
+
+private struct LibraryFirstFrameProbe: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        FirstFrameView(frame: .zero)
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+
+    private final class FirstFrameView: UIView {
+        private var reported = false
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard window != nil, !reported else { return }
+            reported = true
+            DispatchQueue.main.async {
+                VBoardColdLaunchTrace.shared.firstLibraryFrameRendered()
+            }
         }
     }
 }

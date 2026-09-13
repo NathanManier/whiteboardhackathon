@@ -177,10 +177,20 @@ final class AuthSessionStore: ObservableObject {
     }
 
     func resolveLaunchSession() async {
-        guard let credentials = keychain.load(), credentials.refreshExpiresAt > Date().timeIntervalSince1970 else {
+        let keychainStarted = ProcessInfo.processInfo.systemUptime
+        VBoardColdLaunchTrace.shared.event("keychain_restore_start")
+        let restoredCredentials = keychain.load()
+        VBoardColdLaunchTrace.shared.event(
+            "keychain_restore_end",
+            durationMilliseconds: (ProcessInfo.processInfo.systemUptime - keychainStarted) * 1_000,
+            fields: ["found": restoredCredentials != nil]
+        )
+        guard let credentials = restoredCredentials,
+              credentials.refreshExpiresAt > Date().timeIntervalSince1970 else {
             keychain.clear()
             api.install(credentials: nil, reason: .logout)
             state = .signedOut
+            VBoardColdLaunchTrace.shared.event("launch_resolved_signed_out")
             return
         }
         if let appleUser = credentials.appleUserIdentifier {
@@ -192,13 +202,21 @@ final class AuthSessionStore: ObservableObject {
         }
         api.install(credentials: credentials, reason: .restore)
         do {
+            let authStarted = ProcessInfo.processInfo.systemUptime
+            VBoardColdLaunchTrace.shared.event("auth_me_start")
             state = .signedIn(try await api.currentAccount())
+            VBoardColdLaunchTrace.shared.event(
+                "auth_me_end",
+                durationMilliseconds: (ProcessInfo.processInfo.systemUptime - authStarted) * 1_000
+            )
             if case .signedIn(let user) = state { LocalAccountNamespace.activate(user.id) }
         } catch APIError.authenticationExpired {
+            VBoardColdLaunchTrace.shared.event("auth_me_failed", fields: ["reason": "expired"])
             keychain.clear()
             LocalAccountNamespace.clear()
             state = .sessionExpired
         } catch {
+            VBoardColdLaunchTrace.shared.event("auth_me_failed", fields: ["reason": "transport"])
             // A transport outage does not invalidate a refresh credential. Keep
             // the Keychain session so the user can retry after connectivity returns.
             state = .failed("Couldn’t connect to V-Board.")

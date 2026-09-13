@@ -213,7 +213,35 @@ final class APIClient: ObservableObject {
     }
 
     func library(trace: VBoardPerformanceTrace? = nil) async throws -> LibraryResponse {
-        try await get("/api/library", trace: trace)
+        let started = ProcessInfo.processInfo.systemUptime
+        VBoardColdLaunchTrace.shared.event("library_request_start")
+        let request = try request(path: "/api/library", trace: trace)
+        let (data, response) = try await data(for: request, trace: trace)
+        VBoardColdLaunchTrace.shared.event(
+            "library_response_end",
+            durationMilliseconds: (ProcessInfo.processInfo.systemUptime - started) * 1_000,
+            fields: ["bytes": data.count,
+                     "status": (response as? HTTPURLResponse)?.statusCode ?? -1]
+        )
+        debugResponse(path: "/api/library", method: "GET", response: response, data: data)
+        try validate(response, data: data)
+        let decodeStarted = ProcessInfo.processInfo.systemUptime
+        VBoardColdLaunchTrace.shared.event("library_decode_start")
+        do {
+            let result = try decoder.decode(LibraryResponse.self, from: data)
+            VBoardColdLaunchTrace.shared.event(
+                "library_decode_end",
+                durationMilliseconds: (ProcessInfo.processInfo.systemUptime - decodeStarted) * 1_000,
+                fields: ["boards": result.boards.count, "folders": result.folders.count]
+            )
+            return result
+        } catch let error as DecodingError {
+            logDecodingError(error, endpoint: "/api/library", method: "GET",
+                             response: response, data: data)
+            throw APIError.decoding("Could not decode JSON response. The server returned an unexpected JSON shape.")
+        } catch {
+            throw APIError.decoding("Could not decode JSON response.")
+        }
     }
     func recordBoardActivity(id: String) async throws {
         let request = try request(path: "/api/boards/\(id)/activity", method: "POST")

@@ -122,3 +122,73 @@ extension VBoardPerformanceTrace {
         VBoardTaskMetricsDelegate(trace: self, endpoint: endpoint, attempt: attempt)
     }
 }
+
+struct LibraryLoadSettlementTracker: Equatable {
+    private(set) var inFlightThumbnails = 0
+    private(set) var hasRenderedFirstFrame = false
+
+    mutating func thumbnailStarted() { inFlightThumbnails += 1 }
+    mutating func thumbnailFinished() { inFlightThumbnails = max(0, inFlightThumbnails - 1) }
+    mutating func firstFrameRendered() { hasRenderedFirstFrame = true }
+
+    var canSettle: Bool { hasRenderedFirstFrame && inFlightThumbnails == 0 }
+}
+
+/// A single cold-launch timeline. It deliberately records only stage names,
+/// counts, durations, and asset byte sizes; account and board content never
+/// enters diagnostics.
+@MainActor
+final class VBoardColdLaunchTrace {
+    static let shared = VBoardColdLaunchTrace()
+
+    private let trace = VBoardPerformanceTrace(operation: "cold_launch")
+    private var tracker = LibraryLoadSettlementTracker()
+    private var settleTask: Task<Void, Never>?
+
+    func event(_ stage: String, durationMilliseconds: Double? = nil,
+               fields: [String: CustomStringConvertible] = [:], once: Bool = true) {
+        trace.event(stage, durationMilliseconds: durationMilliseconds,
+                    fields: fields, once: once)
+    }
+
+    func libraryMetadataReady(boardCount: Int, folderCount: Int) {
+        event("library_metadata_ready", fields: ["boards": boardCount, "folders": folderCount])
+        scheduleSettlement()
+    }
+
+    func firstLibraryFrameRendered() {
+        tracker.firstFrameRendered()
+        event("first_library_frame")
+        scheduleSettlement()
+    }
+
+    func thumbnailStarted(path: String) -> TimeInterval {
+        tracker.thumbnailStarted()
+        settleTask?.cancel()
+        event("thumbnail_request", fields: ["asset": Self.safeAssetKind(path)], once: false)
+        return ProcessInfo.processInfo.systemUptime
+    }
+
+    func thumbnailFinished(startedAt: TimeInterval, byteCount: Int, decoded: Bool) {
+        tracker.thumbnailFinished()
+        event("thumbnail_decode", durationMilliseconds:
+                (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000,
+              fields: ["bytes": byteCount, "decoded": decoded], once: false)
+        scheduleSettlement()
+    }
+
+    private func scheduleSettlement() {
+        settleTask?.cancel()
+        guard tracker.canSettle else { return }
+        settleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled, let self, self.tracker.canSettle else { return }
+            self.event("library_settled")
+        }
+    }
+
+    private static func safeAssetKind(_ path: String) -> String {
+        (path as NSString).pathExtension.lowercased().isEmpty
+            ? "unknown" : (path as NSString).pathExtension.lowercased()
+    }
+}

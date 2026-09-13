@@ -1625,6 +1625,22 @@ final class StrokeSerializationTests: XCTestCase {
 }
 
 final class ServerContractDecodingTests: XCTestCase {
+    func testLibrarySettlementWaitsForFirstFrameAndEveryStartedThumbnail() {
+        var tracker = LibraryLoadSettlementTracker()
+        XCTAssertFalse(tracker.canSettle)
+        tracker.thumbnailStarted()
+        tracker.firstFrameRendered()
+        XCTAssertFalse(tracker.canSettle)
+        tracker.thumbnailStarted()
+        tracker.thumbnailFinished()
+        XCTAssertFalse(tracker.canSettle)
+        tracker.thumbnailFinished()
+        XCTAssertTrue(tracker.canSettle)
+        tracker.thumbnailFinished()
+        XCTAssertEqual(tracker.inFlightThumbnails, 0)
+        XCTAssertTrue(tracker.canSettle)
+    }
+
     func testCompactPresentationKeepsMathAndChemistryReadable() {
         let source = #"Predict $\text{Pd}(0)$ for $\ce{SO4^{2-}}$, then use $\frac{a}{b} \rightarrow \alpha$."#
         let rendered = CompactStudyPresentation.readableText(from: source)

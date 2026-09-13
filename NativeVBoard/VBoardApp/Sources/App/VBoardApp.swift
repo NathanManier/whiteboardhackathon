@@ -5,6 +5,10 @@ struct VBoardApp: App {
     @StateObject private var api = APIClient.shared
     @StateObject private var auth = AuthSessionStore()
 
+    init() {
+        VBoardColdLaunchTrace.shared.event("process_start")
+    }
+
     var body: some Scene {
         WindowGroup {
             Group {
@@ -20,6 +24,7 @@ struct VBoardApp: App {
             }
             .environmentObject(api)
             .environmentObject(auth)
+            .onAppear { VBoardColdLaunchTrace.shared.event("app_scene_ready") }
         }
     }
 }
