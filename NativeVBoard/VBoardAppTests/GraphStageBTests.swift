@@ -657,7 +657,11 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
 
         let parameterID = try XCTUnwrap(model.addParameter(named: "a"))
         let sliderExpression = try XCTUnwrap(model.expression(id: parameterID))
-        XCTAssertEqual(model.slider(for: sliderExpression)?.value, 1)
+        let initialSlider = try XCTUnwrap(model.slider(for: sliderExpression))
+        XCTAssertEqual(initialSlider.value, 0)
+        XCTAssertEqual(initialSlider.minimum, -10)
+        XCTAssertEqual(initialSlider.maximum, 10)
+        XCTAssertEqual(initialSlider.step, 0.1)
         model.updateSlider(id: parameterID, value: 2.5)
         XCTAssertEqual(model.expression(id: parameterID)?.latex, "a=2.5")
 
@@ -667,6 +671,211 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
             environment: environment
         )
         XCTAssertFalse(segments.isEmpty)
+    }
+
+    func testFirstClassDerivativeSyntaxEvaluatesConstantsAndNeverInventsDSlider() {
+        let derivative = GraphExpression(
+            id: "constant-derivative", latex: "d/dx(2)", type: .unknown
+        )
+        let graph = GraphObject(
+            id: "graph-constant-derivative", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [derivative]
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+
+        XCTAssertEqual(model.feedback(for: derivative), GraphRowFeedback(
+            kind: .derivative, message: "0"
+        ))
+        XCTAssertTrue(model.undefinedParameters(for: derivative).isEmpty)
+    }
+
+    func testCalculusSyntaxSupportsFunctionsPrimesAndDefiniteIntegrals() throws {
+        let function = GraphExpression(
+            id: "function", latex: "f(x)=x^2", type: .explicitFunction
+        )
+        let directFunction = GraphExpression(
+            id: "direct-function", latex: "d/dx(f(x))", type: .unknown
+        )
+        let directExpression = GraphExpression(
+            id: "direct-expression", latex: "d/dx(x^2)", type: .unknown
+        )
+        let primeFunction = GraphExpression(
+            id: "prime-function", latex: "f'(x)", type: .unknown
+        )
+        let primeValue = GraphExpression(
+            id: "prime-value", latex: "f'(3)", type: .unknown
+        )
+        let secondPrime = GraphExpression(
+            id: "second-prime", latex: "f''(2)", type: .unknown
+        )
+        let integral = GraphExpression(
+            id: "integral", latex: "integral(x^2,0,2)", type: .unknown
+        )
+        let graph = GraphObject(
+            id: "calculus-language", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [function, directFunction, directExpression,
+                          primeFunction, primeValue, secondPrime, integral]
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+
+        XCTAssertEqual(model.feedback(for: directFunction)?.message, "Derivative function")
+        XCTAssertEqual(model.feedback(for: directExpression)?.message, "Derivative function")
+        XCTAssertEqual(model.feedback(for: primeFunction)?.message, "Derivative function")
+        XCTAssertEqual(model.feedback(for: primeValue)?.message, "6")
+        XCTAssertEqual(model.feedback(for: secondPrime)?.message, "2")
+        XCTAssertEqual(
+            try XCTUnwrap(Double(model.feedback(for: integral)?.message ?? "")),
+            8.0 / 3.0, accuracy: 0.000_001
+        )
+        for expression in graph.expressions {
+            XCTAssertTrue(model.undefinedParameters(for: expression).isEmpty,
+                          "calculus or known function leaked a slider from \(expression.latex)")
+        }
+    }
+
+    func testGuidedCalculusCreatesNewRowsWithoutConcatenatingSource() throws {
+        let function = GraphExpression(
+            id: "function", latex: "f(x)=sin(x)", type: .explicitFunction
+        )
+        let graph = GraphObject(
+            id: "guided-calculus", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [function]
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+
+        model.beginCalculus(.derivative)
+        XCTAssertEqual(model.calculusDraft?.functionSource, "f(x)")
+        model.calculusDraft?.evaluationPoint = "2"
+        let derivativeID = try XCTUnwrap(model.commitCalculusDraft())
+        XCTAssertEqual(model.expression(id: derivativeID)?.latex, "f'(2)")
+        XCTAssertEqual(model.expressions.first?.latex, "f(x)=sin(x)")
+
+        model.selectedExpressionID = function.id
+        model.beginCalculus(.integral)
+        model.calculusDraft?.lowerBound = "0"
+        model.calculusDraft?.upperBound = "2"
+        let integralID = try XCTUnwrap(model.commitCalculusDraft())
+        XCTAssertEqual(model.expression(id: integralID)?.latex, "integral(f(x),0,2)")
+        XCTAssertFalse(model.expressions.contains {
+            $0.latex.contains("integral(,,)d/dx")
+        })
+    }
+
+    func testReadModeCalculusActionRevealsSemanticConfigurationTray() {
+        let graph = GraphObject(
+            id: "guided-graph", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [GraphExpression(
+                id: "function", latex: "f(x)=x^2", type: .explicitFunction
+            )]
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+
+        model.beginGuidedCalculus(.derivative, from: "function")
+
+        XCTAssertEqual(model.selectedExpressionID, "function")
+        XCTAssertEqual(model.editingExpressionID, "function")
+        XCTAssertEqual(model.keyboardCategory, .calculus)
+        XCTAssertEqual(model.calculusDraft?.operation, .derivative)
+        XCTAssertEqual(model.calculusDraft?.functionSource, "f(x)")
+    }
+
+    func testSliderMetadataPersistsThroughGraphJSONRoundTrip() throws {
+        let graph = GraphObject(
+            id: "slider-persistence", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [GraphExpression(
+                id: "curve", latex: "y=a*sin(x)", type: .explicitFunction
+            )]
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+        let id = try XCTUnwrap(model.addParameter(named: "a"))
+        model.updateSlider(id: id, value: 2.7)
+
+        let restored = try JSONDecoder().decode(
+            GraphObject.self, from: JSONEncoder().encode(model.workingGraph)
+        )
+        let reopened = GraphWorkspaceModel(graph: restored)
+        let expression = try XCTUnwrap(reopened.expression(id: id))
+        let slider = try XCTUnwrap(reopened.slider(for: expression))
+        XCTAssertEqual(slider.name, "a")
+        XCTAssertEqual(slider.value, 2.7)
+        XCTAssertEqual(slider.minimum, -10)
+        XCTAssertEqual(slider.maximum, 10)
+        XCTAssertEqual(slider.step, 0.1)
+    }
+
+    func testCheckMyWorkUsesDedicatedEndpointInsteadOfExplainEndpoint() async throws {
+        let selection = BoardStudySelection(
+            boardID: boardID,
+            canonicalObjectIDs: ["practice-1", "stroke-1"],
+            localBBox: try XCTUnwrap(StudySelectionBBox(
+                rect: CGRect(x: 20, y: 30, width: 240, height: 180)
+            )),
+            selectedTextObjects: [], lectureWorldBBox: nil
+        )
+        let payload = BoardStudyExplainRequest.make(
+            selection: selection,
+            action: "check_my_work",
+            requestID: "1234567890abcdef"
+        )
+        let lock = NSLock()
+        var observedPath: String?
+        GraphURLProtocolStub.handler = { request in
+            lock.withLock { observedPath = request.url?.path }
+            XCTAssertEqual(request.httpMethod, "POST")
+            let requestBody = try JSONSerialization.jsonObject(
+                with: try graphRequestBody(request)
+            ) as? [String: Any]
+            XCTAssertEqual(requestBody?["action"] as? String, "check_my_work")
+            XCTAssertEqual(requestBody?["selectedObjectIds"] as? [String],
+                           ["practice-1", "stroke-1"])
+            let body = Data(#"{"interaction":{"id":"1234567890abcdef","title":"Check My Work","answer":"Correct"}}"#.utf8)
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: ["Content-Type": "application/json"])!,
+                body
+            )
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GraphURLProtocolStub.self]
+        let api = APIClient(baseURL: URL(string: "https://study.test")!,
+                            session: URLSession(configuration: configuration))
+
+        _ = try await api.performStudyAction(.checkWork, request: payload)
+
+        XCTAssertEqual(lock.withLock { observedPath },
+                       "/api/boards/\(boardID)/study/check")
+    }
+
+    func testEveryInitialStudyActionHasOneEndpointAndSpecificLoadingCopy() {
+        XCTAssertEqual(StudyAction.explain.endpoint(boardID: boardID),
+                       "/api/boards/\(boardID)/study/explain")
+        XCTAssertEqual(StudyAction.practice.endpoint(boardID: boardID),
+                       "/api/boards/\(boardID)/study/practice")
+        XCTAssertEqual(StudyAction.checkWork.endpoint(boardID: boardID),
+                       "/api/boards/\(boardID)/study/check")
+        XCTAssertEqual(StudyAction.explain.loadingCopy, "Explaining…")
+        XCTAssertEqual(StudyAction.practice.loadingCopy, "Creating practice problems…")
+        XCTAssertEqual(StudyAction.checkWork.loadingCopy, "Checking your work…")
+        XCTAssertNotEqual(StudyAction.checkWork.endpoint(boardID: boardID),
+                          StudyAction.explain.endpoint(boardID: boardID))
+        XCTAssertTrue(StudyActionResultPolicy.savesExplanationMarker(for: .explain))
+        XCTAssertFalse(StudyActionResultPolicy.savesExplanationMarker(for: .practice))
+        XCTAssertFalse(StudyActionResultPolicy.savesExplanationMarker(for: .checkWork))
+        XCTAssertTrue(StudyActionResultPolicy.placesPracticeCards(
+            for: .practice, problemCount: 3
+        ))
+        XCTAssertFalse(StudyActionResultPolicy.placesPracticeCards(
+            for: .explain, problemCount: 3
+        ))
+        XCTAssertFalse(StudyActionResultPolicy.placesPracticeCards(
+            for: .practice, problemCount: 2
+        ))
     }
 
     func testMathKeyboardInsertsAtCursorAndPlacesTemplateCursor() {
@@ -708,6 +917,104 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         )
         XCTAssertEqual(ticks.map(\.label), ["-10", "-8", "-6", "-4", "-2", "0", "2", "4", "6", "8", "10"])
         XCTAssertEqual(Set(ticks.map(\.label)).count, ticks.count)
+    }
+
+    func testZoomInThenOutIsAnExactInverseAndNeverMutatesExpressions() {
+        let expression = GraphExpression(
+            id: "source", latex: "y=a*sin(x)", type: .explicitFunction,
+            additionalFields: ["future": .string("byte-identical")]
+        )
+        let source = GraphViewport(xMin: -13, xMax: 27, yMin: -7, yMax: 9)
+        let graph = GraphObject(
+            id: "zoom-inverse", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [expression], viewport: source
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let bytesBefore = try? encoder.encode(model.expressions)
+
+        model.updateViewport(GraphViewportNavigation.zoomed(
+            model.viewport, by: GraphViewportNavigation.zoomInFactor
+        ))
+        model.updateViewport(GraphViewportNavigation.zoomed(
+            model.viewport, by: GraphViewportNavigation.zoomOutFactor
+        ))
+
+        XCTAssertEqual(model.viewport.xMin, source.xMin, accuracy: 1e-10)
+        XCTAssertEqual(model.viewport.xMax, source.xMax, accuracy: 1e-10)
+        XCTAssertEqual(model.viewport.yMin, source.yMin, accuracy: 1e-10)
+        XCTAssertEqual(model.viewport.yMax, source.yMax, accuracy: 1e-10)
+        XCTAssertEqual(try? encoder.encode(model.expressions), bytesBefore)
+    }
+
+    func testPassiveGraphOpenPolicyUsesFingerOnceAndNeverConsumesPencil() {
+        XCTAssertEqual(PassiveGraphOpenPolicy.tapCount(for: .direct), 1)
+        XCTAssertEqual(PassiveGraphOpenPolicy.tapCount(for: .indirectPointer), 2)
+        XCTAssertNil(PassiveGraphOpenPolicy.tapCount(for: .pencil))
+    }
+
+    func testPracticePlacementUsesThreeScreenSizedCardsAndFixedBoardWidth() {
+        let workspace = CGRect(x: 0, y: 0, width: 900, height: 700)
+        let obstacle = CGRect(x: 250, y: 340, width: 420, height: 190)
+        let layout = PracticePlacementPlanner.layout(
+            count: 3,
+            source: CGRect(x: 300, y: 180, width: 260, height: 110),
+            occupied: [obstacle], workspace: workspace, cameraScale: 1
+        )
+
+        XCTAssertEqual(layout.frames.count, 3)
+        XCTAssertTrue(layout.frames.allSatisfy { $0.width == 320 && $0.height == 150 })
+        XCTAssertTrue(layout.frames.allSatisfy {
+            $0.minX >= workspace.minX && $0.maxX <= workspace.maxX
+        })
+        XCTAssertFalse(layout.frames[0].intersects(obstacle))
+        XCTAssertFalse(layout.frames[0].intersects(layout.frames[1]))
+        XCTAssertFalse(layout.frames[1].intersects(layout.frames[2]))
+        XCTAssertEqual(layout.requiredWorkspace.width, workspace.width)
+        XCTAssertGreaterThan(layout.requiredWorkspace.height, workspace.height)
+
+        let zoomed = PracticePlacementPlanner.layout(
+            count: 1, source: .zero, occupied: [],
+            workspace: workspace, cameraScale: 2
+        )
+        XCTAssertEqual(zoomed.frames[0].width * 2, 320)
+        XCTAssertEqual(zoomed.frames[0].height * 2, 150)
+    }
+
+    func testCompactStatusThumbnailAndPencilToolContracts() {
+        XCTAssertEqual(EditorStatusPresentation("Saved"), .saved)
+        XCTAssertEqual(EditorStatusPresentation("Saving…"), .saving)
+        XCTAssertTrue(EditorStatusPresentation("Saving…").isProgress)
+        XCTAssertEqual(EditorStatusPresentation("Saved locally"), .offline)
+        XCTAssertEqual(EditorStatusPresentation("Save failed"), .error)
+        XCTAssertEqual(LibraryThumbnailPolicy.aspectRatio, 16.0 / 9.0)
+        XCTAssertTrue(PencilRadialPaletteModel.tools.contains(.select))
+    }
+
+    func testCheckWorkIsContextualToPracticeAndStudentInkOnSameBoard() {
+        func object(id: String, type: String, role: String? = nil) -> CanvasObject {
+            CanvasObject(
+                id: id, type: type, color: "#183153", width: 4, opacity: 1,
+                points: type == "stroke" ? [WorldPoint(x: 0, y: 0, pressure: 1)] : nil,
+                translation: nil, sourceMarkdown: nil, text: type == "text" ? "Problem" : nil,
+                x: type == "text" ? 0 : nil, y: type == "text" ? 0 : nil,
+                height: type == "text" ? 120 : nil, fontSize: 22, role: role
+            )
+        }
+        let practice = object(id: "practice", type: "text", role: "ai_practice_problem")
+        let work = object(id: "work", type: "stroke")
+
+        XCTAssertFalse(CheckWorkVisibilityPolicy.isVisible(
+            selected: [(boardID, practice)]
+        ))
+        XCTAssertTrue(CheckWorkVisibilityPolicy.isVisible(
+            selected: [(boardID, practice), (boardID, work)]
+        ))
+        XCTAssertFalse(CheckWorkVisibilityPolicy.isVisible(
+            selected: [(boardID, practice), ("other-board", work)]
+        ))
     }
 
     func testGraphWorkspacePreservesInvalidSourceAndReportsInlineError() {

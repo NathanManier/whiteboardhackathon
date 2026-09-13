@@ -1729,10 +1729,11 @@ final class ServerContractDecodingTests: XCTestCase {
         let source = #"Predict $\text{Pd}(0)$ for $\ce{SO4^{2-}}$, then use $\frac{a}{b} \rightarrow \alpha$."#
         let rendered = CompactStudyPresentation.readableText(from: source)
 
-        XCTAssertEqual(rendered, "Predict Pd(0) for SO4^2-, then use (a)/(b) → α.")
+        XCTAssertEqual(rendered, "Predict Pd(0) for SO4²⁻, then use (a)/(b) → α.")
         XCTAssertFalse(rendered.contains("\\frac"))
         XCTAssertFalse(rendered.contains("\\ce"))
         XCTAssertFalse(rendered.contains("$"))
+        XCTAssertEqual(CompactStudyPresentation.readableText(from: "$x^2+x_1$"), "x²+x₁")
     }
 
     func testStudyContentDocumentUsesBundledSanitizedRendererWithoutEmbeddingRawSource() {

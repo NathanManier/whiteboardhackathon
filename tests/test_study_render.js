@@ -102,6 +102,24 @@ const currency = render("The notebook costs $5 and the calculator costs $20.");
 assert(currency.includes("$5") && currency.includes("$20"), "ordinary currency was treated as math");
 assert(!currency.includes("class=\"katex"), "ordinary currency produced KaTeX");
 
+const malformedDelimiterCases = [
+  "Domain: $(-\\infty,\\infty)",
+  "Range: $[-1,1]",
+  "$$f(x)=\\sin(x) It defines f(x)$"
+];
+malformedDelimiterCases.forEach((source, index) => {
+  const repaired = ctx.repairMalformedMathDelimiters(source);
+  const html = render(repaired);
+  assert(html.includes("class=\"katex"),
+    `malformed delimiter case ${index + 1} did not produce formatted math`);
+  assert(!html.includes("$"),
+    `malformed delimiter case ${index + 1} leaked raw delimiter tokens`);
+});
+assert(
+  ctx.repairMalformedMathDelimiters("The notebook costs $5.") === "The notebook costs $5.",
+  "malformed-delimiter repair changed ordinary currency"
+);
+
 const notationMatrix = [
   "$x^2$", "$x_i$", "$\\frac{a}{b}$", "$\\sqrt{x}$",
   "$\\sum_{i=1}^{n} x_i$", "$\\int_0^1 x^2 dx$", "$\\vec{v}$",

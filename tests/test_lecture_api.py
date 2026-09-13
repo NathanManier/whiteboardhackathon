@@ -735,7 +735,7 @@ class LectureWorkspaceTests(unittest.TestCase):
             return_value={"title": "Check my work", "answer": "Result: Correct", "confidence": "high"},
         ) as explain:
             created = self.client.post(
-                f"/api/boards/{board_id}/study/explain",
+                f"/api/boards/{board_id}/study/check",
                 json={
                     "selectedObjectIds": ["text-problem", "text-answer"],
                     "selectionBBox": {"x": 40, "y": 40, "width": 420, "height": 102},
@@ -748,6 +748,9 @@ class LectureWorkspaceTests(unittest.TestCase):
         context = explain.call_args.kwargs["selection_context"]
         self.assertTrue(context["relationships"])
         self.assertEqual(created.get_json()["interaction"]["action"], "check_my_work")
+        listed = self.client.get(f"/api/boards/{board_id}/study")
+        self.assertEqual(listed.status_code, 200, listed.get_data(as_text=True))
+        self.assertEqual(listed.get_json()["interactions"], [])
 
     def test_study_guide_marks_stale_when_board_is_attached(self):
         folder = self.client.post("/api/folders", json={"name": "Mechanics"}).get_json()["folder"]

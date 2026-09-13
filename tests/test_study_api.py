@@ -237,6 +237,97 @@ class StudyApiTests(unittest.TestCase):
         saved = json.loads((self.board_dir / "study.json").read_text(encoding="utf-8"))
         self.assertEqual(len(saved["interactions"]), 1)
 
+    def test_direct_practice_is_idempotent_and_never_creates_explain_history(self):
+        views = {
+            "selected": "data:image/png;base64,aaa",
+            "context": "data:image/jpeg;base64,bbb",
+            "selection_bbox": {"x": 10, "y": 12, "width": 80, "height": 60},
+            "objects": [{"id": "black-abc123def456", "color": "#111111", "bbox": None}],
+        }
+        problems = [
+            {"id": "model-1", "problem": "Differentiate x squared."},
+            {"id": "model-2", "problem": "Evaluate the derivative at x equals 2."},
+            {"id": "model-3", "problem": "Find the tangent line."},
+        ]
+        request = {
+            "selectedObjectIds": ["black-abc123def456"],
+            "selectionBBox": {"x": 10, "y": 12, "width": 80, "height": 60},
+            "requestId": "abcdef0123456789",
+            "action": "explain",
+        }
+        with patch("study.service.render_views", return_value=views), patch(
+            "study.service.follow_up_question",
+            return_value={"type": "practice_problems", "problems": problems},
+        ) as practice_model, patch("study.service.explain_selection") as explain_model:
+            first = self.client.post(
+                f"/api/boards/{self.board_id}/study/practice", json=request
+            )
+            duplicate = self.client.post(
+                f"/api/boards/{self.board_id}/study/practice", json=request
+            )
+
+        self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
+        self.assertEqual(duplicate.status_code, 200, duplicate.get_data(as_text=True))
+        payload = first.get_json()
+        self.assertIsNone(payload["interaction"])
+        self.assertEqual(len(payload["problems"]), 3)
+        self.assertEqual(
+            [item["id"] for item in payload["problems"]],
+            [f"abcdef0123456789-{index}" for index in range(1, 4)],
+        )
+        self.assertEqual(duplicate.get_json()["problems"], payload["problems"])
+        self.assertTrue(duplicate.get_json()["idempotentReplay"])
+        self.assertEqual(practice_model.call_count, 1)
+        explain_model.assert_not_called()
+        saved = json.loads((self.board_dir / "study.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["interactions"], [])
+        self.assertEqual(len(saved["practice_requests"]), 1)
+
+    def test_new_explanation_supersedes_same_selection_marker_but_keeps_history(self):
+        views = {
+            "selected": "data:image/png;base64,aaa",
+            "context": "data:image/jpeg;base64,bbb",
+            "overview": "data:image/jpeg;base64,ccc",
+            "selection_bbox": {"x": 10, "y": 12, "width": 80, "height": 60},
+            "objects": [{"id": "black-abc123def456", "color": "#111111", "bbox": None}],
+        }
+        answers = [
+            {"title": "First", "answer": "First explanation.", "confidence": "high"},
+            {"title": "Replacement", "answer": "Replacement explanation.", "confidence": "high"},
+        ]
+        with patch("study.service.render_views", return_value=views), patch(
+            "study.service.explain_selection", side_effect=answers
+        ):
+            first = self.client.post(
+                f"/api/boards/{self.board_id}/study/explain",
+                json={
+                    "selectedObjectIds": ["black-abc123def456"],
+                    "selectionBBox": {"x": 10, "y": 12, "width": 80, "height": 60},
+                    "requestId": "1111111111111111",
+                },
+            )
+            second = self.client.post(
+                f"/api/boards/{self.board_id}/study/explain",
+                json={
+                    "selectedObjectIds": ["black-abc123def456"],
+                    "selectionBBox": {"x": 10, "y": 12, "width": 80, "height": 60},
+                    "requestId": "2222222222222222",
+                },
+            )
+            listed = self.client.get(f"/api/boards/{self.board_id}/study")
+
+        self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
+        self.assertEqual(second.status_code, 200, second.get_data(as_text=True))
+        self.assertEqual(listed.status_code, 200, listed.get_data(as_text=True))
+        self.assertEqual(
+            [item["id"] for item in listed.get_json()["interactions"]],
+            ["2222222222222222"],
+        )
+        saved = json.loads((self.board_dir / "study.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(saved["interactions"]), 2)
+        older = next(item for item in saved["interactions"] if item["id"] == "1111111111111111")
+        self.assertEqual(older["superseded_by"], "2222222222222222")
+
     def test_practice_problem_returns_problem_payload(self):
         views = {
             "selected": "data:image/png;base64,aaa",
@@ -252,12 +343,13 @@ class StudyApiTests(unittest.TestCase):
             "study.service.follow_up_question",
             return_value={
                 "title": "Practice problems",
-                "answer": "**Problem 1**\nFind the cross product of a = <1, 0, 0> and b = <0, 1, 0>.\n\n**Problem 2**\nFind the magnitude of a × b for a = <2, 0, 0> and b = <0, 3, 0>.",
+                "answer": "**Problem 1**\nFind the cross product of a = <1, 0, 0> and b = <0, 1, 0>.\n\n**Problem 2**\nFind the magnitude of a × b for a = <2, 0, 0> and b = <0, 3, 0>.\n\n**Problem 3**\nDetermine whether two vectors are parallel.",
                 "confidence": "medium",
                 "problem": "Find the cross product of a = <1, 0, 0> and b = <0, 1, 0>.",
                 "problems": [
                     {"id": "p1", "problem": "Find the cross product of a = <1, 0, 0> and b = <0, 1, 0>."},
                     {"id": "p2", "problem": "Find the magnitude of a × b for a = <2, 0, 0> and b = <0, 3, 0>."},
+                    {"id": "p3", "problem": "Determine whether two vectors are parallel."},
                 ],
                 "type": "practice_problems",
             },
@@ -281,9 +373,9 @@ class StudyApiTests(unittest.TestCase):
         self.assertEqual(follow.status_code, 200, follow.get_data(as_text=True))
         payload = follow.get_json()
         self.assertEqual(payload["type"], "practice_problems")
-        self.assertEqual(len(payload["problems"]), 2)
+        self.assertEqual(len(payload["problems"]), 3)
         problem_ids = [item["id"] for item in payload["problems"]]
-        self.assertEqual(len(set(problem_ids)), 2)
+        self.assertEqual(len(set(problem_ids)), 3)
         self.assertTrue(all(problem_id.startswith(payload["activeFollowUpId"]) for problem_id in problem_ids))
         self.assertEqual(
             payload["problems"][0]["problem"],
@@ -342,16 +434,17 @@ class StudyApiTests(unittest.TestCase):
         )
         self.assertEqual(result["problem"], "Find a \\times b.")
         self.assertNotIn("Solution", result["problem"])
-        two = parse_practice_problems(
+        three = parse_practice_problems(
             '{"type": "practice_problems", "problems": ['
             '{"id": "a", "problem": "Convert 1101 to decimal."},'
-            '{"id": "b", "problem": "Convert 1010 to decimal.\\nSolution: 10"}'
+            '{"id": "b", "problem": "Convert 1010 to decimal.\\nSolution: 10"},'
+            '{"id": "c", "problem": "Convert 1111 to decimal."}'
             "]}"
         )
-        self.assertEqual(len(two["problems"]), 2)
-        self.assertEqual(two["problems"][0]["problem"], "Convert 1101 to decimal.")
-        self.assertEqual(two["problems"][1]["problem"], "Convert 1010 to decimal.")
-        self.assertNotIn("Solution", two["problems"][1]["problem"])
+        self.assertEqual(len(three["problems"]), 3)
+        self.assertEqual(three["problems"][0]["problem"], "Convert 1101 to decimal.")
+        self.assertEqual(three["problems"][1]["problem"], "Convert 1010 to decimal.")
+        self.assertNotIn("Solution", three["problems"][1]["problem"])
 
     def test_ai_parsers_preserve_source_markdown_and_latex(self):
         from study.ai import LATEX_NOTATION_RULES, _parse_model_json, parse_practice_problem
@@ -1035,6 +1128,7 @@ class StudyApiTests(unittest.TestCase):
                                     "problems": [
                                         {"problem": r"Evaluate $\int \cos^2(x)\,dx$."},
                                         {"problem": r"Simplify $\cos^4(\theta)$ using power reduction."},
+                                        {"problem": r"Differentiate $\sin^2(x)$ using an identity."},
                                     ]
                                 })
                             }]
@@ -1075,13 +1169,13 @@ class StudyApiTests(unittest.TestCase):
             )
 
         self.assertEqual(captured["calls"], 1)
-        self.assertEqual(len(result["problems"]), 2)
+        self.assertEqual(len(result["problems"]), 3)
         config = captured["data"]["generationConfig"]
         self.assertEqual(config["thinkingConfig"]["thinkingLevel"], "minimal")
         self.assertFalse(config["thinkingConfig"]["includeThoughts"])
         self.assertEqual(config["responseMimeType"], "application/json")
-        self.assertEqual(config["responseJsonSchema"]["properties"]["problems"]["minItems"], 2)
-        self.assertEqual(config["responseJsonSchema"]["properties"]["problems"]["maxItems"], 2)
+        self.assertEqual(config["responseJsonSchema"]["properties"]["problems"]["minItems"], 3)
+        self.assertEqual(config["responseJsonSchema"]["properties"]["problems"]["maxItems"], 3)
         self.assertEqual(config["maxOutputTokens"], 640)
         self.assertEqual(len(captured["data"]["contents"]), 1)
         serialized = json.dumps(captured["data"])
@@ -1090,14 +1184,14 @@ class StudyApiTests(unittest.TestCase):
         self.assertLess(metrics["request_bytes"], 20_000)
         self.assertEqual(captured["timeout"], 20)
 
-    def test_practice_parser_requires_exactly_two_unique_problems(self):
+    def test_practice_parser_requires_exactly_three_unique_problems(self):
         from study.ai import StudyAIError, parse_practice_problems
 
         with self.assertRaises(StudyAIError):
             parse_practice_problems('{"problems": [{"problem": "Only one"}]}')
         with self.assertRaises(StudyAIError):
             parse_practice_problems(
-                '{"problems": [{"problem": "Duplicate"}, {"problem": "Duplicate"}]}'
+                '{"problems": [{"problem": "Duplicate"}, {"problem": "Duplicate"}, {"problem": "Third"}]}'
             )
 
     def test_practice_parser_never_rejects_problems_for_notation(self):
@@ -1107,10 +1201,11 @@ class StudyApiTests(unittest.TestCase):
             "problems": [
                 {"problem": r"What is the charge of $SO_4^{2-}$?"},
                 {"problem": r"Interpret $\unsupportedcommand{H_2O}$ and malformed $\frac$."},
+                {"problem": r"Balance $H_2 + O_2 \rightarrow H_2O$."},
             ]
         }))
 
-        self.assertEqual(len(result["problems"]), 2)
+        self.assertEqual(len(result["problems"]), 3)
         self.assertEqual(
             result["problems"][0]["problem"],
             r"What is the charge of $SO_4^{2-}$?",
