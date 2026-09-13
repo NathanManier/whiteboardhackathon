@@ -409,6 +409,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private var scrollPanRecognizer: UIPanGestureRecognizer!
     private var wheelZoomRecognizer: UIPanGestureRecognizer!
     private var pinchRecognizer: UIPinchGestureRecognizer!
+    private var graphFingerTapRecognizer: UITapGestureRecognizer!
+    private var graphPointerDoubleTapRecognizer: UITapGestureRecognizer!
     private var pencilInteraction: UIPencilInteraction!
     private var pencilHoverRecognizer: UIHoverGestureRecognizer!
     private var squeezeState = PencilPaletteStateMachine()
@@ -519,15 +521,27 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         addGestureRecognizer(pinch)
         pinchRecognizer = pinch
 
+        let graphFingerTap = UITapGestureRecognizer(target: self,
+                                                     action: #selector(didOpenGraph(_:)))
+        graphFingerTap.numberOfTapsRequired = PassiveGraphOpenPolicy.tapCount(for: .direct) ?? 1
+        graphFingerTap.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue)
+        ]
+        graphFingerTap.cancelsTouchesInView = true
+        graphFingerTap.delegate = self
+        graphFingerTapRecognizer = graphFingerTap
+        addGestureRecognizer(graphFingerTap)
         let graphDoubleTap = UITapGestureRecognizer(target: self,
-                                                     action: #selector(didDoubleTapGraph(_:)))
-        graphDoubleTap.numberOfTapsRequired = 2
+                                                     action: #selector(didOpenGraph(_:)))
+        graphDoubleTap.numberOfTapsRequired = PassiveGraphOpenPolicy.tapCount(
+            for: .indirectPointer
+        ) ?? 2
         graphDoubleTap.allowedTouchTypes = [
-            NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
         ]
         graphDoubleTap.cancelsTouchesInView = true
         graphDoubleTap.delegate = self
+        graphPointerDoubleTapRecognizer = graphDoubleTap
         addGestureRecognizer(graphDoubleTap)
 
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(pencilHover(_:)))
@@ -635,7 +649,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             applyPaletteEffect(squeezeState.toggle(
                 anchor: pendingSqueezeAnchor ?? point,
                 roll: pendingSqueezeRoll ?? roll,
-                initialIndex: PencilRadialPaletteModel.index(for: activeTool)
+                initialIndex: PencilRadialPaletteModel.index(for: activeTool),
+                itemCount: PencilRadialPaletteModel.tools.count
             ), point: point)
         }
         activeSqueezeAction = .none
@@ -1264,22 +1279,34 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldReceive touch: UITouch) -> Bool {
-        CanvasGestureHitTestPolicy.allowsCanvasGesture(from: touch.view, canvasRoot: self)
+        guard CanvasGestureHitTestPolicy.allowsCanvasGesture(
+            from: touch.view, canvasRoot: self
+        ) else { return false }
+        if gestureRecognizer === graphFingerTapRecognizer
+            || gestureRecognizer === graphPointerDoubleTapRecognizer {
+            return graphSelection(at: touch.location(in: self)) != nil
+        }
+        return true
     }
 
-    @objc private func didDoubleTapGraph(_ recognizer: UITapGestureRecognizer) {
+    @objc private func didOpenGraph(_ recognizer: UITapGestureRecognizer) {
         guard recognizer.state == .ended else { return }
-        let world = screenToWorld(recognizer.location(in: self))
+        guard let selection = graphSelection(at: recognizer.location(in: self)) else { return }
+        callbacks.onGraphDoubleTap(selection)
+    }
+
+    private func graphSelection(at screenPoint: CGPoint) -> SelectionKey? {
+        let world = screenToWorld(screenPoint)
         guard let item = boardItem(at: world),
               let graph = scenes[item.boardID]?.editor.objects.reversed().first(where: {
                 $0.graph != nil && BoardHitTestPolicy.bounds(of: $0).contains(
                     LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item)
                 )
-              })?.graph else { return }
-        callbacks.onGraphDoubleTap(SelectionKey(boardID: item.boardID,
-                                                objectID: graph.id,
-                                                kind: .editorObject,
-                                                objectType: "graph"))
+              })?.graph else { return nil }
+        return SelectionKey(boardID: item.boardID,
+                            objectID: graph.id,
+                            kind: .editorObject,
+                            objectType: "graph")
     }
 
     // MARK: - Pointer, Pencil, and tool routing

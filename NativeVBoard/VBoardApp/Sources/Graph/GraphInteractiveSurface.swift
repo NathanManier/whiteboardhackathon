@@ -1551,14 +1551,20 @@ private struct LightweightGraphSurface: View {
                     Button {
                         model.beginEditing(expression.id)
                     } label: {
-                        Group {
+                        VStack(alignment: .leading, spacing: 3) {
+                            if GraphCalculusSyntax.parse(expression.latex) != nil {
+                                Text("SOURCE")
+                                    .font(.caption2.weight(.semibold))
+                                    .tracking(0.7)
+                                    .foregroundStyle(.tertiary)
+                            }
                             if feedback?.isError == true {
                                 Text(expression.latex.isEmpty ? "Empty expression" : expression.latex)
                                     .font(.body.monospaced())
                                     .foregroundStyle(.primary)
                             } else {
                                 StudyContentView(
-                                    source: "\\(\(expression.latex)\\)",
+                                    source: "\\(\(model.displaySource(for: expression))\\)",
                                     maximumWidth: 310
                                 )
                             }
@@ -1575,8 +1581,16 @@ private struct LightweightGraphSurface: View {
                             Image(systemName: "exclamationmark.circle")
                                 .accessibilityHidden(true)
                         }
-                        Text(feedback.message)
-                            .font(feedback.isError ? .caption : .callout.monospacedDigit())
+                        VStack(alignment: .leading, spacing: 2) {
+                            if !feedback.isError,
+                               GraphCalculusSyntax.parse(expression.latex) != nil {
+                                Text("RESULT")
+                                    .font(.caption2.weight(.semibold))
+                                    .tracking(0.7)
+                            }
+                            Text(feedback.message)
+                                .font(feedback.isError ? .caption : .callout.monospacedDigit())
+                        }
                         Spacer(minLength: 0)
                     }
                     .foregroundStyle(feedback.isError ? Color.red : Color.secondary)
@@ -1652,11 +1666,13 @@ private struct LightweightGraphSurface: View {
                     Button("Color \(colorIndex + 1)") { model.setColor(hex, id: expression.id) }
                 }
             }
-            if let function = GraphMathEnvironment.functionDefinition(in: expression.latex) {
+            if GraphMathEnvironment.functionDefinition(in: expression.latex) != nil {
                 Divider()
-                Button("Add derivative") { _ = model.addExpression(source: "\(function.name)'()") }
+                Button("Add derivative") {
+                    model.beginGuidedCalculus(.derivative, from: expression.id)
+                }
                 Button("Add definite integral") {
-                    _ = model.addExpression(source: "integral(\(function.name)(x),,)")
+                    model.beginGuidedCalculus(.integral, from: expression.id)
                 }
             }
             Divider()
@@ -1677,7 +1693,7 @@ private struct LightweightGraphSurface: View {
                 GraphNativeFallbackSurface(graph: model.workingGraph, showsMetadata: false)
                     .contentShape(Rectangle())
                     .gesture(panGesture(size: proxy.size))
-                    .simultaneousGesture(zoomGesture)
+                    .simultaneousGesture(zoomGesture(size: proxy.size))
 
                 GraphIndirectNavigationCapture(
                     onPan: { state, translation in
@@ -1705,12 +1721,12 @@ private struct LightweightGraphSurface: View {
                 )
 
                 VStack(spacing: 0) {
-                    Button { zoom(by: 0.74) } label: {
+                    Button { zoom(by: GraphViewportNavigation.zoomInFactor) } label: {
                         Image(systemName: "plus")
                             .frame(width: 44, height: 44)
                     }
                     Divider().frame(width: 44)
-                    Button { zoom(by: 1.35) } label: {
+                    Button { zoom(by: GraphViewportNavigation.zoomOutFactor) } label: {
                         Image(systemName: "minus")
                             .frame(width: 44, height: 44)
                     }
@@ -1758,6 +1774,10 @@ private struct LightweightGraphSurface: View {
                 .accessibilityLabel("Hide math keyboard")
             }
 
+            if model.keyboardCategory == .calculus {
+                calculusGuidedControls
+            }
+
             let keys = keys(for: model.keyboardCategory)
             let columns = columnCount(for: model.keyboardCategory)
             LazyVGrid(
@@ -1798,6 +1818,70 @@ private struct LightweightGraphSurface: View {
         .background(Color(uiColor: CanvasDesignTokens.toolbarSurface))
     }
 
+    @ViewBuilder private var calculusGuidedControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                ForEach(GraphCalculusOperation.allCases) { operation in
+                    Button(operation.rawValue) { model.beginCalculus(operation) }
+                        .buttonStyle(.bordered)
+                        .tint(operation == .derivative || operation == .integral
+                              ? Color.accentColor : Color.secondary)
+                        .disabled(model.calculusOperand == nil)
+                }
+            }
+            if let draft = model.calculusDraft {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Function")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text(draft.functionSource)
+                            .font(.callout.monospaced())
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    if draft.operation == .derivative, model.calculusDraftRequiresPoint {
+                        semanticField("At x", value: calculusBinding(\.evaluationPoint), width: 100)
+                    }
+                    if draft.operation == .integral {
+                        semanticField("Lower", value: calculusBinding(\.lowerBound), width: 90)
+                        semanticField("Upper", value: calculusBinding(\.upperBound), width: 90)
+                    }
+                    Button("Create") { _ = model.commitCalculusDraft() }
+                        .buttonStyle(.borderedProminent)
+                    Button("Cancel") { model.cancelCalculus() }
+                        .buttonStyle(.plain)
+                }
+                .padding(10)
+                .background(Color.accentColor.opacity(0.06),
+                            in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+
+    private func calculusBinding(_ keyPath: WritableKeyPath<GraphCalculusDraft, String>)
+        -> Binding<String> {
+        Binding(
+            get: { model.calculusDraft?[keyPath: keyPath] ?? "" },
+            set: { value in
+                guard var draft = model.calculusDraft else { return }
+                draft[keyPath: keyPath] = value
+                model.calculusDraft = draft
+            }
+        )
+    }
+
+    private func semanticField(_ label: String, value: Binding<String>,
+                               width: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            TextField(label, text: value)
+                .textFieldStyle(.roundedBorder)
+                .keyboardType(.numbersAndPunctuation)
+        }
+        .frame(width: width)
+    }
+
     private func columnCount(for category: GraphMathKeyboardCategory) -> Int {
         switch category {
         case .basic: return 6
@@ -1836,10 +1920,6 @@ private struct LightweightGraphSurface: View {
             ]
         case .calculus:
             return [
-                .template("f′( )", "f'()", 1, spoken: "derivative at a point", emphasized: true),
-                .template("d/dx", "d/dx()", 1, spoken: "derivative expression", emphasized: true),
-                .template("∫ bounds", "integral(,,)", 3,
-                          spoken: "definite integral with bounds", emphasized: true),
                 .template("f(x)=", "f(x)=", 0, spoken: "define function f"),
                 .template("g(x)=", "g(x)=", 0, spoken: "define function g"),
                 .template("a=", "a=", 0, spoken: "define parameter a"),
@@ -1869,13 +1949,19 @@ private struct LightweightGraphSurface: View {
             }
     }
 
-    private var zoomGesture: some Gesture {
-        MagnificationGesture()
+    private func zoomGesture(size: CGSize) -> some Gesture {
+        MagnifyGesture()
             .onChanged { value in
                 let start = magnificationStart ?? model.viewport
                 if magnificationStart == nil { magnificationStart = start }
-                let scale = min(20, max(0.05, Double(value)))
-                model.updateViewport(GraphViewportNavigation.zoomed(start, by: 1 / scale))
+                let scale = min(20, max(0.05, Double(value.magnification)))
+                let midpoint = CGPoint(
+                    x: value.startAnchor.x * size.width,
+                    y: value.startAnchor.y * size.height
+                )
+                model.updateViewport(GraphViewportNavigation.zoomed(
+                    start, by: 1 / scale, anchor: midpoint, size: size
+                ))
             }
             .onEnded { _ in
                 magnificationStart = nil

@@ -9,6 +9,23 @@ enum GraphMathKeyboardCategory: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum GraphCalculusOperation: String, CaseIterable, Identifiable {
+    case derivative = "Derivative"
+    case integral = "Integral"
+    case evaluate = "Evaluate"
+    case roots = "Roots"
+
+    var id: String { rawValue }
+}
+
+struct GraphCalculusDraft: Equatable {
+    var operation: GraphCalculusOperation
+    var functionSource: String
+    var evaluationPoint = ""
+    var lowerBound = "0"
+    var upperBound = "2"
+}
+
 enum GraphRowFeedbackKind: Equatable {
     case value
     case derivative
@@ -93,6 +110,9 @@ enum GraphMathInsertionPlan {
 }
 
 enum GraphViewportNavigation {
+    static let zoomInFactor = 0.8
+    static let zoomOutFactor = 1 / zoomInFactor
+
     static func zoomed(_ source: GraphViewport, by factor: Double,
                        anchor: CGPoint? = nil, size: CGSize? = nil) -> GraphViewport {
         let safe = min(4, max(0.25, factor))
@@ -140,6 +160,7 @@ final class GraphWorkspaceModel: ObservableObject {
     @Published var selectedExpressionID: String?
     @Published var editingExpressionID: String?
     @Published var keyboardCategory: GraphMathKeyboardCategory = .basic
+    @Published var calculusDraft: GraphCalculusDraft?
 
     private let onExpressionMutation: ExpressionMutationSink
 
@@ -296,10 +317,123 @@ final class GraphWorkspaceModel: ObservableObject {
     }
 
     @discardableResult
-    func addParameter(named name: String, value: Double = 1) -> String? {
+    func addParameter(named name: String, value: Double = 0) -> String? {
         guard GraphMathEnvironment.scalarDefinition(in: "\(name)=1")?.name == name,
               mathEnvironment.variables[name] == nil else { return nil }
-        return addExpression(source: "\(name)=\(Self.format(value))")
+        guard expressions.count < GraphRecognitionController.maximumExpressions else {
+            return nil
+        }
+        let expression = GraphExpression(
+            id: "native-\(UUID().uuidString.lowercased())",
+            latex: "\(name)=\(Self.format(value))",
+            type: .unknown,
+            additionalFields: [
+                "slider_min": .number(-10),
+                "slider_max": .number(10),
+                "slider_step": .number(0.1)
+            ]
+        )
+        var next = expressions
+        next.append(expression)
+        commitExpressions(next)
+        selectedExpressionID = expression.id
+        return expression.id
+    }
+
+    func beginCalculus(_ operation: GraphCalculusOperation) {
+        guard let source = calculusOperand else { return }
+        if operation == .evaluate {
+            _ = addExpression(source: source)
+            return
+        }
+        if operation == .roots {
+            _ = addExpression(source: "\(source)=0")
+            return
+        }
+        calculusDraft = GraphCalculusDraft(
+            operation: operation,
+            functionSource: source,
+            evaluationPoint: operation == .derivative ? "" : "",
+            lowerBound: "0", upperBound: "2"
+        )
+    }
+
+    /// Enters the visible guided-calculus workflow from a read-mode row.
+    /// The semantic fields live in the Calculus keyboard tray, so the row,
+    /// keyboard category, and operation draft must transition together.
+    func beginGuidedCalculus(_ operation: GraphCalculusOperation,
+                             from expressionID: String) {
+        guard expression(id: expressionID) != nil else { return }
+        beginEditing(expressionID)
+        keyboardCategory = .calculus
+        beginCalculus(operation)
+    }
+
+    func cancelCalculus() { calculusDraft = nil }
+
+    @discardableResult
+    func commitCalculusDraft() -> String? {
+        guard let draft = calculusDraft else { return nil }
+        let source: String
+        switch draft.operation {
+        case .derivative:
+            if let definition = GraphMathEnvironment.functionDefinition(
+                in: expression(id: selectedExpressionID ?? "")?.latex ?? ""
+            ) {
+                let point = draft.evaluationPoint.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                source = point.isEmpty
+                    ? "d/dx(\(definition.name)(x))"
+                    : "\(definition.name)'(\(point))"
+            } else {
+                source = "d/dx(\(draft.functionSource))"
+            }
+        case .integral:
+            let lower = draft.lowerBound.trimmingCharacters(in: .whitespacesAndNewlines)
+            let upper = draft.upperBound.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !lower.isEmpty, !upper.isEmpty else { return nil }
+            source = "integral(\(draft.functionSource),\(lower),\(upper))"
+        case .evaluate, .roots:
+            return nil
+        }
+        calculusDraft = nil
+        return addExpression(source: source)
+    }
+
+    var calculusOperand: String? {
+        guard let id = selectedExpressionID, let expression = expression(id: id) else {
+            return nil
+        }
+        if let definition = GraphMathEnvironment.functionDefinition(in: expression.latex) {
+            return "\(definition.name)(x)"
+        }
+        if let right = GraphEquationClassifier.explicitRightHandSide(expression.latex) {
+            return right.isEmpty ? nil : right
+        }
+        let source = GraphLatexNormalizer.normalize(expression.latex)
+        return source.isEmpty || GraphCalculusSyntax.parse(source) != nil ? nil : source
+    }
+
+    var calculusDraftRequiresPoint: Bool {
+        guard calculusDraft?.operation == .derivative,
+              let id = selectedExpressionID, let expression = expression(id: id) else {
+            return false
+        }
+        return GraphMathEnvironment.functionDefinition(in: expression.latex) != nil
+    }
+
+    func displaySource(for expression: GraphExpression) -> String {
+        switch GraphCalculusSyntax.parse(expression.latex) {
+        case .derivative(let operand):
+            return "\\frac{d}{dx}\\left(\(operand)\\right)"
+        case .prime(let function, let order, let argument):
+            return "\(function)\(String(repeating: "'", count: order))(\(argument))"
+        case .definiteIntegral(let integrand, let lower, let upper):
+            return "\\int_{\(lower)}^{\(upper)} \(integrand)\\,dx"
+        case nil:
+            return expression.latex
+        }
     }
 
     func undefinedParameters(for expression: GraphExpression) -> [String] {
@@ -332,11 +466,23 @@ final class GraphWorkspaceModel: ObservableObject {
                 return friendlyError(error, source: source, environment: environment)
             }
         }
-        if let derivative = derivativeCall(normalized, environment: environment) {
+        switch GraphCalculusSyntax.parse(normalized) {
+        case .prime(let function, let order, let argument):
             do {
-                let point = try scalarValue(derivative.argument, environment: environment)
+                guard let body = environment.functions[function] else {
+                    return GraphRowFeedback(
+                        kind: .error, message: "Unknown function \(function)."
+                    )
+                }
+                if argument == "x" {
+                    return GraphRowFeedback(
+                        kind: .derivative,
+                        message: order == 1 ? "Derivative function" : "Derivative order \(order)"
+                    )
+                }
+                let point = try scalarValue(argument, environment: environment)
                 let result = try NativeGraphMath.derivative(
-                    derivative.body, at: point,
+                    body, at: point, order: order,
                     angleMode: workingGraph.settings.angleMode,
                     variables: environment.variables,
                     functions: environment.functions
@@ -348,25 +494,38 @@ final class GraphWorkspaceModel: ObservableObject {
             } catch {
                 return friendlyError(error, source: source, environment: environment)
             }
-        }
-        if let integrand = derivativeExpression(normalized, environment: environment) {
+        case .derivative(let operand):
+            let integrand = resolvedCalculusOperand(operand, environment: environment)
             do {
-                _ = try SafeGraphExpression(
+                let parsed = try SafeGraphExpression(
                     source: integrand, angleMode: workingGraph.settings.angleMode,
                     variables: environment.variables, functions: environment.functions
                 )
-                return GraphRowFeedback(kind: .derivative, message: "Derivative")
+                guard !parsed.usesVariable else {
+                    return GraphRowFeedback(kind: .derivative, message: "Derivative function")
+                }
+                let result = try NativeGraphMath.derivative(
+                    integrand, at: 0,
+                    angleMode: workingGraph.settings.angleMode,
+                    variables: environment.variables,
+                    functions: environment.functions
+                )
+                return GraphRowFeedback(
+                    kind: .derivative,
+                    message: Self.format(result.values.first ?? .nan)
+                )
             } catch {
                 return friendlyError(error, source: source, environment: environment)
             }
-        }
-        if normalized.hasPrefix("integral(") {
+        case .definiteIntegral:
             do {
                 let value = try integralValue(normalized, environment: environment)
                 return GraphRowFeedback(kind: .integral, message: Self.format(value))
             } catch {
                 return friendlyError(error, source: source, environment: environment)
             }
+        case nil:
+            break
         }
         if let relation = GraphEquationClassifier.relation(in: source) {
             do {
@@ -455,23 +614,12 @@ final class GraphWorkspaceModel: ObservableObject {
         return GraphRowFeedback(kind: .error, message: "Complete this expression.")
     }
 
-    private func derivativeCall(_ source: String,
-                                environment: GraphMathEnvironment)
-        -> (body: String, argument: String)? {
-        guard source.hasSuffix(")"), let marker = source.range(of: "'(") else { return nil }
-        let name = String(source[..<marker.lowerBound])
-        let argumentStart = marker.upperBound
-        let argument = String(source[argumentStart..<source.index(before: source.endIndex)])
-        guard !argument.isEmpty, let body = environment.functions[name] else { return nil }
-        return (body, argument)
-    }
-
-    private func derivativeExpression(_ source: String,
-                                      environment: GraphMathEnvironment) -> String? {
-        guard source.hasPrefix("d/dx("), source.hasSuffix(")") else { return nil }
-        let inner = String(source.dropFirst(5).dropLast())
-        guard inner.hasSuffix("(x)"),
-              let body = environment.functions[String(inner.dropLast(3))] else { return nil }
+    private func resolvedCalculusOperand(_ source: String,
+                                         environment: GraphMathEnvironment) -> String {
+        guard source.hasSuffix("(x)"),
+              let body = environment.functions[String(source.dropLast(3))] else {
+            return source
+        }
         return body
     }
 

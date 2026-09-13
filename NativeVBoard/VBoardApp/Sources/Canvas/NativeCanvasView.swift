@@ -5,6 +5,20 @@ enum CanvasTool: String, CaseIterable, Sendable {
     case navigation, pen, highlighter, select, lasso, objectEraser
 }
 
+enum PassiveGraphOpenPolicy {
+    /// Finger taps promote a passive graph immediately. Trackpad/mouse keeps
+    /// the familiar double-click gesture, and Pencil is never intercepted so
+    /// it continues through the active drawing/editing tool.
+    static func tapCount(for touchType: UITouch.TouchType) -> Int? {
+        switch touchType {
+        case .direct: return 1
+        case .indirectPointer: return 2
+        case .pencil, .indirect: return nil
+        @unknown default: return nil
+        }
+    }
+}
+
 struct CanvasStrokeStyle: Equatable, Sendable {
     var colorHex: String
     var width: Double
@@ -476,6 +490,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var scrollPanGesture: UIPanGestureRecognizer!
     private var wheelZoomGesture: UIPanGestureRecognizer!
     private var pinchGesture: UIPinchGestureRecognizer!
+    private var graphFingerTapGesture: UITapGestureRecognizer!
+    private var graphPointerDoubleTapGesture: UITapGestureRecognizer!
     private var isSpacePressed = false
     private var interactionState: InteractionState = .idle
     private var activeInputSource: InputSource = .touch
@@ -669,15 +685,27 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                                    NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         pinch.cancelsTouchesInView = true
         pinch.delegate = self; pinchGesture = pinch; addGestureRecognizer(pinch)
+        let graphFingerTap = UITapGestureRecognizer(target: self,
+                                                     action: #selector(didOpenGraph(_:)))
+        graphFingerTap.numberOfTapsRequired = PassiveGraphOpenPolicy.tapCount(for: .direct) ?? 1
+        graphFingerTap.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue)
+        ]
+        graphFingerTap.cancelsTouchesInView = true
+        graphFingerTap.delegate = self
+        graphFingerTapGesture = graphFingerTap
+        addGestureRecognizer(graphFingerTap)
         let graphDoubleTap = UITapGestureRecognizer(target: self,
-                                                     action: #selector(didDoubleTapGraph(_:)))
-        graphDoubleTap.numberOfTapsRequired = 2
+                                                     action: #selector(didOpenGraph(_:)))
+        graphDoubleTap.numberOfTapsRequired = PassiveGraphOpenPolicy.tapCount(
+            for: .indirectPointer
+        ) ?? 2
         graphDoubleTap.allowedTouchTypes = [
-            NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
         ]
         graphDoubleTap.cancelsTouchesInView = true
         graphDoubleTap.delegate = self
+        graphPointerDoubleTapGesture = graphDoubleTap
         addGestureRecognizer(graphDoubleTap)
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(pencilHover(_:)))
         hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
@@ -807,7 +835,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             applyPaletteEffect(squeezeState.toggle(
                 anchor: pendingSqueezeAnchor ?? point,
                 roll: pendingSqueezeRoll ?? roll,
-                initialIndex: PencilRadialPaletteModel.index(for: activeTool)
+                initialIndex: PencilRadialPaletteModel.index(for: activeTool),
+                itemCount: PencilRadialPaletteModel.tools.count
             ), point: point)
         }
         activeSqueezeAction = .none
@@ -1339,7 +1368,14 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldReceive touch: UITouch) -> Bool {
-        CanvasGestureHitTestPolicy.allowsCanvasGesture(from: touch.view, canvasRoot: self)
+        guard CanvasGestureHitTestPolicy.allowsCanvasGesture(
+            from: touch.view, canvasRoot: self
+        ) else { return false }
+        if gestureRecognizer === graphFingerTapGesture
+            || gestureRecognizer === graphPointerDoubleTapGesture {
+            return graphObjectID(at: touch.location(in: self)) != nil
+        }
+        return true
     }
 
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -1348,13 +1384,17 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         return true
     }
 
-    @objc private func didDoubleTapGraph(_ recognizer: UITapGestureRecognizer) {
+    @objc private func didOpenGraph(_ recognizer: UITapGestureRecognizer) {
         guard recognizer.state == .ended else { return }
-        let world = worldPoint(recognizer.location(in: self), from: self)
-        guard let graphID = objects.reversed().first(where: {
-            $0.graph != nil && BoardHitTestPolicy.bounds(of: $0).contains(world)
-        })?.id else { return }
+        guard let graphID = graphObjectID(at: recognizer.location(in: self)) else { return }
         onGraphDoubleTap(graphID)
+    }
+
+    private func graphObjectID(at screenPoint: CGPoint) -> String? {
+        let world = worldPoint(screenPoint, from: self)
+        return objects.reversed().first(where: {
+            $0.graph != nil && BoardHitTestPolicy.bounds(of: $0).contains(world)
+        })?.id
     }
 
     private var drawsWithFinger: Bool {

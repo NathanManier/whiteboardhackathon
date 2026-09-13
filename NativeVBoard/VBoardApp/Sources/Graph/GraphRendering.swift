@@ -1139,6 +1139,83 @@ enum GraphEquationClassifier {
     }
 }
 
+/// First-class calculus syntax recognized before the ordinary expression
+/// grammar. Guided controls and direct keyboard input both produce these same
+/// canonical nodes, so operator names can never masquerade as free scalars.
+enum GraphCalculusSyntax: Equatable, Sendable {
+    case derivative(operand: String)
+    case prime(function: String, order: Int, argument: String)
+    case definiteIntegral(integrand: String, lower: String, upper: String)
+
+    static func parse(_ source: String) -> GraphCalculusSyntax? {
+        let value = GraphLatexNormalizer.normalize(source)
+        if value.hasPrefix("d/dx("), value.hasSuffix(")"),
+           enclosesWholeSuffix(value, openingAt: 4) {
+            return .derivative(operand: String(value.dropFirst(5).dropLast()))
+        }
+        if value.hasPrefix("integral("), value.hasSuffix(")"),
+           enclosesWholeSuffix(value, openingAt: 8) {
+            let arguments = splitArguments(String(value.dropFirst(9).dropLast()))
+            guard arguments.count == 3 else { return nil }
+            return .definiteIntegral(
+                integrand: arguments[0], lower: arguments[1], upper: arguments[2]
+            )
+        }
+        let characters = Array(value)
+        var index = 0
+        guard index < characters.count, characters[index].isLetter else { return nil }
+        while index < characters.count,
+              characters[index].isLetter || characters[index].isNumber
+                || characters[index] == "_" { index += 1 }
+        let name = String(characters[..<index])
+        let primeStart = index
+        while index < characters.count, characters[index] == "'" { index += 1 }
+        let order = index - primeStart
+        guard !name.isEmpty, order > 0, index < characters.count,
+              characters[index] == "(", value.hasSuffix(")"),
+              enclosesWholeSuffix(value, openingAt: index) else { return nil }
+        let argumentStart = value.index(value.startIndex, offsetBy: index + 1)
+        return .prime(
+            function: name, order: order,
+            argument: String(value[argumentStart..<value.index(before: value.endIndex)])
+        )
+    }
+
+    private static func enclosesWholeSuffix(_ value: String, openingAt offset: Int) -> Bool {
+        let characters = Array(value)
+        guard offset < characters.count, characters[offset] == "(" else { return false }
+        var depth = 0
+        for index in offset..<characters.count {
+            if characters[index] == "(" { depth += 1 }
+            if characters[index] == ")" {
+                depth -= 1
+                if depth == 0 { return index == characters.count - 1 }
+                if depth < 0 { return false }
+            }
+        }
+        return false
+    }
+
+    private static func splitArguments(_ source: String) -> [String] {
+        var depth = 0
+        var start = source.startIndex
+        var result: [String] = []
+        var index = source.startIndex
+        while index < source.endIndex {
+            let character = source[index]
+            if character == "(" { depth += 1 }
+            if character == ")" { depth -= 1 }
+            if character == ",", depth == 0 {
+                result.append(String(source[start..<index]))
+                start = source.index(after: index)
+            }
+            index = source.index(after: index)
+        }
+        result.append(String(source[start...]))
+        return result
+    }
+}
+
 /// Board-local math definitions derived from canonical expression source.
 /// Nothing in this environment is persisted separately: scalar values and
 /// user functions are rebuilt from rows such as `a=2` and `f(x)=sin(x)`.
@@ -1201,37 +1278,42 @@ struct GraphMathEnvironment: Equatable, Sendable {
 
     func undefinedSliderParameters(in source: String) -> [String] {
         let normalized = GraphLatexNormalizer.normalize(source)
-        var rightHandSource: String
+        let rightHandSource: String
         if let relation = GraphEquationClassifier.relation(in: normalized),
            relation.left == "y" || relation.left.hasSuffix("(x)") {
             rightHandSource = relation.right
         } else {
             rightHandSource = normalized
         }
-        if rightHandSource.hasPrefix("d/dx("), rightHandSource.hasSuffix(")") {
-            rightHandSource = String(rightHandSource.dropFirst(5).dropLast())
+        let analysisSources: [String]
+        switch GraphCalculusSyntax.parse(rightHandSource) {
+        case .derivative(let operand):
+            analysisSources = [resolvedFunctionBody(operand) ?? operand]
+        case .prime(let name, _, let argument):
+            analysisSources = [argument, functions[name]].compactMap { $0 }
+        case .definiteIntegral(let integrand, let lower, let upper):
+            analysisSources = [resolvedFunctionBody(integrand) ?? integrand, lower, upper]
+        case nil:
+            analysisSources = [rightHandSource]
         }
-        let characters = Array(rightHandSource)
         var result = Set<String>()
-        var index = 0
-        while index < characters.count {
-            guard characters[index].isLetter else { index += 1; continue }
-            let start = index
-            while index < characters.count, characters[index].isLetter { index += 1 }
-            let name = String(characters[start..<index])
-            let isCall = index < characters.count && (
-                characters[index] == "("
-                || (characters[index] == "'"
-                    && index + 1 < characters.count
-                    && characters[index + 1] == "(")
-            )
-            if Self.isSliderIdentifier(name), !isCall,
-               variables[name] == nil, name != "x", name != "y",
-               name != "e", name != "pi" {
-                result.insert(name)
-            }
+        for analysisSource in analysisSources where !analysisSource.isEmpty {
+            guard let expression = try? SafeGraphExpression(
+                source: analysisSource,
+                variables: variables,
+                functions: functions,
+                permitsUndefinedScalars: true
+            ) else { continue }
+            result.formUnion(expression.referencedVariables.filter {
+                Self.isSliderIdentifier($0) && variables[$0] == nil
+            })
         }
         return result.sorted()
+    }
+
+    private func resolvedFunctionBody(_ source: String) -> String? {
+        guard source.hasSuffix("(x)") else { return nil }
+        return functions[String(source.dropLast(3))]
     }
 
     private static func isIdentifier(_ value: String) -> Bool {
@@ -1406,6 +1488,21 @@ struct SafeGraphExpression {
                     || body.usesFreeVariable(boundX: true)
             }
         }
+
+        func referencedVariables() -> Set<String> {
+            switch self {
+            case .number:
+                return []
+            case .variable(let name):
+                return [name]
+            case .negated(let value), .function(_, let value):
+                return value.referencedVariables()
+            case .binary(_, let lhs, let rhs):
+                return lhs.referencedVariables().union(rhs.referencedVariables())
+            case .userFunction(let argument, let body):
+                return argument.referencedVariables().union(body.referencedVariables())
+            }
+        }
     }
 
     private enum Token: Equatable {
@@ -1419,15 +1516,18 @@ struct SafeGraphExpression {
     private let usesDegrees: Bool
 
     var usesVariable: Bool { root.usesFreeVariable() }
+    var referencedVariables: Set<String> { root.referencedVariables() }
 
     init(source: String, angleMode: String? = "radians",
-         variables: [String: Double] = [:], functions: [String: String] = [:]) throws {
+         variables: [String: Double] = [:], functions: [String: String] = [:],
+         permitsUndefinedScalars: Bool = false) throws {
         let normalized = GraphLatexNormalizer.normalize(source)
         guard normalized.count <= Self.maximumSourceLength else {
             throw GraphRendererError.invalidExpression("expression too long")
         }
         var parser = try Parser(source: normalized, variables: variables,
-                                functions: functions)
+                                functions: functions,
+                                permitsUndefinedScalars: permitsUndefinedScalars)
         root = try parser.parse()
         usesDegrees = angleMode == "degrees"
     }
@@ -1455,13 +1555,16 @@ struct SafeGraphExpression {
         private let variables: [String: Double]
         private let userFunctions: [String: String]
         private let functionDepth: Int
+        private let permitsUndefinedScalars: Bool
 
         init(source: String, variables: [String: Double] = [:],
-             functions: [String: String] = [:], functionDepth: Int = 0) throws {
+             functions: [String: String] = [:], functionDepth: Int = 0,
+             permitsUndefinedScalars: Bool = false) throws {
             tokens = try Self.tokenize(source)
             self.variables = variables
             userFunctions = functions
             self.functionDepth = functionDepth
+            self.permitsUndefinedScalars = permitsUndefinedScalars
         }
 
         mutating func parse() throws -> Node {
@@ -1536,6 +1639,9 @@ struct SafeGraphExpression {
                 if let value = variables[name], value.isFinite {
                     return try make(.number(value))
                 }
+                if permitsUndefinedScalars, current != .symbol("(") {
+                    return try make(.variable(name))
+                }
                 let isBuiltInFunction = Self.functions.contains(name)
                 let userFunctionBody = userFunctions[name]
                 guard isBuiltInFunction || userFunctionBody != nil else {
@@ -1562,7 +1668,8 @@ struct SafeGraphExpression {
                 var bodyParser = try Parser(
                     source: GraphLatexNormalizer.normalize(bodySource),
                     variables: variables, functions: nestedFunctions,
-                    functionDepth: functionDepth + 1
+                    functionDepth: functionDepth + 1,
+                    permitsUndefinedScalars: permitsUndefinedScalars
                 )
                 let body = try bodyParser.parse()
                 return try make(.userFunction(argument: argument, body: body))
@@ -1766,18 +1873,30 @@ enum NativeGraphMath {
                                      isExact: false)
     }
 
-    static func derivative(_ source: String, at x: Double,
+    static func derivative(_ source: String, at x: Double, order: Int = 1,
                            angleMode: String? = "radians",
                            variables: [String: Double] = [:],
                            functions: [String: String] = [:]) throws -> NativeGraphMathResult {
+        guard (1...2).contains(order) else {
+            throw GraphRendererError.invalidExpression("derivative order")
+        }
         let expression = try explicitExpression(
             source, angleMode: angleMode, variables: variables, functions: functions
         )
         let h = max(1e-6, abs(x) * 1e-5)
-        let value = (expression.evaluate(x: x - 2 * h)
+        let value: Double
+        if order == 1 {
+            value = (expression.evaluate(x: x - 2 * h)
                      - 8 * expression.evaluate(x: x - h)
                      + 8 * expression.evaluate(x: x + h)
                      - expression.evaluate(x: x + 2 * h)) / (12 * h)
+        } else {
+            let secondStep = max(1e-4, abs(x) * 1e-4)
+            value = (expression.evaluate(x: x + secondStep)
+                     - 2 * expression.evaluate(x: x)
+                     + expression.evaluate(x: x - secondStep))
+                / (secondStep * secondStep)
+        }
         guard value.isFinite else { throw GraphRendererError.invalidExpression("derivative undefined") }
         return NativeGraphMathResult(kind: .derivative, values: [value],
                                      message: "f′(\(format(x))) ≈ \(format(value))", isExact: false)
