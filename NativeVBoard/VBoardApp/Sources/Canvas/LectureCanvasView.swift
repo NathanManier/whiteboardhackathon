@@ -1253,13 +1253,17 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         }
         guard owner == .stroke, isDrawingTouch(touch),
               let item = boardItem(at: world),
-              boardViews[item.boardID]?.hasFullScene == true else {
+              scenes[item.boardID] != nil else {
             if let item = boardItem(at: world) {
                 callbacks.onActiveBoardChanged(item.boardID)
                 callbacks.onDetailDemand([item.boardID])
             }
             return
         }
+        // Rendering LOD is presentation state, not input authority. Once the
+        // canonical board scene exists, let the user draw immediately over a
+        // thumbnail/refining representation and promote detail in parallel.
+        callbacks.onDetailDemand([item.boardID])
         let strokeID = UUID().uuidString
         recentlyCommittedStroke = nil
         strokeAccumulator.reset()
