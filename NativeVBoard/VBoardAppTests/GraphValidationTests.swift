@@ -100,7 +100,7 @@ final class GraphPersistenceValidatorTests: XCTestCase {
 
         XCTAssertEqual(clean.frame, GraphFrame(x: -240.1235, y: 900.9877,
                                                width: 640.1235, height: 420.9877))
-        XCTAssertEqual(clean.expressions[0].latex, "y=x^2-4")
+        XCTAssertEqual(clean.expressions[0].latex, "  y=x^2-4  ")
         XCTAssertEqual(clean.expressions[0].displayStyle?.color, "#2d70b3")
         XCTAssertEqual(clean.expressions[0].displayStyle?.lineWidth, 3.1235)
         XCTAssertEqual(clean.expressions[0].displayStyle?.opacity, 0.8765)
@@ -134,9 +134,7 @@ final class GraphPersistenceValidatorTests: XCTestCase {
     }
 
     func testExpressionCountIDsAndFutureTypesMatchServerLimits() throws {
-        validationPath("graph.expressions") {
-            try GraphPersistenceValidator.validate(graph(expressions: []))
-        }
+        XCTAssertNoThrow(try GraphPersistenceValidator.validate(graph(expressions: [])))
         validationPath("graph.expressions") {
             let expressions = (0..<9).map { expression(id: "expression-\($0)") }
             try GraphPersistenceValidator.validate(graph(expressions: expressions))

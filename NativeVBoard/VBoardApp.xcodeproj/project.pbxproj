@@ -51,6 +51,7 @@
 		Q001 /* Sources/Canvas/PencilInputSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = Q101 /* Sources/Canvas/PencilInputSystem.swift */; };
 		R001 /* PencilInputSystemTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = R101 /* PencilInputSystemTests.swift */; };
 		S001 /* Sources/API/VBoardPerformanceTrace.swift in Sources */ = {isa = PBXBuildFile; fileRef = S101 /* Sources/API/VBoardPerformanceTrace.swift */; };
+		T001 /* Sources/Graph/GraphWorkspaceModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = T101 /* Sources/Graph/GraphWorkspaceModel.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -130,6 +131,7 @@
 		Q101 /* Sources/Canvas/PencilInputSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Canvas/PencilInputSystem.swift; sourceTree = "<group>"; };
 		R101 /* PencilInputSystemTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilInputSystemTests.swift; sourceTree = "<group>"; };
 		S101 /* Sources/API/VBoardPerformanceTrace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/API/VBoardPerformanceTrace.swift; sourceTree = "<group>"; };
+		T101 /* Sources/Graph/GraphWorkspaceModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Graph/GraphWorkspaceModel.swift; sourceTree = "<group>"; };
 		B001 /* VBoardApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VBoardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B002 /* VBoardAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = VBoardAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B003 /* VBoardShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; path = VBoardShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -206,6 +208,7 @@
 				K101 /* Sources/Graph/GraphInteractiveSurface.swift */,
 				M101 /* Sources/Graph/GraphProxyCache.swift */,
 				N101 /* Sources/Graph/GraphValidation.swift */,
+				T101 /* Sources/Graph/GraphWorkspaceModel.swift */,
 				A124 /* Resources/Assets.xcassets */,
 			);
 			path = VBoardApp;
@@ -421,6 +424,7 @@
 				K001 /* Sources/Graph/GraphInteractiveSurface.swift in Sources */,
 				M001 /* Sources/Graph/GraphProxyCache.swift in Sources */,
 				N001 /* Sources/Graph/GraphValidation.swift in Sources */,
+				T001 /* Sources/Graph/GraphWorkspaceModel.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

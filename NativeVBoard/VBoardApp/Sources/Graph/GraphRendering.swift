@@ -603,6 +603,9 @@ enum GraphFallbackRenderer {
     private static func appendExpressions(to container: CALayer, graph: GraphObject,
                                           frame: CGRect, contentsScale: CGFloat) {
         var unsupported: [String] = []
+        let environment = GraphMathEnvironment.build(
+            from: graph.expressions, angleMode: graph.settings.angleMode
+        )
         for (index, expression) in graph.expressions.filter(\.visible).enumerated() {
             let color = expression.displayStyle?.color.map { UIColor(svgHex: $0) }
                 ?? GraphFallbackPalette.colors[index % GraphFallbackPalette.colors.count]
@@ -610,7 +613,7 @@ enum GraphFallbackRenderer {
             let lineWidth = CGFloat(expression.displayStyle?.lineWidth ?? 2.25)
             if let fillPath = GraphFallbackSampler.inequalityFillPath(
                 for: expression, viewport: graph.viewport, frame: frame,
-                angleMode: graph.settings.angleMode
+                angleMode: graph.settings.angleMode, environment: environment
             ), !fillPath.isEmpty {
                 let fill = CAShapeLayer()
                 fill.frame = frame
@@ -629,7 +632,8 @@ enum GraphFallbackRenderer {
             shape.lineJoin = .round
             shape.contentsScale = contentsScale
             let path = GraphFallbackSampler.path(for: expression, viewport: graph.viewport,
-                                                 frame: frame, angleMode: graph.settings.angleMode)
+                                                 frame: frame, angleMode: graph.settings.angleMode,
+                                                 environment: environment)
             shape.path = path.cgPath
             if GraphEquationClassifier.isStrictInequality(expression.latex) {
                 shape.lineDashPattern = [6, 4]
@@ -724,7 +728,8 @@ enum GraphTickPolicy {
 
 enum GraphFallbackSampler {
     static func path(for expression: GraphExpression, viewport: GraphViewport,
-                     frame: CGRect, angleMode: String? = "radians") -> UIBezierPath {
+                     frame: CGRect, angleMode: String? = "radians",
+                     environment: GraphMathEnvironment = .empty) -> UIBezierPath {
         let path = UIBezierPath()
         // The provider understands arbitrary Desmos restriction syntax. The
         // safe native parser intentionally does not; rendering an unrestricted
@@ -747,7 +752,7 @@ enum GraphFallbackSampler {
                                                     width: 8, height: 8)))
         case GraphExpressionType.implicitEquation.rawValue:
             appendImplicit(expression.latex, to: path, viewport: viewport, frame: frame,
-                           angleMode: angleMode)
+                           angleMode: angleMode, environment: environment)
         case GraphExpressionType.inequality.rawValue:
             if let relation = GraphEquationClassifier.relation(in: expression.latex),
                relation.left == "x",
@@ -758,18 +763,21 @@ enum GraphFallbackSampler {
                 path.move(to: a); path.addLine(to: b)
             } else {
                 appendExplicitSegments(expression.latex, to: path, viewport: viewport,
-                                       frame: frame, angleMode: angleMode)
+                                       frame: frame, angleMode: angleMode,
+                                       environment: environment)
             }
         default:
             appendExplicitSegments(expression.latex, to: path, viewport: viewport,
-                                   frame: frame, angleMode: angleMode)
+                                   frame: frame, angleMode: angleMode,
+                                   environment: environment)
         }
         return path
     }
 
     static func inequalityFillPath(for expression: GraphExpression,
                                    viewport: GraphViewport, frame: CGRect,
-                                   angleMode: String? = "radians") -> UIBezierPath? {
+                                   angleMode: String? = "radians",
+                                   environment: GraphMathEnvironment = .empty) -> UIBezierPath? {
         guard expression.type == .inequality,
               expression.restrictions.isEmpty,
               let relation = GraphEquationClassifier.relation(in: expression.latex) else {
@@ -790,7 +798,7 @@ enum GraphFallbackSampler {
         guard relation.left == "y" else { return nil }
         let segments = segments(for: expression.latex, viewport: viewport,
                                 sampleCount: max(128, min(1_024, Int(frame.width * 1.5))),
-                                angleMode: angleMode)
+                                angleMode: angleMode, environment: environment)
         guard segments.count == 1, let segment = segments.first,
               let first = segment.first, let last = segment.last else { return nil }
         let fillsGreater = relation.operation == ">" || relation.operation == ">="
@@ -812,11 +820,14 @@ enum GraphFallbackSampler {
     /// `1/x` and tangent asymptotes can never acquire a connecting stroke.
     static func segments(for latex: String, viewport: GraphViewport,
                          sampleCount: Int = 512,
-                         angleMode: String? = "radians") -> [[CGPoint]] {
+                         angleMode: String? = "radians",
+                         environment: GraphMathEnvironment = .empty) -> [[CGPoint]] {
         guard viewport.isValid,
               let source = GraphEquationClassifier.explicitRightHandSide(latex),
               let expression = try? SafeGraphExpression(source: source,
-                                                        angleMode: angleMode) else { return [] }
+                                                        angleMode: angleMode,
+                                                        variables: environment.variables,
+                                                        functions: environment.functions) else { return [] }
         let count = max(16, min(sampleCount, 4_096))
         let dx = (viewport.xMax - viewport.xMin) / Double(count - 1)
         let discontinuity = max((viewport.yMax - viewport.yMin) * 1.5, 1)
@@ -845,10 +856,11 @@ enum GraphFallbackSampler {
 
     private static func appendExplicitSegments(_ latex: String, to path: UIBezierPath,
                                                viewport: GraphViewport, frame: CGRect,
-                                               angleMode: String?) {
+                                               angleMode: String?,
+                                               environment: GraphMathEnvironment) {
         for segment in segments(for: latex, viewport: viewport,
                                 sampleCount: max(128, min(1_024, Int(frame.width * 1.5))),
-                                angleMode: angleMode) {
+                                angleMode: angleMode, environment: environment) {
             guard let first = segment.first else { continue }
             path.move(to: map(x: first.x, y: first.y, viewport: viewport, frame: frame))
             for point in segment.dropFirst() {
@@ -868,13 +880,18 @@ enum GraphFallbackSampler {
 
     private static func appendImplicit(_ latex: String, to path: UIBezierPath,
                                        viewport: GraphViewport, frame: CGRect,
-                                       angleMode: String?) {
+                                       angleMode: String?,
+                                       environment: GraphMathEnvironment) {
         guard let relation = GraphEquationClassifier.relation(in: latex),
               relation.operation == "=",
               let lhs = try? SafeGraphExpression(source: relation.left,
-                                                  angleMode: angleMode),
+                                                  angleMode: angleMode,
+                                                  variables: environment.variables,
+                                                  functions: environment.functions),
               let rhs = try? SafeGraphExpression(source: relation.right,
-                                                  angleMode: angleMode) else { return }
+                                                  angleMode: angleMode,
+                                                  variables: environment.variables,
+                                                  functions: environment.functions) else { return }
         // Marching squares is derived display geometry. A bounded grid keeps
         // it deterministic and safe while supporting general classroom
         // relations such as x^2+y^2=1 without provider code or network access.
@@ -999,6 +1016,104 @@ enum GraphEquationClassifier {
     }
 }
 
+/// Board-local math definitions derived from canonical expression source.
+/// Nothing in this environment is persisted separately: scalar values and
+/// user functions are rebuilt from rows such as `a=2` and `f(x)=sin(x)`.
+struct GraphMathEnvironment: Equatable, Sendable {
+    static let builtInFunctions: Set<String> = [
+        "sin", "cos", "tan", "sec", "csc", "cot",
+        "asin", "acos", "atan", "sqrt", "abs", "exp", "log", "ln",
+    ]
+
+    var variables: [String: Double]
+    var functions: [String: String]
+
+    static let empty = GraphMathEnvironment(variables: [:], functions: [:])
+
+    static func build(from expressions: [GraphExpression],
+                      angleMode: String? = "radians") -> GraphMathEnvironment {
+        var environment = GraphMathEnvironment.empty
+        let scalarSources = expressions.compactMap { scalarDefinition(in: $0.latex) }
+        for expression in expressions {
+            if let definition = functionDefinition(in: expression.latex) {
+                environment.functions[definition.name] = definition.body
+            }
+        }
+        // A small fixed-point pass supports definitions that reference rows
+        // above or below them without allowing recursive evaluation.
+        for _ in 0...scalarSources.count {
+            var changed = false
+            for definition in scalarSources {
+                guard let parsed = try? SafeGraphExpression(
+                    source: definition.source, angleMode: angleMode,
+                    variables: environment.variables,
+                    functions: environment.functions
+                ), !parsed.usesVariable else { continue }
+                let value = parsed.evaluate(x: 0, y: 0)
+                guard value.isFinite,
+                      environment.variables[definition.name] != value else { continue }
+                environment.variables[definition.name] = value
+                changed = true
+            }
+            if !changed { break }
+        }
+        return environment
+    }
+
+    static func functionDefinition(in source: String) -> (name: String, body: String)? {
+        guard let relation = GraphEquationClassifier.relation(in: source),
+              relation.operation == "=", relation.left.hasSuffix("(x)") else { return nil }
+        let name = String(relation.left.dropLast(3))
+        guard isIdentifier(name), !builtInFunctions.contains(name),
+              !relation.right.isEmpty else { return nil }
+        return (name, relation.right)
+    }
+
+    static func scalarDefinition(in source: String) -> (name: String, source: String)? {
+        guard let relation = GraphEquationClassifier.relation(in: source),
+              relation.operation == "=", isSliderIdentifier(relation.left),
+              !relation.right.isEmpty else { return nil }
+        return (relation.left, relation.right)
+    }
+
+    func undefinedSliderParameters(in source: String) -> [String] {
+        let normalized = GraphLatexNormalizer.normalize(source)
+        let rightHandSource: String
+        if let relation = GraphEquationClassifier.relation(in: normalized),
+           relation.left == "y" || relation.left.hasSuffix("(x)") {
+            rightHandSource = relation.right
+        } else {
+            rightHandSource = normalized
+        }
+        let characters = Array(rightHandSource)
+        var result = Set<String>()
+        var index = 0
+        while index < characters.count {
+            guard characters[index].isLetter else { index += 1; continue }
+            let start = index
+            while index < characters.count, characters[index].isLetter { index += 1 }
+            let name = String(characters[start..<index])
+            let isCall = index < characters.count && characters[index] == "("
+            if Self.isSliderIdentifier(name), !isCall,
+               variables[name] == nil, name != "x", name != "y",
+               name != "e", name != "pi" {
+                result.insert(name)
+            }
+        }
+        return result.sorted()
+    }
+
+    private static func isIdentifier(_ value: String) -> Bool {
+        guard let first = value.first, first.isLetter else { return false }
+        return value.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
+    }
+
+    private static func isSliderIdentifier(_ value: String) -> Bool {
+        value.count == 1 && value.first?.isLetter == true
+            && value != "x" && value != "y" && value != "e"
+    }
+}
+
 enum GraphLatexNormalizer {
     static func normalize(_ input: String) -> String {
         var value = rewriteFractionsAndRoots(input)
@@ -1009,6 +1124,7 @@ enum GraphLatexNormalizer {
             ("\\geq", ">="), ("\\ge", ">="), ("\\leq", "<="), ("\\le", "<="),
             ("\\pi", "pi"), ("π", "pi"), ("²", "^2"), ("³", "^3"),
             ("\\sin", "sin"), ("\\cos", "cos"), ("\\tan", "tan"),
+            ("\\sec", "sec"), ("\\csc", "csc"), ("\\cot", "cot"),
             ("\\arcsin", "asin"), ("\\arccos", "acos"), ("\\arctan", "atan"),
             ("\\log", "log"), ("\\ln", "ln"), ("\\exp", "exp"),
             ("\\abs", "abs")
@@ -1021,6 +1137,9 @@ enum GraphLatexNormalizer {
             .replacingOccurrences(of: "}", with: ")")
             .filter { !$0.isWhitespace }
             .lowercased()
+            .replacingOccurrences(of: "arcsin", with: "asin")
+            .replacingOccurrences(of: "arccos", with: "acos")
+            .replacingOccurrences(of: "arctan", with: "atan")
     }
 
     private static func rewriteFractionsAndRoots(_ input: String) -> String {
@@ -1081,6 +1200,7 @@ struct SafeGraphExpression {
         case negated(Node)
         case binary(Character, Node, Node)
         case function(String, Node)
+        case userFunction(argument: Node, body: Node)
 
         func evaluate(x: Double, y: Double, usesDegrees: Bool) -> Double {
             switch self {
@@ -1109,6 +1229,9 @@ struct SafeGraphExpression {
                 case "sin": return Foundation.sin(trigArgument)
                 case "cos": return Foundation.cos(trigArgument)
                 case "tan": return Foundation.tan(trigArgument)
+                case "sec": return reciprocal(Foundation.cos(trigArgument))
+                case "csc": return reciprocal(Foundation.sin(trigArgument))
+                case "cot": return reciprocal(Foundation.tan(trigArgument))
                 case "asin":
                     guard (-1...1).contains(argument) else { return .nan }
                     let result = Foundation.asin(argument)
@@ -1127,15 +1250,29 @@ struct SafeGraphExpression {
                 case "ln": return argument <= 0 ? .nan : Foundation.log(argument)
                 default: return .nan
                 }
+            case .userFunction(let argument, let body):
+                let value = argument.evaluate(x: x, y: y, usesDegrees: usesDegrees)
+                guard value.isFinite else { return .nan }
+                return body.evaluate(x: value, y: y, usesDegrees: usesDegrees)
             }
         }
 
-        var usesVariable: Bool {
+        private func reciprocal(_ value: Double) -> Double {
+            abs(value) <= 1e-14 ? .nan : 1 / value
+        }
+
+        func usesFreeVariable(boundX: Bool = false) -> Bool {
             switch self {
             case .number: return false
-            case .variable: return true
-            case .negated(let value), .function(_, let value): return value.usesVariable
-            case .binary(_, let lhs, let rhs): return lhs.usesVariable || rhs.usesVariable
+            case .variable(let name): return name == "x" ? !boundX : true
+            case .negated(let value), .function(_, let value):
+                return value.usesFreeVariable(boundX: boundX)
+            case .binary(_, let lhs, let rhs):
+                return lhs.usesFreeVariable(boundX: boundX)
+                    || rhs.usesFreeVariable(boundX: boundX)
+            case .userFunction(let argument, let body):
+                return argument.usesFreeVariable(boundX: boundX)
+                    || body.usesFreeVariable(boundX: true)
             }
         }
     }
@@ -1150,14 +1287,16 @@ struct SafeGraphExpression {
     private let root: Node
     private let usesDegrees: Bool
 
-    var usesVariable: Bool { root.usesVariable }
+    var usesVariable: Bool { root.usesFreeVariable() }
 
-    init(source: String, angleMode: String? = "radians") throws {
+    init(source: String, angleMode: String? = "radians",
+         variables: [String: Double] = [:], functions: [String: String] = [:]) throws {
         let normalized = GraphLatexNormalizer.normalize(source)
         guard normalized.count <= Self.maximumSourceLength else {
             throw GraphRendererError.invalidExpression("expression too long")
         }
-        var parser = try Parser(source: normalized)
+        var parser = try Parser(source: normalized, variables: variables,
+                                functions: functions)
         root = try parser.parse()
         usesDegrees = angleMode == "degrees"
     }
@@ -1177,14 +1316,21 @@ struct SafeGraphExpression {
     private struct Parser {
         private static let functions = Set([
             "sin", "cos", "tan", "asin", "acos", "atan",
-            "sqrt", "abs", "exp", "log", "ln"
+            "sec", "csc", "cot", "sqrt", "abs", "exp", "log", "ln"
         ])
         private var tokens: [Token]
         private var index = 0
         private var nodeCount = 0
+        private let variables: [String: Double]
+        private let userFunctions: [String: String]
+        private let functionDepth: Int
 
-        init(source: String) throws {
+        init(source: String, variables: [String: Double] = [:],
+             functions: [String: String] = [:], functionDepth: Int = 0) throws {
             tokens = try Self.tokenize(source)
+            self.variables = variables
+            userFunctions = functions
+            self.functionDepth = functionDepth
         }
 
         mutating func parse() throws -> Node {
@@ -1256,8 +1402,13 @@ struct SafeGraphExpression {
                 if name == "x" || name == "y" { return try make(.variable(name)) }
                 if name == "pi" { return try make(.number(.pi)) }
                 if name == "e" { return try make(.number(M_E)) }
-                guard Self.functions.contains(name) else {
-                    throw GraphRendererError.invalidExpression("identifier")
+                if let value = variables[name], value.isFinite {
+                    return try make(.number(value))
+                }
+                let isBuiltInFunction = Self.functions.contains(name)
+                let userFunctionBody = userFunctions[name]
+                guard isBuiltInFunction || userFunctionBody != nil else {
+                    throw GraphRendererError.invalidExpression("undefined \(name)")
                 }
                 let argument: Node
                 if current == .symbol("(") {
@@ -1269,7 +1420,21 @@ struct SafeGraphExpression {
                 } else {
                     argument = try unary(depth: depth + 1)
                 }
-                return try make(.function(name, argument))
+                if isBuiltInFunction {
+                    return try make(.function(name, argument))
+                }
+                guard let bodySource = userFunctionBody, functionDepth < 8 else {
+                    throw GraphRendererError.invalidExpression("undefined \(name)")
+                }
+                var nestedFunctions = userFunctions
+                nestedFunctions.removeValue(forKey: name)
+                var bodyParser = try Parser(
+                    source: GraphLatexNormalizer.normalize(bodySource),
+                    variables: variables, functions: nestedFunctions,
+                    functionDepth: functionDepth + 1
+                )
+                let body = try bodyParser.parse()
+                return try make(.userFunction(argument: argument, body: body))
             case .symbol("("):
                 consume()
                 let result = try expression(depth: depth + 1)
@@ -1360,9 +1525,14 @@ struct NativeGraphMathResult: Equatable, Sendable {
 /// input is parsed by SafeGraphExpression and is never passed to eval, a web
 /// provider, Python, or another arbitrary-code runtime.
 enum NativeGraphMath {
-    static func calculate(_ source: String, angleMode: String? = "radians")
+    static func calculate(_ source: String, angleMode: String? = "radians",
+                          variables: [String: Double] = [:],
+                          functions: [String: String] = [:])
         throws -> NativeGraphMathResult {
-        let expression = try SafeGraphExpression(source: source, angleMode: angleMode)
+        let expression = try SafeGraphExpression(
+            source: source, angleMode: angleMode,
+            variables: variables, functions: functions
+        )
         guard !expression.usesVariable else {
             throw GraphRendererError.invalidExpression("numeric expression contains a variable")
         }
@@ -1373,7 +1543,9 @@ enum NativeGraphMath {
     }
 
     static func solve(_ equation: String, domain: ClosedRange<Double>,
-                      angleMode: String? = "radians") throws -> NativeGraphMathResult {
+                      angleMode: String? = "radians",
+                      variables: [String: Double] = [:],
+                      functions: [String: String] = [:]) throws -> NativeGraphMathResult {
         if isUnboundedIntegral(equation) {
             return NativeGraphMathResult(
                 kind: .unsupportedIndefiniteIntegral, values: [],
@@ -1381,7 +1553,10 @@ enum NativeGraphMath {
                 isExact: false
             )
         }
-        let evaluator = try equationEvaluator(equation, angleMode: angleMode)
+        let evaluator = try equationEvaluator(
+            equation, angleMode: angleMode,
+            variables: variables, functions: functions
+        )
         let f0 = evaluator(0), f1 = evaluator(1), fm1 = evaluator(-1), f2 = evaluator(2)
         if [f0, f1, fm1, f2].allSatisfy(\.isFinite) {
             let a = (f1 + fm1) / 2 - f0
@@ -1440,9 +1615,15 @@ enum NativeGraphMath {
 
     static func intersections(_ first: String, _ second: String,
                               domain: ClosedRange<Double>,
-                              angleMode: String? = "radians") throws -> NativeGraphMathResult {
-        let lhs = try explicitExpression(first, angleMode: angleMode)
-        let rhs = try explicitExpression(second, angleMode: angleMode)
+                              angleMode: String? = "radians",
+                              variables: [String: Double] = [:],
+                              functions: [String: String] = [:]) throws -> NativeGraphMathResult {
+        let lhs = try explicitExpression(
+            first, angleMode: angleMode, variables: variables, functions: functions
+        )
+        let rhs = try explicitExpression(
+            second, angleMode: angleMode, variables: variables, functions: functions
+        )
         let roots = scanRoots({ lhs.evaluate(x: $0) - rhs.evaluate(x: $0) }, domain: domain)
         var coordinates: [Double] = []
         for x in roots { coordinates.append(contentsOf: [x, lhs.evaluate(x: x)]) }
@@ -1455,8 +1636,12 @@ enum NativeGraphMath {
     }
 
     static func derivative(_ source: String, at x: Double,
-                           angleMode: String? = "radians") throws -> NativeGraphMathResult {
-        let expression = try explicitExpression(source, angleMode: angleMode)
+                           angleMode: String? = "radians",
+                           variables: [String: Double] = [:],
+                           functions: [String: String] = [:]) throws -> NativeGraphMathResult {
+        let expression = try explicitExpression(
+            source, angleMode: angleMode, variables: variables, functions: functions
+        )
         let h = max(1e-6, abs(x) * 1e-5)
         let value = (expression.evaluate(x: x - 2 * h)
                      - 8 * expression.evaluate(x: x - h)
@@ -1468,8 +1653,12 @@ enum NativeGraphMath {
     }
 
     static func integral(_ source: String, from a: Double, to b: Double,
-                         angleMode: String? = "radians") throws -> NativeGraphMathResult {
-        let expression = try explicitExpression(source, angleMode: angleMode)
+                         angleMode: String? = "radians",
+                         variables: [String: Double] = [:],
+                         functions: [String: String] = [:]) throws -> NativeGraphMathResult {
+        let expression = try explicitExpression(
+            source, angleMode: angleMode, variables: variables, functions: functions
+        )
         let f: (Double) -> Double = { expression.evaluate(x: $0) }
         let whole = simpson(f, a, b)
         let value = adaptiveSimpson(f, a, b, epsilon: 1e-8, whole: whole, depth: 14)
@@ -1478,24 +1667,43 @@ enum NativeGraphMath {
                                      message: "∫ ≈ \(format(value))", isExact: false)
     }
 
-    private static func explicitExpression(_ source: String, angleMode: String?) throws
+    private static func explicitExpression(_ source: String, angleMode: String?,
+                                           variables: [String: Double],
+                                           functions: [String: String]) throws
         -> SafeGraphExpression {
         let rhs = GraphEquationClassifier.explicitRightHandSide(source) ?? source
-        return try SafeGraphExpression(source: rhs, angleMode: angleMode)
+        return try SafeGraphExpression(
+            source: rhs, angleMode: angleMode,
+            variables: variables, functions: functions
+        )
     }
 
-    private static func equationEvaluator(_ source: String, angleMode: String?) throws
+    private static func equationEvaluator(_ source: String, angleMode: String?,
+                                          variables: [String: Double],
+                                          functions: [String: String]) throws
         -> (Double) -> Double {
         if let rhs = GraphEquationClassifier.explicitRightHandSide(source) {
-            let expression = try SafeGraphExpression(source: rhs, angleMode: angleMode)
+            let expression = try SafeGraphExpression(
+                source: rhs, angleMode: angleMode,
+                variables: variables, functions: functions
+            )
             return { expression.evaluate(x: $0) }
         }
         if let relation = GraphEquationClassifier.relation(in: source) {
-            let left = try SafeGraphExpression(source: relation.left, angleMode: angleMode)
-            let right = try SafeGraphExpression(source: relation.right, angleMode: angleMode)
+            let left = try SafeGraphExpression(
+                source: relation.left, angleMode: angleMode,
+                variables: variables, functions: functions
+            )
+            let right = try SafeGraphExpression(
+                source: relation.right, angleMode: angleMode,
+                variables: variables, functions: functions
+            )
             return { left.evaluate(x: $0) - right.evaluate(x: $0) }
         }
-        let expression = try SafeGraphExpression(source: source, angleMode: angleMode)
+        let expression = try SafeGraphExpression(
+            source: source, angleMode: angleMode,
+            variables: variables, functions: functions
+        )
         return { expression.evaluate(x: $0) }
     }
 

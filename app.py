@@ -1321,8 +1321,8 @@ def validate_graph_object(item: dict[str, Any], index: int, board_id: str | None
     if board_id is not None and owning_board_id != board_id:
         raise ValueError(f"{label} belongs to a different board.")
     expressions_value = item.get("expressions")
-    if not isinstance(expressions_value, list) or not 1 <= len(expressions_value) <= MAX_GRAPH_EXPRESSIONS:
-        raise ValueError(f"{label}.expressions must contain one to {MAX_GRAPH_EXPRESSIONS} items.")
+    if not isinstance(expressions_value, list) or not 0 <= len(expressions_value) <= MAX_GRAPH_EXPRESSIONS:
+        raise ValueError(f"{label}.expressions must contain at most {MAX_GRAPH_EXPRESSIONS} items.")
     expressions: list[dict[str, Any]] = []
     expression_ids: set[str] = set()
     expression_reserved = {"id", "latex", "type", "visible", "display_style", "restrictions"}
@@ -1346,10 +1346,22 @@ def validate_graph_object(item: dict[str, Any], index: int, board_id: str | None
             )
         ):
             raise ValueError(f"{expression_label}.type is invalid.")
-        try:
-            latex = validate_graph_latex(raw.get("latex"), expression_label)
-        except Exception as exc:
-            raise ValueError(f"{expression_label}.latex is invalid.") from exc
+        latex_source = raw.get("latex")
+        if (
+            not isinstance(latex_source, str)
+            or len(latex_source) > 1_000
+            or any(ord(char) < 32 for char in latex_source)
+        ):
+            raise ValueError(f"{expression_label}.latex is invalid.")
+        if latex_source.strip():
+            try:
+                validate_graph_latex(latex_source, expression_label)
+            except Exception as exc:
+                raise ValueError(f"{expression_label}.latex is invalid.") from exc
+        # Editor source is user-authored document data. Validation may inspect
+        # a trimmed form, but persistence must retain the exact draft so a
+        # temporarily incomplete expression survives dismissal and reopen.
+        latex = latex_source
         visible = raw.get("visible", True)
         if not isinstance(visible, bool):
             raise ValueError(f"{expression_label}.visible must be true or false.")

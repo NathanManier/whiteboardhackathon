@@ -565,6 +565,121 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         XCTAssertTrue(unsupported.message.localizedCaseInsensitiveContains("indefinite"))
     }
 
+    func testNativeEnvironmentSupportsVariablesUserFunctionsAndTrigAliases() throws {
+        let expressions = [
+            GraphExpression(id: "a", latex: "a=2", type: .unknown),
+            GraphExpression(id: "f", latex: "f(x)=x^2+a", type: .explicitFunction),
+        ]
+        let environment = GraphMathEnvironment.build(from: expressions)
+
+        XCTAssertEqual(environment.variables["a"], 2)
+        XCTAssertEqual(
+            try NativeGraphMath.calculate(
+                "f(3)", variables: environment.variables,
+                functions: environment.functions
+            ).values.first!,
+            11, accuracy: 1e-10
+        )
+        XCTAssertEqual(try NativeGraphMath.calculate("sec(0)").values.first!,
+                       1, accuracy: 1e-10)
+        XCTAssertEqual(try NativeGraphMath.calculate("csc(pi/2)").values.first!,
+                       1, accuracy: 1e-10)
+        XCTAssertEqual(try NativeGraphMath.calculate("cot(pi/4)").values.first!,
+                       1, accuracy: 1e-10)
+        XCTAssertEqual(
+            try NativeGraphMath.calculate("arcsin(1)", angleMode: "degrees")
+                .values.first!,
+            90, accuracy: 1e-10
+        )
+    }
+
+    func testGraphWorkspaceKeepsExpressionAndViewportMutationsIndependent() {
+        let originalViewport = GraphViewport(xMin: -8, xMax: 8, yMin: -6, yMax: 6)
+        let expression = GraphExpression(
+            id: "expression-1", latex: "y=sin(x)", type: .explicitFunction
+        )
+        let graph = GraphObject(
+            id: "graph-workspace", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [expression], viewport: originalViewport
+        )
+        var expressionCommits: [GraphObject] = []
+        let model = GraphWorkspaceModel(graph: graph) { expressionCommits.append($0) }
+        let moved = GraphViewport(xMin: -4, xMax: 12, yMin: -10, yMax: 14)
+
+        model.updateViewport(moved)
+        XCTAssertEqual(model.expressions, [expression])
+        XCTAssertTrue(expressionCommits.isEmpty,
+                      "Viewport movement must not rewrite the expression array")
+
+        model.updateSource(id: expression.id, source: "y=cos(x)")
+        XCTAssertEqual(model.viewport, moved,
+                       "Expression editing must not reset the live viewport")
+        XCTAssertEqual(expressionCommits.count, 1)
+        XCTAssertEqual(expressionCommits.first?.expressions.first?.latex, "y=cos(x)")
+
+        model.resetViewport()
+        XCTAssertEqual(model.expressions.first?.latex, "y=cos(x)")
+        XCTAssertEqual(model.viewport, .conventional)
+    }
+
+    func testGraphWorkspaceDirectDerivativeIntegralAndParameterSlider() throws {
+        let function = GraphExpression(
+            id: "function", latex: "f(x)=x^2", type: .explicitFunction
+        )
+        let derivative = GraphExpression(
+            id: "derivative", latex: "f'(2)", type: .unknown
+        )
+        let integral = GraphExpression(
+            id: "integral", latex: "integral(f(x),0,2)", type: .unknown
+        )
+        let parameterized = GraphExpression(
+            id: "curve", latex: "y=a*sin(x)", type: .explicitFunction
+        )
+        let graph = GraphObject(
+            id: "graph-calculus", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [function, derivative, integral, parameterized]
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+
+        XCTAssertEqual(model.feedback(for: derivative)?.message, "4")
+        XCTAssertEqual(
+            try XCTUnwrap(Double(model.feedback(for: integral)?.message ?? "")),
+            8.0 / 3.0, accuracy: 0.000_001
+        )
+        XCTAssertEqual(model.undefinedParameters(for: parameterized), ["a"])
+
+        let parameterID = try XCTUnwrap(model.addParameter(named: "a"))
+        let sliderExpression = try XCTUnwrap(model.expression(id: parameterID))
+        XCTAssertEqual(model.slider(for: sliderExpression)?.value, 1)
+        model.updateSlider(id: parameterID, value: 2.5)
+        XCTAssertEqual(model.expression(id: parameterID)?.latex, "a=2.5")
+
+        let environment = GraphMathEnvironment.build(from: model.expressions)
+        let segments = GraphFallbackSampler.segments(
+            for: "y=a*sin(x)", viewport: .conventional,
+            environment: environment
+        )
+        XCTAssertFalse(segments.isEmpty)
+    }
+
+    func testMathKeyboardInsertsAtCursorAndPlacesTemplateCursor() {
+        let middle = GraphMathInsertionPlan.apply(
+            .insert(text: "cos()", cursorBacktrack: 1),
+            to: "y=+1", selection: NSRange(location: 2, length: 0)
+        )
+        XCTAssertEqual(middle.source, "y=cos()+1")
+        XCTAssertEqual(middle.selection, NSRange(location: 6, length: 0))
+
+        let integral = GraphMathInsertionPlan.apply(
+            .insert(text: "integral(,,)", cursorBacktrack: 3),
+            to: "", selection: NSRange(location: 0, length: 0)
+        )
+        XCTAssertEqual(integral.source, "integral(,,)")
+        XCTAssertEqual(integral.selection, NSRange(location: 9, length: 0))
+    }
+
     func testNativeMarchingSquaresRendersGeneralImplicitCircle() {
         let expression = GraphExpression(
             id: "implicit-circle", latex: "x²+y²=1", type: .implicitEquation

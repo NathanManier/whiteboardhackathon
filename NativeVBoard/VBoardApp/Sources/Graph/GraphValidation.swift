@@ -73,9 +73,9 @@ enum GraphPersistenceValidator {
         }
 
         let frame = try sanitizedFrame(graph.frame, path: "graph.frame", minimumSize: 32)
-        guard (1...maximumExpressions).contains(graph.expressions.count) else {
+        guard (0...maximumExpressions).contains(graph.expressions.count) else {
             throw failure("graph.expressions",
-                          "must contain between 1 and \(maximumExpressions) expressions")
+                          "must contain at most \(maximumExpressions) expressions")
         }
 
         var expressionIDs = Set<String>()
@@ -181,9 +181,9 @@ enum GraphPersistenceValidator {
     }
 
     private static func sanitizedLatex(_ value: String, path: String) throws -> String {
-        let latex = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !latex.isEmpty, latex.unicodeScalars.count <= maximumLatexScalars else {
-            throw failure(path, "must contain between 1 and \(maximumLatexScalars) characters")
+        let latex = value
+        guard latex.unicodeScalars.count <= maximumLatexScalars else {
+            throw failure(path, "must contain at most \(maximumLatexScalars) characters")
         }
         guard !latex.unicodeScalars.contains(where: { $0.value < 32 }) else {
             throw failure(path, "contains a control character")
