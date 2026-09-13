@@ -358,6 +358,35 @@ class EditorApiTests(unittest.TestCase):
         self.assertEqual(reloaded["expressions"][0]["latex"], r"y=x^2-4")
         self.assertEqual(reloaded["viewport"]["y_max"], 12)
 
+    def test_graph_object_preserves_incomplete_source_and_can_be_empty(self):
+        state = self.editor_state()
+        graph = self.graph_object()
+        graph["expressions"][0]["latex"] = "  f(x)=sin(  "
+        state["objects"].append(graph)
+
+        saved_response = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=state
+        )
+        self.assertEqual(
+            saved_response.status_code, 200, saved_response.get_data(as_text=True)
+        )
+        saved = saved_response.get_json()["editor"]
+        saved_graph = next(item for item in saved["objects"] if item["id"] == "graph-one")
+        self.assertEqual(saved_graph["expressions"][0]["latex"], "  f(x)=sin(  ")
+
+        saved_graph["expressions"] = []
+        empty_response = self.client.put(
+            f"/api/boards/{self.board_id}/editor", json=saved
+        )
+        self.assertEqual(
+            empty_response.status_code, 200, empty_response.get_data(as_text=True)
+        )
+        empty_graph = next(
+            item for item in empty_response.get_json()["editor"]["objects"]
+            if item["id"] == "graph-one"
+        )
+        self.assertEqual(empty_graph["expressions"], [])
+
     def test_graph_nested_extensions_survive_repeated_editor_round_trips(self):
         state = self.editor_state()
         graph = self.graph_object()

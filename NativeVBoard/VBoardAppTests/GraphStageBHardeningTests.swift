@@ -998,6 +998,48 @@ final class GraphStageBHardeningTests: XCTestCase {
         XCTAssertEqual(restored.expressions.first?.id, source.expressions.first?.id)
     }
 
+    func testGraphRowAddDeleteVisibilityAndSliderValueRestoreFromOutbox() throws {
+        let persistenceBoardID = UUID().uuidString
+            .replacingOccurrences(of: "-", with: "").lowercased()
+        let source = makeGraph(owningBoardID: persistenceBoardID)
+        let server = EditorState(
+            schemaVersion: 4, revision: 4, updatedAt: nil,
+            viewport: CameraRect(x: -400, y: -300, width: 1_200, height: 900),
+            objects: [CanvasObject(graph: source)], groups: [], importedTransforms: [:],
+            sourceBoards: [], mergedBoardIDs: []
+        )
+        let api = APIClient(baseURL: URL(string: "https://graph-row-outbox.invalid")!)
+
+        do {
+            let editingStore = BoardDocumentStore(boardID: persistenceBoardID,
+                                                  editor: server)
+            editingStore.beginGraphEditing(id: source.id)
+            let model = GraphWorkspaceModel(graph: source) {
+                editingStore.updateGraphDuringEditing($0, api: api)
+            }
+            let curveID = try XCTUnwrap(model.addExpression(source: "y=a*cos(x)"))
+            model.toggleVisibility(id: curveID)
+            let parameterID = try XCTUnwrap(model.addParameter(named: "a"))
+            model.updateSlider(id: parameterID, value: 3.5)
+            model.deleteExpression(id: source.expressions[0].id)
+            editingStore.persistForBackgrounding()
+        }
+
+        let reopened = BoardDocumentStore(boardID: persistenceBoardID, editor: server)
+        reopened.restoreLocalIfPresent(server: server)
+        let graph = try XCTUnwrap(reopened.editor.objects.first?.graph)
+        let curve = try XCTUnwrap(graph.expressions.first(where: {
+            $0.latex == "y=a*cos(x)"
+        }))
+
+        XCTAssertEqual(graph.expressions.count, 2)
+        XCTAssertFalse(curve.visible)
+        XCTAssertFalse(graph.expressions.contains(where: { $0.id == "e1" }))
+        XCTAssertEqual(graph.expressions.first(where: {
+            GraphMathEnvironment.scalarDefinition(in: $0.latex)?.name == "a"
+        })?.latex, "a=3.5")
+    }
+
     func testMixedGraphNoteAndProfessorResizeUsesOneBoundedFactor() throws {
         let mutationBoardID = UUID().uuidString
             .replacingOccurrences(of: "-", with: "").lowercased()

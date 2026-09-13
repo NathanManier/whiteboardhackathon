@@ -648,6 +648,11 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
             try XCTUnwrap(Double(model.feedback(for: integral)?.message ?? "")),
             8.0 / 3.0, accuracy: 0.000_001
         )
+        XCTAssertTrue(model.undefinedParameters(for: derivative).isEmpty)
+        XCTAssertTrue(model.undefinedParameters(for: integral).isEmpty)
+        XCTAssertTrue(model.undefinedParameters(for: GraphExpression(
+            id: "symbolic-derivative", latex: "d/dx(f(x))", type: .unknown
+        )).isEmpty)
         XCTAssertEqual(model.undefinedParameters(for: parameterized), ["a"])
 
         let parameterID = try XCTUnwrap(model.addParameter(named: "a"))
@@ -678,6 +683,48 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         )
         XCTAssertEqual(integral.source, "integral(,,)")
         XCTAssertEqual(integral.selection, NSRange(location: 9, length: 0))
+    }
+
+    func testGraphViewportNavigationAndTicksRemainIndependentAndReadable() {
+        let source = GraphViewport(xMin: -10, xMax: 10, yMin: -8, yMax: 12)
+        let zoomed = GraphViewportNavigation.zoomed(source, by: 0.5)
+        XCTAssertEqual(zoomed.xMax - zoomed.xMin, 10, accuracy: 1e-10)
+        XCTAssertEqual(zoomed.yMax - zoomed.yMin, 10, accuracy: 1e-10)
+        let anchored = GraphViewportNavigation.zoomed(
+            source, by: 0.5, anchor: CGPoint(x: 0, y: 0),
+            size: CGSize(width: 600, height: 400)
+        )
+        XCTAssertEqual(anchored.xMin, source.xMin, accuracy: 1e-10)
+        XCTAssertEqual(anchored.yMax, source.yMax, accuracy: 1e-10)
+        let panned = GraphViewportNavigation.panned(
+            source, by: CGSize(width: 60, height: -40),
+            size: CGSize(width: 600, height: 400)
+        )
+        XCTAssertEqual(panned.xMin, -12, accuracy: 1e-10)
+        XCTAssertEqual(panned.yMin, -10, accuracy: 1e-10)
+
+        let ticks = GraphTickPolicy.ticks(
+            min: -10, max: 10, pixelLength: 700, minimumSpacing: 64
+        )
+        XCTAssertEqual(ticks.map(\.label), ["-10", "-8", "-6", "-4", "-2", "0", "2", "4", "6", "8", "10"])
+        XCTAssertEqual(Set(ticks.map(\.label)).count, ticks.count)
+    }
+
+    func testGraphWorkspacePreservesInvalidSourceAndReportsInlineError() {
+        let expression = GraphExpression(
+            id: "invalid", latex: "f(x)=sin(", type: .explicitFunction
+        )
+        let graph = GraphObject(
+            id: "graph-invalid", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [expression]
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+
+        XCTAssertEqual(model.expression(id: expression.id)?.latex, "f(x)=sin(")
+        XCTAssertEqual(model.feedback(for: expression), GraphRowFeedback(
+            kind: .error, message: "Close the open parenthesis."
+        ))
     }
 
     func testNativeMarchingSquaresRendersGeneralImplicitCircle() {
