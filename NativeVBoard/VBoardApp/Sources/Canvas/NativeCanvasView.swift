@@ -426,6 +426,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var pencilHoverRecognizer: UIHoverGestureRecognizer!
     private var squeezeState = PencilPaletteStateMachine()
     private var activeSqueezeAction: PencilLogicalAction = .none
+    private var isPencilPalettePresented = false
+    private var pendingSqueezeAnchor: CGPoint?
+    private var pendingSqueezeRoll: CGFloat?
     private var pencilFeedback: PencilFeedbackProviding!
     private var selectedIDs = Set<String>()
     private var editStart = CGPoint.zero
@@ -505,6 +508,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
         self.pencilPreferences = pencilPreferences
+        self.isPencilPalettePresented = isPencilPalettePresented
         self.showsDeveloperDiagnostics = showsDeveloperDiagnostics
         self.backgroundStyle = backgroundStyle
         self.onStroke = onStroke
@@ -759,39 +763,62 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                 setting: pencilPreferences.squeeze,
                 system: PencilPreferredAction(UIPencilInteraction.preferredSqueezeAction)
             )
-            if activeSqueezeAction == .showToolPalette || activeSqueezeAction == .showInkAttributes
-                || activeSqueezeAction == .showColorPalette {
-                if case .present(let anchor, let index) = squeezeState.receive(
-                    .began, anchor: point, roll: roll,
-                    initialIndex: PencilRadialPaletteModel.index(for: activeTool)
-                ) {
-                    routePencilAction(activeSqueezeAction, anchor: anchor)
-                    onPencilPaletteHighlight(index)
-                    pencilFeedback.request(.paletteActivation(anchor
-                        ?? CGPoint(x: bounds.midX, y: bounds.midY)))
-                }
-            } else {
+            pendingSqueezeAnchor = point
+            pendingSqueezeRoll = roll
+            if !isPaletteAction(activeSqueezeAction) {
                 routePencilAction(activeSqueezeAction, anchor: point)
             }
             return
         }
+        if phase == .changed {
+            if let point { pendingSqueezeAnchor = point }
+            if let roll { pendingSqueezeRoll = roll }
+            if squeezeState.isPresented {
+                applyPaletteEffect(squeezeState.update(anchor: point, roll: roll), point: point)
+            }
+            return
+        }
+        if phase == .ended, isPaletteAction(activeSqueezeAction) {
+            applyPaletteEffect(squeezeState.toggle(
+                anchor: pendingSqueezeAnchor ?? point,
+                roll: pendingSqueezeRoll ?? roll,
+                initialIndex: PencilRadialPaletteModel.index(for: activeTool)
+            ), point: point)
+        }
+        activeSqueezeAction = .none
+        pendingSqueezeAnchor = nil
+        pendingSqueezeRoll = nil
+    }
 
-        let effect = squeezeState.receive(phase, anchor: point, roll: roll)
+    private func isPaletteAction(_ action: PencilLogicalAction) -> Bool {
+        action == .showToolPalette || action == .showInkAttributes
+            || action == .showColorPalette
+    }
+
+    private func applyPaletteEffect(_ effect: PencilPaletteStateMachine.Effect,
+                                    point: CGPoint?) {
         switch effect {
+        case .present(let anchor, let index):
+            isPencilPalettePresented = true
+            routePencilAction(activeSqueezeAction, anchor: anchor)
+            onPencilPaletteHighlight(index)
+            pencilFeedback.request(.paletteActivation(anchor
+                ?? CGPoint(x: bounds.midX, y: bounds.midY)))
         case .update(let anchor, let index, let selectionChanged):
             if let anchor { onPencilPaletteMoved(anchor) }
             onPencilPaletteHighlight(index)
             if selectionChanged { pencilFeedback.request(.toolSelection(point)) }
         case .commit(let index):
+            isPencilPalettePresented = false
             onPencilPaletteCommit(index)
             onPencilPaletteDismiss()
             pencilFeedback.request(.action(point))
         case .dismiss:
+            isPencilPalettePresented = false
             onPencilPaletteDismiss()
-        case .none, .present:
+        case .none:
             break
         }
-        if phase == .ended || phase == .cancelled { activeSqueezeAction = .none }
     }
 
     private func routePencilAction(_ action: PencilLogicalAction, anchor: CGPoint?) {
@@ -813,13 +840,19 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         #if DEBUG
         pencilRawMonitor.recordHover(recognizer, in: self)
         #endif
+        let point = recognizer.location(in: self)
+        if isPencilPalettePresented,
+           recognizer.state == .began || recognizer.state == .changed,
+           #available(iOS 17.5, *) {
+            let roll = PencilScreenAngle.roll(fromAppleRaw: recognizer.rollAngle)
+            applyPaletteEffect(squeezeState.update(anchor: point, roll: roll), point: point)
+        }
         guard shouldShowPencilHoverPreview,
               recognizer.state == .began || recognizer.state == .changed else {
             pencilHoverLayer.path = nil
             pencilHoverLayer.isHidden = true
             return
         }
-        let point = recognizer.location(in: self)
         let scale = max(worldTransform.scale, 0.001)
         let path = UIBezierPath()
         switch activeTool {
@@ -845,7 +878,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             )
             stamp.apply(transform); path.append(stamp)
         case .objectEraser:
-            let radius = max(8, 14 * scale)
+            let radius = PencilEraserFootprint.screenRadius
             path.append(UIBezierPath(ovalIn: CGRect(x: point.x - radius, y: point.y - radius,
                                                     width: radius * 2, height: radius * 2)))
         case .lasso, .select, .navigation:
@@ -940,6 +973,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         self.importedTransforms = importedTransforms; self.composition = composition; self.showsPaper = showsPaper
         self.penStyle = penStyle; self.markerStyle = markerStyle
         self.pencilPreferences = pencilPreferences
+        self.isPencilPalettePresented = isPencilPalettePresented
         if !isPencilPalettePresented { _ = squeezeState.dismiss() }
         self.showsDeveloperDiagnostics = showsDeveloperDiagnostics
         #if DEBUG
@@ -1554,6 +1588,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         activeID = UUID().uuidString
         let layer = CAShapeLayer(); layer.fillColor = strokeColor.cgColor
         layer.strokeColor = nil
+        layer.fillRule = .nonZero
         // Canonical object layers retain document order. The transient trace
         // is presentation-only and must remain visible above opaque graph
         // proxies until the finalized canonical stroke replaces it.
@@ -1983,12 +2018,16 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     }
 
     private func eraseSegment(from start: CGPoint, to end: CGPoint) {
-        let segmentBounds = CGRect(x: min(start.x, end.x), y: min(start.y, end.y), width: abs(end.x - start.x), height: abs(end.y - start.y)).insetBy(dx: -14, dy: -14)
+        let radius = PencilEraserFootprint.worldRadius(cameraScale: worldTransform.scale)
+        let segmentBounds = SweptEraserGeometry.bounds(from: start, to: end, radius: radius)
         var hit = Set(objects.compactMap { object -> String? in
-            let objectBounds = BoardHitTestPolicy.bounds(of: object).insetBy(dx: -12, dy: -12)
-            return segmentBounds.intersects(objectBounds) ? object.id : nil
+            guard segmentBounds.intersects(BoardHitTestPolicy.bounds(of: object)) else { return nil }
+            return CanvasObjectEraserHitTest.intersects(
+                object, from: start, to: end, eraserRadius: radius
+            ) ? object.id : nil
         })
-        hit.formUnion(professor.ids(intersecting: segmentBounds))
+        hit.formUnion(professor.ids(intersectingSweptSegmentFrom: start, to: end,
+                                    radius: radius))
         let fresh = eraseTransaction.register(hit)
         guard !fresh.isEmpty else { return }
         // Visual feedback is immediate, while canonical deletion remains one
@@ -2242,7 +2281,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         if let pencilTool = object.pencilTool {
             layer.path = PencilStrokeGeometry.path(points: transformedPoints, tool: pencilTool,
                                                    baseWidth: CGFloat((object.width ?? 4) * sqrt(abs(scaleX * scaleY))))
-            layer.fillColor = color; layer.strokeColor = nil
+            layer.fillColor = color; layer.strokeColor = nil; layer.fillRule = .nonZero
         } else {
             layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor
             layer.strokeColor = color
@@ -2268,7 +2307,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             }
             layer.path = PencilStrokeGeometry.path(points: translated, tool: pencilTool,
                                                    baseWidth: CGFloat(stroke.width))
-            layer.fillColor = color; layer.strokeColor = nil
+            layer.fillColor = color; layer.strokeColor = nil; layer.fillRule = .nonZero
         } else {
             layer.path = path.cgPath; layer.fillColor = UIColor.clear.cgColor
             layer.strokeColor = color

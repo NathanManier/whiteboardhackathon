@@ -173,8 +173,8 @@ struct PencilPaletteStateMachine: Equatable, Sendable {
     private(set) var highlightedIndex = 0
     private var lastRoll: CGFloat?
     private var accumulatedRoll: CGFloat = 0
-    private var sectorOffset = 0
-    private var sectorCount = 4
+    private var itemOffset = 0
+    private var itemCount = 4
     private var initialSectorIndex = 0
 
     enum Effect: Equatable, Sendable {
@@ -185,58 +185,56 @@ struct PencilPaletteStateMachine: Equatable, Sendable {
         case dismiss
     }
 
-    /// Roll is already converted into VBoard screen-angle space: zero points
-    /// right and positive advances clockwise on the display.
-    mutating func receive(_ phase: PencilSqueezePhase, anchor: CGPoint?,
-                          roll: CGFloat? = nil, initialIndex: Int = 0,
-                          sectorCount requestedSectorCount: Int = 4,
-                          hysteresis: CGFloat = .pi / 24) -> Effect {
-        switch phase {
-        case .began:
-            guard !isPresented else { return .none }
-            isPresented = true
-            self.anchor = anchor
-            sectorCount = max(1, requestedSectorCount)
-            initialSectorIndex = Self.wrapped(initialIndex, count: sectorCount)
-            highlightedIndex = initialSectorIndex
-            lastRoll = roll
-            accumulatedRoll = 0
-            sectorOffset = 0
-            return .present(anchor, highlightedIndex: highlightedIndex)
-        case .changed:
-            guard isPresented else { return .none }
-            if let anchor { self.anchor = anchor }
-            var changed = false
-            if let roll {
-                if let lastRoll {
-                    accumulatedRoll += PencilAngleMath.shortestDelta(from: lastRoll, to: roll)
-                }
-                self.lastRoll = roll
-                let sectorAngle = PencilAngleMath.fullTurn / CGFloat(sectorCount)
-                let threshold = sectorAngle / 2 + max(0, hysteresis)
-                while accumulatedRoll - CGFloat(sectorOffset) * sectorAngle > threshold {
-                    sectorOffset += 1
-                    changed = true
-                }
-                while accumulatedRoll - CGFloat(sectorOffset) * sectorAngle < -threshold {
-                    sectorOffset -= 1
-                    changed = true
-                }
-                highlightedIndex = Self.wrapped(initialSectorIndex + sectorOffset,
-                                                count: sectorCount)
-            }
-            return .update(self.anchor, highlightedIndex: highlightedIndex,
-                           selectionChanged: changed)
-        case .ended:
-            guard isPresented else { return .none }
+    /// A completed squeeze toggles the palette. The second squeeze commits the
+    /// currently highlighted tool and closes it, so roll-only navigation has a
+    /// complete, discoverable interaction without requiring a sustained hold.
+    /// Roll is already in VBoard screen-angle space: positive is clockwise.
+    mutating func toggle(anchor: CGPoint?, roll: CGFloat?, initialIndex: Int,
+                         itemCount requestedItemCount: Int = 4) -> Effect {
+        if isPresented {
             let committed = highlightedIndex
             clear()
             return .commit(highlightedIndex: committed)
-        case .cancelled:
-            guard isPresented else { return .none }
-            clear()
-            return .dismiss
         }
+        isPresented = true
+        self.anchor = anchor
+        itemCount = max(1, requestedItemCount)
+        initialSectorIndex = Self.wrapped(initialIndex, count: itemCount)
+        highlightedIndex = initialSectorIndex
+        lastRoll = roll
+        accumulatedRoll = 0
+        itemOffset = 0
+        return .present(anchor, highlightedIndex: highlightedIndex)
+    }
+
+    /// The menu is an arc, not a four-way 360-degree wheel. Consequently each
+    /// relative roll step is intentionally much smaller than a quadrant.
+    mutating func update(anchor: CGPoint?, roll: CGFloat?,
+                         stepAngle: CGFloat = 22 * .pi / 180,
+                         hysteresis: CGFloat = 5 * .pi / 180) -> Effect {
+        guard isPresented else { return .none }
+        if let anchor { self.anchor = anchor }
+        var changed = false
+        if let roll {
+            if let lastRoll {
+                accumulatedRoll += PencilAngleMath.shortestDelta(from: lastRoll, to: roll)
+            }
+            self.lastRoll = roll
+            let step = max(1 * .pi / 180, stepAngle)
+            let threshold = step / 2 + max(0, hysteresis)
+            while accumulatedRoll - CGFloat(itemOffset) * step > threshold {
+                itemOffset += 1
+                changed = true
+            }
+            while accumulatedRoll - CGFloat(itemOffset) * step < -threshold {
+                itemOffset -= 1
+                changed = true
+            }
+            highlightedIndex = Self.wrapped(initialSectorIndex + itemOffset,
+                                            count: itemCount)
+        }
+        return .update(self.anchor, highlightedIndex: highlightedIndex,
+                       selectionChanged: changed)
     }
 
     mutating func dismiss() -> Effect {
@@ -250,7 +248,7 @@ struct PencilPaletteStateMachine: Equatable, Sendable {
         anchor = nil
         lastRoll = nil
         accumulatedRoll = 0
-        sectorOffset = 0
+        itemOffset = 0
         initialSectorIndex = 0
     }
 
@@ -271,6 +269,18 @@ enum PencilRadialPaletteModel {
         let count = tools.count
         let wrapped = ((index % count) + count) % count
         return tools[wrapped]
+    }
+}
+
+enum PencilArcPaletteLayout {
+    /// An upper offset arc keeps the center and Pencil-tip area empty while
+    /// moving primary tools away from the writing hand.
+    static let startAngle = CGFloat(200) * .pi / 180
+    static let sweepAngle = CGFloat(140) * .pi / 180
+
+    static func angle(for index: Int, count: Int) -> CGFloat {
+        guard count > 1 else { return startAngle + sweepAngle / 2 }
+        return startAngle + sweepAngle * CGFloat(index) / CGFloat(count - 1)
     }
 }
 
@@ -315,7 +325,7 @@ enum PencilPressureResponse {
     }
 
     static func curved(_ raw: CGFloat) -> CGFloat {
-        pow(min(max(raw.isFinite ? raw : 0, 0), 1), 0.72)
+        pow(min(max(raw.isFinite ? raw : 0, 0), 1), 0.85)
     }
 
     static func smoothed(previous: CGFloat?, sample: CGFloat) -> CGFloat {
@@ -329,7 +339,10 @@ enum PencilPressureResponse {
 
     static func widthMultiplier(forDisplayPressure pressure: CGFloat?) -> CGFloat {
         guard let pressure else { return 1 }
-        return 0.55 + curved(pressure) * 1.10
+        // Physical Pencil Pro samples clustered around 0.10 for a light hand
+        // and reached roughly 0.87 when firm. This range keeps normal writing
+        // controlled while making those endpoints visibly distinct.
+        return 0.45 + curved(pressure) * 1.40
     }
 
     static func widthMultiplier(for pressure: CGFloat) -> CGFloat {
@@ -542,6 +555,25 @@ enum PencilStrokeGeometry {
                                    y: start.left.y - start.tangent.dy * startControl)
         )
         outline.close()
+
+        // A narrow, non-zero-winding spine lies wholly inside the intended
+        // ribbon and guarantees that every canonical centerline sample is
+        // inked even if an extreme reversal makes the variable-width outline
+        // self-intersect. It does not affect the visible outside edge.
+        let centerline = UIBezierPath()
+        centerline.move(to: displaySamples[0].point)
+        for sample in displaySamples.dropFirst() { centerline.addLine(to: sample.point) }
+        let minimumDiameter = displaySamples.reduce(CGFloat.greatestFiniteMagnitude) {
+            partial, sample in
+            let diameter = sample.markerNib?.minorAxis ?? sample.penRadius * 2
+            return min(partial, diameter)
+        }
+        let spine = centerline.cgPath.copy(
+            strokingWithWidth: max(1, minimumDiameter * 0.62),
+            lineCap: .round, lineJoin: .round, miterLimit: 2
+        )
+        outline.append(UIBezierPath(cgPath: spine))
+        outline.usesEvenOddFillRule = false
         return outline.cgPath
     }
 
@@ -565,6 +597,185 @@ enum PencilStrokeGeometry {
         let b = nib.minorAxis / 2
         return max(0.5, sqrt(pow(a * majorProjection, 2)
                              + pow(b * minorProjection, 2)))
+    }
+}
+
+enum PencilEraserFootprint {
+    /// The eraser preview is intentionally screen-stable. Hit testing converts
+    /// this radius back into world units through the authoritative camera.
+    static let screenRadius: CGFloat = 14
+
+    static func worldRadius(cameraScale: CGFloat) -> CGFloat {
+        screenRadius / max(cameraScale, 0.001)
+    }
+}
+
+/// Exact/near-exact geometry used after spatial-index broad phase. It tests a
+/// swept circular eraser so fast motion cannot tunnel across thin visible ink.
+enum SweptEraserGeometry {
+    struct LineSegment: Equatable, Sendable { let start: CGPoint; let end: CGPoint }
+
+    static func bounds(from start: CGPoint, to end: CGPoint, radius: CGFloat) -> CGRect {
+        CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+               width: abs(end.x - start.x), height: abs(end.y - start.y))
+            .insetBy(dx: -radius, dy: -radius)
+    }
+
+    static func intersects(polyline: [CGPoint], renderedWidth: CGFloat,
+                           from start: CGPoint, to end: CGPoint,
+                           eraserRadius: CGFloat) -> Bool {
+        guard let first = polyline.first else { return false }
+        let radius = max(0, eraserRadius) + max(0, renderedWidth) / 2
+        if polyline.count == 1 { return pointSegmentDistance(first, start, end) <= radius }
+        return zip(polyline, polyline.dropFirst()).contains {
+            segmentDistance(start, end, $0.0, $0.1) <= radius
+        }
+    }
+
+    static func intersects(rect: CGRect, from start: CGPoint, to end: CGPoint,
+                           eraserRadius: CGFloat) -> Bool {
+        guard !rect.isNull, !rect.isEmpty else { return false }
+        let expanded = rect.insetBy(dx: -eraserRadius, dy: -eraserRadius)
+        if expanded.contains(start) || expanded.contains(end) { return true }
+        let corners = [CGPoint(x: expanded.minX, y: expanded.minY),
+                       CGPoint(x: expanded.maxX, y: expanded.minY),
+                       CGPoint(x: expanded.maxX, y: expanded.maxY),
+                       CGPoint(x: expanded.minX, y: expanded.maxY)]
+        return zip(corners, Array(corners.dropFirst()) + [corners[0]]).contains {
+            segmentsIntersect(start, end, $0.0, $0.1)
+        }
+    }
+
+    static func intersects(path: CGPath, fillRule: CAShapeLayerFillRule = .nonZero,
+                           from start: CGPoint, to end: CGPoint,
+                           eraserRadius: CGFloat) -> Bool {
+        let rule: CGPathFillRule = fillRule == .evenOdd ? .evenOdd : .winding
+        if path.contains(start, using: rule) || path.contains(end, using: rule) { return true }
+        return flattenedSegments(path).contains {
+            segmentDistance(start, end, $0.start, $0.end) <= eraserRadius
+        }
+    }
+
+    static func flattenedSegments(_ path: CGPath, curveSteps: Int = 12) -> [LineSegment] {
+        var result: [LineSegment] = []
+        var current = CGPoint.zero
+        var subpathStart = CGPoint.zero
+        func append(_ point: CGPoint) {
+            if point != current { result.append(LineSegment(start: current, end: point)) }
+            current = point
+        }
+        path.applyWithBlock { pointer in
+            let element = pointer.pointee
+            switch element.type {
+            case .moveToPoint:
+                current = element.points[0]; subpathStart = current
+            case .addLineToPoint:
+                append(element.points[0])
+            case .addQuadCurveToPoint:
+                let origin = current, control = element.points[0], end = element.points[1]
+                for step in 1...max(2, curveSteps) {
+                    let t = CGFloat(step) / CGFloat(max(2, curveSteps)), u = 1 - t
+                    append(CGPoint(x: u * u * origin.x + 2 * u * t * control.x + t * t * end.x,
+                                   y: u * u * origin.y + 2 * u * t * control.y + t * t * end.y))
+                }
+            case .addCurveToPoint:
+                let origin = current, c1 = element.points[0], c2 = element.points[1]
+                let end = element.points[2]
+                for step in 1...max(3, curveSteps) {
+                    let t = CGFloat(step) / CGFloat(max(3, curveSteps)), u = 1 - t
+                    append(CGPoint(
+                        x: u * u * u * origin.x + 3 * u * u * t * c1.x
+                            + 3 * u * t * t * c2.x + t * t * t * end.x,
+                        y: u * u * u * origin.y + 3 * u * u * t * c1.y
+                            + 3 * u * t * t * c2.y + t * t * t * end.y
+                    ))
+                }
+            case .closeSubpath:
+                append(subpathStart)
+            @unknown default:
+                break
+            }
+        }
+        return result
+    }
+
+    static func pointSegmentDistance(_ point: CGPoint, _ start: CGPoint,
+                                     _ end: CGPoint) -> CGFloat {
+        let dx = end.x - start.x, dy = end.y - start.y
+        let lengthSquared = dx * dx + dy * dy
+        guard lengthSquared > 0.000_001 else { return hypot(point.x - start.x, point.y - start.y) }
+        let t = min(1, max(0, ((point.x - start.x) * dx + (point.y - start.y) * dy)
+                             / lengthSquared))
+        return hypot(point.x - (start.x + t * dx), point.y - (start.y + t * dy))
+    }
+
+    static func segmentDistance(_ a: CGPoint, _ b: CGPoint,
+                                _ c: CGPoint, _ d: CGPoint) -> CGFloat {
+        if segmentsIntersect(a, b, c, d) { return 0 }
+        return min(pointSegmentDistance(a, c, d), pointSegmentDistance(b, c, d),
+                   pointSegmentDistance(c, a, b), pointSegmentDistance(d, a, b))
+    }
+
+    private static func segmentsIntersect(_ a: CGPoint, _ b: CGPoint,
+                                          _ c: CGPoint, _ d: CGPoint) -> Bool {
+        func cross(_ p: CGPoint, _ q: CGPoint, _ r: CGPoint) -> CGFloat {
+            (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x)
+        }
+        let abC = cross(a, b, c), abD = cross(a, b, d)
+        let cdA = cross(c, d, a), cdB = cross(c, d, b)
+        let epsilon: CGFloat = 0.000_01
+        if abs(abC) <= epsilon && pointSegmentDistance(c, a, b) <= epsilon { return true }
+        if abs(abD) <= epsilon && pointSegmentDistance(d, a, b) <= epsilon { return true }
+        if abs(cdA) <= epsilon && pointSegmentDistance(a, c, d) <= epsilon { return true }
+        if abs(cdB) <= epsilon && pointSegmentDistance(b, c, d) <= epsilon { return true }
+        return (abC > 0) != (abD > 0) && (cdA > 0) != (cdB > 0)
+    }
+}
+
+enum CanvasObjectEraserHitTest {
+    static func intersects(_ object: CanvasObject, from start: CGPoint, to end: CGPoint,
+                           eraserRadius: CGFloat) -> Bool {
+        let translation = object.translation ?? WorldPoint(x: 0, y: 0, pressure: nil)
+        let scaleX = object.scaleX ?? 1, scaleY = object.scaleY ?? 1
+        let transformed = (object.points ?? []).map {
+            StrokePoint(x: $0.x * scaleX + translation.x,
+                        y: $0.y * scaleY + translation.y,
+                        pressure: $0.pressure, altitude: $0.altitude,
+                        azimuth: $0.azimuth, roll: $0.roll,
+                        timestamp: $0.timestamp,
+                        estimationUpdateIndex: $0.estimationUpdateIndex)
+        }
+        if !transformed.isEmpty {
+            if let tool = object.pencilTool {
+                let ink = PencilStrokeGeometry.path(
+                    points: transformed, tool: tool,
+                    baseWidth: CGFloat((object.width ?? 4) * sqrt(abs(scaleX * scaleY)))
+                )
+                return SweptEraserGeometry.intersects(path: ink, from: start, to: end,
+                                                      eraserRadius: eraserRadius)
+            }
+            return SweptEraserGeometry.intersects(
+                polyline: transformed.map { CGPoint(x: $0.x, y: $0.y) },
+                renderedWidth: CGFloat((object.width ?? 4) * sqrt(abs(scaleX * scaleY))),
+                from: start, to: end, eraserRadius: eraserRadius
+            )
+        }
+        if object.type == "path", let definition = object.d,
+           let parsed = try? SVGPathParser.cachedPath(from: definition) {
+            var transform = CGAffineTransform.identity
+                .translatedBy(x: CGFloat(translation.x), y: CGFloat(translation.y))
+                .scaledBy(x: CGFloat(scaleX), y: CGFloat(scaleY))
+            if let path = parsed.copy(using: &transform) {
+                return SweptEraserGeometry.intersects(
+                    path: path, fillRule: .evenOdd, from: start, to: end,
+                    eraserRadius: eraserRadius
+                )
+            }
+        }
+        return SweptEraserGeometry.intersects(
+            rect: BoardHitTestPolicy.bounds(of: object), from: start, to: end,
+            eraserRadius: eraserRadius
+        )
     }
 }
 

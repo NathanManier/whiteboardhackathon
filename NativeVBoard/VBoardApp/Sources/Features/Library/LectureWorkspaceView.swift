@@ -238,6 +238,9 @@ struct LectureWorkspaceView: View {
             }
             await loadStudyInteractions()
         }
+        .onChange(of: interactiveGraph?.id) { _, graphID in
+            if graphID != nil { pencilQuickPalettePoint = nil }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             store.persistForBackgrounding()
         }
@@ -448,19 +451,21 @@ struct LectureWorkspaceView: View {
                 }
 
                 if let point = pencilQuickPalettePoint {
-                    let paletteRadius: CGFloat = 122
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture { pencilQuickPalettePoint = nil }
+                        .zIndex(30.5)
+                    let paletteRadius: CGFloat = 164
                     let center = PencilPalettePlacement.center(
                         anchor: point, radius: paletteRadius,
                         safeBounds: CGRect(origin: .zero, size: proxy.size).insetBy(dx: 8, dy: 8)
                     )
                     PencilQuickPalette(activeTool: activeTool,
-                                       recentColors: [penColor, markerColor],
                                        highlightedIndex: pencilQuickPaletteHighlight,
+                                       color: activeTool == .highlighter ? $markerColor : $penColor,
                                        width: activeTool == .highlighter ? $markerWidth : $penWidth,
-                                       selectColor: { color in
-                                           if activeTool == .highlighter { markerColor = color }
-                                           else { penColor = color }
-                                       },
+                                       canUndo: store.canUndo,
+                                       canRedo: store.canRedo,
                                        undo: { store.undo(api: api) },
                                        redo: { store.redo(api: api) }) { tool in
                         activeTool = tool
@@ -565,7 +570,9 @@ struct LectureWorkspaceView: View {
     private var pencilPreferences: PencilPreferences {
         PencilPreferences(
             doubleTap: PencilDoubleTapSetting(rawValue: pencilDoubleTapRaw) ?? .followSystem,
-            squeeze: PencilSqueezeSetting(rawValue: pencilSqueezeRaw) ?? .followSystem,
+            squeeze: interactiveGraph == nil
+                ? (PencilSqueezeSetting(rawValue: pencilSqueezeRaw) ?? .followSystem)
+                : .off,
             hover: PencilHoverSetting(rawValue: pencilHoverRaw) ?? .followSystem
         )
     }
@@ -1411,69 +1418,74 @@ private struct WorkspaceToolButton: View {
 
 struct PencilQuickPalette: View {
     let activeTool: CanvasTool
-    let recentColors: [String]
     let highlightedIndex: Int
+    @Binding var color: String
     @Binding var width: Double
-    let selectColor: (String) -> Void
+    let canUndo: Bool
+    let canRedo: Bool
     let undo: () -> Void
     let redo: () -> Void
     let select: (CanvasTool) -> Void
     private let tools = PencilRadialPaletteModel.tools
+    private let colors = ["#111827", "#2563EB", "#DC2626", "#16A34A",
+                          "#7C3AED", "#EA580C", "#DB2777", "#F8FAFC"]
+    private let center = CGPoint(x: 164, y: 166)
 
     var body: some View {
         ZStack {
-            Circle()
+            PencilArcBandShape()
                 .fill(.regularMaterial)
-                .frame(width: 224, height: 224)
-                .overlay { Circle().stroke(.separator.opacity(0.5), lineWidth: 0.5) }
-                .shadow(color: .black.opacity(0.17), radius: 16, y: 6)
+                .overlay { PencilArcBandShape().stroke(.separator.opacity(0.5), lineWidth: 0.5) }
 
             ForEach(Array(tools.enumerated()), id: \.offset) { index, tool in
                 radialToolButton(tool, index: index)
-                    .offset(radialOffset(index: index, radius: 66))
+                    .position(arcPoint(index: index, radius: 96))
             }
 
-            ForEach(Array(recentColors.prefix(2).enumerated()), id: \.offset) { index, color in
-                Button { selectColor(color) } label: {
-                    Circle().fill(Color(uiColor: UIColor(svgHex: color)))
-                        .frame(width: 27, height: 27)
+            HStack(spacing: 10) {
+                Menu {
+                    ForEach(colors, id: \.self) { option in
+                        Button {
+                            color = option
+                        } label: {
+                            Label(option, systemImage: option == color ? "checkmark.circle.fill" : "circle.fill")
+                        }
+                    }
+                } label: {
+                    Circle()
+                        .fill(Color(uiColor: UIColor(svgHex: color)))
+                        .frame(width: 30, height: 30)
                         .overlay(Circle().stroke(.white.opacity(0.85), lineWidth: 1.5))
+                        .overlay(Circle().stroke(.separator.opacity(0.65), lineWidth: 0.5))
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Use recent color \(index + 1)")
-                .offset(radialOffset(angle: index == 0 ? .pi / 4 : .pi * 3 / 4,
-                                     radius: 99))
-            }
+                .accessibilityLabel("Ink color")
 
-            Button(action: undo) {
-                Image(systemName: "arrow.uturn.backward")
-                    .frame(width: 30, height: 30)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Undo")
-            .offset(radialOffset(angle: .pi * 5 / 4, radius: 99))
-
-            Button(action: redo) {
-                Image(systemName: "arrow.uturn.forward")
-                    .frame(width: 30, height: 30)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Redo")
-            .offset(radialOffset(angle: .pi * 7 / 4, radius: 99))
-
-            Menu {
+                Capsule()
+                    .fill(Color(uiColor: UIColor(svgHex: color)))
+                    .frame(width: max(3, min(18, width)), height: 8)
+                    .accessibilityHidden(true)
                 Slider(value: $width, in: activeTool == .highlighter ? 10...40 : 1.5...14)
-                Text("Width \(width, specifier: "%.1f")")
-            } label: {
-                Image(systemName: "lineweight")
-                    .font(.system(size: 16, weight: .semibold))
-                    .frame(width: 42, height: 42)
-                    .background(.thinMaterial, in: Circle())
-                    .overlay { Circle().stroke(.separator.opacity(0.5), lineWidth: 0.5) }
+                    .frame(width: 96)
+                    .accessibilityLabel("Stroke width")
+                    .accessibilityValue("\(width, specifier: "%.1f")")
+
+                Button(action: undo) { Image(systemName: "arrow.uturn.backward") }
+                    .buttonStyle(.plain)
+                    .disabled(!canUndo)
+                    .accessibilityLabel("Undo")
+                Button(action: redo) { Image(systemName: "arrow.uturn.forward") }
+                    .buttonStyle(.plain)
+                    .disabled(!canRedo)
+                    .accessibilityLabel("Redo")
             }
-            .accessibilityLabel("Stroke width")
+            .padding(.horizontal, 12)
+            .frame(height: 48)
+            .background(.regularMaterial, in: Capsule())
+            .overlay { Capsule().stroke(.separator.opacity(0.5), lineWidth: 0.5) }
+            .position(x: center.x, y: 226)
         }
-        .frame(width: 244, height: 244)
+        .frame(width: 328, height: 258)
         .accessibilityElement(children: .contain)
     }
 
@@ -1498,12 +1510,10 @@ struct PencilQuickPalette: View {
         .accessibilityValue(highlighted ? "Highlighted" : "")
     }
 
-    private func radialOffset(index: Int, radius: CGFloat) -> CGSize {
-        radialOffset(angle: -.pi / 2 + CGFloat(index) * .pi / 2, radius: radius)
-    }
-
-    private func radialOffset(angle: CGFloat, radius: CGFloat) -> CGSize {
-        CGSize(width: cos(angle) * radius, height: sin(angle) * radius)
+    private func arcPoint(index: Int, radius: CGFloat) -> CGPoint {
+        let angle = PencilArcPaletteLayout.angle(for: index, count: tools.count)
+        return CGPoint(x: center.x + cos(angle) * radius,
+                       y: center.y + sin(angle) * radius)
     }
 
     private func accessibilityName(for tool: CanvasTool) -> String {
@@ -1524,6 +1534,31 @@ struct PencilQuickPalette: View {
         case .lasso: return "lasso"
         default: return "cursorarrow"
         }
+    }
+}
+
+private struct PencilArcBandShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let center = CGPoint(x: rect.midX, y: rect.height * 0.643)
+        let outer: CGFloat = 128
+        let inner: CGFloat = 64
+        let samples = 28
+        var path = Path()
+        for index in 0...samples {
+            let angle = PencilArcPaletteLayout.startAngle
+                + PencilArcPaletteLayout.sweepAngle * CGFloat(index) / CGFloat(samples)
+            let point = CGPoint(x: center.x + cos(angle) * outer,
+                                y: center.y + sin(angle) * outer)
+            index == 0 ? path.move(to: point) : path.addLine(to: point)
+        }
+        for index in (0...samples).reversed() {
+            let angle = PencilArcPaletteLayout.startAngle
+                + PencilArcPaletteLayout.sweepAngle * CGFloat(index) / CGFloat(samples)
+            path.addLine(to: CGPoint(x: center.x + cos(angle) * inner,
+                                      y: center.y + sin(angle) * inner))
+        }
+        path.closeSubpath()
+        return path
     }
 }
 

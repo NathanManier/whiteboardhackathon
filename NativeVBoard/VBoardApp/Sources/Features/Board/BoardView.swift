@@ -415,6 +415,9 @@ private struct BoardEditorSurface: View {
                 interactiveGraph = nil
             }
         }
+        .onChange(of: interactiveGraph?.id) { _, graphID in
+            if graphID != nil { pencilQuickPalettePoint = nil }
+        }
         .onChange(of: studySelection) { _, selection in
             // Graph recognition begins only after the explicit Graph action.
             // Selection changes must not spend AI work or leave an unexplained
@@ -558,18 +561,20 @@ private struct BoardEditorSurface: View {
             .zIndex(30)
 
             if let point = pencilQuickPalettePoint {
-                let paletteRadius: CGFloat = 122
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { pencilQuickPalettePoint = nil }
+                    .zIndex(30.5)
+                let paletteRadius: CGFloat = 164
                 let center = PencilPalettePlacement.center(
                     anchor: point, radius: paletteRadius,
                     safeBounds: CGRect(origin: .zero, size: proxy.size).insetBy(dx: 8, dy: 8)
                 )
-                PencilQuickPalette(activeTool: activeTool, recentColors: [penColor, markerColor],
+                PencilQuickPalette(activeTool: activeTool,
                                    highlightedIndex: pencilQuickPaletteHighlight,
+                                   color: activeTool == .highlighter ? $markerColor : $penColor,
                                    width: activeTool == .highlighter ? $markerWidth : $penWidth,
-                                   selectColor: { color in
-                                       if activeTool == .highlighter { markerColor = color }
-                                       else { penColor = color }
-                                   },
+                                   canUndo: store.canUndo, canRedo: store.canRedo,
                                    undo: { store.undo(api: api) }, redo: { store.redo(api: api) }) {
                     activeTool = $0
                     pencilQuickPalettePoint = nil
@@ -647,7 +652,9 @@ private struct BoardEditorSurface: View {
     private var pencilPreferences: PencilPreferences {
         PencilPreferences(
             doubleTap: PencilDoubleTapSetting(rawValue: pencilDoubleTapRaw) ?? .followSystem,
-            squeeze: PencilSqueezeSetting(rawValue: pencilSqueezeRaw) ?? .followSystem,
+            squeeze: interactiveGraph == nil
+                ? (PencilSqueezeSetting(rawValue: pencilSqueezeRaw) ?? .followSystem)
+                : .off,
             hover: PencilHoverSetting(rawValue: pencilHoverRaw) ?? .followSystem
         )
     }

@@ -127,6 +127,25 @@ final class ProfessorSVGView: UIView {
 
     func ids(intersecting rect: CGRect) -> Set<String> { index.query(rect) }
 
+    /// Uses the spatial index only as a broad phase, then tests the actual
+    /// filled contour boundary against the swept circular eraser footprint.
+    func ids(intersectingSweptSegmentFrom start: CGPoint, to end: CGPoint,
+             radius: CGFloat) -> Set<String> {
+        let query = SweptEraserGeometry.bounds(from: start, to: end, radius: radius)
+        var result = Set<String>()
+        for id in index.query(query) {
+            guard let entry = entries[id], let path = entry.layer.path,
+                  entry.bounds.intersects(query) else { continue }
+            if SweptEraserGeometry.intersects(
+                path: path, fillRule: entry.layer.fillRule,
+                from: start, to: end, eraserRadius: radius
+            ) {
+                result.insert(id)
+            }
+        }
+        return result
+    }
+
     /// Returns professor contours whose sampled filled area is substantially
     /// inside a board-local lasso. The spatial index is only the candidate
     /// reducer; stable path IDs remain the selection identity.

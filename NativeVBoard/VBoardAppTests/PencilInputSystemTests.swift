@@ -119,8 +119,8 @@ final class PencilGeometryAndPressureTests: XCTestCase {
             .map { PencilPressureResponse.widthMultiplier(forDisplayPressure: $0) }
         XCTAssertTrue(zip(values, values.dropFirst()).allSatisfy(<=))
         XCTAssertTrue(values.allSatisfy(\.isFinite))
-        XCTAssertEqual(values.first ?? 0, 0.55, accuracy: 0.000_01)
-        XCTAssertEqual(values.last ?? 0, 1.65, accuracy: 0.000_01)
+        XCTAssertEqual(values.first ?? 0, 0.45, accuracy: 0.000_01)
+        XCTAssertEqual(values.last ?? 0, 1.85, accuracy: 0.000_01)
         XCTAssertLessThan(PencilPressureResponse.widthMultiplier(forDisplayPressure: 0.10),
                           PencilPressureResponse.widthMultiplier(forDisplayPressure: 0.87))
         XCTAssertEqual(PencilPressureResponse.widthMultiplier(forDisplayPressure: nil), 1)
@@ -231,7 +231,7 @@ final class PencilGeometryAndPressureTests: XCTestCase {
     }
 
 
-    func testPenRibbonIsOneClosedOutlineAndContainsItsCenterline() {
+    func testPenRibbonAndSafetySpineContainEveryCanonicalCenterlineSample() {
         var points: [StrokePoint] = []
         for index in 0...20 {
             let x = Double(index * 8)
@@ -241,15 +241,15 @@ final class PencilGeometryAndPressureTests: XCTestCase {
         }
         let path = PencilStrokeGeometry.path(points: points, tool: .pen, baseWidth: 12)
         let counts = elementCounts(path)
-        XCTAssertEqual(counts.moves, 1)
-        XCTAssertEqual(counts.closes, 1)
+        XCTAssertEqual(counts.moves, 2)
+        XCTAssertEqual(counts.closes, 2)
         for point in points {
             XCTAssertTrue(path.contains(CGPoint(x: CGFloat(point.x), y: CGFloat(point.y))),
                           "Pen ribbon left a centerline hole at \(point.x), \(point.y)")
         }
     }
 
-    func testMarkerRibbonIsOneClosedOutlineRatherThanRepeatedStamps() {
+    func testMarkerRibbonAndSafetySpineAvoidRepeatedStampScalloping() {
         var points: [StrokePoint] = []
         for index in 0...30 {
             let roll = Double(index) * Double.pi / 180.0
@@ -259,8 +259,8 @@ final class PencilGeometryAndPressureTests: XCTestCase {
         }
         let path = PencilStrokeGeometry.path(points: points, tool: .marker, baseWidth: 24)
         let counts = elementCounts(path)
-        XCTAssertEqual(counts.moves, 1)
-        XCTAssertEqual(counts.closes, 1)
+        XCTAssertEqual(counts.moves, 2)
+        XCTAssertEqual(counts.closes, 2)
         for step in 0...30 {
             XCTAssertTrue(path.contains(CGPoint(x: CGFloat(step * 6), y: CGFloat(step))))
         }
@@ -277,6 +277,64 @@ final class PencilGeometryAndPressureTests: XCTestCase {
             }
         }
         return (moves, closes)
+    }
+}
+
+final class SweptEraserGeometryTests: XCTestCase {
+    func testScreenStablePreviewRadiusConvertsThroughAuthoritativeCameraScale() {
+        XCTAssertEqual(PencilEraserFootprint.screenRadius, 14)
+        XCTAssertEqual(PencilEraserFootprint.worldRadius(cameraScale: 2), 7)
+        XCTAssertEqual(PencilEraserFootprint.worldRadius(cameraScale: 0.5), 28)
+    }
+
+    func testFastSweepCannotTunnelAcrossThinVisibleStroke() {
+        XCTAssertTrue(SweptEraserGeometry.intersects(
+            polyline: [CGPoint(x: 50, y: 0), CGPoint(x: 50, y: 100)],
+            renderedWidth: 2,
+            from: CGPoint(x: 0, y: 50), to: CGPoint(x: 100, y: 50),
+            eraserRadius: 3
+        ))
+    }
+
+    func testBroadPhaseBoundingBoxOverlapDoesNotCreateFalsePositiveDeletion() {
+        let eraserStart = CGPoint(x: 0, y: 0)
+        let eraserEnd = CGPoint(x: 100, y: 100)
+        let distantStroke = [CGPoint(x: 0, y: 100), CGPoint(x: 12, y: 100)]
+        XCTAssertTrue(SweptEraserGeometry.bounds(
+            from: eraserStart, to: eraserEnd, radius: 4
+        ).intersects(CGRect(x: 0, y: 98, width: 12, height: 4)))
+        XCTAssertFalse(SweptEraserGeometry.intersects(
+            polyline: distantStroke, renderedWidth: 2,
+            from: eraserStart, to: eraserEnd, eraserRadius: 4
+        ))
+    }
+
+    func testVisibleFilledPathAndBoundaryAreBothErasable() {
+        let rectangle = CGPath(rect: CGRect(x: 40, y: 40, width: 20, height: 20),
+                               transform: nil)
+        XCTAssertTrue(SweptEraserGeometry.intersects(
+            path: rectangle, from: CGPoint(x: 45, y: 50), to: CGPoint(x: 55, y: 50),
+            eraserRadius: 1
+        ))
+        XCTAssertTrue(SweptEraserGeometry.intersects(
+            path: rectangle, from: CGPoint(x: 0, y: 40), to: CGPoint(x: 100, y: 40),
+            eraserRadius: 1
+        ))
+        XCTAssertFalse(SweptEraserGeometry.intersects(
+            path: rectangle, from: CGPoint(x: 0, y: 0), to: CGPoint(x: 30, y: 0),
+            eraserRadius: 3
+        ))
+    }
+
+    func testStationaryEraserUsesSameVisibleCircularFootprint() {
+        XCTAssertTrue(SweptEraserGeometry.intersects(
+            polyline: [CGPoint(x: 13, y: 0)], renderedWidth: 0,
+            from: .zero, to: .zero, eraserRadius: 14
+        ))
+        XCTAssertFalse(SweptEraserGeometry.intersects(
+            polyline: [CGPoint(x: 15, y: 0)], renderedWidth: 0,
+            from: .zero, to: .zero, eraserRadius: 14
+        ))
     }
 }
 
@@ -371,27 +429,29 @@ final class PencilPaletteAndArbitrationTests: XCTestCase {
         XCTAssertLessThanOrEqual(PencilHitTarget.resizeHandleRadius * 2, 44)
     }
 
-    func testOneSqueezeProducesOnePaletteLifecycle() {
+    func testCompletedSqueezesTogglePersistentPaletteAndCommitOnSecondSqueeze() {
         var state = PencilPaletteStateMachine()
-        XCTAssertEqual(state.receive(.began, anchor: CGPoint(x: 10, y: 20)),
+        XCTAssertEqual(state.toggle(anchor: CGPoint(x: 10, y: 20), roll: 0,
+                                    initialIndex: 0),
                        .present(CGPoint(x: 10, y: 20), highlightedIndex: 0))
-        XCTAssertEqual(state.receive(.began, anchor: CGPoint(x: 11, y: 21)), .none)
-        XCTAssertEqual(state.receive(.changed, anchor: CGPoint(x: 12, y: 22)),
+        XCTAssertTrue(state.isPresented)
+        XCTAssertEqual(state.update(anchor: CGPoint(x: 12, y: 22), roll: 0),
                        .update(CGPoint(x: 12, y: 22), highlightedIndex: 0,
                                selectionChanged: false))
-        XCTAssertEqual(state.receive(.ended, anchor: CGPoint(x: 13, y: 23)),
+        XCTAssertEqual(state.toggle(anchor: CGPoint(x: 13, y: 23), roll: 0,
+                                    initialIndex: 0),
                        .commit(highlightedIndex: 0))
         XCTAssertFalse(state.isPresented)
         XCTAssertEqual(state.dismiss(), .none)
     }
 
-    func testSqueezeCancellationDismissesAndClearsHitBlockingState() {
+    func testExplicitDismissClearsPaletteHitBlockingState() {
         var state = PencilPaletteStateMachine()
-        _ = state.receive(.began, anchor: nil)
-        XCTAssertEqual(state.receive(.cancelled, anchor: nil), .dismiss)
+        _ = state.toggle(anchor: nil, roll: nil, initialIndex: 0)
+        XCTAssertEqual(state.dismiss(), .dismiss)
         XCTAssertFalse(state.isPresented)
         XCTAssertNil(state.anchor)
-        XCTAssertEqual(state.receive(.cancelled, anchor: nil), .none)
+        XCTAssertEqual(state.dismiss(), .none)
     }
 
     func testPalettePlacementFlipsAndClampsAtScreenEdges() {
@@ -411,54 +471,63 @@ final class PencilPaletteAndArbitrationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(center.y - 112, bounds.minY)
     }
 
-    func testClockwiseRollAdvancesRadialSectorAcrossWraparound() {
+    func testClockwiseRollAdvancesOneArcItemAcrossWraparound() {
         var state = PencilPaletteStateMachine()
-        _ = state.receive(.began, anchor: .zero,
-                          roll: CGFloat(350.0 * .pi / 180), initialIndex: 1)
+        _ = state.toggle(anchor: .zero, roll: CGFloat(350.0 * .pi / 180),
+                         initialIndex: 1)
         XCTAssertEqual(
-            state.receive(.changed, anchor: .zero,
-                          roll: CGFloat(50.0 * .pi / 180)),
+            state.update(anchor: .zero, roll: CGFloat(15.0 * .pi / 180)),
             .update(.zero, highlightedIndex: 2, selectionChanged: true)
         )
     }
 
-    func testCounterclockwiseRollMovesRadialSectorCounterclockwise() {
+    func testCounterclockwiseRollMovesOneArcItemCounterclockwise() {
         var state = PencilPaletteStateMachine()
-        _ = state.receive(.began, anchor: .zero, roll: 0, initialIndex: 0)
+        _ = state.toggle(anchor: .zero, roll: 0, initialIndex: 0)
         XCTAssertEqual(
-            state.receive(.changed, anchor: .zero, roll: -.pi / 3),
+            state.update(anchor: .zero, roll: CGFloat(-17.0 * .pi / 180)),
             .update(.zero, highlightedIndex: 3, selectionChanged: true)
         )
     }
 
-    func testRadialSectorHysteresisPreventsBoundaryJitter() {
+    func testArcItemHysteresisPreventsBoundaryJitter() {
         var state = PencilPaletteStateMachine()
-        _ = state.receive(.began, anchor: .zero, roll: 0, initialIndex: 0)
-        let underForwardThreshold = CGFloat(52.0 * .pi / 180)
+        _ = state.toggle(anchor: .zero, roll: 0, initialIndex: 0)
+        let underForwardThreshold = CGFloat(15.0 * .pi / 180)
         XCTAssertEqual(
-            state.receive(.changed, anchor: .zero, roll: underForwardThreshold),
+            state.update(anchor: .zero, roll: underForwardThreshold),
             .update(.zero, highlightedIndex: 0, selectionChanged: false)
         )
         XCTAssertEqual(
-            state.receive(.changed, anchor: .zero, roll: CGFloat(54.0 * .pi / 180)),
+            state.update(anchor: .zero, roll: CGFloat(17.0 * .pi / 180)),
             .update(.zero, highlightedIndex: 1, selectionChanged: true)
         )
         XCTAssertEqual(
-            state.receive(.changed, anchor: .zero, roll: CGFloat(38.0 * .pi / 180)),
+            state.update(anchor: .zero, roll: CGFloat(7.0 * .pi / 180)),
             .update(.zero, highlightedIndex: 1, selectionChanged: false)
         )
         XCTAssertEqual(
-            state.receive(.changed, anchor: .zero, roll: CGFloat(36.0 * .pi / 180)),
+            state.update(anchor: .zero, roll: 0),
             .update(.zero, highlightedIndex: 0, selectionChanged: true)
         )
     }
 
-    func testCancelledSqueezeNeverCommitsHighlightedSector() {
+    func testOutsideTapDismissNeverCommitsHighlightedArcItem() {
         var state = PencilPaletteStateMachine()
-        _ = state.receive(.began, anchor: .zero, roll: 0, initialIndex: 2)
-        _ = state.receive(.changed, anchor: .zero, roll: .pi / 2)
-        XCTAssertEqual(state.receive(.cancelled, anchor: .zero), .dismiss)
+        _ = state.toggle(anchor: .zero, roll: 0, initialIndex: 2)
+        _ = state.update(anchor: .zero, roll: CGFloat(17.0 * .pi / 180))
+        XCTAssertEqual(state.dismiss(), .dismiss)
         XCTAssertFalse(state.isPresented)
+    }
+
+    func testArcGeometryUsesRequestedOffset140DegreeBandWithEmptyCenter() {
+        XCTAssertEqual(PencilArcPaletteLayout.sweepAngle,
+                       CGFloat(140) * .pi / 180, accuracy: 0.000_01)
+        let angles = (0..<4).map { PencilArcPaletteLayout.angle(for: $0, count: 4) }
+        XCTAssertEqual(angles.first, PencilArcPaletteLayout.startAngle)
+        XCTAssertEqual(angles.last, PencilArcPaletteLayout.startAngle
+                       + PencilArcPaletteLayout.sweepAngle)
+        XCTAssertTrue(zip(angles, angles.dropFirst()).allSatisfy(<))
     }
 
     func testToolContactMatrixHasOneDeterministicOwner() {
