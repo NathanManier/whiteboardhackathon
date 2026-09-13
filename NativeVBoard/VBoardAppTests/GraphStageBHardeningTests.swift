@@ -915,6 +915,89 @@ final class GraphStageBHardeningTests: XCTestCase {
         XCTAssertTrue(store.editor.objects.isEmpty)
     }
 
+    func testLiveGraphEditKeepsTypedSourceWhenViewportChangesAndUsesOneUndoStep() throws {
+        let mutationBoardID = UUID().uuidString
+            .replacingOccurrences(of: "-", with: "").lowercased()
+        let source = makeGraph(owningBoardID: mutationBoardID)
+        let initial = EditorState(
+            schemaVersion: 4, revision: 5, updatedAt: nil,
+            viewport: CameraRect(x: -400, y: -300, width: 1_200, height: 900),
+            objects: [CanvasObject(graph: source)], groups: [], importedTransforms: [:],
+            sourceBoards: [], mergedBoardIDs: []
+        )
+        let store = BoardDocumentStore(boardID: mutationBoardID, editor: initial)
+        let api = APIClient(baseURL: URL(string: "https://graph-edit-session.invalid")!)
+
+        store.beginGraphEditing(id: source.id)
+        store.updateGraphDuringEditing(
+            source.replacing(expressions: [
+                GraphExpression(id: "e1", latex: "y=x^3",
+                                type: .explicitFunction)
+            ]),
+            api: api
+        )
+        let invalidButSafeDraft = try XCTUnwrap(
+            store.editor.objects.first?.graph
+        ).replacing(expressions: [
+            GraphExpression(id: "e1", latex: "f(x)=sin(",
+                            type: .explicitFunction)
+        ])
+        store.updateGraphDuringEditing(invalidButSafeDraft, api: api)
+        let movedViewport = GraphViewport(xMin: -4, xMax: 12,
+                                          yMin: -8, yMax: 20)
+        store.updateGraphViewportDuringEditing(
+            id: source.id, viewport: movedViewport, api: api
+        )
+        store.endGraphEditing(id: source.id)
+
+        let edited = try XCTUnwrap(store.editor.objects.first?.graph)
+        XCTAssertEqual(edited.expressions.first?.latex, "f(x)=sin(")
+        XCTAssertEqual(edited.expressions.first?.id, "e1")
+        XCTAssertEqual(edited.viewport, movedViewport)
+        XCTAssertTrue(store.canUndo)
+
+        store.undo(api: api)
+        XCTAssertEqual(store.editor.objects.first?.graph, source,
+                       "One undo must restore the graph from before the typing session")
+        XCTAssertFalse(store.canUndo,
+                       "Per-character edits and viewport movement must not create extra history entries")
+    }
+
+    func testInvalidGraphDraftRestoresFromOutboxAfterDismissalWithoutNetworkSave() throws {
+        let persistenceBoardID = UUID().uuidString
+            .replacingOccurrences(of: "-", with: "").lowercased()
+        let source = makeGraph(owningBoardID: persistenceBoardID)
+        let server = EditorState(
+            schemaVersion: 4, revision: 9, updatedAt: nil,
+            viewport: CameraRect(x: -400, y: -300, width: 1_200, height: 900),
+            objects: [CanvasObject(graph: source)], groups: [], importedTransforms: [:],
+            sourceBoards: [], mergedBoardIDs: []
+        )
+        let api = APIClient(baseURL: URL(string: "https://graph-outbox.invalid")!)
+        var draft = source
+        draft = draft.replacing(expressions: [
+            GraphExpression(id: "e1", latex: "f(x)=sin(",
+                            type: .explicitFunction, visible: false)
+        ])
+
+        do {
+            let editingStore = BoardDocumentStore(boardID: persistenceBoardID,
+                                                  editor: server)
+            editingStore.beginGraphEditing(id: source.id)
+            editingStore.updateGraphDuringEditing(draft, api: api)
+            editingStore.persistForBackgrounding()
+        }
+
+        let reopened = BoardDocumentStore(boardID: persistenceBoardID, editor: server)
+        reopened.restoreLocalIfPresent(server: server)
+        let restored = try XCTUnwrap(reopened.editor.objects.first?.graph)
+
+        XCTAssertEqual(reopened.status, .offlinePending)
+        XCTAssertEqual(restored.expressions.first?.latex, "f(x)=sin(")
+        XCTAssertFalse(try XCTUnwrap(restored.expressions.first?.visible))
+        XCTAssertEqual(restored.expressions.first?.id, source.expressions.first?.id)
+    }
+
     func testMixedGraphNoteAndProfessorResizeUsesOneBoundedFactor() throws {
         let mutationBoardID = UUID().uuidString
             .replacingOccurrences(of: "-", with: "").lowercased()

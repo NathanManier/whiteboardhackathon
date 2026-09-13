@@ -382,19 +382,23 @@ struct LectureWorkspaceView: View {
                         },
                         onPencilRequestsPassiveMode: { interactiveGraph = nil },
                         onCommitViewport: { owningBoardID, graphID, viewport in
-                            guard let current = store.scenes[owningBoardID]?.editor.objects
-                                .first(where: { $0.id == graphID })?.graph else { return }
-                            let updated = current.replacing(viewport: viewport)
-                            store.replaceGraph(updated, boardID: owningBoardID, api: api)
-                            if interactiveGraph?.id == graphID { interactiveGraph = updated }
+                            store.updateGraphViewportDuringEditing(
+                                id: graphID, boardID: owningBoardID,
+                                viewport: viewport, api: api
+                            )
                         },
                         onCommitGraph: { updated in
                             guard updated.id == graph.id,
                                   updated.owningBoardID == graph.owningBoardID else { return }
-                            store.replaceGraph(
+                            store.updateGraphDuringEditing(
                                 updated, boardID: updated.owningBoardID, api: api
                             )
-                            interactiveGraph = updated
+                        },
+                        onBeginGraphEditing: { owningBoardID, graphID in
+                            store.beginGraphEditing(id: graphID, boardID: owningBoardID)
+                        },
+                        onEndGraphEditing: { owningBoardID, graphID in
+                            store.endGraphEditing(id: graphID, boardID: owningBoardID)
                         },
                         onExplain: { openStudy(action: "explain") },
                         onPractice: { openStudy(action: "practice_problems") },

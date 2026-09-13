@@ -979,6 +979,8 @@ struct GraphInteractiveSurface: View {
     let onPencilRequestsPassiveMode: () -> Void
     let onCommitViewport: (String, String, GraphViewport) -> Void
     let onCommitGraph: (GraphObject) -> Void
+    let onBeginGraphEditing: (String, String) -> Void
+    let onEndGraphEditing: (String, String) -> Void
     let onExplain: () -> Void
     let onPractice: () -> Void
     let onDelete: () -> Void
@@ -999,6 +1001,8 @@ struct GraphInteractiveSurface: View {
          onPencilRequestsPassiveMode: @escaping () -> Void,
          onCommitViewport: @escaping (String, String, GraphViewport) -> Void,
          onCommitGraph: @escaping (GraphObject) -> Void = { _ in },
+         onBeginGraphEditing: @escaping (String, String) -> Void = { _, _ in },
+         onEndGraphEditing: @escaping (String, String) -> Void = { _, _ in },
          onExplain: @escaping () -> Void = {},
          onPractice: @escaping () -> Void = {},
          onDelete: @escaping () -> Void = {},
@@ -1017,6 +1021,8 @@ struct GraphInteractiveSurface: View {
             onPencilRequestsPassiveMode: onPencilRequestsPassiveMode,
             onCommitViewport: onCommitViewport,
             onCommitGraph: onCommitGraph,
+            onBeginGraphEditing: onBeginGraphEditing,
+            onEndGraphEditing: onEndGraphEditing,
             onExplain: onExplain,
             onPractice: onPractice,
             onDelete: onDelete,
@@ -1037,6 +1043,8 @@ struct GraphInteractiveSurface: View {
          onPencilRequestsPassiveMode: @escaping () -> Void,
          onCommitViewport: @escaping (String, String, GraphViewport) -> Void,
          onCommitGraph: @escaping (GraphObject) -> Void = { _ in },
+         onBeginGraphEditing: @escaping (String, String) -> Void = { _, _ in },
+         onEndGraphEditing: @escaping (String, String) -> Void = { _, _ in },
          onExplain: @escaping () -> Void = {},
          onPractice: @escaping () -> Void = {},
          onDelete: @escaping () -> Void = {},
@@ -1056,6 +1064,8 @@ struct GraphInteractiveSurface: View {
         self.onPencilRequestsPassiveMode = onPencilRequestsPassiveMode
         self.onCommitViewport = onCommitViewport
         self.onCommitGraph = onCommitGraph
+        self.onBeginGraphEditing = onBeginGraphEditing
+        self.onEndGraphEditing = onEndGraphEditing
         self.onExplain = onExplain
         self.onPractice = onPractice
         self.onDelete = onDelete
@@ -1073,6 +1083,12 @@ struct GraphInteractiveSurface: View {
                     onCommitViewport(graph.owningBoardID, graph.id, viewport)
                 },
                 onCommitGraph: onCommitGraph,
+                onBeginEditing: {
+                    onBeginGraphEditing(graph.owningBoardID, graph.id)
+                },
+                onEndEditing: {
+                    onEndGraphEditing(graph.owningBoardID, graph.id)
+                },
                 onExplain: onExplain,
                 onPractice: onPractice,
                 onDelete: onDelete,
@@ -1243,6 +1259,8 @@ private struct LightweightGraphSurface: View {
     let graph: GraphObject
     let onCommitViewport: (GraphViewport) -> Void
     let onCommitGraph: (GraphObject) -> Void
+    let onBeginEditing: () -> Void
+    let onEndEditing: () -> Void
     let onExplain: () -> Void
     let onPractice: () -> Void
     let onDelete: () -> Void
@@ -1266,12 +1284,16 @@ private struct LightweightGraphSurface: View {
 
     init(graph: GraphObject, onCommitViewport: @escaping (GraphViewport) -> Void,
          onCommitGraph: @escaping (GraphObject) -> Void,
+         onBeginEditing: @escaping () -> Void,
+         onEndEditing: @escaping () -> Void,
          onExplain: @escaping () -> Void, onPractice: @escaping () -> Void,
          onDelete: @escaping () -> Void,
          onEdit: @escaping () -> Void, onDone: @escaping () -> Void) {
         self.graph = graph
         self.onCommitViewport = onCommitViewport
         self.onCommitGraph = onCommitGraph
+        self.onBeginEditing = onBeginEditing
+        self.onEndEditing = onEndEditing
         self.onExplain = onExplain
         self.onPractice = onPractice
         self.onDelete = onDelete
@@ -1321,6 +1343,8 @@ private struct LightweightGraphSurface: View {
         .environment(\.colorScheme, VBoardCanvasTheme.colorScheme)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(GraphAccessibility.label(for: graph))
+        .onAppear(perform: onBeginEditing)
+        .onDisappear(perform: onEndEditing)
         .onChange(of: graph) { _, value in
             viewport = value.viewport
             expressions = value.expressions
@@ -1340,7 +1364,7 @@ private struct LightweightGraphSurface: View {
             Button("Delete", systemImage: "trash", role: .destructive) {
                 onDelete(); onDone()
             }
-            Button("Done") { commitGraph(); onDone() }
+            Button("Done") { commit(); onEndEditing(); onDone() }
                 .buttonStyle(.borderedProminent)
         }
         .buttonStyle(.bordered)
@@ -1634,10 +1658,7 @@ private struct LightweightGraphSurface: View {
 
     private func commit() { onCommitViewport(viewport) }
 
-    private func commitGraph() {
-        onCommitGraph(workingGraph)
-        onCommitViewport(viewport)
-    }
+    private func commitLiveGraph() { onCommitGraph(workingGraph) }
 
     private func selectExpression(_ expression: GraphExpression?) {
         selectedExpressionID = expression?.id
@@ -1661,6 +1682,7 @@ private struct LightweightGraphSurface: View {
             displayStyle: existing.displayStyle, restrictions: existing.restrictions,
             additionalFields: existing.additionalFields
         )
+        commitLiveGraph()
     }
 
     private func replaceExpression(_ expression: GraphExpression, visible: Bool) {
@@ -1670,6 +1692,7 @@ private struct LightweightGraphSurface: View {
             visible: visible, displayStyle: expression.displayStyle,
             restrictions: expression.restrictions, additionalFields: expression.additionalFields
         )
+        commitLiveGraph()
     }
 
     private func addExpression() {
@@ -1678,12 +1701,14 @@ private struct LightweightGraphSurface: View {
                                          latex: "y=x", type: .explicitFunction)
         expressions.append(expression)
         selectExpression(expression)
+        commitLiveGraph()
     }
 
     private func removeExpression(_ id: String) {
         guard expressions.count > 1 else { return }
         expressions.removeAll { $0.id == id }
         if selectedExpressionID == id { selectExpression(expressions.first) }
+        commitLiveGraph()
     }
 
     private func insertion(for key: String) -> String {

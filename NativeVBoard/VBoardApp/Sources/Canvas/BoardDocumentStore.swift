@@ -525,6 +525,12 @@ final class BoardDocumentStore: ObservableObject {
     private var undoStack: [EditorState] = []
     private var redoStack: [EditorState] = []
     private var saveTask: Task<Void, Never>?
+    /// While the expanded graph workspace is open, every source and viewport
+    /// change is canonical immediately, but the whole interaction remains one
+    /// meaningful undo item. The autosave task is still debounced, so live
+    /// typing never produces one request per character.
+    private var graphEditingID: String?
+    private var graphEditingHasUndoSnapshot = false
 
     init(boardID: String, editor: EditorState) {
         self.boardID = boardID
@@ -536,6 +542,7 @@ final class BoardDocumentStore: ObservableObject {
     deinit { saveTask?.cancel() }
 
     func replace(with editor: EditorState, status: EditorPersistenceStatus = .clean) {
+        endGraphEditing()
         self.editor = editor
         if status == .clean {
             baseRevision = editor.revision
@@ -546,9 +553,8 @@ final class BoardDocumentStore: ObservableObject {
     }
 
     func apply(_ editor: EditorState, api: APIClient) {
-        undoStack.append(self.editor)
-        if undoStack.count > 100 { undoStack.removeFirst() }
-        redoStack.removeAll(); canUndo = true; canRedo = false
+        endGraphEditing()
+        recordUndoSnapshot()
         self.editor = editor
         mutationGeneration += 1
         status = .dirty
@@ -557,6 +563,7 @@ final class BoardDocumentStore: ObservableObject {
     }
 
     func undo(api: APIClient) {
+        endGraphEditing()
         guard var previous = undoStack.popLast() else { return }
         // History snapshots describe content, not a stale server precondition.
         // Rebase the restored content onto the latest accepted revision so an
@@ -568,6 +575,7 @@ final class BoardDocumentStore: ObservableObject {
     }
 
     func redo(api: APIClient) {
+        endGraphEditing()
         guard var next = redoStack.popLast() else { return }
         next.revision = editor.revision
         next.updatedAt = editor.updatedAt
@@ -609,6 +617,7 @@ final class BoardDocumentStore: ObservableObject {
     /// an undoable content operation for every pointer sample.
     func updateViewport(_ viewport: CameraRect, api: APIClient) {
         guard editor.viewport != viewport else { return }
+        endGraphEditing()
         editor.viewport = viewport
         mutationGeneration += 1
         status = .dirty
@@ -699,6 +708,72 @@ final class BoardDocumentStore: ObservableObject {
         var next = editor
         next.objects[index] = CanvasObject(graph: canonical)
         apply(next, api: api)
+    }
+
+    /// Opens one canonical editing transaction for an expanded graph. The
+    /// transaction records no history until the first real mutation.
+    func beginGraphEditing(id: String) {
+        guard editor.objects.contains(where: { $0.id == id && $0.type == "graph" }) else {
+            return
+        }
+        if graphEditingID != id { endGraphEditing() }
+        graphEditingID = id
+    }
+
+    /// Closes the undo-coalescing boundary. All edits were already copied into
+    /// `editor` and the recovery outbox before this method is called.
+    func endGraphEditing(id: String? = nil) {
+        if let id, graphEditingID != id { return }
+        graphEditingID = nil
+        graphEditingHasUndoSnapshot = false
+    }
+
+    /// Replaces the canonical graph on every accepted editor change. Invalid
+    /// mathematical drafts such as `f(x)=sin(` remain valid persistence source
+    /// as long as they satisfy the bounded/safe storage contract; parse errors
+    /// are a derived UI concern, not a reason to discard what the user typed.
+    func updateGraphDuringEditing(_ graph: GraphObject, api: APIClient) {
+        let canonical: GraphObject
+        do {
+            canonical = try GraphPersistenceValidator.sanitized(
+                graph, expectedBoardID: boardID
+            )
+        } catch {
+            #if DEBUG
+            print("[VBoard] LIVE GRAPH UPDATE REJECTED board=\(boardID) graph=\(graph.id) error=\(error.localizedDescription)")
+            #endif
+            return
+        }
+        guard let index = editor.objects.firstIndex(where: {
+            $0.id == canonical.id && $0.type == "graph"
+        }), editor.objects[index].graph != canonical else { return }
+
+        if graphEditingID != canonical.id {
+            endGraphEditing()
+            graphEditingID = canonical.id
+        }
+        if !graphEditingHasUndoSnapshot {
+            recordUndoSnapshot()
+            graphEditingHasUndoSnapshot = true
+        }
+
+        editor.objects[index] = CanvasObject(graph: canonical)
+        mutationGeneration += 1
+        status = .dirty
+        persistOutbox()
+        scheduleSave(api: api, delayNanoseconds: 400_000_000)
+    }
+
+    /// Viewport updates are based on the latest canonical graph, never the
+    /// snapshot that originally opened the workspace. This prevents a pan or
+    /// pinch from restoring stale expression source.
+    func updateGraphViewportDuringEditing(id: String, viewport: GraphViewport,
+                                          api: APIClient) {
+        guard let current = editor.objects.first(where: { $0.id == id })?.graph,
+              current.viewport != viewport else {
+            return
+        }
+        updateGraphDuringEditing(current.replacing(viewport: viewport), api: api)
     }
 
     /// Closure form keeps mutation logic provider-independent while ensuring
@@ -1074,12 +1149,24 @@ final class BoardDocumentStore: ObservableObject {
         conflictServerEditor = nil; status = .clean; removeOutbox()
     }
 
-    func persistForBackgrounding() { if status != .clean { persistOutbox() } }
+    func persistForBackgrounding() {
+        endGraphEditing()
+        if status != .clean { persistOutbox() }
+    }
 
-    private func scheduleSave(api: APIClient) {
+    private func recordUndoSnapshot() {
+        undoStack.append(editor)
+        if undoStack.count > 100 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        canUndo = true
+        canRedo = false
+    }
+
+    private func scheduleSave(api: APIClient,
+                              delayNanoseconds: UInt64 = 700_000_000) {
         saveTask?.cancel()
         saveTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 700_000_000)
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
             guard !Task.isCancelled, let self else { return }
             self.saveTask = nil
             await self.drainSaveQueue(api: api)

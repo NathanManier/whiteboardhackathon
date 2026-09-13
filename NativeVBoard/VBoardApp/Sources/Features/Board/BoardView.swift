@@ -527,18 +527,23 @@ private struct BoardEditorSurface: View {
                     onPencilStroke: { store.applyStroke($0, api: api) },
                     onPencilRequestsPassiveMode: { interactiveGraph = nil },
                     onCommitViewport: { owningBoardID, graphID, viewport in
-                        guard owningBoardID == board.id,
-                              let current = store.editor.objects
-                                .first(where: { $0.id == graphID })?.graph else { return }
-                        let updated = current.replacing(viewport: viewport)
-                        store.replaceGraph(updated, api: api)
-                        if interactiveGraph?.id == graphID { interactiveGraph = updated }
+                        guard owningBoardID == board.id else { return }
+                        store.updateGraphViewportDuringEditing(
+                            id: graphID, viewport: viewport, api: api
+                        )
                     },
                     onCommitGraph: { updated in
                         guard updated.id == graph.id,
                               updated.owningBoardID == board.id else { return }
-                        store.replaceGraph(updated, api: api)
-                        interactiveGraph = updated
+                        store.updateGraphDuringEditing(updated, api: api)
+                    },
+                    onBeginGraphEditing: { owningBoardID, graphID in
+                        guard owningBoardID == board.id else { return }
+                        store.beginGraphEditing(id: graphID)
+                    },
+                    onEndGraphEditing: { owningBoardID, graphID in
+                        guard owningBoardID == board.id else { return }
+                        store.endGraphEditing(id: graphID)
                     },
                     onExplain: { openStudy("explain") },
                     onPractice: { openStudy("practice_problems") },

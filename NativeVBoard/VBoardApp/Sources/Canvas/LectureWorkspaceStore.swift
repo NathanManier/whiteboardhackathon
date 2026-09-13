@@ -149,6 +149,9 @@ final class LectureWorkspaceStore: ObservableObject {
     private var saveWaiters: [CheckedContinuation<Void, Never>] = []
     private var undoHistory: [HistoryEntry] = []
     private var redoHistory: [HistoryEntry] = []
+    private var graphEditingBoardID: String?
+    private var graphEditingGraphID: String?
+    private var graphEditingHasWorkspaceUndo = false
 
     init(folderID: String) {
         self.folderID = folderID
@@ -548,6 +551,63 @@ final class LectureWorkspaceStore: ObservableObject {
         refreshSceneSnapshot(boardID, api: api)
     }
 
+    func beginGraphEditing(id: String, boardID: String) {
+        guard let store = boardStores[boardID],
+              store.editor.objects.contains(where: { $0.id == id && $0.graph != nil })
+        else { return }
+        if graphEditingBoardID != boardID || graphEditingGraphID != id {
+            endGraphEditing()
+        }
+        graphEditingBoardID = boardID
+        graphEditingGraphID = id
+        store.beginGraphEditing(id: id)
+    }
+
+    func updateGraphDuringEditing(_ graph: GraphObject, boardID: String,
+                                  api: APIClient) {
+        guard graph.owningBoardID == boardID,
+              let store = boardStores[boardID],
+              let before = store.editor.objects.first(where: { $0.id == graph.id })?.graph
+        else { return }
+        beginGraphEditing(id: graph.id, boardID: boardID)
+        store.updateGraphDuringEditing(graph, api: api)
+        guard let after = store.editor.objects.first(where: { $0.id == graph.id })?.graph,
+              after != before else { return }
+        if !graphEditingHasWorkspaceUndo {
+            recordBoardUndo([boardID])
+            graphEditingHasWorkspaceUndo = true
+        }
+        refreshSceneSnapshot(boardID, api: api)
+    }
+
+    func updateGraphViewportDuringEditing(id: String, boardID: String,
+                                          viewport: GraphViewport, api: APIClient) {
+        guard let store = boardStores[boardID],
+              let before = store.editor.objects.first(where: { $0.id == id })?.graph
+        else { return }
+        beginGraphEditing(id: id, boardID: boardID)
+        store.updateGraphViewportDuringEditing(id: id, viewport: viewport, api: api)
+        guard let after = store.editor.objects.first(where: { $0.id == id })?.graph,
+              after != before else { return }
+        if !graphEditingHasWorkspaceUndo {
+            recordBoardUndo([boardID])
+            graphEditingHasWorkspaceUndo = true
+        }
+        refreshSceneSnapshot(boardID, api: api)
+    }
+
+    func endGraphEditing(id: String? = nil, boardID: String? = nil) {
+        if let id, graphEditingGraphID != id { return }
+        if let boardID, graphEditingBoardID != boardID { return }
+        if let activeBoardID = graphEditingBoardID,
+           let activeGraphID = graphEditingGraphID {
+            boardStores[activeBoardID]?.endGraphEditing(id: activeGraphID)
+        }
+        graphEditingBoardID = nil
+        graphEditingGraphID = nil
+        graphEditingHasWorkspaceUndo = false
+    }
+
     @discardableResult
     func duplicateGraph(_ key: SelectionKey, api: APIClient) -> SelectionKey? {
         guard key.kind == .editorObject,
@@ -623,6 +683,9 @@ final class LectureWorkspaceStore: ObservableObject {
     func persistForBackgrounding() {
         if status != .clean { persistOutbox() }
         boardStores.values.forEach { $0.persistForBackgrounding() }
+        graphEditingBoardID = nil
+        graphEditingGraphID = nil
+        graphEditingHasWorkspaceUndo = false
     }
 
     func saveNow(api: APIClient) async {
