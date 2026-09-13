@@ -6,6 +6,45 @@ import UIKit
 final class GraphRecognitionAndRenderingTests: XCTestCase {
     private let boardID = "603f5213ab0a249716833214c5ab88da"
 
+    func testIntegralSelectionOffersIntegrandInsteadOfInventingAntiderivative() throws {
+        let text = StudySelectedTextObject(
+            id: "integral-text", type: "text", role: "study",
+            text: #"$\int_0^1 \frac{1}{1+x^2}\,dx$"#,
+            fontSize: 20, x: 0, y: 0, width: 260, height: 60,
+            practiceProblemId: nil, sourceStudyInteractionId: nil
+        )
+        let selection = BoardStudySelection(
+            boardID: boardID, canonicalObjectIDs: [text.id],
+            localBBox: try XCTUnwrap(StudySelectionBBox(
+                rect: CGRect(x: 0, y: 0, width: 260, height: 60)
+            )), selectedTextObjects: [text], lectureWorldBBox: nil
+        )
+        let proposal = try XCTUnwrap(GraphNonDirectExpressionPolicy.integralProposal(
+            from: .board(selection)
+        ))
+
+        XCTAssertEqual(proposal.sourceLatex, #"\int_0^1 \frac{1}{1+x^2}\,dx"#)
+        XCTAssertEqual(proposal.integrandLatex, #"\frac{1}{1+x^2}"#)
+        XCTAssertEqual(proposal.graphLatex, #"y=\frac{1}{1+x^2}"#)
+        XCTAssertEqual(GraphExpressionInference.type(for: proposal.graphLatex), .explicitFunction)
+    }
+
+    func testUnicodeIntegralWithoutDifferentialIsNotSilentlyConverted() throws {
+        let text = StudySelectedTextObject(
+            id: "ambiguous-integral", type: "text", role: "study",
+            text: "∫ 1/(1+x²)", fontSize: nil, x: nil, y: nil, width: nil, height: nil,
+            practiceProblemId: nil, sourceStudyInteractionId: nil
+        )
+        let selection = BoardStudySelection(
+            boardID: boardID, canonicalObjectIDs: [text.id],
+            localBBox: try XCTUnwrap(StudySelectionBBox(
+                rect: CGRect(x: 0, y: 0, width: 200, height: 50)
+            )), selectedTextObjects: [text], lectureWorldBBox: nil
+        )
+
+        XCTAssertNil(GraphNonDirectExpressionPolicy.integralProposal(from: .board(selection)))
+    }
+
     override func tearDown() {
         GraphURLProtocolStub.handler = nil
         super.tearDown()

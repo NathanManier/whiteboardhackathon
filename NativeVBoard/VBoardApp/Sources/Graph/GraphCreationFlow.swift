@@ -189,6 +189,87 @@ enum GraphLocalExpressionExtractor {
     }
 }
 
+struct GraphIntegralProposal: Equatable {
+    let sourceLatex: String
+    let integrandLatex: String
+
+    var graphLatex: String { "y=\(integrandLatex)" }
+}
+
+/// An integral is not itself a graph expression. This local policy offers the
+/// integrand, but never invents or graphs an antiderivative for the user.
+enum GraphNonDirectExpressionPolicy {
+    static func integralProposal(from target: GraphRecognitionTarget) -> GraphIntegralProposal? {
+        for item in target.selections.flatMap(\.selectedTextObjects) {
+            for candidate in candidates(in: item.text) {
+                if let proposal = integralProposal(in: candidate) { return proposal }
+            }
+        }
+        return nil
+    }
+
+    private static func candidates(in source: String) -> [String] {
+        var values: [String] = []
+        for pattern in [#"\$([^$\n]+)\$"#, #"\\\(([\s\S]*?)\\\)"#] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(source.startIndex..<source.endIndex, in: source)
+            for match in regex.matches(in: source, range: range) where match.numberOfRanges > 1 {
+                guard let swiftRange = Range(match.range(at: 1), in: source) else { continue }
+                values.append(String(source[swiftRange]))
+            }
+        }
+        if values.isEmpty { values = source.split(whereSeparator: \.isNewline).map(String.init) }
+        return values
+    }
+
+    private static func integralProposal(in candidate: String) -> GraphIntegralProposal? {
+        let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tokenRange: Range<String.Index>
+        if let range = trimmed.range(of: "\\int") { tokenRange = range }
+        else if let range = trimmed.range(of: "∫") { tokenRange = range }
+        else { return nil }
+
+        var remainder = String(trimmed[tokenRange.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        remainder = droppingIntegralLimits(remainder)
+        guard let differential = remainder.range(
+            of: #"(?:\\,)?\s*d\s*x\s*$"#,
+            options: .regularExpression
+        ) else { return nil }
+        let integrand = String(remainder[..<differential.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !integrand.isEmpty,
+              integrand.count <= GraphRecognitionController.maximumLatexLength,
+              !GraphLatexNormalizer.normalize(integrand).isEmpty else { return nil }
+        return GraphIntegralProposal(sourceLatex: trimmed, integrandLatex: integrand)
+    }
+
+    private static func droppingIntegralLimits(_ source: String) -> String {
+        let characters = Array(source)
+        var cursor = 0
+        while cursor < characters.count,
+              characters[cursor] == "_" || characters[cursor] == "^" {
+            cursor += 1
+            if cursor < characters.count, characters[cursor] == "{" {
+                var depth = 0
+                repeat {
+                    if characters[cursor] == "{" { depth += 1 }
+                    if characters[cursor] == "}" { depth -= 1 }
+                    cursor += 1
+                } while cursor < characters.count && depth > 0
+            } else {
+                while cursor < characters.count,
+                      !characters[cursor].isWhitespace,
+                      characters[cursor] != "_", characters[cursor] != "^" {
+                    cursor += 1
+                }
+            }
+            while cursor < characters.count, characters[cursor].isWhitespace { cursor += 1 }
+        }
+        return String(characters[cursor...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 struct GraphCreationRequest: Identifiable {
     let id = UUID()
     let target: GraphRecognitionTarget
@@ -227,6 +308,7 @@ struct GraphCreationSheet: View {
     @State private var phase: Phase = .reading
     @State private var drafts: [GraphExpressionDraft] = []
     @State private var recognitionRequestID: String?
+    @State private var integralProposal: GraphIntegralProposal?
     @State private var error: String?
     @State private var isCreating = false
 
@@ -266,7 +348,16 @@ struct GraphCreationSheet: View {
 
     private var confirmationView: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Recognized equation").font(.headline)
+            Text(integralProposal == nil ? "Recognized equation" : "Graph the integrand?")
+                .font(.headline)
+            if let integralProposal {
+                Text("An integral is not itself a y = f(x) curve. V-Board can graph the expression inside it without inventing an antiderivative.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                StudyContentView(source: "\\(\(integralProposal.sourceLatex)\\)",
+                                 maximumWidth: 560)
+                    .frame(minHeight: 34, alignment: .leading)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach($drafts) { $draft in
@@ -297,17 +388,23 @@ struct GraphCreationSheet: View {
             ScrollView {
                 VStack(spacing: 10) {
                     ForEach($drafts) { $draft in
-                        HStack {
-                            Toggle("", isOn: $draft.enabled).labelsHidden()
-                            TextField("y=x^2", text: $draft.latex)
-                                .textFieldStyle(.roundedBorder)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .onSubmit { create() }
-                            Button(role: .destructive) {
-                                drafts.removeAll { $0.id == draft.id }
-                            } label: { Image(systemName: "trash") }
-                            .buttonStyle(.plain)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Toggle("", isOn: $draft.enabled).labelsHidden()
+                                TextField("y=x^2", text: $draft.latex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .onSubmit { create() }
+                                Button(role: .destructive) {
+                                    drafts.removeAll { $0.id == draft.id }
+                                } label: { Image(systemName: "trash") }
+                                .buttonStyle(.plain)
+                            }
+                            if !draft.latex.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                StudyContentView(source: "\\(\(draft.latex)\\)", maximumWidth: 520)
+                                    .frame(minHeight: 30, alignment: .leading)
+                            }
                         }
                     }
                     Button { addDraft() } label: { Label("Add equation", systemImage: "plus") }
@@ -349,9 +446,17 @@ struct GraphCreationSheet: View {
         phase = .reading
         error = nil
         if !force {
+            if let proposal = GraphNonDirectExpressionPolicy.integralProposal(from: target) {
+                recognitionRequestID = nil
+                integralProposal = proposal
+                drafts = [GraphExpressionDraft(latex: proposal.graphLatex)]
+                phase = .confirm
+                return
+            }
             let local = GraphLocalExpressionExtractor.expressions(from: target)
             if !local.isEmpty {
                 recognitionRequestID = nil
+                integralProposal = nil
                 drafts = local.map(GraphExpressionDraft.init(expression:))
                 phase = .confirm
                 return
@@ -363,6 +468,7 @@ struct GraphCreationSheet: View {
                 target, api: api, prepareSelection: prepareSelection
             )
             recognitionRequestID = result.requestID
+            integralProposal = nil
             if result.graphable, !result.expressions.isEmpty {
                 drafts = result.expressions.prefix(GraphRecognitionController.maximumExpressions).map {
                     GraphExpressionDraft(expression: $0.canonicalExpression)
@@ -561,11 +667,17 @@ struct GraphExpressionEditor: View {
             Form {
                 Section("Equations") {
                     ForEach($drafts) { $draft in
-                        HStack {
-                            Toggle("Visible", isOn: $draft.enabled).labelsHidden()
-                            TextField("y=x^2", text: $draft.latex)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Toggle("Visible", isOn: $draft.enabled).labelsHidden()
+                                TextField("y=x^2", text: $draft.latex)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                            }
+                            if !draft.latex.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                StudyContentView(source: "\\(\(draft.latex)\\)", maximumWidth: 520)
+                                    .frame(minHeight: 30, alignment: .leading)
+                            }
                         }
                     }
                     .onDelete { drafts.remove(atOffsets: $0) }

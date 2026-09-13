@@ -72,6 +72,27 @@ cases.forEach((source, index) => {
   assert(!html.includes("\\[F=ma\\]"), `case ${index + 1} leaked bracket-delimited source`);
 });
 
+const requiredProductFixtures = [
+  "$f(x)=\\sin(x)$",
+  "$$\\frac{1}{1+x^2}$$",
+  "$\\int_0^1 x^2\\,dx$",
+  "$\\sqrt{x^2+1}$",
+  "$x_{n+1}$",
+  "$e^{i\\pi}+1=0$",
+  "$\\ce{H2O}$",
+  "$\\ce{SO4^{2-}}$",
+  "$\\ce{NH4+}$",
+  "**Derivative:** $f'(x)=2x$",
+  "- Velocity is $v(t)=t^2$.\n- Acceleration is $a(t)=2t$."
+];
+requiredProductFixtures.forEach((fixture, index) => {
+  const html = render(fixture);
+  assert(html.includes("class=\"katex"),
+    `required product fixture ${index + 1} did not render notation`);
+  assert(!html.includes("study-math-error"),
+    `required product fixture ${index + 1} used the local fallback unexpectedly`);
+});
+
 const mixed = render(cases[6]);
 assert(mixed.includes("<h1>Energy</h1>"), "heading Markdown did not render");
 assert(mixed.includes("<strong>Newton's law</strong>"), "bold Markdown did not render");
