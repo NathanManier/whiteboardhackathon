@@ -547,7 +547,18 @@ final class APIClient: ObservableObject {
     func deleteBoard(id: String) async throws { let request = try request(path: "/api/boards/\(id)", method: "DELETE"); let (data, response) = try await data(for: request); try validate(response, data: data) }
 
     func explain(request payload: BoardStudyExplainRequest) async throws -> StudyInteractionResponse {
-        let path = "/api/boards/\(payload.boardID)/study/explain"
+        let action = StudyAction(wireValue: payload.action) ?? .explain
+        return try await performStudyAction(action, request: payload)
+    }
+
+    func performStudyAction(_ action: StudyAction,
+                            request payload: BoardStudyExplainRequest) async throws
+        -> StudyInteractionResponse {
+        guard action == StudyAction(wireValue: payload.action),
+              [.explain, .practice, .checkWork].contains(action) else {
+            throw APIError.decoding("The study action did not match its request.")
+        }
+        let path = action.endpoint(boardID: payload.boardID)
         var request = try request(path: path, method: "POST")
         request.httpBody = try encoder.encode(payload)
         let started = Date().timeIntervalSinceReferenceDate
@@ -560,7 +571,16 @@ final class APIClient: ObservableObject {
                               status: http.statusCode, data: data)
         }
         try validate(response, data: data)
-        do { return try decoder.decode(StudyInteractionResponse.self, from: data) }
+        do {
+            let decoded = try decoder.decode(StudyInteractionResponse.self, from: data)
+            if action == .practice, decoded.problems?.count != 3 {
+                throw APIError.decoding(
+                    "Practice must return exactly three problems. Nothing was added."
+                )
+            }
+            return decoded
+        }
+        catch let apiError as APIError { throw apiError }
         catch { throw APIError.decoding("Could not decode the study response.") }
     }
 

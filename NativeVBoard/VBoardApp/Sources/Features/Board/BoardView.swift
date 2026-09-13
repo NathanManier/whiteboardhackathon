@@ -284,7 +284,7 @@ private struct BoardEditorSurface: View {
     @State private var selectedPDFRegion: CGRect?
     @State private var selectionGeneration = 0
     @State private var liveCamera: CameraRect?
-    @State private var studyInitialAction: String?
+    @State private var studyInitialAction: StudyAction?
     @State private var studyInteractions: [StudyInteraction] = []
     @State private var reopenedStudy: StudyInteraction?
     @State private var graphCreationRequest: GraphCreationRequest?
@@ -389,7 +389,7 @@ private struct BoardEditorSurface: View {
         .sheet(item: $reopenedStudy) { interaction in
             SavedStudyInteractionView(interaction: interaction) {
                 reopenedStudy = nil
-                DispatchQueue.main.async { openStudy("explain", forceNew: true) }
+                DispatchQueue.main.async { openStudy(.explain, forceNew: true) }
             }
         }
         .sheet(isPresented: $showShare) { if let exportURL { ShareSheet(items: [exportURL]) } }
@@ -549,8 +549,8 @@ private struct BoardEditorSurface: View {
                         guard owningBoardID == board.id else { return }
                         store.endGraphEditing(id: graphID)
                     },
-                    onExplain: { openStudy("explain") },
-                    onPractice: { openStudy("practice_problems") },
+                    onExplain: { openStudy(.explain) },
+                    onPractice: { openStudy(.practice) },
                     onDelete: {
                         selectedIDs.remove(graph.id)
                         store.deleteObjects(ids: Set([graph.id]), api: api)
@@ -607,9 +607,9 @@ private struct BoardEditorSurface: View {
                                    selectionGeneration: selectionGeneration,
                                    graphPrimaryTitle: graphPrimaryTitle,
                                    graphIsLoading: false,
-                                   explain: { openStudy("explain") },
-                                   practice: { openStudy("practice_problems") },
-                                   check: { openStudy("check_my_work") },
+                                   explain: { openStudy(.explain) },
+                                   practice: { openStudy(.practice) },
+                                   check: { openStudy(.checkWork) },
                                    graphPrimary: { performPrimaryGraphAction() },
                                    graphSelection: { openGraphCreation() },
                                    editGraph: selectedGraph.map { graph in { editingGraph = graph } },
@@ -711,7 +711,21 @@ private struct BoardEditorSurface: View {
                              compact: compact,
                              onInteractionSaved: upsertStudyInteraction,
                              onPracticeProblems: { problems, interactionID in
-                                 store.applyPracticeProblems(problems, interactionID: interactionID, api: api)
+                                 let scale = canvasSize.width > 0 && canvasSize.height > 0
+                                     ? WorldScreenTransform(
+                                         camera: liveCamera ?? store.editor.viewport,
+                                         viewport: canvasSize
+                                     ).scale : 1
+                                 let workspace = WorkspaceEffectiveBounds.boardLocal(
+                                     editor: store.editor, boardSize: document.viewBox.size
+                                 )
+                                 store.applyPracticeProblems(
+                                     problems, interactionID: interactionID,
+                                     sourceBounds: selection.localBBox.cgRect,
+                                     workspaceBounds: workspace,
+                                     professorContentBounds: document.viewBox,
+                                     cameraScale: scale, api: api
+                                 )
                              })
         } else {
             ContentUnavailableView("Select ink first", systemImage: "lasso",
@@ -719,15 +733,15 @@ private struct BoardEditorSurface: View {
         }
     }
 
-    private func openStudy(_ action: String, forceNew: Bool = false) {
-        if action == "explain", !forceNew, let selection = studySelection,
+    private func openStudy(_ action: StudyAction, forceNew: Bool = false) {
+        if action == .explain, !forceNew, let selection = studySelection,
            let existing = studyInteractions.first(where: {
                Set($0.selectedObjectIDs ?? []) == Set(selection.canonicalObjectIDs)
            }) {
             reopenedStudy = existing
             return
         }
-        studyInitialAction = action == "explain" ? nil : action
+        studyInitialAction = action
         studyPanelCollapsed = false
         showStudy = true
     }
@@ -735,6 +749,13 @@ private struct BoardEditorSurface: View {
     private func upsertStudyInteraction(_ interaction: StudyInteraction) {
         guard let id = interaction.id else { return }
         if let index = studyInteractions.firstIndex(where: { $0.id == id }) {
+            studyInteractions[index] = interaction
+        } else if interaction.action == nil || interaction.action == "explain",
+                  let index = studyInteractions.firstIndex(where: {
+                      ($0.action == nil || $0.action == "explain")
+                          && Set($0.selectedObjectIDs ?? [])
+                              == Set(interaction.selectedObjectIDs ?? [])
+                  }) {
             studyInteractions[index] = interaction
         } else {
             studyInteractions.append(interaction)
@@ -804,8 +825,9 @@ private struct BoardEditorSurface: View {
     }
     private var selectionCanCheckWork: Bool {
         let selectedObjects = store.editor.objects.filter { selectedIDs.contains($0.id) }
-        return selectedObjects.contains(where: { $0.role == "ai_practice_problem" })
-            && selectedObjects.contains(where: { $0.role != "ai_practice_problem" })
+        return CheckWorkVisibilityPolicy.isVisible(
+            selected: selectedObjects.map { (board.id, $0) }
+        )
     }
     private func export(_ format: APIClient.BoardExportFormat) async {
         do {
@@ -825,36 +847,54 @@ private struct BoardEditorSurface: View {
     private func deleteBoard() async { do { try await api.deleteBoard(id: board.id); dismiss() } catch { exportError = "The board could not be deleted." } }
 }
 
-struct StudyActionsView: View {
-    private enum LoadingStage {
-        case preparingSelection
-        case requestingExplanation
-        case requestingPractice
+enum StudyActionResultPolicy {
+    static func savesExplanationMarker(for action: StudyAction) -> Bool {
+        action == .explain
+    }
 
-        var label: String {
-            switch self {
-            case .preparingSelection: return "Reading selection…"
-            case .requestingExplanation: return "Analyzing this board…"
-            case .requestingPractice: return "Creating practice problems…"
-            }
+    static func placesPracticeCards(for action: StudyAction,
+                                    problemCount: Int) -> Bool {
+        action == .practice && problemCount == 3
+    }
+}
+
+enum CheckWorkVisibilityPolicy {
+    static func isVisible(
+        selected: [(boardID: String, object: CanvasObject)]
+    ) -> Bool {
+        selected.contains { boardID, object in
+            object.role == "ai_practice_problem"
+                && selected.contains { candidateBoardID, candidate in
+                    candidateBoardID == boardID
+                        && candidate.role != "ai_practice_problem"
+                        && candidate.type != "text"
+                        && candidate.type != "graph"
+                }
         }
+    }
+}
+
+struct StudyActionsView: View {
+    private enum PanelState {
+        case idle
+        case loading(StudyAction)
+        case result(StudyAction, StudyInteractionResponse)
+        case failed(StudyAction, String)
     }
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
     let selection: BoardStudySelection
     let prepareSelection: () async -> Void
-    var initialAction: String? = nil
+    var initialAction: StudyAction? = nil
     var compact = false
     var onInteractionSaved: (StudyInteraction) -> Void = { _ in }
     let onPracticeProblems: ([PracticeProblem], String?) -> Void
     @StateObject private var submissionGate = StudySubmissionGate()
-    @State private var loading = false
-    @State private var loadingStage: LoadingStage = .preparingSelection
-    @State private var result: StudyInteractionResponse?
-    @State private var error: String?
+    @State private var panelState: PanelState = .idle
+    @State private var isPreparingSelection = false
     @State private var initialQuestion = ""
     @State private var followUpQuestion = ""
-    @State private var launchedInitialAction: String?
+    @State private var launchedInitialAction: StudyAction?
 
     var body: some View {
         Group {
@@ -871,35 +911,30 @@ struct StudyActionsView: View {
         .task(id: initialAction) {
             guard let initialAction, launchedInitialAction != initialAction else { return }
             launchedInitialAction = initialAction
-            switch initialAction {
-            case "practice_problems": submitInitial(followUpAction: "practice_problems")
-            case "check_my_work": submitInitial(action: "check_my_work")
-            default: submitInitial()
-            }
+            submitInitial(action: initialAction)
         }
     }
 
+    @ViewBuilder
     private var studyBody: some View {
         VStack(spacing: compact ? 12 : 18) {
-                if loading {
+            switch panelState {
+            case .loading(let action):
                     VStack(spacing: 12) {
                         ProgressView()
-                        Text(loadingStage.label)
+                        Text(isPreparingSelection ? "Reading selection…" : action.loadingCopy)
                             .font(.subheadline.weight(.medium))
                         Text("Your selection stays visible while V-Board works.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                } else if let result {
-                    StudyRichHeading(
-                        source: result.interaction?.title
-                            ?? (result.problems == nil ? "Board explanation" : "Practice Problems")
-                    )
+            case .result(let action, let response):
+                    StudyRichHeading(source: resultTitle(action: action, response: response))
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
-                            StudyContentView(source: displayAnswer(result), maximumWidth: 700)
-                            if let problems = result.problems, !problems.isEmpty {
-                                ForEach(Array(problems.prefix(2))) { problem in
+                            StudyContentView(source: displayAnswer(response), maximumWidth: 700)
+                            if let problems = response.problems, !problems.isEmpty {
+                                ForEach(Array(problems.prefix(3))) { problem in
                                     StudyContentView(source: problem.text, maximumWidth: 660)
                                         .padding(14)
                                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -910,38 +945,57 @@ struct StudyActionsView: View {
                             }
                         }
                     }
-                    HStack {
-                        Button("Practice Problems") { followUp(action: "practice_problems") }
-                            .buttonStyle(.bordered)
-                        Button("Check My Work") { followUp(action: "check_my_work") }
+                    if action == .explain {
+                        Button("Practice Problems") { submitInitial(action: .practice) }
                             .buttonStyle(.bordered)
                     }
-                    HStack {
-                        TextField("Ask a follow-up…", text: $followUpQuestion)
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { followUp() }
-                        Button("Send") { followUp() }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(followUpQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if response.interaction?.id != nil, action != .practice {
+                        HStack {
+                            TextField("Ask a follow-up…", text: $followUpQuestion)
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit { followUp(from: response, action: action) }
+                            Button("Send") { followUp(from: response, action: action) }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(followUpQuestion.trimmingCharacters(
+                                    in: .whitespacesAndNewlines
+                                ).isEmpty)
+                        }
+                        .frame(maxWidth: compact ? .infinity : 700)
                     }
-                    .frame(maxWidth: compact ? .infinity : 700)
-                } else {
+            case .idle:
                     Image(systemName: "text.magnifyingglass").font(compact ? .title2 : .largeTitle).foregroundStyle(.tint)
                     Text("Study the selected ink").font(compact ? .headline : .title2.bold())
-                    Text("Explain a selected concept, create two practice problems, or check a handwritten solution.")
+                    Text("Explain a selected concept or create three practice problems.")
                         .multilineTextAlignment(.center).foregroundStyle(.secondary)
                     TextField("Optional question or focus", text: $initialQuestion)
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: compact ? .infinity : 700)
-                        .onSubmit { submitInitial(question: initialQuestion) }
-                    Button("Explain") { submitInitial(question: initialQuestion) }
+                        .onSubmit { submitInitial(action: .explain, question: initialQuestion) }
+                    Button("Explain") { submitInitial(action: .explain, question: initialQuestion) }
                         .buttonStyle(.borderedProminent)
-                    Button("Practice Problems") { submitInitial(followUpAction: "practice_problems") }.buttonStyle(.bordered)
-                    Button("Check My Work") { submitInitial(action: "check_my_work") }.buttonStyle(.bordered)
-                }
-                if let error { Text(error).foregroundStyle(.red) }
+                    Button("Practice Problems") { submitInitial(action: .practice) }
+                        .buttonStyle(.bordered)
+            case .failed(_, let message):
+                    ContentUnavailableView(
+                        "Study action unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(message)
+                    )
+                    Button("Try Again") { panelState = .idle }
+                        .buttonStyle(.borderedProminent)
+            }
         }
         .padding(compact ? 16 : 28)
+    }
+
+    private func resultTitle(action: StudyAction,
+                             response: StudyInteractionResponse) -> String {
+        if let title = response.interaction?.title { return title }
+        switch action {
+        case .practice: return "Practice Problems"
+        case .checkWork: return "Check My Work"
+        default: return "Board explanation"
+        }
     }
 
     private func displayAnswer(_ response: StudyInteractionResponse) -> String {
@@ -953,7 +1007,7 @@ struct StudyActionsView: View {
             ?? "No study response was returned."
     }
 
-    private func submitInitial(action: String = "explain", followUpAction: String? = nil,
+    private func submitInitial(action: StudyAction = .explain,
                                question: String? = nil) {
         let trimmedQuestion = question?.trimmingCharacters(in: .whitespacesAndNewlines)
         let request = BoardStudyExplainRequest.make(
@@ -967,13 +1021,11 @@ struct StudyActionsView: View {
             #endif
             return
         }
-        loading = true
-        loadingStage = .preparingSelection
-        error = nil
+        panelState = .loading(action)
+        isPreparingSelection = true
         Task {
             defer {
                 submissionGate.end(requestID: request.requestId)
-                loading = false
             }
             do {
                 #if DEBUG
@@ -983,57 +1035,48 @@ struct StudyActionsView: View {
                 #if DEBUG
                 print("[VBoard] AI TIMELINE request=\(request.requestId) stage=selectionPrepared milliseconds=\((Date().timeIntervalSinceReferenceDate - preparationStarted) * 1_000)")
                 #endif
-                loadingStage = .requestingExplanation
-                let initial = try await api.explain(request: request)
-                if let followUpAction {
-                    guard let interactionID = initial.interaction?.id else {
-                        throw APIError.decoding("The explanation did not include an interaction ID.")
-                    }
-                    loadingStage = followUpAction == "practice_problems"
-                        ? .requestingPractice : .requestingExplanation
-                    let response = try await api.followUp(
-                        boardID: selection.boardID,
-                        interactionID: interactionID,
-                        action: followUpAction
-                    )
-                    apply(response)
-                } else {
-                    apply(initial)
-                }
+                isPreparingSelection = false
+                let response = try await api.performStudyAction(action, request: request)
+                apply(response, action: action)
             } catch {
-                self.error = "AI is temporarily unavailable."
+                isPreparingSelection = false
+                panelState = .failed(action, "AI is temporarily unavailable.")
             }
         }
     }
 
-    private func followUp(action: String = "followup") {
-        guard !loading, let interactionID = result?.interaction?.id else { return }
+    private func followUp(from response: StudyInteractionResponse,
+                          action sourceAction: StudyAction) {
+        guard let interactionID = response.interaction?.id else { return }
         let question = followUpQuestion
-        loading = true
-        loadingStage = action == "practice_problems" ? .requestingPractice : .requestingExplanation
-        error = nil
+        panelState = .loading(.followUp)
+        isPreparingSelection = false
         Task {
             do {
                 let response = try await api.followUp(boardID: selection.boardID,
                                                       interactionID: interactionID,
-                                                      action: action, question: question)
+                                                      action: StudyAction.followUp.rawValue,
+                                                      question: question)
                 followUpQuestion = ""
-                apply(response)
+                apply(response, action: sourceAction)
             } catch {
-                loading = false; self.error = "AI is temporarily unavailable."
+                panelState = .failed(.followUp, "AI is temporarily unavailable.")
             }
         }
     }
 
-    private func apply(_ response: StudyInteractionResponse) {
-        result = response
-        if let interaction = response.interaction {
+    private func apply(_ response: StudyInteractionResponse, action: StudyAction) {
+        if StudyActionResultPolicy.savesExplanationMarker(for: action),
+           let interaction = response.interaction {
             onInteractionSaved(interaction)
         }
-        if let problems = response.problems, !problems.isEmpty {
-            onPracticeProblems(Array(problems.prefix(2)), response.interaction?.id)
+        if let problems = response.problems,
+           StudyActionResultPolicy.placesPracticeCards(
+               for: action, problemCount: problems.count
+           ) {
+            onPracticeProblems(problems, nil)
         }
-        loading = false
+        panelState = .result(action, response)
     }
 }
 
@@ -1052,19 +1095,23 @@ struct StudyMarkerButton: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: "info.circle.fill")
-                .font(.system(size: 19, weight: .semibold))
-                .symbolRenderingMode(.palette)
-                .foregroundStyle(.white, Color.accentColor)
-                .frame(width: 44, height: 44)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Open saved explanation")
-        .accessibilityHint(CompactStudyPresentation.readableText(
-            from: interaction.title ?? "Study note"
-        ))
+        Image(systemName: "info.circle")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(Color(uiColor: CanvasDesignTokens.canvasSecondaryText))
+            .frame(width: 34, height: 34)
+            .background(.ultraThinMaterial, in: Circle())
+            .overlay(Circle().stroke(.secondary.opacity(0.24), lineWidth: 0.5))
+            .contentShape(Circle())
+            .onTapGesture(perform: action)
+            // Markers are source-owned tap targets. Consume a pointer drag
+            // without installing any transient translation state.
+            .highPriorityGesture(DragGesture(minimumDistance: 6))
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { action() }
+            .accessibilityLabel("Open saved explanation")
+            .accessibilityHint(CompactStudyPresentation.readableText(
+                from: interaction.title ?? "Study note"
+            ))
     }
 }
 

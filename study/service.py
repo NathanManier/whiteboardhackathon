@@ -1458,6 +1458,157 @@ def explain_lecture_selection(
     return public_interaction(interaction)
 
 
+def practice_board(
+    *,
+    board_id: str,
+    board_dir: Path,
+    metadata: dict[str, Any],
+    editor: dict[str, Any],
+    payload: dict[str, Any],
+    combined_svg: CombinedSvg,
+    atomic_json: AtomicJson,
+    folder_id: str | None = None,
+    library: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Generate three board-owned practice cards without an Explain record.
+
+    Request receipts live beside study state solely for retry idempotency. They
+    are not Study interactions and therefore never become information markers.
+    """
+    request_id = requested_interaction_id(payload.get("requestId"))
+    if request_id is None:
+        raise StudyAIError(
+            "requestId must be a 16-character lowercase hexadecimal id.", status=400
+        )
+    state = read_study_state(board_dir)
+    receipts = state.get("practice_requests")
+    receipts = receipts if isinstance(receipts, list) else []
+    existing = next(
+        (
+            item for item in receipts
+            if isinstance(item, dict) and item.get("request_id") == request_id
+        ),
+        None,
+    )
+    if existing is not None:
+        return {
+            "requestId": request_id,
+            "type": "practice_problems",
+            "problems": list(existing.get("problems") or []),
+            "idempotentReplay": True,
+        }
+
+    selected_ids = expand_group_ids(
+        editor,
+        clean_selected_ids(
+            payload.get("selectedObjectIds") or payload.get("selected_object_ids"),
+            known_object_ids(editor, board_dir=board_dir, metadata=metadata),
+        ),
+    )
+    bbox = validate_bbox(payload.get("selectionBBox") or payload.get("selection_bbox"))
+    if not selected_ids and bbox is None:
+        raise StudyAIError("Select something on the board first.", status=400)
+    try:
+        views = render_views(
+            metadata,
+            board_dir,
+            selected_ids=selected_ids,
+            bbox=bbox,
+            combined_svg=combined_svg,
+            include_overview=False,
+        )
+    except Exception as exc:
+        raise StudyAIError(
+            "Couldn't create practice problems right now. Your board is still saved.",
+            status=503,
+        ) from exc
+
+    selection_context = build_selection_context(
+        editor, selected_ids, study_state=state, payload=payload
+    )
+    lecture_pack = lecture_ai_pack(
+        folder_id=folder_id,
+        library=library,
+        host_id=board_id,
+        editor=editor,
+        action="practice_problems",
+        atomic_json=atomic_json,
+        current_board_id=source_board_id_for_selection(editor, selected_ids, board_id),
+    )
+    images = {"selected": views["selected"]}
+    if views.get("context"):
+        images["context"] = views["context"]
+    result = follow_up_question(
+        question="Create practice problems",
+        prior_answer="",
+        history=[],
+        board_context=compact_board_context(state.get("board_ai_context")),
+        lecture_context=lecture_pack.get("context"),
+        action="practice_problems",
+        selection_context=selection_context,
+        interaction_title="Selected concept",
+        request_id=request_id,
+        images=images,
+    )
+    raw_problems = result.get("problems")
+    if not isinstance(raw_problems, list) or len(raw_problems) != 3:
+        raise StudyAIError(
+            "The study assistant did not return exactly three practice problems."
+        )
+    problems = []
+    for index, item in enumerate(raw_problems, start=1):
+        if not isinstance(item, dict) or not str(item.get("problem") or "").strip():
+            raise StudyAIError(
+                "The study assistant did not return exactly three practice problems."
+            )
+        problems.append({
+            "id": f"{request_id}-{index}",
+            "problem": str(item["problem"]).strip(),
+        })
+    receipt = {
+        "request_id": request_id,
+        "created_at": time.time(),
+        "problems": problems,
+    }
+    state["practice_requests"] = [receipt, *receipts][:40]
+    write_study_state(board_dir, state, atomic_json)
+    return {
+        "requestId": request_id,
+        "type": "practice_problems",
+        "problems": problems,
+        "idempotentReplay": False,
+    }
+
+
+def study_selection_signature(
+    board_id: str,
+    selected_ids: list[str],
+    selected_text_objects: list[dict[str, Any]] | None,
+    bbox: dict[str, float] | None,
+) -> str:
+    semantic_text = [
+        {
+            "id": str(item.get("id") or ""),
+            "role": str(item.get("role") or ""),
+            "text": str(item.get("text") or ""),
+        }
+        for item in (selected_text_objects or [])
+        if isinstance(item, dict)
+    ]
+    identity: dict[str, Any] = {
+        "board_id": board_id,
+        "selected_object_ids": sorted(set(selected_ids)),
+        "semantic_text": sorted(semantic_text, key=lambda item: item["id"]),
+    }
+    # PDF/image region selections may have no canonical child object IDs. In
+    # that one case the stable board-local source region completes identity;
+    # camera coordinates are never included.
+    if not selected_ids:
+        identity["source_region"] = bbox
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def explain_board(
     *,
     board_id: str,
@@ -1538,6 +1689,12 @@ def explain_board(
         selected_ids,
         study_state=state,
         payload=payload,
+    )
+    selection_signature = study_selection_signature(
+        board_id,
+        selected_ids,
+        selection_context.get("text_objects") or [],
+        views.get("selection_bbox") or bbox,
     )
     if selected_ids or views.get("objects") or views.get("content_found"):
         selection_context["empty_region"] = False
@@ -1662,6 +1819,23 @@ def explain_board(
         source_board_id=current_id,
         action=action,
     )
+    interaction["selection_signature"] = selection_signature
+    if action == "explain":
+        for previous in state["interactions"]:
+            if not isinstance(previous, dict):
+                continue
+            same_signature = previous.get("selection_signature") == selection_signature
+            if not previous.get("selection_signature"):
+                same_signature = (
+                    previous.get("board_id") in {None, board_id}
+                    and set(previous.get("selected_object_ids") or []) == set(selected_ids)
+                )
+            if (
+                same_signature
+                and str(previous.get("action") or "explain") == "explain"
+                and previous.get("id") != interaction_id
+            ):
+                previous["superseded_by"] = interaction_id
     try:
         key = visual_cache_key(board_dir, metadata, editor)
         cached = cache_interaction_views(board_dir, interaction_id, key, views)
@@ -1864,7 +2038,7 @@ def follow_up_board(
         problems = result.get("problems")
         clean_problems = []
         if isinstance(problems, list):
-            for index, item in enumerate(problems[:2], start=1):
+            for index, item in enumerate(problems[:3], start=1):
                 if isinstance(item, dict) and item.get("problem"):
                     clean_problems.append({
                         "id": f"{follow_id}-{index}",

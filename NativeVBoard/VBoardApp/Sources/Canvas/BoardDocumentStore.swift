@@ -504,6 +504,67 @@ enum EditorThreeWayMerger {
     }
 }
 
+struct PracticePlacementLayout: Equatable, Sendable {
+    let frames: [CGRect]
+    let requiredWorkspace: CGRect
+}
+
+/// Practice cards are presentation-sized in screen points, but persisted in
+/// board-local coordinates. Placement is deterministic, source-relative, and
+/// downward-only so it cannot widen or rescale the owning board.
+enum PracticePlacementPlanner {
+    static let targetScreenSize = CGSize(width: 320, height: 150)
+    static let horizontalScreenPadding: CGFloat = 20
+    static let verticalScreenGap: CGFloat = 18
+
+    static func layout(count: Int, source: CGRect, occupied: [CGRect],
+                       workspace: CGRect, cameraScale: CGFloat) -> PracticePlacementLayout {
+        guard count > 0 else {
+            return PracticePlacementLayout(frames: [], requiredWorkspace: workspace)
+        }
+        let scale = cameraScale.isFinite && cameraScale > 0 ? cameraScale : 1
+        let horizontalPadding = horizontalScreenPadding / scale
+        let verticalGap = verticalScreenGap / scale
+        let availableWidth = max(1, workspace.width - horizontalPadding * 2)
+        let cardSize = CGSize(
+            width: min(targetScreenSize.width / scale, availableWidth),
+            height: targetScreenSize.height / scale
+        )
+        let minimumX = workspace.minX + horizontalPadding
+        let maximumX = max(minimumX, workspace.maxX - horizontalPadding - cardSize.width)
+        let desiredX = source.midX - cardSize.width / 2
+        let x = min(maximumX, max(minimumX, desiredX))
+
+        var blockers = occupied.filter {
+            !$0.isNull && !$0.isInfinite && $0.width.isFinite && $0.height.isFinite
+        }
+        var frames: [CGRect] = []
+        var nextY = max(source.maxY + verticalGap, workspace.minY + verticalGap)
+        for _ in 0..<count {
+            var candidate = CGRect(origin: CGPoint(x: x, y: nextY), size: cardSize)
+            // Move only downward until this card clears all current content.
+            // The bounded loop protects corrupt legacy geometry without making
+            // placement depend on the iteration order of source objects.
+            for _ in 0..<(blockers.count + 2) {
+                let padded = candidate.insetBy(dx: -horizontalPadding / 2,
+                                               dy: -verticalGap / 2)
+                let collisions = blockers.filter { padded.intersects($0) }
+                guard let bottom = collisions.map(\.maxY).max() else { break }
+                candidate.origin.y = bottom + verticalGap
+            }
+            frames.append(candidate)
+            blockers.append(candidate)
+            nextY = candidate.maxY + verticalGap
+        }
+        let requiredBottom = max(workspace.maxY,
+                                 (frames.last?.maxY ?? workspace.maxY) + verticalGap)
+        let required = CGRect(x: workspace.minX, y: workspace.minY,
+                              width: workspace.width,
+                              height: requiredBottom - workspace.minY)
+        return PracticePlacementLayout(frames: frames, requiredWorkspace: required)
+    }
+}
+
 /// Server-authoritative editor state plus a recoverable local working copy.
 /// The outbox stores the complete latest document, so unknown future fields
 /// are not intentionally reconstructed or merged by the client.
@@ -625,30 +686,56 @@ final class BoardDocumentStore: ObservableObject {
         scheduleSave(api: api)
     }
 
+    @discardableResult
     func applyPracticeProblems(_ problems: [PracticeProblem], interactionID: String? = nil,
-                               unitLabel: String? = nil, api: APIClient) {
+                               unitLabel: String? = nil, sourceBounds: CGRect? = nil,
+                               workspaceBounds: CGRect? = nil,
+                               professorContentBounds: CGRect? = nil,
+                               cameraScale: CGFloat = 1,
+                               api: APIClient) -> CGRect? {
         let existing = Set(editor.objects.filter { $0.role == "ai_practice_problem" }.map(\.id))
-        let fresh = problems.filter { !existing.contains($0.id) }.prefix(2)
-        guard !fresh.isEmpty else { return }
+        let fresh = Array(problems.filter { !existing.contains($0.id) }.prefix(3))
+        guard !fresh.isEmpty else { return nil }
         var next = editor
-        let originX = editor.viewport.x + editor.viewport.width * 0.08
-        let originY = editor.viewport.y + editor.viewport.height * 0.12
-        let cardWidth = editor.viewport.width * 0.35
-        let presentationFontSize = min(82, max(58, cardWidth * 0.06))
-        for (offset, problem) in fresh.enumerated() {
+        let source = sourceBounds ?? CGRect(
+            x: editor.viewport.x + editor.viewport.width * 0.1,
+            y: editor.viewport.y + editor.viewport.height * 0.1,
+            width: editor.viewport.width * 0.4,
+            height: editor.viewport.height * 0.2
+        )
+        let workspace = workspaceBounds ?? CGRect(
+            x: editor.viewport.x, y: editor.viewport.y,
+            width: editor.viewport.width, height: editor.viewport.height
+        )
+        var occupied = editor.objects.compactMap { object -> CGRect? in
+            let bounds = BoardHitTestPolicy.bounds(of: object)
+            return bounds.isNull || bounds.isInfinite ? nil : bounds
+        }
+        if let professorContentBounds,
+           !professorContentBounds.isNull, !professorContentBounds.isInfinite {
+            occupied.append(professorContentBounds)
+        }
+        let layout = PracticePlacementPlanner.layout(
+            count: fresh.count, source: source, occupied: occupied,
+            workspace: workspace, cameraScale: cameraScale
+        )
+        for (index, pair) in zip(fresh, layout.frames).enumerated() {
+            let (problem, frame) = pair
+            let displayText = "Problem \(index + 1)\n\(problem.text)"
             next.objects.append(CanvasObject(id: problem.id, type: "text", color: "#183153",
-                                             width: cardWidth, opacity: 1,
+                                             width: frame.width, opacity: 1,
                                              points: nil, translation: nil,
-                                             sourceMarkdown: problem.text, text: problem.text,
-                                             x: originX + Double(offset) * editor.viewport.width * 0.40,
-                                             y: originY, height: editor.viewport.height * 0.28,
-                                             fontSize: presentationFontSize, role: "ai_practice_problem",
+                                             sourceMarkdown: displayText, text: displayText,
+                                             x: frame.minX, y: frame.minY, height: frame.height,
+                                             fontSize: 22 / max(cameraScale, 0.01),
+                                             role: "ai_practice_problem",
                                              sourceStudyInteractionID: interactionID,
                                              createdAt: Date().timeIntervalSince1970,
                                              unitLabel: unitLabel,
                                              origin: "ai_practice"))
         }
         apply(next, api: api)
+        return layout.requiredWorkspace
     }
 
     func addNote(markdown: String, at point: CGPoint, unitLabel: String?, api: APIClient) {

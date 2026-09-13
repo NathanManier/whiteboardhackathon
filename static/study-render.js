@@ -89,6 +89,43 @@
     return escapedBreaks > realBreaks + 2 ? unescapeLegacyNewlines(text) : text;
   }
 
+  /*
+   * Repair only presentation-time delimiter damage that has an unambiguous
+   * mathematical shape. Canonical source is never rewritten. Currency such as
+   * `$5` remains prose, while model output like `Domain: $(-\\infty,\\infty)`
+   * and the common `$$formula$` mismatch becomes renderable.
+   */
+  function repairMalformedMathDelimiters(source) {
+    const lines = String(source ?? "").split("\n");
+    let fenced = false;
+    return lines.map(line => {
+      if (/^\s*(?:```|~~~)/.test(line)) {
+        fenced = !fenced;
+        return line;
+      }
+      if (fenced) return line;
+      const dollars = [];
+      for (let index = 0; index < line.length; index += 1) {
+        if (line[index] === "$" && line[index - 1] !== "\\") dollars.push(index);
+      }
+      if (dollars.length % 2 === 0) return line;
+      if (line.startsWith("$$") && line.endsWith("$") && dollars.length === 3) {
+        return line.slice(1);
+      }
+      const opener = dollars[dollars.length - 1];
+      const tail = line.slice(opener + 1);
+      const currencyOnly = /^\d+(?:[.,]\d{1,2})?(?:\s|$)/.test(tail)
+        && !/[\\^_=()[\]]/.test(tail);
+      const mathShaped = /(?:^|\b)(?:domain|range)\s*:/i.test(line.slice(0, opener))
+        || /[\\^_=()[\]]/.test(tail);
+      if (currencyOnly || !mathShaped) return line;
+      const punctuation = tail.match(/([.,;:!?])$/);
+      return punctuation
+        ? line.slice(0, -1) + "$" + punctuation[1]
+        : line + "$";
+    }).join("\n");
+  }
+
   function simplifiedChemistry(value) {
     return String(value ?? "")
       .replace(/\\(?:longrightarrow|Longrightarrow|rightarrow)/g, "->")
@@ -732,7 +769,9 @@
   }
 
   function renderSource(source, options = {}, inline = false) {
-    const markdown = normalizeChemistryMarkdown(coerceStudyMarkdown(source));
+    const markdown = normalizeChemistryMarkdown(
+      repairMalformedMathDelimiters(coerceStudyMarkdown(source))
+    );
     const parser = parserFor(options);
     const html = inline ? parser.renderInline(markdown) : parser.render(markdown);
     const fragment = sanitizedFragment(html);
@@ -793,6 +832,7 @@
   }
 
   globalThis.coerceStudyMarkdown = coerceStudyMarkdown;
+  globalThis.repairMalformedMathDelimiters = repairMalformedMathDelimiters;
   globalThis.normalizeChemistryMarkdown = normalizeChemistryMarkdown;
   globalThis.readableNotationFallback = readableNotationFallback;
   globalThis.readableContentFallback = readableContentFallback;

@@ -18,7 +18,12 @@ def study_path(board_dir: Path) -> Path:
 
 
 def empty_study_state() -> dict[str, Any]:
-    return {"schema_version": 2, "interactions": [], "board_ai_context": None}
+    return {
+        "schema_version": 2,
+        "interactions": [],
+        "practice_requests": [],
+        "board_ai_context": None,
+    }
 
 
 def stored_board_context(value: Any) -> dict[str, Any] | None:
@@ -133,6 +138,14 @@ def read_study_state(board_dir: Path) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "interactions": owned_interactions[:MAX_INTERACTIONS],
+        "practice_requests": [
+            dict(item)
+            for item in (
+                value.get("practice_requests")
+                if isinstance(value.get("practice_requests"), list) else []
+            )[:40]
+            if isinstance(item, dict)
+        ],
         "board_ai_context": stored_board_context(value.get("board_ai_context")),
     }
 
@@ -158,6 +171,14 @@ def write_study_state(board_dir: Path, value: dict[str, Any], atomic_json) -> No
         {
             "schema_version": 2,
             "interactions": owned_interactions[:MAX_INTERACTIONS],
+            "practice_requests": [
+                dict(item)
+                for item in (
+                    value.get("practice_requests")
+                    if isinstance(value.get("practice_requests"), list) else []
+                )[:40]
+                if isinstance(item, dict)
+            ],
             "board_ai_context": stored_board_context(context),
         },
     )
@@ -272,7 +293,7 @@ def public_interaction(item: dict[str, Any]) -> dict[str, Any]:
             entry["problem"] = str(problem or follow.get("answer") or "")
             if isinstance(problems, list):
                 clean_problems = []
-                for problem_item in problems[:2]:
+                for problem_item in problems[:3]:
                     if isinstance(problem_item, dict) and (problem_item.get("problem") or problem_item.get("text")):
                         clean_problems.append({
                             "id": str(problem_item.get("id") or "")[:32],

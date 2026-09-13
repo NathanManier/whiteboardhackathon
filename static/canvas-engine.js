@@ -505,74 +505,61 @@
     };
   }
 
-  function practiceCardMetrics(board = {}) {
+  function practiceCardMetrics(board = {}, cameraScale = 1) {
     const boardWidth = Math.max(1, finiteNumber(board.width, 1200));
-    const boardHeight = Math.max(1, finiteNumber(board.height, 800));
-    const width = Math.min(700, Math.max(500, boardWidth * 0.42));
-    const height = Math.min(450, Math.max(300, boardHeight * 0.36));
+    const scale = Math.max(0.001, finiteNumber(cameraScale, 1));
+    const padding = 20 / scale;
+    const width = Math.min(320 / scale, Math.max(1, boardWidth - padding * 2));
+    const height = 150 / scale;
     return {
       width,
       height,
-      fontSize: Math.min(34, Math.max(26, width / 21)),
-      gap: Math.min(250, Math.max(100, width * 0.2)),
-      sourceGap: Math.min(250, Math.max(100, Math.min(boardWidth, boardHeight) * 0.14))
+      fontSize: 22 / scale,
+      gap: 18 / scale,
+      sourceGap: 18 / scale,
+      horizontalPadding: padding
     };
   }
 
   function placePracticeCards({
-    count = 2,
+    count = 3,
     anchor,
     board,
     card,
     obstacles = []
   } = {}) {
-    const amount = Math.max(1, Math.min(2, Math.floor(finiteNumber(count, 2))));
+    const amount = Math.max(1, Math.min(3, Math.floor(finiteNumber(count, 3))));
     const metrics = { ...practiceCardMetrics(board), ...(card || {}) };
     const source = anchor || board || { x: 0, y: 0, width: 1, height: 1 };
     const boardBox = board && board.width > 0 && board.height > 0 ? board : null;
     const gap = Math.max(1, finiteNumber(metrics.gap, 120));
     const sourceGap = Math.max(1, finiteNumber(metrics.sourceGap, gap));
-    const pairWidth = metrics.width * amount + gap * (amount - 1);
-    const pairHeight = metrics.height * amount + gap * (amount - 1);
-    const baseX = finiteNumber(source.x) + finiteNumber(source.width) / 2 - pairWidth / 2;
+    const horizontalPadding = Math.max(0, finiteNumber(metrics.horizontalPadding, gap));
+    const minimumX = boardBox ? boardBox.x + horizontalPadding : -Infinity;
+    const maximumX = boardBox
+      ? Math.max(minimumX, boardBox.x + boardBox.width - horizontalPadding - metrics.width)
+      : Infinity;
+    const desiredX = finiteNumber(source.x) + finiteNumber(source.width) / 2 - metrics.width / 2;
+    const baseX = Math.min(maximumX, Math.max(minimumX, desiredX));
     const belowY = (boardBox
       ? Math.max(finiteNumber(source.y) + finiteNumber(source.height), boardBox.y + boardBox.height)
       : finiteNumber(source.y) + finiteNumber(source.height)) + sourceGap;
-    const rightX = (boardBox
-      ? Math.max(finiteNumber(source.x) + finiteNumber(source.width), boardBox.x + boardBox.width)
-      : finiteNumber(source.x) + finiteNumber(source.width)) + sourceGap;
-    const candidates = [
-      { x: baseX, y: belowY, vertical: false },
-      { x: rightX, y: finiteNumber(source.y), vertical: true },
-      {
-        x: boardBox ? boardBox.x : finiteNumber(source.x),
-        y: belowY,
-        vertical: true
-      },
-      {
-        x: rightX,
-        y: finiteNumber(source.y) + finiteNumber(source.height) / 2 - pairHeight / 2,
-        vertical: true
-      }
-    ];
     const occupied = obstacles.filter(item => item && item.width > 0 && item.height > 0);
-    const boxesFor = candidate => Array.from({ length: amount }, (_, index) => ({
-      x: candidate.x + (candidate.vertical ? 0 : index * (metrics.width + gap)),
-      y: candidate.y + (candidate.vertical ? index * (metrics.height + gap) : 0),
-      width: metrics.width,
-      height: metrics.height
-    }));
-    for (const candidate of candidates) {
-      const boxes = boxesFor(candidate);
-      if (!boxes.some(box => occupied.some(obstacle => intersects(box, obstacle)))) return boxes;
-    }
-    const fallback = candidates[0];
-    let boxes = boxesFor(fallback);
-    let guard = 0;
-    while (boxes.some(box => occupied.some(obstacle => intersects(box, obstacle))) && guard < 40) {
-      fallback.y += metrics.height + gap;
-      boxes = boxesFor(fallback);
-      guard += 1;
+    const boxes = [];
+    let y = belowY;
+    for (let index = 0; index < amount; index += 1) {
+      let candidate = { x: baseX, y, width: metrics.width, height: metrics.height };
+      let guard = 0;
+      while (occupied.some(obstacle => intersects(expand(candidate, gap / 2), obstacle)) && guard < occupied.length + 2) {
+        const bottoms = occupied
+          .filter(obstacle => intersects(expand(candidate, gap / 2), obstacle))
+          .map(obstacle => obstacle.y + obstacle.height);
+        candidate = { ...candidate, y: Math.max(...bottoms) + gap };
+        guard += 1;
+      }
+      boxes.push(candidate);
+      occupied.push(candidate);
+      y = candidate.y + candidate.height + gap;
     }
     return boxes;
   }

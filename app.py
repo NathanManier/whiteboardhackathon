@@ -5615,6 +5615,8 @@ def list_study_interactions(board_id: str) -> Response:
             public_interaction(item)
             for item in state["interactions"]
             if isinstance(item, dict)
+            and str(item.get("action") or "explain") == "explain"
+            and not item.get("superseded_by")
         ]
     )
 
@@ -5797,10 +5799,9 @@ def grouped_graph_recognition_route(folder_id: str) -> Response | tuple[Response
     return response
 
 
-@app.post("/api/boards/<board_id>/study/explain")
-@locked_board_operation
-@require_authenticated
-def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
+def _board_study_explanation_response(
+    board_id: str, *, forced_action: str
+) -> Response | tuple[Response, int]:
     from study.ai import StudyAIError
     from study.service import explain_board
 
@@ -5810,7 +5811,15 @@ def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify(error="A JSON request body is required."), 415
-    action = str(payload.get("action") or payload.get("kind") or "explain")
+    requested_action = str(payload.get("action") or "").strip().lower()
+    # Keep the established lecture-wide Explain variant on the Explain route,
+    # while Check My Work remains impossible to smuggle through that route.
+    action = (
+        "explain_across_boards"
+        if forced_action == "explain" and requested_action == "explain_across_boards"
+        else forced_action
+    )
+    payload["action"] = action
     if limited := enforce_rate_limit(study_rate_limit_action(action)):
         return limited
     library = read_library()
@@ -5855,6 +5864,72 @@ def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
         requestId=payload.get("requestId") or payload.get("studyInteractionId"),
         followUpEnabled=True,
     )
+
+
+@app.post("/api/boards/<board_id>/study/explain")
+@locked_board_operation
+@require_authenticated
+def explain_selection_route(board_id: str) -> Response | tuple[Response, int]:
+    return _board_study_explanation_response(board_id, forced_action="explain")
+
+
+@app.post("/api/boards/<board_id>/study/check")
+@locked_board_operation
+@require_authenticated
+def check_work_route(board_id: str) -> Response | tuple[Response, int]:
+    return _board_study_explanation_response(board_id, forced_action="check_my_work")
+
+
+@app.post("/api/boards/<board_id>/study/practice")
+@locked_board_operation
+@require_authenticated
+def practice_problems_route(board_id: str) -> Response | tuple[Response, int]:
+    from study.ai import StudyAIError
+    from study.service import practice_board
+
+    require_board_owner(board_id)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="A JSON request body is required."), 415
+    payload["action"] = "practice_problems"
+    if limited := enforce_rate_limit("practice"):
+        return limited
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    library = read_library()
+    catalog = library["boards"].get(board_id)
+    folder_id = (
+        catalog.get("folder_id")
+        if isinstance(catalog, dict) else metadata.get("folder_id")
+    )
+    selected_ids = payload.get("selectedObjectIds") or payload.get("selected_object_ids") or []
+    try:
+        route_context = ai_context(
+            action="practice_problems",
+            question="Create practice problems",
+            request_id=str(payload.get("requestId") or "") or None,
+            board_id=board_id,
+            folder_id=folder_id if isinstance(folder_id, str) else None,
+            selected_ids=selected_ids,
+            has_selected_visual=bool(
+                selected_ids or payload.get("selectionBBox") or payload.get("selection_bbox")
+            ),
+        )
+        with routed_study(route_context):
+            outcome = practice_board(
+                board_id=board_id,
+                board_dir=board_dir,
+                metadata=metadata,
+                editor=read_editor_state(board_dir, metadata),
+                payload=payload,
+                folder_id=folder_id if isinstance(folder_id, str) else None,
+                library=library,
+                combined_svg=combined_svg,
+                atomic_json=atomic_json,
+            )
+    except StudyAIError as exc:
+        return jsonify(error=str(exc), retryable=exc.status >= 500), exc.status
+    return jsonify(interaction=None, **outcome)
 
 
 @app.post("/api/boards/<board_id>/study/graph-recognition")

@@ -274,6 +274,50 @@ struct BoardStudySelection: Equatable, Sendable {
     }
 }
 
+enum StudyAction: String, Codable, CaseIterable, Equatable, Sendable {
+    case explain
+    case practice = "practice_problems"
+    case checkWork = "check_my_work"
+    case followUp = "followup"
+    case studyGuide = "study_guide"
+    case graphRecognition = "graph_recognition"
+
+    init?(wireValue: String) {
+        let normalized = wireValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased().replacingOccurrences(of: "-", with: "_")
+        switch normalized {
+        case "explain": self = .explain
+        case "practice", "practice_problem", "practice_problems": self = .practice
+        case "check", "check_work", "check_my_work": self = .checkWork
+        case "followup", "follow_up": self = .followUp
+        case "study_guide": self = .studyGuide
+        case "graph", "graph_recognition": self = .graphRecognition
+        default: return nil
+        }
+    }
+
+    func endpoint(boardID: String) -> String {
+        switch self {
+        case .explain: return "/api/boards/\(boardID)/study/explain"
+        case .practice: return "/api/boards/\(boardID)/study/practice"
+        case .checkWork: return "/api/boards/\(boardID)/study/check"
+        case .graphRecognition: return "/api/boards/\(boardID)/study/graph-recognition"
+        case .followUp, .studyGuide: return ""
+        }
+    }
+
+    var loadingCopy: String {
+        switch self {
+        case .explain: return "Explaining…"
+        case .practice: return "Creating practice problems…"
+        case .checkWork: return "Checking your work…"
+        case .followUp: return "Answering…"
+        case .studyGuide: return "Creating study guide…"
+        case .graphRecognition: return "Reading graphable math…"
+        }
+    }
+}
+
 struct BoardStudyExplainRequest: Encodable, Equatable, Sendable {
     let boardID: String
     let selectedObjectIds: [String]
@@ -295,15 +339,13 @@ struct BoardStudyExplainRequest: Encodable, Equatable, Sendable {
     }
 
     static func make(selection: BoardStudySelection,
-                     action: String = "explain",
+                     action: StudyAction = .explain,
                      question: String? = nil,
                      requestID: String = makeRequestID()) -> BoardStudyExplainRequest {
         let resolvedQuestion = question ?? [
             "explain": "Explain this",
-            "explain_across_boards": "How does this relate to the previous board?",
-            "where_from": "Where did this come from?",
             "check_my_work": "Check my work"
-        ][action] ?? "Explain this"
+        ][action.rawValue] ?? (action == .practice ? "Create practice problems" : "Explain this")
         let pad = max(10, max(selection.localBBox.width, selection.localBBox.height) * 0.01)
         let anchorX = selection.localBBox.x + selection.localBBox.width + pad
         let anchorY = selection.localBBox.y
@@ -319,8 +361,17 @@ struct BoardStudyExplainRequest: Encodable, Equatable, Sendable {
             studyInteractionId: requestID,
             requestId: requestID,
             question: resolvedQuestion,
-            action: action
+            action: action.rawValue
         )
+    }
+
+    static func make(selection: BoardStudySelection,
+                     action: String,
+                     question: String? = nil,
+                     requestID: String = makeRequestID()) -> BoardStudyExplainRequest {
+        make(selection: selection,
+             action: StudyAction(wireValue: action) ?? .explain,
+             question: question, requestID: requestID)
     }
 
     static func makeRequestID() -> String {

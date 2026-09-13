@@ -188,8 +188,10 @@ enum CompactStudyPresentation {
         // native text layer cannot run the full HTML math layout engine.
         value = replacing(#"\\frac\{([^{}]+)\}\{([^{}]+)\}"#, in: value, with: "($1)/($2)")
         value = replacing(#"\\sqrt\{([^{}]+)\}"#, in: value, with: "√($1)")
-        value = replacing(#"\^\{([^{}]+)\}"#, in: value, with: "^$1")
-        value = replacing(#"_\{([^{}]+)\}"#, in: value, with: "_$1")
+        value = replacingScript(#"\^\{([^{}]+)\}"#, in: value, symbols: superscript)
+        value = replacingScript(#"_\{([^{}]+)\}"#, in: value, symbols: subscriptSymbols)
+        value = replacingScript(#"\^([0-9]+)"#, in: value, symbols: superscript)
+        value = replacingScript(#"_([0-9]+)"#, in: value, symbols: subscriptSymbols)
         for command in ["text", "mathrm", "mathbf", "operatorname", "ce"] {
             value = replacing(#"\\"# + command + #"\{([^{}]*)\}"#, in: value, with: "$1")
         }
@@ -210,6 +212,18 @@ enum CompactStudyPresentation {
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static let superscript: [Character: Character] = [
+        "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+        "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+        "+": "⁺", "-": "⁻", "(": "⁽", ")": "⁾", "n": "ⁿ", "i": "ⁱ"
+    ]
+
+    private static let subscriptSymbols: [Character: Character] = [
+        "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄",
+        "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+        "+": "₊", "-": "₋", "(": "₍", ")": "₎", "i": "ᵢ", "n": "ₙ"
+    ]
+
     @MainActor
     static func layer(for object: CanvasObject,
                       frame: CGRect,
@@ -229,20 +243,30 @@ enum CompactStudyPresentation {
         let source = object.sourceMarkdown ?? object.text ?? ""
         let isPractice = object.role == "ai_practice_problem"
         let requestedSize = CGFloat(object.fontSize ?? 32)
-        let fontSize = isPractice ? max(58, requestedSize) : max(38, requestedSize)
+        let fontSize = isPractice ? max(16, requestedSize) : max(38, requestedSize)
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = max(5, fontSize * 0.16)
         paragraph.paragraphSpacing = max(7, fontSize * 0.20)
         let color = UIColor(svgHex: object.color ?? "#183153")
-        textLayer.string = NSAttributedString(
-            string: readableText(from: source),
+        let readable = readableText(from: source)
+        let attributed = NSMutableAttributedString(
+            string: readable,
             attributes: [
                 .font: UIFont.systemFont(ofSize: fontSize,
-                                         weight: isPractice ? .semibold : .regular),
+                                         weight: .regular),
                 .foregroundColor: color,
                 .paragraphStyle: paragraph
             ]
         )
+        if isPractice, let newline = readable.firstIndex(of: "\n") {
+            let labelLength = readable.distance(from: readable.startIndex, to: newline)
+            attributed.addAttributes([
+                .font: UIFont.systemFont(ofSize: max(11, fontSize * 0.68),
+                                         weight: .semibold),
+                .foregroundColor: CanvasDesignTokens.canvasSecondaryText
+            ], range: NSRange(location: 0, length: labelLength))
+        }
+        textLayer.string = attributed
         textLayer.isWrapped = true
         textLayer.truncationMode = .end
         textLayer.alignmentMode = .left
@@ -262,5 +286,26 @@ enum CompactStudyPresentation {
         return expression.stringByReplacingMatches(in: source,
                                                    range: range,
                                                    withTemplate: template)
+    }
+
+    private static func replacingScript(_ pattern: String,
+                                        in source: String,
+                                        symbols: [Character: Character]) -> String {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return source
+        }
+        var result = source
+        let matches = expression.matches(
+            in: source, range: NSRange(source.startIndex..<source.endIndex, in: source)
+        )
+        for match in matches.reversed() {
+            guard match.numberOfRanges == 2,
+                  let fullRange = Range(match.range(at: 0), in: result),
+                  let contentRange = Range(match.range(at: 1), in: result) else { continue }
+            let content = result[contentRange]
+            guard content.allSatisfy({ symbols[$0] != nil }) else { continue }
+            result.replaceSubrange(fullRange, with: String(content.compactMap { symbols[$0] }))
+        }
+        return result
     }
 }

@@ -4902,7 +4902,7 @@
     const status = document.createElement("p");
     status.className = "study-generating";
     status.textContent = state.pendingStudyAction === "practice_problems"
-      ? "Generating 2 practice problems…"
+      ? "Generating 3 practice problems…"
       : "Generating…";
     parent.append(status);
   }
@@ -5380,7 +5380,8 @@
       appendGenerating(body);
     }
     try {
-      const payload = await requestStudy(studyApi("/study/explain"), {
+      const initialEndpoint = action === "check_my_work" ? "/study/check" : "/study/explain";
+      const payload = await requestStudy(studyApi(initialEndpoint), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -5547,7 +5548,7 @@
         return String(item || "").trim();
       })
       .filter(Boolean);
-    statements.splice(2);
+    statements.splice(3);
     if (!statements.length) return;
     const interaction = state.studyInteractions.find(item => item.id === state.activeStudyId);
     const ids = interaction?.selectedObjectIds || [...state.selected];
@@ -5557,27 +5558,29 @@
     }));
     const boardBox = { x: 0, y: 0, width: state.width, height: state.height };
     const metrics = Engine.practiceCardMetrics
-      ? Engine.practiceCardMetrics(boardBox)
-      : { width: 600, height: 360, fontSize: 29, gap: 140, sourceGap: 140 };
+      ? Engine.practiceCardMetrics(boardBox, cameraZoom())
+      : { width: 320, height: 150, fontSize: 22, gap: 18, sourceGap: 18 };
     const anchor = live || {
       x: Number(interaction?.anchorX) || state.camera.x + 40,
       y: Number(interaction?.anchorY) || state.camera.y + 40,
       width: 1,
       height: 1
     };
-    const existingCards = topLevelItems()
-      .filter(object => !object.deleted && object.role === "ai_practice_problem")
+    const existingContent = topLevelItems()
+      .filter(object => !object.deleted)
       .map(objectBounds);
     const placements = Engine.placePracticeCards
       ? Engine.placePracticeCards({
           count: statements.length,
           anchor,
           card: metrics,
-          obstacles: [anchor, ...existingCards]
+          board: boardBox,
+          obstacles: [boardBox, anchor, ...existingContent]
         })
       : statements.map((_, index) => ({
-          x: anchor.x + index * (metrics.width + metrics.gap),
-          y: anchor.y + anchor.height + metrics.sourceGap,
+          x: anchor.x,
+          y: anchor.y + anchor.height + metrics.sourceGap
+            + index * (metrics.height + metrics.gap),
           width: metrics.width,
           height: metrics.height
         }));

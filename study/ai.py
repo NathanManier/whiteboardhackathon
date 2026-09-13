@@ -143,11 +143,11 @@ PRACTICE_PROBLEM_SYSTEM = """You generate concise practice problems for the exac
 
 Use evidence in this order: selected visual, exact selected text, current study interaction, local visual context, then cached board or class summary. Background context must not override the selection.
 
-Create exactly TWO related but distinct practice problems for the same underlying concept. They must be independently solvable, contain enough information to solve, not be duplicates or trivial rephrasings, and match the selected material's difficulty.
+Create exactly THREE related but distinct practice problems for the same underlying concept. They must be independently solvable, contain enough information to solve, not be duplicates or trivial rephrasings, and match the selected material's difficulty.
 
 CRITICAL OUTPUT RULES:
-- Return JSON only with this exact shape: {"problems": [{"problem": "..."}, {"problem": "..."}]}
-- Generate exactly two problems.
+- Return JSON only with this exact shape: {"problems": [{"problem": "..."}, {"problem": "..."}, {"problem": "..."}]}
+- Generate exactly three problems.
 - Each problem string must contain ONLY the problem the student should solve.
 - Do NOT include an explanation, solution, answer, hints, commentary, or wrapper text.
 - Do NOT write "Here is a practice problem."
@@ -162,8 +162,8 @@ PRACTICE_PROBLEMS_SCHEMA = {
     "properties": {
         "problems": {
             "type": "array",
-            "minItems": 2,
-            "maxItems": 2,
+            "minItems": 3,
+            "maxItems": 3,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -221,8 +221,8 @@ ACTION_INSTRUCTIONS = {
         "Show steps and use Markdown and LaTeX."
     ),
     "practice_problems": (
-        "Generate exactly two related but distinct practice problems for the same concept. "
-        "Return only the two problem statements, with no solutions."
+        "Generate exactly three related but distinct practice problems for the same concept. "
+        "Return only the three problem statements, with no solutions."
     ),
     "check_my_work": (
         "Evaluate the student's attempt against the practice problem in the selection. "
@@ -1291,8 +1291,8 @@ def parse_practice_problems(raw: str) -> dict[str, Any]:
                 continue
             seen.add(entry["problem"])
             problems.append(entry)
-    if len(problems) != 2:
-        raise StudyAIError("The study assistant did not return exactly two practice problems.")
+    if len(problems) != 3:
+        raise StudyAIError("The study assistant did not return exactly three practice problems.")
     display = "\n\n".join(
         f"**Problem {index + 1}**\n{item['problem']}" for index, item in enumerate(problems)
     )
@@ -1673,7 +1673,7 @@ def follow_up_question(
     kind = normalize_study_action(action)
     if kind == "practice_problems":
         lines = [
-            "Generate exactly two concise, independent practice problems for this selected concept.",
+            "Generate exactly three concise, independent practice problems for this selected concept.",
             f"Selected concept: {interaction_title or 'the current study interaction'}",
             f"Student's original question: {question or 'Explain this'}",
             "Current study explanation (concept context, not a solution to copy): "

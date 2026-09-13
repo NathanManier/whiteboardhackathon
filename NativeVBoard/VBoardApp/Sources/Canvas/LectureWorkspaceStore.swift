@@ -514,14 +514,46 @@ final class LectureWorkspaceStore: ObservableObject {
     }
 
     func applyPracticeProblems(_ problems: [PracticeProblem], interactionID: String?,
-                               boardID: String, api: APIClient) {
-        guard let store = boardStores[boardID] else { return }
+                               boardID: String, sourceBounds: CGRect,
+                               cameraScale: CGFloat, api: APIClient) {
+        guard let store = boardStores[boardID],
+              let item = workspace?.items.first(where: { $0.boardID == boardID }) else { return }
         let before = store.editor.objects.count
-        let unitLabel = workspace?.items.first(where: { $0.boardID == boardID })?.unitLabel
-        store.applyPracticeProblems(problems, interactionID: interactionID,
-                                    unitLabel: unitLabel, api: api)
-        guard store.editor.objects.count != before else { return }
+        let existingLocal = item.effectiveFrame.offsetBy(
+            dx: -CGFloat(item.canvasX), dy: -CGFloat(item.canvasY)
+        )
+        let existingProblemIDs = Set(store.editor.objects.filter {
+            $0.role == "ai_practice_problem"
+        }.map(\.id))
+        let freshCount = problems.filter { !existingProblemIDs.contains($0.id) }
+            .prefix(3).count
+        guard freshCount > 0 else { return }
         recordBoardUndo([boardID])
+        let occupied = store.editor.objects.compactMap { object -> CGRect? in
+            let bounds = BoardHitTestPolicy.bounds(of: object)
+            return bounds.isNull || bounds.isInfinite ? nil : bounds
+        } + [CGRect(x: 0, y: 0, width: item.boardWidth, height: item.boardHeight)]
+        let previewLayout = PracticePlacementPlanner.layout(
+            count: freshCount, source: sourceBounds, occupied: occupied,
+            workspace: existingLocal, cameraScale: cameraScale
+        )
+        // Workspace ownership grows first; the following document mutation can
+        // therefore publish all three cards directly inside its final surface.
+        expandBoardDownward(
+            boardID: boardID, to: previewLayout.requiredWorkspace, api: api
+        )
+        let required = store.applyPracticeProblems(
+            problems, interactionID: interactionID, unitLabel: item.unitLabel,
+            sourceBounds: sourceBounds, workspaceBounds: existingLocal,
+            professorContentBounds: CGRect(
+                x: 0, y: 0, width: item.boardWidth, height: item.boardHeight
+            ),
+            cameraScale: cameraScale, api: api
+        )
+        guard store.editor.objects.count != before else { return }
+        if let required, required.maxY > previewLayout.requiredWorkspace.maxY {
+            expandBoardDownward(boardID: boardID, to: required, api: api)
+        }
         refreshSceneSnapshot(boardID, api: api)
     }
 
