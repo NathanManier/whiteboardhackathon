@@ -105,6 +105,81 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertEqual(payload["detection_mode"], "edge")
         self.assertTrue(payload["detection_found"])
 
+    def test_status_exposes_persisted_work_backed_processing_fields(self):
+        board_id = "a" * 32
+        board_dir = board_app.board_directory(board_id, create=True)
+        metadata = self.ready_board(board_id, None)
+        board_app.set_processing_stage(
+            board_dir,
+            metadata,
+            "vectorizing",
+            3,
+            message="Creating editable vectors",
+        )
+
+        response = self.client.get(
+            f"/board/{board_id}", headers={"Accept": "application/json"}
+        )
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "processing")
+        self.assertEqual(payload["processing_stage"], "vectorizing")
+        self.assertEqual(payload["processing_stage_index"], 3)
+        self.assertEqual(payload["processing_stage_count"], 6)
+        self.assertEqual(payload["processing_progress"], 0.5)
+        self.assertEqual(payload["processing_message"], "Creating editable vectors")
+        self.assertIn("processing_started_at", payload)
+        self.assertIn("processing_updated_at", payload)
+
+    def test_downstream_reports_real_stage_order_and_ready_only_after_save(self):
+        board_id = "b" * 32
+        board_dir = board_app.board_directory(board_id, create=True)
+        metadata = {
+            "id": board_id,
+            "assets": {},
+            "pipeline": {"status": "processing", "timings_ms": {}, "errors": []},
+        }
+        image = np.full((40, 60, 3), 255, dtype=np.uint8)
+        stages = []
+        real_transition = board_app.set_processing_stage
+
+        def record_transition(*args, **kwargs):
+            stages.append(args[2])
+            return real_transition(*args, **kwargs)
+
+        with patch("app.set_processing_stage", side_effect=record_transition), patch(
+            "app.perspective_correct", return_value=image
+        ), patch("app.enhance_image", return_value=image), patch(
+            "app.analyze_image", return_value={"ink": "measured"}
+        ), patch(
+            "app.vectorize_image",
+            return_value=(
+                b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40"/>',
+                "conservative",
+                [],
+                {},
+                object(),
+            ),
+        ), patch("app.write_debug_artifacts"), patch(
+            "study.service.persist_thumbnail"
+        ):
+            board_app.run_downstream(board_dir, metadata, image, self.corners)
+
+        self.assertEqual(
+            stages,
+            [
+                "correcting_perspective",
+                "enhancing_board",
+                "analyzing_ink",
+                "vectorizing",
+                "generating_preview",
+                "saving",
+                "ready",
+            ],
+        )
+        self.assertEqual(metadata["pipeline"]["status"], "ready")
+        self.assertEqual(metadata["pipeline"]["processing_progress"], 1.0)
+        self.assertEqual(metadata["pipeline"]["processing_stage_index"], 6)
+
     def test_confident_detection_waits_for_user_confirmation(self):
         with patch("app.detect_corners", return_value=(self.corners, 0.9)), patch(
             "app.run_downstream", side_effect=self.fake_downstream
@@ -132,6 +207,26 @@ class BoardWorkflowTests(unittest.TestCase):
         self.assertEqual(metadata["pipeline"]["status"], "ready")
         self.assertEqual(len(metadata["confirmed_corners"]), 4)
         self.assertIn("corners_confirmed_at", metadata)
+
+    def test_processing_failure_persists_safe_stable_error_code_for_retry_ui(self):
+        with patch("app.detect_corners", return_value=(self.corners, 0.0)):
+            created = self.upload().get_json()
+        with patch("app.run_downstream", side_effect=RuntimeError("private detail")):
+            response = self.client.post(
+                f"/board/{created['id']}/corners",
+                json={"corners": self.corners.tolist()},
+                headers={"Accept": "application/json"},
+            )
+        self.assertEqual(response.status_code, 500)
+        status = self.client.get(
+            f"/board/{created['id']}", headers={"Accept": "application/json"}
+        ).get_json()
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["processing_stage"], "failed")
+        self.assertEqual(
+            status["processing_error_code"], "whiteboard_processing_failed"
+        )
+        self.assertNotIn("private detail", json.dumps(status))
 
     def test_deleted_board_returns_404_without_recreating_directory(self):
         with patch("app.detect_corners", return_value=(self.corners, 0.0)):

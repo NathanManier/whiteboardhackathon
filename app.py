@@ -2423,14 +2423,55 @@ def set_stage(metadata: dict[str, Any], stage: str, started: float) -> None:
     print(f"[PIPELINE] {stage.upper()} END: {elapsed_ms / 1000:.3f}s", flush=True)
 
 
+PROCESSING_STAGE_COUNT = 6
+
+
+def set_processing_stage(
+    board_dir: Path,
+    metadata: dict[str, Any],
+    stage: str,
+    index: int,
+    *,
+    count: int = PROCESSING_STAGE_COUNT,
+    message: str,
+    status: str = "processing",
+    error_code: str | None = None,
+) -> None:
+    """Persist an externally observable, work-backed pipeline transition.
+
+    ``index`` is the number of completed product stages. It only advances when
+    the preceding stage has actually finished; no timer manufactures progress.
+    """
+
+    now = time.time()
+    pipeline = metadata.setdefault("pipeline", {})
+    pipeline["status"] = status
+    pipeline["processing_stage"] = stage
+    pipeline["processing_stage_index"] = max(0, min(int(index), int(count)))
+    pipeline["processing_stage_count"] = max(1, int(count))
+    pipeline["processing_progress"] = round(
+        pipeline["processing_stage_index"] / pipeline["processing_stage_count"], 4
+    )
+    pipeline["processing_message"] = message
+    pipeline.setdefault("processing_started_at", now)
+    pipeline["processing_updated_at"] = now
+    if error_code:
+        pipeline["processing_error_code"] = error_code
+    else:
+        pipeline.pop("processing_error_code", None)
+    update_metadata(board_dir, metadata)
+
+
 def run_downstream(
     board_dir: Path, metadata: dict[str, Any], image: np.ndarray, corners: np.ndarray
 ) -> None:
     pipeline_started = time.perf_counter()
     pipeline = metadata.setdefault("pipeline", {})
-    pipeline["status"] = "processing"
     errors = pipeline.setdefault("errors", [])
-    update_metadata(board_dir, metadata)
+    set_processing_stage(
+        board_dir, metadata, "correcting_perspective", 0,
+        message="Correcting perspective",
+    )
 
     corrected = image
     started = time.perf_counter()
@@ -2454,6 +2495,10 @@ def run_downstream(
         corrected.shape[0],
     )
 
+    set_processing_stage(
+        board_dir, metadata, "enhancing_board", 1,
+        message="Enhancing board",
+    )
     master = corrected
     started = time.perf_counter()
     LOGGER.info(
@@ -2480,6 +2525,10 @@ def run_downstream(
         master.shape[0],
     )
 
+    set_processing_stage(
+        board_dir, metadata, "analyzing_ink", 2,
+        message="Detecting marker ink",
+    )
     started = time.perf_counter()
     LOGGER.info("SAVE ANALYSIS METADATA START")
     try:
@@ -2491,6 +2540,10 @@ def run_downstream(
     metadata["assets"]["analysis"] = "analysis.json"
     set_stage(metadata, "analysis", started)
 
+    set_processing_stage(
+        board_dir, metadata, "vectorizing", 3,
+        message="Creating editable vectors",
+    )
     started = time.perf_counter()
     try:
         svg, vector_method, vector_objects, vector_metrics, ink = vectorize_image(master)
@@ -2513,15 +2566,15 @@ def run_downstream(
         except Exception as fallback_exc:
             errors.append({"stage": "vector_fallback", "message": str(fallback_exc)})
     set_stage(metadata, "vectorization", started)
-    pipeline["status"] = "ready"
-    pipeline["timings_ms"]["total_downstream"] = round(
-        (time.perf_counter() - pipeline_started) * 1000, 2
+
+    set_processing_stage(
+        board_dir, metadata, "generating_preview", 4,
+        message="Preparing preview",
     )
     LOGGER.info(
         "SAVE ARTIFACTS START board=%s",
         metadata.get("id", "unknown"),
     )
-    update_metadata(board_dir, metadata)
     try:
         from study.service import persist_thumbnail
 
@@ -2533,6 +2586,18 @@ def run_downstream(
         )
     except Exception:
         LOGGER.info("THUMBNAIL SKIPPED board=%s", metadata.get("id", "unknown"))
+
+    set_processing_stage(
+        board_dir, metadata, "saving", 5,
+        message="Saving board",
+    )
+    pipeline["timings_ms"]["total_downstream"] = round(
+        (time.perf_counter() - pipeline_started) * 1000, 2
+    )
+    set_processing_stage(
+        board_dir, metadata, "ready", PROCESSING_STAGE_COUNT,
+        message="Board ready", status="ready",
+    )
     LOGGER.info(
         "SAVE ARTIFACTS COMPLETE board=%s total=%.3fs",
         metadata.get("id", "unknown"),
@@ -2669,7 +2734,10 @@ def asset_paths(metadata: dict[str, Any]) -> set[str]:
 
 
 def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
-    status = str(metadata.get("pipeline", {}).get("status", "unknown"))
+    pipeline = metadata.get("pipeline", {})
+    if not isinstance(pipeline, dict):
+        pipeline = {}
+    status = str(pipeline.get("status", "unknown"))
     dimensions = metadata.get("dimensions")
     if not isinstance(dimensions, dict):
         dimensions = {
@@ -2727,7 +2795,7 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
         "detection_found": detection_found,
         "user_strokes": strokes,
         "user_ink": strokes,
-        "pipeline": metadata.get("pipeline", {}),
+        "pipeline": pipeline,
         "source_kind": str(metadata.get("source_kind") or metadata.get("source", {}).get("kind") or "physical_whiteboard"),
         "pdf_url": (
             url_for("board_file", board_id=board_id, asset=assets["pdf"])
@@ -2736,6 +2804,18 @@ def frontend_board_data(board_id: str, metadata: dict[str, Any]) -> dict[str, An
         ),
         "pdf_page_number": metadata.get("source", {}).get("page_number"),
     }
+    for key in (
+        "processing_stage",
+        "processing_stage_index",
+        "processing_stage_count",
+        "processing_progress",
+        "processing_message",
+        "processing_started_at",
+        "processing_updated_at",
+        "processing_error_code",
+    ):
+        if key in pipeline:
+            data[key] = pipeline[key]
     if isinstance(metadata.get("normalized_corners"), list):
         data["normalized_corners"] = metadata["normalized_corners"]
     lecture = lecture_payload_for_board(board_id, metadata, library)
@@ -4084,7 +4164,18 @@ def upload() -> Response | tuple[str, int]:
             "height": int(image.shape[0]),
         },
         "assets": {"original": original_name},
-        "pipeline": {"status": "detecting", "timings_ms": {}, "errors": []},
+        "pipeline": {
+            "status": "detecting",
+            "timings_ms": {},
+            "errors": [],
+            "processing_stage": "finding_whiteboard",
+            "processing_stage_index": 0,
+            "processing_stage_count": 1,
+            "processing_progress": 0.0,
+            "processing_message": "Finding whiteboard",
+            "processing_started_at": time.time(),
+            "processing_updated_at": time.time(),
+        },
     }
     update_metadata(board_dir, metadata)
     library["boards"][board_id] = {
@@ -4127,8 +4218,11 @@ def upload() -> Response | tuple[str, int]:
         confidence = detection["confidence"]
     except Exception:
         LOGGER.exception("BOARD CREATE FAILED board=%s stage=detection", board_id)
-        metadata.setdefault("pipeline", {})["status"] = "failed"
-        update_metadata(board_dir, metadata)
+        set_processing_stage(
+            board_dir, metadata, "failed", 0, count=1,
+            message="Whiteboard processing failed", status="failed",
+            error_code="whiteboard_detection_failed",
+        )
         return upload_failure(
             "We couldn't analyze that whiteboard photo. Try another image.",
             500,
@@ -4169,12 +4263,14 @@ def upload() -> Response | tuple[str, int]:
             }
             for point in corners
         ]
-    metadata["pipeline"]["status"] = "needs_corners"
     # Always show the automatic detection for confirmation before correction.
     atomic_image(board_dir / "master.png", image)
     metadata["assets"]["master"] = "master.png"
     metadata["dimensions"] = {"width": int(width), "height": int(height)}
-    update_metadata(board_dir, metadata)
+    set_processing_stage(
+        board_dir, metadata, "awaiting_corners", 1, count=1,
+        message="Confirm the whiteboard boundary", status="needs_corners",
+    )
     LOGGER.info("BOARD NEEDS_CORNERS board=%s", board_id)
     LOGGER.info(
         "BOARD CREATE COMPLETE board=%s lecture=%s state=needs_corners elapsed=%.3fs",
@@ -4435,16 +4531,24 @@ def set_corners(board_id: str) -> Response | tuple[str, int]:
                 metadata["normalized_corners"] = values
         except (KeyError, TypeError, ValueError):
             pass
-    metadata.setdefault("pipeline", {})["status"] = "processing"
-    update_metadata(board_dir, metadata)
+    set_processing_stage(
+        board_dir, metadata, "submitting_corners", 0,
+        message="Submitting corners",
+    )
     LOGGER.info("BOARD CORNERS SAVED board=%s", board_id)
     LOGGER.info("BOARD PROCESSING RESUME board=%s manual=true", board_id)
     try:
         run_downstream(board_dir, metadata, image, corners)
     except Exception:
         LOGGER.exception("BOARD CORNERS FAILED board=%s stage=processing", board_id)
-        metadata.setdefault("pipeline", {})["status"] = "failed"
-        update_metadata(board_dir, metadata)
+        failed_pipeline = metadata.setdefault("pipeline", {})
+        set_processing_stage(
+            board_dir, metadata, "failed",
+            int(failed_pipeline.get("processing_stage_index") or 0),
+            count=int(failed_pipeline.get("processing_stage_count") or PROCESSING_STAGE_COUNT),
+            message="Whiteboard processing failed", status="failed",
+            error_code="whiteboard_processing_failed",
+        )
         if request.is_json:
             return jsonify(error="Whiteboard processing failed."), 500
         return "Whiteboard processing failed.", 500

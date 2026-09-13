@@ -155,6 +155,7 @@ struct LibraryBoard: Codable, Identifiable, Hashable, Sendable {
 struct BoardRecord: Codable, Identifiable, Sendable {
     let id: String
     let name: String?
+    let status: String?
     let dimensions: BoardDimensions?
     let assets: BoardAssets?
     let suggestedCorners: [[Double]]?
@@ -162,17 +163,33 @@ struct BoardRecord: Codable, Identifiable, Sendable {
     let detectionConfidence: Double?
     let detectionMode: String?
     let detectionFound: Bool?
+    let processingStage: String?
+    let processingStageIndex: Int?
+    let processingStageCount: Int?
+    let processingProgress: Double?
+    let processingMessage: String?
+    let processingStartedAt: Double?
+    let processingUpdatedAt: Double?
+    let processingErrorCode: String?
     let sourceKind: BoardSourceKind?
     let pdfURL: String?
     let pdfPageNumber: Int?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, dimensions, assets
+        case id, name, status, dimensions, assets
         case suggestedCorners = "suggested_corners"
         case normalizedCorners = "normalized_corners"
         case detectionConfidence = "detection_confidence"
         case detectionMode = "detection_mode"
         case detectionFound = "detection_found"
+        case processingStage = "processing_stage"
+        case processingStageIndex = "processing_stage_index"
+        case processingStageCount = "processing_stage_count"
+        case processingProgress = "processing_progress"
+        case processingMessage = "processing_message"
+        case processingStartedAt = "processing_started_at"
+        case processingUpdatedAt = "processing_updated_at"
+        case processingErrorCode = "processing_error_code"
         case sourceKind = "source_kind"
         case pdfURL = "pdf_url"
         case pdfPageNumber = "pdf_page_number"

@@ -559,17 +559,28 @@ final class NativeImportCoordinateTests: XCTestCase {
         let current = try decoder.decode(BoardRecord.self, from: Data(#"""
         {
             "id":"board-1","suggested_corners":[[1,2],[9,2],[9,8],[1,8]],
-            "detection_confidence":0.72,"detection_mode":"brightness","detection_found":true
+            "detection_confidence":0.72,"detection_mode":"brightness","detection_found":true,
+            "status":"processing","processing_stage":"vectorizing",
+            "processing_stage_index":3,"processing_stage_count":6,"processing_progress":0.5,
+            "processing_message":"Creating editable vectors","processing_error_code":null
         }
         """#.utf8))
         XCTAssertEqual(current.detectionConfidence, 0.72)
         XCTAssertEqual(current.detectionMode, "brightness")
         XCTAssertEqual(current.detectionFound, true)
+        XCTAssertEqual(current.status, "processing")
+        XCTAssertEqual(current.processingStage, "vectorizing")
+        XCTAssertEqual(current.processingProgress, 0.5)
+        let presentation = BoardProcessingPresentation(record: current)
+        XCTAssertEqual(presentation.label, "Creating editable vectors")
+        XCTAssertEqual(presentation.fraction, 0.5)
 
         let legacy = try decoder.decode(BoardRecord.self, from: Data(#"{"id":"board-2"}"#.utf8))
         XCTAssertNil(legacy.detectionConfidence)
         XCTAssertNil(legacy.detectionMode)
         XCTAssertNil(legacy.detectionFound)
+        XCTAssertNil(legacy.processingStage)
+        XCTAssertNil(BoardProcessingPresentation(record: legacy).fraction)
     }
 }
 
@@ -582,6 +593,8 @@ final class ImportFlowStateMachineTests: XCTestCase {
         XCTAssertFalse(state.beginImageUpload(UUID()), "a second tap must not submit again")
         XCTAssertTrue(state.requireCorners(after: upload))
         XCTAssertTrue(state.beginCornerSubmission(firstSubmit))
+        XCTAssertTrue(state.beginProcessing(after: firstSubmit))
+        XCTAssertEqual(state.cornerOperationID, firstSubmit)
         XCTAssertTrue(state.failToCorners(firstSubmit))
         XCTAssertTrue(state.beginCornerSubmission(retry))
         XCTAssertTrue(state.complete(retry))
@@ -599,6 +612,18 @@ final class ImportFlowStateMachineTests: XCTestCase {
         XCTAssertEqual(state.phase, .choosing)
         state.sourceSelected()
         XCTAssertTrue(state.beginImageUpload(UUID()))
+    }
+
+    func testUploadProgressUsesMeasuredBytesAndClampsInvalidRanges() {
+        XCTAssertEqual(UploadByteProgress(bytesSent: 25, totalBytes: 100).fraction, 0.25)
+        XCTAssertEqual(UploadByteProgress(bytesSent: 150, totalBytes: 100).fraction, 1)
+        XCTAssertEqual(UploadByteProgress(bytesSent: -1, totalBytes: 100).fraction, 0)
+        XCTAssertNil(UploadByteProgress(bytesSent: 1, totalBytes: 0).fraction)
+    }
+
+    func testLongOperationIndicatorUsesRequestedAntiFlickerBounds() {
+        XCTAssertEqual(LongOperationVisibilityPolicy.appearanceDelay, 0.2)
+        XCTAssertEqual(LongOperationVisibilityPolicy.minimumVisibleDuration, 0.4)
     }
 }
 

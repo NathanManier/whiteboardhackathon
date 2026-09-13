@@ -505,6 +505,7 @@ private struct RenamePrompt: View {
 struct ImportFlowView: View {
     @EnvironmentObject private var api: APIClient
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     let folderID: String?
     let pendingImport: PendingImport?
     let onComplete: (LibraryBoard) -> Void
@@ -531,8 +532,13 @@ struct ImportFlowView: View {
     @State private var createLecture = false
     @State private var newLectureName = ""
     @State private var activeTask: Task<Void, Never>?
+    @State private var statusTask: Task<Void, Never>?
+    @State private var uploadByteProgress: UploadByteProgress?
+    @State private var processingRecord: BoardRecord?
     @State private var processingTipIndex = 0
     @State private var showsProcessingTip = false
+    @State private var showsOperationProgress = false
+    @State private var progressBecameVisibleAt: Date?
     private let processingTips = [
         "Lasso an equation and tap Explain.",
         "Two fingers pan and zoom without changing your Pencil tool.",
@@ -545,7 +551,7 @@ struct ImportFlowView: View {
         self.folderID = folderID; self.pendingImport = pendingImport; self.onComplete = onComplete
     }
     var body: some View {
-        NavigationStack { Group { switch importState.phase { case .choosing: chooseView; case .previewing: previewView; case .needsCorners: cornerView; case .uploading, .submittingCorners, .importingPDF, .completed: processingView } }.navigationTitle(importState.phase.title).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { cancelAndDismiss() } } } }
+        NavigationStack { Group { switch importState.phase { case .choosing: chooseView; case .previewing: previewView; case .needsCorners: cornerView; case .uploading, .submittingCorners, .processing, .importingPDF, .completed: processingView } }.navigationTitle(importState.phase.title).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { cancelAndDismiss() } } } }
             .fileImporter(isPresented: $fileImporter, allowedContentTypes: importFileKind == .pdf ? [.pdf] : [.image]) { result in
                 if case .success(let url) = result { Task { await loadFile(url) } }
             }
@@ -579,10 +585,20 @@ struct ImportFlowView: View {
             .onDisappear {
                 activeTask?.cancel()
                 activeTask = nil
+                statusTask?.cancel()
+                statusTask = nil
                 pickerItem = nil
                 fileImporter = false
                 showCamera = false
                 importState.cancel()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .background {
+                    statusTask?.cancel()
+                    statusTask = nil
+                } else if phase == .active {
+                    resumeStatusPollingIfNeeded()
+                }
             }
     }
     private var chooseView: some View {
@@ -707,15 +723,30 @@ struct ImportFlowView: View {
                     .overlay { RoundedRectangle(cornerRadius: 16).stroke(.separator.opacity(0.35), lineWidth: 0.5) }
                     .shadow(color: .black.opacity(0.08), radius: 14, y: 6)
             }
-            ProgressView().controlSize(.large)
-            Text(importState.phase.processingTitle).font(.title2.weight(.semibold))
-            Text(pdfData == nil
-                 ? "The server is correcting perspective, enhancing the board, finding marker ink, and creating editable vectors."
-                 : "V-Board is preserving source quality, preparing page previews, and adding boards to your lecture.")
+            if showsOperationProgress {
+                if let progress = displayedProgress {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .frame(maxWidth: 420)
+                        .accessibilityLabel(processingLabel)
+                        .accessibilityValue("\(Int((progress * 100).rounded())) percent")
+                } else {
+                    ProgressView().controlSize(.large).accessibilityLabel(processingLabel)
+                }
+            }
+            Text(processingLabel).font(.title2.weight(.semibold))
+            Text(processingDetail)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 30)
                 .frame(maxWidth: 680)
+            if importState.phase.isServerProcessing {
+                Text("Cancel closes this view. Server processing may continue safely, and the board remains in your library.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 520)
+            }
             if showsProcessingTip {
                 Label(processingTips[processingTipIndex], systemImage: "lightbulb")
                     .font(.subheadline)
@@ -729,9 +760,15 @@ struct ImportFlowView: View {
         .padding(28)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: importState.phase) {
+            showsOperationProgress = false
+            progressBecameVisibleAt = nil
             showsProcessingTip = false
             processingTipIndex = 0
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            try? await Task.sleep(nanoseconds: LongOperationVisibilityPolicy.appearanceDelayNanoseconds)
+            guard !Task.isCancelled, importState.phase.isBusy else { return }
+            progressBecameVisibleAt = Date()
+            showsOperationProgress = true
+            try? await Task.sleep(nanoseconds: 3_800_000_000)
             guard !Task.isCancelled, importState.phase.isBusy else { return }
             withAnimation(.easeInOut(duration: 0.2)) { showsProcessingTip = true }
             while !Task.isCancelled, importState.phase.isBusy {
@@ -741,6 +778,49 @@ struct ImportFlowView: View {
                     processingTipIndex = (processingTipIndex + 1) % processingTips.count
                 }
             }
+        }
+    }
+    private var processingPresentation: BoardProcessingPresentation? {
+        processingRecord.map(BoardProcessingPresentation.init)
+    }
+    private var processingLabel: String {
+        switch importState.phase {
+        case .uploading:
+            return uploadByteProgress?.fraction == 1 ? "Finding whiteboard" : "Uploading photo"
+        case .submittingCorners:
+            return "Submitting corners"
+        case .processing:
+            return processingPresentation?.label ?? "Creating editable board"
+        case .importingPDF:
+            if uploadByteProgress?.fraction != 1 { return "Uploading PDF" }
+            return pdfPageCount > 1 ? "Preparing \(pdfPageCount) PDF pages" : "Preparing PDF page"
+        case .completed:
+            return "Board ready"
+        default:
+            return importState.phase.processingTitle
+        }
+    }
+    private var processingDetail: String {
+        if let message = processingPresentation?.message, !message.isEmpty {
+            return message
+        }
+        if pdfData != nil {
+            return "V-Board is preserving source quality and preparing each page in source order."
+        }
+        return "Your selected photo stays here while V-Board prepares the editable board."
+    }
+    private var displayedProgress: Double? {
+        switch importState.phase {
+        case .uploading:
+            guard let fraction = uploadByteProgress?.fraction, fraction < 1 else { return nil }
+            return fraction
+        case .processing:
+            return processingPresentation?.fraction
+        case .importingPDF:
+            guard let fraction = uploadByteProgress?.fraction, fraction < 1 else { return nil }
+            return fraction
+        default:
+            return nil
         }
     }
     private func loadImageData(_ data: Data) async {
@@ -765,6 +845,7 @@ struct ImportFlowView: View {
     }
     private func install(_ normalized: NormalizedImageAsset) {
         activeTask?.cancel(); activeTask = nil
+        statusTask?.cancel(); statusTask = nil
         pdfData = nil
         pdfPageCount = 0
         imageAsset = normalized
@@ -773,6 +854,8 @@ struct ImportFlowView: View {
         corners = CornerGeometry.defaultCorners(sourceSize: normalized.pixelSize)
         cornerDetectionWasConfident = false
         boardID = nil
+        uploadByteProgress = nil
+        processingRecord = nil
         error = nil
         importState.sourceSelected()
     }
@@ -812,6 +895,8 @@ struct ImportFlowView: View {
         let operationID = UUID()
         guard importState.beginImageUpload(operationID) else { return }
         error = nil
+        uploadByteProgress = UploadByteProgress(bytesSent: 0,
+                                                totalBytes: Int64(imageAsset?.uploadData.count ?? 0))
         activeTask = Task { await upload(operationID: operationID) }
     }
     private func beginPDFUpload() {
@@ -819,6 +904,8 @@ struct ImportFlowView: View {
         let operationID = UUID()
         guard importState.beginPDFUpload(operationID) else { return }
         error = nil
+        uploadByteProgress = UploadByteProgress(bytesSent: 0,
+                                                totalBytes: Int64(pdfData?.count ?? 0))
         activeTask = Task { await uploadPDF(operationID: operationID) }
     }
     private func beginCornerSubmission() {
@@ -830,6 +917,7 @@ struct ImportFlowView: View {
         let operationID = UUID()
         guard importState.beginCornerSubmission(operationID) else { return }
         error = nil
+        processingRecord = nil
         debugCornerSubmission(boardID: boardID, operationID: operationID)
         activeTask = Task { await process(operationID: operationID) }
     }
@@ -837,7 +925,17 @@ struct ImportFlowView: View {
         guard let imageAsset else { return }
         do {
             let target = try await resolvedFolderID()
-            let result = try await api.upload(imageData: imageAsset.uploadData, filename: "whiteboard.jpg", mimeType: "image/jpeg", folderID: target, name: name.isEmpty ? nil : name)
+            let result = try await api.upload(
+                imageData: imageAsset.uploadData,
+                filename: "whiteboard.jpg",
+                mimeType: "image/jpeg",
+                folderID: target,
+                name: name.isEmpty ? nil : name,
+                onProgress: { progress in
+                    guard importState.phase == .uploading(operationID) else { return }
+                    uploadByteProgress = progress
+                }
+            )
             guard importState.phase == .uploading(operationID), !Task.isCancelled else { return }
             boardID = result.id
             let record = try await api.board(id: result.id)
@@ -864,10 +962,12 @@ struct ImportFlowView: View {
                 cornerDetectionWasConfident = false
             }
             activeTask = nil
+            uploadByteProgress = nil
             _ = importState.requireCorners(after: operationID)
         } catch {
             guard importState.phase == .uploading(operationID), !Task.isCancelled else { return }
             activeTask = nil
+            uploadByteProgress = nil
             _ = importState.failToPreview(operationID)
             self.error = error is ImportUIError ? error.localizedDescription : "Couldn’t upload this photo. Try again."
         }
@@ -876,15 +976,28 @@ struct ImportFlowView: View {
         guard let pdfData else { return }
         do {
             let target = try await resolvedFolderID()
-            let result = try await api.importPDF(data: pdfData, filename: pdfFilename, folderID: target, name: name.isEmpty ? nil : name)
+            let result = try await api.importPDF(
+                data: pdfData,
+                filename: pdfFilename,
+                folderID: target,
+                name: name.isEmpty ? nil : name,
+                onProgress: { progress in
+                    guard importState.phase == .importingPDF(operationID) else { return }
+                    uploadByteProgress = progress
+                }
+            )
             guard importState.phase == .importingPDF(operationID), !Task.isCancelled else { return }
             guard let first = result.boards.first else { throw ImportUIError.emptyImport }
+            await maintainPerceivableProgressIfShown()
+            guard importState.phase == .importingPDF(operationID), !Task.isCancelled else { return }
             activeTask = nil
+            uploadByteProgress = nil
             _ = importState.complete(operationID)
             onComplete(first)
         } catch {
             guard importState.phase == .importingPDF(operationID), !Task.isCancelled else { return }
             activeTask = nil
+            uploadByteProgress = nil
             _ = importState.failToPreview(operationID)
             self.error = error is ImportUIError ? error.localizedDescription : "Couldn’t import this PDF. Your selected file is still here so you can try again."
         }
@@ -896,12 +1009,20 @@ struct ImportFlowView: View {
             ["x": Double($0.x) / max(Double(sourcePixelSize.width - 1), 1),
              "y": Double($0.y) / max(Double(sourcePixelSize.height - 1), 1)]
         }
+        statusTask?.cancel()
+        statusTask = Task { await pollProcessingStatus(boardID: boardID, operationID: operationID) }
+        defer {
+            statusTask?.cancel()
+            statusTask = nil
+        }
         do {
             _ = try await api.processCorners(boardID: boardID, corners: pixels, normalizedCorners: normalized)
-            guard importState.phase == .submittingCorners(operationID), !Task.isCancelled else { return }
+            guard importState.isCornerOperation(operationID), !Task.isCancelled else { return }
             let result = try await api.library()
-            guard importState.phase == .submittingCorners(operationID), !Task.isCancelled else { return }
+            guard importState.isCornerOperation(operationID), !Task.isCancelled else { return }
             if let board = result.boards.first(where: { $0.id == boardID }) {
+                await maintainPerceivableProgressIfShown()
+                guard importState.isCornerOperation(operationID), !Task.isCancelled else { return }
                 activeTask = nil
                 _ = importState.complete(operationID)
                 onComplete(board)
@@ -911,11 +1032,55 @@ struct ImportFlowView: View {
                 _ = importState.failToCorners(operationID)
             }
         } catch {
-            guard importState.phase == .submittingCorners(operationID), !Task.isCancelled else { return }
+            guard importState.isCornerOperation(operationID), !Task.isCancelled else { return }
             activeTask = nil
             _ = importState.failToCorners(operationID)
-            self.error = "Those corners couldn’t be used. Adjust them and try again."
+            if case APIError.server(let status, _, _) = error, status >= 500 {
+                self.error = "Whiteboard processing failed. Try processing these corners again."
+            } else {
+                self.error = "Those corners couldn’t be used. Adjust them and try again."
+            }
         }
+    }
+    private func pollProcessingStatus(boardID: String, operationID: UUID) async {
+        var delay: UInt64 = 700_000_000
+        while !Task.isCancelled, importState.isCornerOperation(operationID) {
+            do {
+                let record = try await api.board(id: boardID)
+                guard !Task.isCancelled, importState.isCornerOperation(operationID) else { return }
+                processingRecord = record
+                if record.status == "processing"
+                    || record.processingStage.map({
+                        !["awaiting_corners", "submitting_corners"].contains($0)
+                    }) == true {
+                    _ = importState.beginProcessing(after: operationID)
+                }
+                if record.status == "failed" || record.processingStage == "failed" {
+                    _ = importState.failToCorners(operationID)
+                    self.error = "Whiteboard processing failed. Try processing these corners again."
+                    return
+                }
+                if record.status == "ready" { return }
+            } catch {
+                // The authoritative corner request still owns success/failure.
+                // A transient status read must not restart or fail processing.
+            }
+            try? await Task.sleep(nanoseconds: delay)
+            delay = min(UInt64(Double(delay) * 1.35), 2_000_000_000)
+        }
+    }
+    private func resumeStatusPollingIfNeeded() {
+        guard statusTask == nil,
+              let operationID = importState.cornerOperationID,
+              let boardID else { return }
+        statusTask = Task { await pollProcessingStatus(boardID: boardID, operationID: operationID) }
+    }
+    private func maintainPerceivableProgressIfShown() async {
+        guard let visibleAt = progressBecameVisibleAt else { return }
+        let remaining = LongOperationVisibilityPolicy.minimumVisibleDuration
+            - Date().timeIntervalSince(visibleAt)
+        guard remaining > 0 else { return }
+        try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
     }
     private func rememberCornerPreview(proxy: GeometryProxy, mapper: AspectFitImageTransform) {
         cornerPreviewRect = mapper.imageRect
@@ -938,6 +1103,8 @@ struct ImportFlowView: View {
     private func cancelAndDismiss() {
         activeTask?.cancel()
         activeTask = nil
+        statusTask?.cancel()
+        statusTask = nil
         importState.cancel()
         pickerItem = nil
         fileImporter = false
@@ -958,12 +1125,19 @@ enum ImportFlowPhase: Equatable {
     case uploading(UUID)
     case needsCorners
     case submittingCorners(UUID)
+    case processing(UUID)
     case importingPDF(UUID)
     case completed
 
     var isBusy: Bool {
         switch self {
-        case .uploading, .submittingCorners, .importingPDF: return true
+        case .uploading, .submittingCorners, .processing, .importingPDF: return true
+        default: return false
+        }
+    }
+    var isServerProcessing: Bool {
+        switch self {
+        case .submittingCorners, .processing: return true
         default: return false
         }
     }
@@ -972,13 +1146,14 @@ enum ImportFlowPhase: Equatable {
         case .choosing: return "New Whiteboard"
         case .previewing: return "Preview"
         case .needsCorners: return "Confirm Board"
-        case .uploading, .submittingCorners, .importingPDF, .completed: return "Processing"
+        case .uploading, .submittingCorners, .processing, .importingPDF, .completed: return "Processing"
         }
     }
     var processingTitle: String {
         switch self {
         case .uploading: return "Uploading photo…"
         case .submittingCorners: return "Creating your editable board…"
+        case .processing: return "Creating your editable board…"
         case .importingPDF: return "Importing your PDF…"
         default: return "Finishing import…"
         }
@@ -1008,6 +1183,12 @@ struct ImportFlowStateMachine: Equatable {
         return true
     }
 
+    mutating func beginProcessing(after id: UUID) -> Bool {
+        guard phase == .submittingCorners(id) || phase == .processing(id) else { return false }
+        phase = .processing(id)
+        return true
+    }
+
     mutating func requireCorners(after id: UUID) -> Bool {
         guard phase == .uploading(id) else { return false }
         phase = .needsCorners
@@ -1021,18 +1202,69 @@ struct ImportFlowStateMachine: Equatable {
     }
 
     mutating func failToCorners(_ id: UUID) -> Bool {
-        guard phase == .submittingCorners(id) else { return false }
+        guard phase == .submittingCorners(id) || phase == .processing(id) else { return false }
         phase = .needsCorners
         return true
     }
 
     mutating func complete(_ id: UUID) -> Bool {
-        guard phase == .submittingCorners(id) || phase == .importingPDF(id) else { return false }
+        guard phase == .submittingCorners(id) || phase == .processing(id) || phase == .importingPDF(id) else { return false }
         phase = .completed
         return true
     }
 
     mutating func cancel() { phase = .choosing }
+
+    func isCornerOperation(_ id: UUID) -> Bool {
+        phase == .submittingCorners(id) || phase == .processing(id)
+    }
+
+    var cornerOperationID: UUID? {
+        switch phase {
+        case .submittingCorners(let id), .processing(let id): return id
+        default: return nil
+        }
+    }
+}
+
+struct BoardProcessingPresentation: Equatable, Sendable {
+    let label: String
+    let message: String?
+    let fraction: Double?
+    let errorCode: String?
+
+    init(record: BoardRecord) {
+        let labels = [
+            "submitting_corners": "Submitting corners",
+            "correcting_perspective": "Correcting perspective",
+            "enhancing_board": "Enhancing board",
+            "analyzing_ink": "Detecting marker ink",
+            "vectorizing": "Creating editable vectors",
+            "generating_preview": "Preparing preview",
+            "saving": "Saving board",
+            "ready": "Board ready",
+            "failed": "Whiteboard processing failed"
+        ]
+        label = record.processingStage.flatMap { labels[$0] }
+            ?? record.processingMessage
+            ?? "Creating editable board"
+        message = record.processingMessage
+        if let value = record.processingProgress, value.isFinite {
+            fraction = min(max(value, 0), 1)
+        } else if let index = record.processingStageIndex,
+                  let count = record.processingStageCount, count > 0 {
+            fraction = min(max(Double(index) / Double(count), 0), 1)
+        } else {
+            fraction = nil
+        }
+        errorCode = record.processingErrorCode
+    }
+}
+
+enum LongOperationVisibilityPolicy {
+    static let appearanceDelay: TimeInterval = 0.2
+    static let minimumVisibleDuration: TimeInterval = 0.4
+    static let appearanceDelayNanoseconds = UInt64(appearanceDelay * 1_000_000_000)
 }
 
 struct AspectFitImageTransform: Equatable {

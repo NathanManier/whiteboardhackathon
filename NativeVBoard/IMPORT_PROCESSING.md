@@ -42,3 +42,17 @@ The persisted `pipeline.status` remains the compatibility status consumed by
 older web and native clients. New progress fields are optional additions. A
 client that does not receive them falls back to its existing indeterminate
 loading state.
+
+`GET /board/<board-id>` may expose `processing_stage`, its zero-based completed
+stage index and count, the resulting overall fraction, concise display copy,
+start/update timestamps, and a stable safe failure code. The pipeline advances
+that index only after real work finishes: perspective, enhancement, ink
+analysis, vectorization, preview generation, and final saving. `ready` and 100%
+are persisted only after preview generation and the final metadata write.
+
+Photo and PDF upload bars use measured URL-session bytes sent divided by total
+bytes. During the synchronous corners request the native client polls board
+status at 0.7 seconds with modest backoff, and resumes that polling when the app
+returns to the foreground. Cancelling the import view stops the local request
+and polling; it does not claim to cancel server work already underway. The
+in-progress board remains in the library for status recovery.

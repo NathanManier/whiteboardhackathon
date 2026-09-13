@@ -35,6 +35,32 @@ enum AuthSessionUpdateReason: String, Sendable {
     case sessionExpired
 }
 
+struct UploadByteProgress: Equatable, Sendable {
+    let bytesSent: Int64
+    let totalBytes: Int64
+
+    var fraction: Double? {
+        guard totalBytes > 0 else { return nil }
+        return min(max(Double(bytesSent) / Double(totalBytes), 0), 1)
+    }
+}
+
+private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    let onProgress: @MainActor @Sendable (UploadByteProgress) -> Void
+
+    init(onProgress: @escaping @MainActor @Sendable (UploadByteProgress) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didSendBodyData bytesSent: Int64, totalBytesSent: Int64,
+                    totalBytesExpectedToSend: Int64) {
+        let progress = UploadByteProgress(bytesSent: totalBytesSent,
+                                          totalBytes: totalBytesExpectedToSend)
+        Task { @MainActor in onProgress(progress) }
+    }
+}
+
 #if DEBUG
 enum DebugAPIEnvironment: String, CaseIterable, Identifiable {
     case production
@@ -324,7 +350,9 @@ final class APIClient: ObservableObject {
         catch { throw APIError.decoding("Could not decode saved editor state: \(error.localizedDescription)") }
     }
 
-    func upload(imageData: Data, filename: String, mimeType: String, folderID: String? = nil, name: String? = nil) async throws -> UploadResponse {
+    func upload(imageData: Data, filename: String, mimeType: String,
+                folderID: String? = nil, name: String? = nil,
+                onProgress: (@MainActor @Sendable (UploadByteProgress) -> Void)? = nil) async throws -> UploadResponse {
         let boundary = "VBoard-\(UUID().uuidString)"
         var request = try request(path: "/upload", method: "POST", accept: "application/json")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -337,15 +365,16 @@ final class APIClient: ObservableObject {
         body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"image\"; filename=\"\(filename)\"\r\nContent-Type: \(mimeType)\r\n\r\n".utf8))
         body.append(imageData)
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-        request.httpBody = body
-        let (data, response) = try await data(for: request)
+        let (data, response) = try await uploadData(for: request, body: body,
+                                                    onProgress: onProgress)
         try validate(response, data: data)
         do { return try decoder.decode(UploadResponse.self, from: data) }
         catch { throw APIError.decoding("Could not decode the upload response.") }
     }
 
     func importPDF(data pdfData: Data, filename: String, folderID: String? = nil,
-                   name: String? = nil, sourceKind: BoardSourceKind = .freeformPDF) async throws -> PDFImportResponse {
+                   name: String? = nil, sourceKind: BoardSourceKind = .freeformPDF,
+                   onProgress: (@MainActor @Sendable (UploadByteProgress) -> Void)? = nil) async throws -> PDFImportResponse {
         let boundary = "VBoard-PDF-\(UUID().uuidString)"
         var request = try request(path: "/api/import/pdf", method: "POST", accept: "application/json")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -360,9 +389,9 @@ final class APIClient: ObservableObject {
         body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"pdf\"; filename=\"\(safeFilename)\"\r\nContent-Type: application/pdf\r\n\r\n".utf8))
         body.append(pdfData)
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-        request.httpBody = body
         request.timeoutInterval = 120
-        let (data, response) = try await self.data(for: request)
+        let (data, response) = try await uploadData(for: request, body: body,
+                                                    onProgress: onProgress)
         try validate(response, data: data)
         do { return try decoder.decode(PDFImportResponse.self, from: data) }
         catch { throw APIError.decoding("Could not decode the imported PDF response.") }
@@ -598,6 +627,46 @@ final class APIClient: ObservableObject {
                                                   isRetry: true)
             let retryGeneration = accessTokenGeneration
             let retry = try await session.data(for: retryRequest)
+            logAuthResponse(for: retryRequest, response: retry.1)
+            if (retry.1 as? HTTPURLResponse)?.statusCode == 401,
+               accessTokenGeneration == retryGeneration {
+                invalidateAuthentication()
+            }
+            return retry
+        } catch let error as APIError {
+            throw error
+        } catch {
+            throw APIError.transport("Could not reach V-Board: \(error.localizedDescription)")
+        }
+    }
+
+    private func uploadData(
+        for request: URLRequest,
+        body: Data,
+        onProgress: (@MainActor @Sendable (UploadByteProgress) -> Void)?
+    ) async throws -> (Data, URLResponse) {
+        let callback: @MainActor @Sendable (UploadByteProgress) -> Void = onProgress ?? { _ in }
+        do {
+            let firstRequest = try rebuiltRequest(from: request, authenticated: true,
+                                                  isRetry: false)
+            let firstGeneration = accessTokenGeneration
+            let firstDelegate = UploadProgressDelegate(onProgress: callback)
+            let first = try await session.upload(for: firstRequest, from: body,
+                                                 delegate: firstDelegate)
+            logAuthResponse(for: firstRequest, response: first.1)
+            guard (first.1 as? HTTPURLResponse)?.statusCode == 401,
+                  !isNonRefreshingAuthPath(request.url?.path) else {
+                return first
+            }
+            if accessTokenGeneration == firstGeneration {
+                guard try await refreshSession() != nil else { return first }
+            }
+            let retryRequest = try rebuiltRequest(from: request, authenticated: true,
+                                                  isRetry: true)
+            let retryGeneration = accessTokenGeneration
+            let retryDelegate = UploadProgressDelegate(onProgress: callback)
+            let retry = try await session.upload(for: retryRequest, from: body,
+                                                 delegate: retryDelegate)
             logAuthResponse(for: retryRequest, response: retry.1)
             if (retry.1 as? HTTPURLResponse)?.statusCode == 401,
                accessTokenGeneration == retryGeneration {
