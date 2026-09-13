@@ -63,6 +63,7 @@ struct LectureWorkspaceView: View {
         }
         .navigationTitle(folder.name)
         .navigationBarTitleDisplayMode(.inline)
+        .background(EditorNavigationGestureGuard())
         .toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
                 Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }

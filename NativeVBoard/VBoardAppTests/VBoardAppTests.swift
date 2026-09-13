@@ -115,6 +115,40 @@ final class WorkspaceAppearanceTests: XCTestCase {
 }
 
 @MainActor
+final class EditorNavigationGestureGuardTests: XCTestCase {
+    private final class GestureDelegate: NSObject, UIGestureRecognizerDelegate {}
+
+    func testEditorOwnershipDisablesAndRestoresExactRecognizerStateAndDelegate() {
+        let recognizer = UIScreenEdgePanGestureRecognizer()
+        let delegate = GestureDelegate()
+        recognizer.isEnabled = true
+        recognizer.delegate = delegate
+        let ownership = EditorBackSwipeOwnership()
+
+        ownership.acquire(recognizer)
+        XCTAssertTrue(ownership.isActive)
+        XCTAssertFalse(recognizer.isEnabled)
+        XCTAssertTrue(recognizer.delegate === delegate)
+
+        ownership.restore()
+        XCTAssertFalse(ownership.isActive)
+        XCTAssertTrue(recognizer.isEnabled)
+        XCTAssertTrue(recognizer.delegate === delegate)
+    }
+
+    func testOriginallyDisabledRecognizerRemainsDisabledAfterEditorExit() {
+        let recognizer = UIScreenEdgePanGestureRecognizer()
+        recognizer.isEnabled = false
+        let ownership = EditorBackSwipeOwnership()
+
+        ownership.acquire(recognizer)
+        ownership.restore()
+
+        XCTAssertFalse(recognizer.isEnabled)
+    }
+}
+
+@MainActor
 final class SelectionResizeTests: XCTestCase {
     func testEveryCornerUsesFixedOppositeAnchorAndUniformScale() {
         let bounds = CGRect(x: -40, y: 20, width: 200, height: 100)

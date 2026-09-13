@@ -17,6 +17,7 @@ struct BoardView: View {
         }
         .navigationTitle(board.name)
         .navigationBarTitleDisplayMode(.inline)
+        .background(EditorNavigationGestureGuard())
         .task(id: board.id) { await load() }
     }
     private func load() async {
@@ -82,6 +83,83 @@ struct BoardView: View {
         #if DEBUG
         print("[VBoard] \(message)")
         #endif
+    }
+}
+
+/// Owns the system's edge-back recognizer only while an editor destination is
+/// onscreen. Canvas panning begins at the display edge, so allowing the
+/// navigation controller to compete there causes accidental exits and lost
+/// gesture sequences. The exact prior recognizer state is restored on exit.
+@MainActor
+final class EditorBackSwipeOwnership {
+    private weak var recognizer: UIGestureRecognizer?
+    private var previousIsEnabled = true
+    private var previousDelegate: UIGestureRecognizerDelegate?
+    private(set) var isActive = false
+
+    func acquire(_ recognizer: UIGestureRecognizer) {
+        if isActive, self.recognizer === recognizer {
+            recognizer.isEnabled = false
+            return
+        }
+        restore()
+        self.recognizer = recognizer
+        previousIsEnabled = recognizer.isEnabled
+        previousDelegate = recognizer.delegate
+        recognizer.isEnabled = false
+        isActive = true
+    }
+
+    func restore() {
+        guard isActive else { return }
+        recognizer?.delegate = previousDelegate
+        recognizer?.isEnabled = previousIsEnabled
+        recognizer = nil
+        previousDelegate = nil
+        isActive = false
+    }
+}
+
+struct EditorNavigationGestureGuard: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> HostController {
+        HostController()
+    }
+
+    func updateUIViewController(_ controller: HostController, context: Context) {
+        controller.acquireNavigationGestureIfAvailable()
+    }
+
+    static func dismantleUIViewController(_ controller: HostController, coordinator: Void) {
+        controller.restoreNavigationGesture()
+    }
+
+    @MainActor
+    final class HostController: UIViewController {
+        private let ownership = EditorBackSwipeOwnership()
+
+        override func viewWillAppear(_ animated: Bool) {
+            super.viewWillAppear(animated)
+            acquireNavigationGestureIfAvailable()
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            acquireNavigationGestureIfAvailable()
+        }
+
+        override func viewWillDisappear(_ animated: Bool) {
+            restoreNavigationGesture()
+            super.viewWillDisappear(animated)
+        }
+
+        func acquireNavigationGestureIfAvailable() {
+            guard let gesture = navigationController?.interactivePopGestureRecognizer else { return }
+            ownership.acquire(gesture)
+        }
+
+        func restoreNavigationGesture() {
+            ownership.restore()
+        }
     }
 }
 
