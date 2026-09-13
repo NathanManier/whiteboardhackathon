@@ -17,6 +17,11 @@ final class ProfessorSVGView: UIView {
     private var sourceBounds: [String: CGRect] = [:]
     private var index = SpatialIndex()
     private var visibleIDs = Set<String>()
+    /// IDs hidden by an in-flight eraser gesture. This is presentation-only:
+    /// canonical deletion still belongs to the editor store at gesture end.
+    /// Keeping the set here makes the preview survive visibility refinement
+    /// and an offscreen vector rebuild without mutating the SVG document.
+    private var transientHiddenIDs = Set<String>()
     private var document: SVGDocument?
     private var importedTransforms: [String: ObjectTransform] = [:]
     private var composition: SceneComposition?
@@ -219,6 +224,24 @@ final class ProfessorSVGView: UIView {
         for id in ids { entries[id]?.layer.setAffineTransform(.identity) }
     }
 
+    /// Immediately hides or restores professor paths for the live eraser.
+    /// The viewport visibility bit is composed with the transient bit so a
+    /// camera refinement can never accidentally reveal an erased preview.
+    func setTransientHidden(ids: Set<String>, hidden: Bool) {
+        guard !ids.isEmpty else { return }
+        if hidden {
+            transientHiddenIDs.formUnion(ids)
+        } else {
+            transientHiddenIDs.subtract(ids)
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for id in ids {
+            entries[id]?.layer.isHidden = hidden || !visibleIDs.contains(id)
+        }
+        CATransaction.commit()
+    }
+
     /// Parses canonical paths away from the frame-critical interaction path.
     /// Computational batches remain hidden; visual promotion is atomic so the
     /// contour order can never appear as scanlines, stripes, or subdivisions.
@@ -251,6 +274,7 @@ final class ProfessorSVGView: UIView {
             entries.removeAll(keepingCapacity: true)
             index = SpatialIndex(cellSize: max(document.viewBox.width, document.viewBox.height) / 32)
             visibleIDs.removeAll(keepingCapacity: true)
+            transientHiddenIDs.removeAll(keepingCapacity: true)
             CATransaction.commit()
             onProgress?(1)
             return
@@ -371,6 +395,7 @@ final class ProfessorSVGView: UIView {
             CATransaction.setDisableActions(true)
             for (id, entry) in nextEntries {
                 entry.layer.isHidden = !nextVisibleIDs.contains(id)
+                    || self.transientHiddenIDs.contains(id)
                 entry.layer.setAffineTransform(.identity)
             }
             let previous = self.activeContentLayer
@@ -381,6 +406,10 @@ final class ProfessorSVGView: UIView {
             self.index = nextIndex
             self.sourceBounds = nextSourceBounds
             self.visibleIDs = nextVisibleIDs
+            // A successfully committed deletion no longer exists in the new
+            // canonical presentation. Forgetting it here is what lets undo
+            // re-create it visibly on a later rebuild.
+            self.transientHiddenIDs.formIntersection(nextEntries.keys)
             previous?.removeFromSuperlayer()
             CATransaction.commit()
             let promotionMilliseconds = (CACurrentMediaTime() - promotionStarted) * 1_000
@@ -419,7 +448,10 @@ final class ProfessorSVGView: UIView {
         let visibleRect = transform.camera.cgRect.expanded(by: preloadMargin)
         let candidates = index.query(visibleRect)
         let changed = visibleIDs.symmetricDifference(candidates)
-        for id in changed { entries[id]?.layer.isHidden = !candidates.contains(id) }
+        for id in changed {
+            entries[id]?.layer.isHidden = !candidates.contains(id)
+                || transientHiddenIDs.contains(id)
+        }
         visibleIDs = candidates
         #if DEBUG
         print("[VBoard] VECTOR VISIBILITY cameraRect=\(transform.camera.cgRect) preloadMargin=\(preloadMargin) queryRect=\(visibleRect) candidates=\(candidates.count) changed=\(changed.count) interacting=\(isInteracting)")

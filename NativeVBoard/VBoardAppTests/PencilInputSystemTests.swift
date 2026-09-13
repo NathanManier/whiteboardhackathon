@@ -114,14 +114,59 @@ final class PencilGeometryAndPressureTests: XCTestCase {
         XCTAssertEqual(PencilPressureResponse.normalized(force: 2, maximum: 4), 0.5)
     }
 
-    func testPressureMappingIsFiniteGentleAndMonotonic() {
+    func testPressureMappingIsFiniteVisibleAndMonotonic() {
         let values = stride(from: CGFloat(0), through: 1, by: 0.05)
             .map { PencilPressureResponse.widthMultiplier(forDisplayPressure: $0) }
         XCTAssertTrue(zip(values, values.dropFirst()).allSatisfy(<=))
         XCTAssertTrue(values.allSatisfy(\.isFinite))
-        XCTAssertGreaterThanOrEqual(values.first ?? 0, 0.65)
-        XCTAssertLessThanOrEqual(values.last ?? 99, 1.25)
+        XCTAssertEqual(values.first ?? 0, 0.55, accuracy: 0.000_01)
+        XCTAssertEqual(values.last ?? 0, 1.65, accuracy: 0.000_01)
+        XCTAssertLessThan(PencilPressureResponse.widthMultiplier(forDisplayPressure: 0.10),
+                          PencilPressureResponse.widthMultiplier(forDisplayPressure: 0.87))
         XCTAssertEqual(PencilPressureResponse.widthMultiplier(forDisplayPressure: nil), 1)
+    }
+
+    func testPressureSmoothingRespondsWithoutOverwritingOrDoubleCurvingSamples() {
+        let light = PencilPressureResponse.smoothed(previous: nil, sample: 0.10)
+        let firm = PencilPressureResponse.smoothed(previous: light, sample: 0.90)
+        XCTAssertEqual(light, 0.10, accuracy: 0.000_01)
+        XCTAssertEqual(firm, 0.54, accuracy: 0.000_01)
+        XCTAssertGreaterThan(PencilPressureResponse.widthMultiplier(forDisplayPressure: firm), 1)
+    }
+
+    func testAppleRawRollConvertsToClockwisePositiveScreenAngles() {
+        let inputs: [CGFloat] = [0, .pi / 2, .pi, 3 * .pi / 2, 2 * .pi]
+        let expected: [CGFloat] = [0, 3 * .pi / 2, .pi, .pi / 2, 0]
+        for (raw, screen) in zip(inputs, expected) {
+            XCTAssertEqual(PencilScreenAngle.roll(fromAppleRaw: raw), screen,
+                           accuracy: 0.000_01)
+        }
+    }
+
+    func testMeasuredPhysicalClockwiseRawDecreaseBecomesClockwiseScreenIncrease() {
+        let rawStart = CGFloat(-167) * .pi / 180
+        let rawClockwise = CGFloat(-257) * .pi / 180
+        let screenStart = PencilScreenAngle.roll(fromAppleRaw: rawStart)
+        let screenClockwise = PencilScreenAngle.roll(fromAppleRaw: rawClockwise)
+        XCTAssertEqual(PencilAngleMath.shortestDelta(from: screenStart,
+                                                     to: screenClockwise),
+                       .pi / 2, accuracy: 0.000_01)
+        XCTAssertEqual(PencilAngleMath.shortestDelta(from: screenClockwise,
+                                                     to: screenStart),
+                       -.pi / 2, accuracy: 0.000_01)
+    }
+
+    func testScreenRollConversionStaysContinuousAcrossBothWrapDirections() {
+        let clockwise = PencilAngleMath.shortestDelta(
+            from: PencilScreenAngle.roll(fromAppleRaw: CGFloat(-179) * .pi / 180),
+            to: PencilScreenAngle.roll(fromAppleRaw: CGFloat(179) * .pi / 180)
+        )
+        let counterclockwise = PencilAngleMath.shortestDelta(
+            from: PencilScreenAngle.roll(fromAppleRaw: CGFloat(179) * .pi / 180),
+            to: PencilScreenAngle.roll(fromAppleRaw: CGFloat(-179) * .pi / 180)
+        )
+        XCTAssertEqual(clockwise, CGFloat(2) * .pi / 180, accuracy: 0.000_01)
+        XCTAssertEqual(counterclockwise, CGFloat(-2) * .pi / 180, accuracy: 0.000_01)
     }
 
     func testRollUsesShortestPathAcrossZeroDegrees() {
@@ -139,9 +184,24 @@ final class PencilGeometryAndPressureTests: XCTestCase {
             let nib = PencilNibGeometry.marker(baseWidth: 20, pressure: 0.5,
                                                altitude: .pi / 3, azimuth: 0,
                                                roll: angle)
-            XCTAssertEqual(nib.orientation, angle, accuracy: 0.000_01)
+            XCTAssertEqual(nib.orientation,
+                           PencilScreenAngle.roll(fromAppleRaw: angle),
+                           accuracy: 0.000_01)
             XCTAssertGreaterThan(nib.majorAxis, nib.minorAxis)
         }
+    }
+
+    func testMarkerOrientationCombinesAbsoluteAzimuthAndRelativeScreenRoll() {
+        let nib = PencilNibGeometry.marker(baseWidth: 20, pressure: 0.5,
+                                           altitude: .pi / 3,
+                                           azimuth: .pi / 2,
+                                           roll: .pi / 4)
+        XCTAssertEqual(nib.orientation, .pi / 4, accuracy: 0.000_01)
+        let fallback = PencilNibGeometry.marker(baseWidth: 20, pressure: nil,
+                                                altitude: .pi / 2,
+                                                azimuth: .pi / 3,
+                                                roll: 0)
+        XCTAssertEqual(fallback.orientation, .pi / 3, accuracy: 0.000_01)
     }
 
     func testMarkerPathRotatesVisibleChiselFootprint() {
@@ -168,6 +228,55 @@ final class PencilGeometryAndPressureTests: XCTestCase {
             XCTAssertTrue(path.contains(CGPoint(x: 160 * fraction, y: 40 * fraction)),
                           "Marker left a gap at interpolation step \(step)")
         }
+    }
+
+
+    func testPenRibbonIsOneClosedOutlineAndContainsItsCenterline() {
+        var points: [StrokePoint] = []
+        for index in 0...20 {
+            let x = Double(index * 8)
+            let y = Double(40 + index % 3)
+            let pressure = Double(index) / 20.0
+            points.append(StrokePoint(x: x, y: y, pressure: pressure))
+        }
+        let path = PencilStrokeGeometry.path(points: points, tool: .pen, baseWidth: 12)
+        let counts = elementCounts(path)
+        XCTAssertEqual(counts.moves, 1)
+        XCTAssertEqual(counts.closes, 1)
+        for point in points {
+            XCTAssertTrue(path.contains(CGPoint(x: CGFloat(point.x), y: CGFloat(point.y))),
+                          "Pen ribbon left a centerline hole at \(point.x), \(point.y)")
+        }
+    }
+
+    func testMarkerRibbonIsOneClosedOutlineRatherThanRepeatedStamps() {
+        var points: [StrokePoint] = []
+        for index in 0...30 {
+            let roll = Double(index) * Double.pi / 180.0
+            points.append(StrokePoint(x: Double(index * 6), y: Double(index),
+                                      pressure: 0.5, altitude: 0.9,
+                                      azimuth: 0.7, roll: roll))
+        }
+        let path = PencilStrokeGeometry.path(points: points, tool: .marker, baseWidth: 24)
+        let counts = elementCounts(path)
+        XCTAssertEqual(counts.moves, 1)
+        XCTAssertEqual(counts.closes, 1)
+        for step in 0...30 {
+            XCTAssertTrue(path.contains(CGPoint(x: CGFloat(step * 6), y: CGFloat(step))))
+        }
+    }
+
+    private func elementCounts(_ path: CGPath) -> (moves: Int, closes: Int) {
+        var moves = 0
+        var closes = 0
+        path.applyWithBlock { element in
+            switch element.pointee.type {
+            case .moveToPoint: moves += 1
+            case .closeSubpath: closes += 1
+            default: break
+            }
+        }
+        return (moves, closes)
     }
 }
 

@@ -1502,6 +1502,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         if case .resizingSelection(let session) = interaction {
             clearSelectionResizePreview(keys: session.keys)
         }
+        if case .erasing(_, let erased) = interaction {
+            setErasePreview(keys: erased, hidden: false)
+        }
         if case .movingBoard(let boardID, _) = interaction,
            let item = workspace.items.first(where: { $0.boardID == boardID }) {
             boardViews[boardID]?.frame = item.frame
@@ -1618,9 +1621,17 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         if case .erasing(let boardID, let already) = interaction {
             let fresh = hits.subtracting(already)
             guard !fresh.isEmpty else { return }
-            // Accumulate intent only. Canonical deletion occurs once on a
-            // successful end so cancellation can restore the entire gesture.
+            // Present each hit in the same move sample. Canonical deletion is
+            // still one batch on a successful end, preserving undo grouping.
+            setErasePreview(keys: fresh, hidden: true)
             interaction = .erasing(boardID: boardID ?? fresh.first?.boardID, erased: already.union(fresh))
+        }
+    }
+
+    private func setErasePreview(keys: Set<SelectionKey>, hidden: Bool) {
+        let grouped = Dictionary(grouping: keys, by: \.boardID)
+        for (boardID, boardKeys) in grouped {
+            boardViews[boardID]?.setErasePreview(keys: Set(boardKeys), hidden: hidden)
         }
     }
 
@@ -2139,6 +2150,17 @@ private final class LectureBoardRenderView: UIView {
                                        kind: .professorPath, objectType: "professorPath"))
         }
         return result
+    }
+
+    func setErasePreview(keys: Set<SelectionKey>, hidden: Bool) {
+        let professorIDs = Set(keys.lazy.filter { $0.kind == .professorPath }.map(\.objectID))
+        professor.setTransientHidden(ids: professorIDs, hidden: hidden)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for key in keys where key.kind == .editorObject {
+            objectLayers[key.objectID]?.isHidden = hidden
+        }
+        CATransaction.commit()
     }
 
     func selectionBounds(keys: Set<SelectionKey>) -> CGRect? {

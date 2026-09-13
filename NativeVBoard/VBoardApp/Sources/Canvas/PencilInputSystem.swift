@@ -240,14 +240,17 @@ enum PencilPressureResponse {
     }
 
     static func smoothed(previous: CGFloat?, sample: CGFloat) -> CGFloat {
-        let next = curved(sample)
+        let next = min(max(sample.isFinite ? sample : 0, 0), 1)
         guard let previous, previous.isFinite else { return next }
-        return previous * 0.68 + next * 0.32
+        // Favor the current hardware sample so a light-to-firm transition is
+        // visible immediately. This remains derived display state; the raw
+        // normalized force stays unchanged in StrokePoint.
+        return previous * 0.45 + next * 0.55
     }
 
     static func widthMultiplier(forDisplayPressure pressure: CGFloat?) -> CGFloat {
         guard let pressure else { return 1 }
-        return 0.68 + curved(pressure) * 0.52
+        return 0.55 + curved(pressure) * 1.10
     }
 
     static func widthMultiplier(for pressure: CGFloat) -> CGFloat {
@@ -276,6 +279,27 @@ enum PencilAngleMath {
     }
 }
 
+/// V-Board's one visual-angle convention: zero points right and positive angles
+/// rotate clockwise on the physical display. UIKit view coordinates are Y-down,
+/// so a positive CGAffineTransform rotation already follows that convention.
+///
+/// Physical Pencil Pro measurements on the target iPad show UITouch/hover
+/// `rollAngle` decreasing for a clockwise barrel rotation. Convert that relative
+/// raw value exactly once before any visual consumer uses it.
+enum PencilScreenAngle {
+    static func roll(fromAppleRaw raw: CGFloat) -> CGFloat {
+        PencilAngleMath.normalized(-raw)
+    }
+
+    /// Apple documents Pencil Pro roll as relative to the angle at wake. The
+    /// view-relative azimuth supplies the absolute nib heading; converted roll
+    /// adds the barrel delta. Unsupported Pencils report roll == 0, naturally
+    /// leaving azimuth as the fallback.
+    static func markerOrientation(azimuth: CGFloat?, appleRoll: CGFloat?) -> CGFloat {
+        PencilAngleMath.normalized((azimuth ?? 0) + roll(fromAppleRaw: appleRoll ?? 0))
+    }
+}
+
 struct PencilNibGeometry: Equatable, Sendable {
     let majorAxis: CGFloat
     let minorAxis: CGFloat
@@ -289,34 +313,35 @@ struct PencilNibGeometry: Equatable, Sendable {
         let major = max(1, baseWidth * pressureScale * (1 + tilt * 0.22))
         let minor = max(1, baseWidth * 0.34 * (1 - tilt * 0.12))
         return PencilNibGeometry(majorAxis: major, minorAxis: minor,
-                                 orientation: PencilAngleMath.normalized(roll ?? azimuth ?? 0))
+                                 orientation: PencilScreenAngle.markerOrientation(
+                                    azimuth: azimuth, appleRoll: roll
+                                 ))
     }
 }
 
 enum PencilStrokeGeometry {
-    /// Builds a filled, deterministic path from canonical raw samples. Pressure
-    /// smoothing happens here and is intentionally never written back to data.
+    private struct DisplaySample {
+        let point: CGPoint
+        let penRadius: CGFloat
+        let markerNib: PencilNibGeometry?
+    }
+
+    private struct RibbonSection {
+        let point: CGPoint
+        let tangent: CGVector
+        let left: CGPoint
+        let right: CGPoint
+        let capExtent: CGFloat
+    }
+
+    /// Builds one filled, deterministic outline from canonical raw samples.
+    /// Pressure smoothing and nib-angle conversion are presentation-only and
+    /// are intentionally never written back to the canonical points.
     static func path(points: [StrokePoint], tool: PencilStrokeTool?, baseWidth: CGFloat) -> CGPath {
-        let path = UIBezierPath()
-        guard !points.isEmpty else { return path.cgPath }
+        guard !points.isEmpty else { return UIBezierPath().cgPath }
         var displayPressure: CGFloat?
-        var previousPoint: CGPoint?
-        var previousRadius: CGFloat = baseWidth / 2
-        var previousMarkerNib: PencilNibGeometry?
-
-        func appendMarkerStamp(at point: CGPoint, nib: PencilNibGeometry) {
-            let stamp = UIBezierPath(ovalIn: CGRect(
-                x: -nib.majorAxis / 2, y: -nib.minorAxis / 2,
-                width: nib.majorAxis, height: nib.minorAxis
-            ))
-            var transform = CGAffineTransform(rotationAngle: nib.orientation)
-            transform = transform.concatenating(
-                CGAffineTransform(translationX: point.x, y: point.y)
-            )
-            stamp.apply(transform)
-            path.append(stamp)
-        }
-
+        var displaySamples: [DisplaySample] = []
+        displaySamples.reserveCapacity(points.count)
         for sample in points {
             let point = CGPoint(x: sample.x, y: sample.y)
             if let raw = sample.pressure.map({ CGFloat($0) }) {
@@ -325,66 +350,142 @@ enum PencilStrokeGeometry {
                 displayPressure = nil
             }
 
-            if tool == .marker {
-                let nib = PencilNibGeometry.marker(
-                    baseWidth: baseWidth,
-                    pressure: displayPressure,
-                    altitude: sample.altitude.map { CGFloat($0) },
-                    azimuth: sample.azimuth.map { CGFloat($0) },
-                    roll: sample.roll.map { CGFloat($0) }
-                )
-                if let previousPoint, let previousMarkerNib {
-                    let distance = hypot(point.x - previousPoint.x, point.y - previousPoint.y)
-                    let spacing = max(1, min(previousMarkerNib.minorAxis, nib.minorAxis) * 0.45)
-                    let steps = max(1, Int(ceil(distance / spacing)))
-                    for index in 1...steps {
-                        let fraction = CGFloat(index) / CGFloat(steps)
-                        appendMarkerStamp(
-                            at: CGPoint(x: previousPoint.x + (point.x - previousPoint.x) * fraction,
-                                        y: previousPoint.y + (point.y - previousPoint.y) * fraction),
-                            nib: PencilNibGeometry(
-                                majorAxis: previousMarkerNib.majorAxis
-                                    + (nib.majorAxis - previousMarkerNib.majorAxis) * fraction,
-                                minorAxis: previousMarkerNib.minorAxis
-                                    + (nib.minorAxis - previousMarkerNib.minorAxis) * fraction,
-                                orientation: PencilAngleMath.interpolated(
-                                    from: previousMarkerNib.orientation,
-                                    to: nib.orientation, fraction: fraction
-                                )
-                            )
-                        )
-                    }
-                } else {
-                    appendMarkerStamp(at: point, nib: nib)
-                }
-                previousMarkerNib = nib
+            let penRadius = max(0.5, baseWidth * PencilPressureResponse.widthMultiplier(
+                forDisplayPressure: displayPressure
+            ) / 2)
+            let markerNib = tool == .marker ? PencilNibGeometry.marker(
+                baseWidth: baseWidth,
+                pressure: displayPressure,
+                altitude: sample.altitude.map { CGFloat($0) },
+                azimuth: sample.azimuth.map { CGFloat($0) },
+                roll: sample.roll.map { CGFloat($0) }
+            ) : nil
+            let rendered = DisplaySample(point: point, penRadius: penRadius,
+                                         markerNib: markerNib)
+            if let last = displaySamples.last,
+               hypot(last.point.x - point.x, last.point.y - point.y) < 0.001 {
+                // Keep the newest pressure/pose at a stationary coordinate
+                // without creating a zero-length ribbon section.
+                displaySamples[displaySamples.count - 1] = rendered
             } else {
-                let radius = max(0.5, baseWidth * PencilPressureResponse.widthMultiplier(
-                    forDisplayPressure: displayPressure
-                ) / 2)
-                path.append(UIBezierPath(ovalIn: CGRect(x: point.x - radius, y: point.y - radius,
-                                                        width: radius * 2, height: radius * 2)))
-                if let previousPoint, previousPoint != point {
-                    let dx = point.x - previousPoint.x
-                    let dy = point.y - previousPoint.y
-                    let length = max(0.0001, hypot(dx, dy))
-                    let nx = -dy / length
-                    let ny = dx / length
-                    let connector = UIBezierPath()
-                    connector.move(to: CGPoint(x: previousPoint.x + nx * previousRadius,
-                                               y: previousPoint.y + ny * previousRadius))
-                    connector.addLine(to: CGPoint(x: point.x + nx * radius, y: point.y + ny * radius))
-                    connector.addLine(to: CGPoint(x: point.x - nx * radius, y: point.y - ny * radius))
-                    connector.addLine(to: CGPoint(x: previousPoint.x - nx * previousRadius,
-                                                   y: previousPoint.y - ny * previousRadius))
-                    connector.close()
-                    path.append(connector)
-                }
-                previousRadius = radius
+                displaySamples.append(rendered)
             }
-            previousPoint = point
         }
-        return path.cgPath
+
+        guard displaySamples.count > 1 else {
+            let sample = displaySamples[0]
+            if let nib = sample.markerNib {
+                let footprint = UIBezierPath(ovalIn: CGRect(
+                    x: -nib.majorAxis / 2, y: -nib.minorAxis / 2,
+                    width: nib.majorAxis, height: nib.minorAxis
+                ))
+                var transform = CGAffineTransform(rotationAngle: nib.orientation)
+                transform = transform.concatenating(
+                    CGAffineTransform(translationX: sample.point.x, y: sample.point.y)
+                )
+                footprint.apply(transform)
+                return footprint.cgPath
+            }
+            let radius = sample.penRadius
+            return UIBezierPath(ovalIn: CGRect(x: sample.point.x - radius,
+                                               y: sample.point.y - radius,
+                                               width: radius * 2,
+                                               height: radius * 2)).cgPath
+        }
+
+        let tangents = displaySamples.indices.map { index -> CGVector in
+            if index == 0 {
+                return unitVector(from: displaySamples[0].point,
+                                  to: displaySamples[1].point)
+            }
+            if index == displaySamples.count - 1 {
+                return unitVector(from: displaySamples[index - 1].point,
+                                  to: displaySamples[index].point)
+            }
+            let incoming = unitVector(from: displaySamples[index - 1].point,
+                                      to: displaySamples[index].point)
+            let outgoing = unitVector(from: displaySamples[index].point,
+                                      to: displaySamples[index + 1].point)
+            let sum = CGVector(dx: incoming.dx + outgoing.dx,
+                               dy: incoming.dy + outgoing.dy)
+            let length = hypot(sum.dx, sum.dy)
+            // A reversal has no stable miter direction. Use the outgoing
+            // segment instead, which bounds the join and cannot create a spike.
+            return length > 0.2
+                ? CGVector(dx: sum.dx / length, dy: sum.dy / length)
+                : outgoing
+        }
+
+        let sections = zip(displaySamples, tangents).map { sample, tangent -> RibbonSection in
+            let normal = CGVector(dx: -tangent.dy, dy: tangent.dx)
+            let sideExtent: CGFloat
+            let capExtent: CGFloat
+            if let nib = sample.markerNib {
+                sideExtent = ellipseExtent(nib: nib, direction: normal)
+                capExtent = ellipseExtent(nib: nib, direction: tangent)
+            } else {
+                sideExtent = sample.penRadius
+                capExtent = sample.penRadius
+            }
+            return RibbonSection(
+                point: sample.point,
+                tangent: tangent,
+                left: CGPoint(x: sample.point.x + normal.dx * sideExtent,
+                              y: sample.point.y + normal.dy * sideExtent),
+                right: CGPoint(x: sample.point.x - normal.dx * sideExtent,
+                               y: sample.point.y - normal.dy * sideExtent),
+                capExtent: capExtent
+            )
+        }
+
+        let outline = UIBezierPath()
+        outline.move(to: sections[0].left)
+        for section in sections.dropFirst() { outline.addLine(to: section.left) }
+
+        let end = sections[sections.count - 1]
+        let endControl = end.capExtent * 4 / 3
+        outline.addCurve(
+            to: end.right,
+            controlPoint1: CGPoint(x: end.left.x + end.tangent.dx * endControl,
+                                   y: end.left.y + end.tangent.dy * endControl),
+            controlPoint2: CGPoint(x: end.right.x + end.tangent.dx * endControl,
+                                   y: end.right.y + end.tangent.dy * endControl)
+        )
+        for section in sections.dropLast().reversed() { outline.addLine(to: section.right) }
+
+        let start = sections[0]
+        let startControl = start.capExtent * 4 / 3
+        outline.addCurve(
+            to: start.left,
+            controlPoint1: CGPoint(x: start.right.x - start.tangent.dx * startControl,
+                                   y: start.right.y - start.tangent.dy * startControl),
+            controlPoint2: CGPoint(x: start.left.x - start.tangent.dx * startControl,
+                                   y: start.left.y - start.tangent.dy * startControl)
+        )
+        outline.close()
+        return outline.cgPath
+    }
+
+    private static func unitVector(from start: CGPoint, to end: CGPoint) -> CGVector {
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let length = max(hypot(dx, dy), 0.000_001)
+        return CGVector(dx: dx / length, dy: dy / length)
+    }
+
+    /// Support radius of a rotated ellipse in `direction`. This lets a chisel
+    /// footprint become a continuous swept ribbon instead of overlapping
+    /// translucent/stamped ovals.
+    private static func ellipseExtent(nib: PencilNibGeometry,
+                                      direction: CGVector) -> CGFloat {
+        let major = CGVector(dx: cos(nib.orientation), dy: sin(nib.orientation))
+        let minor = CGVector(dx: -major.dy, dy: major.dx)
+        let majorProjection = direction.dx * major.dx + direction.dy * major.dy
+        let minorProjection = direction.dx * minor.dx + direction.dy * minor.dy
+        let a = nib.majorAxis / 2
+        let b = nib.minorAxis / 2
+        return max(0.5, sqrt(pow(a * majorProjection, 2)
+                             + pow(b * minorProjection, 2)))
     }
 }
 

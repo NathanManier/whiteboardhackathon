@@ -118,20 +118,29 @@ final class PencilRawEventMonitor: NSObject {
             if touch.altitudeAngle.isFinite {
                 PencilHardwareValidationStore.shared.detect(.tilt)
             }
-            let roll: String
+            let rawRoll: String
+            let screenRoll: String
             if #available(iOS 17.5, *) {
-                roll = Self.degrees(touch.rollAngle)
+                rawRoll = Self.degrees(touch.rollAngle)
+                screenRoll = Self.degrees(PencilScreenAngle.roll(
+                    fromAppleRaw: touch.rollAngle
+                ))
                 if abs(touch.rollAngle) > 0.0001 {
                     PencilHardwareValidationStore.shared.detect(.barrelRoll)
                 }
             } else {
-                roll = "n/a"
+                rawRoll = "n/a"
+                screenRoll = "n/a"
             }
+            let widthMultiplier = PencilPressureResponse.widthMultiplier(
+                forDisplayPressure: normalizedForce
+            )
             poseLine = String(
-                format: "pose: force=%.3f/%.3f norm=%.3f altitude=%@ azimuth=%@ roll=%@",
+                format: "pose: force=%.3f/%.3f norm=%.3f width=%.2fx altitude=%@ azimuth=%@ rawRoll=%@ screenRoll=%@",
                 touch.force, touch.maximumPossibleForce, normalizedForce,
+                widthMultiplier,
                 Self.degrees(touch.altitudeAngle),
-                Self.degrees(touch.azimuthAngle(in: view)), roll
+                Self.degrees(touch.azimuthAngle(in: view)), rawRoll, screenRoll
             )
         } else {
             poseLine = "pose: non-Pencil input (Pencil-only fields not sampled)"
@@ -166,20 +175,25 @@ final class PencilRawEventMonitor: NSObject {
     func recordHover(_ recognizer: UIHoverGestureRecognizer, in view: UIView) {
         PencilHardwareValidationStore.shared.detect(.hover)
         let point = recognizer.location(in: view)
-        let roll: String
+        let rawRoll: String
+        let screenRoll: String
         if #available(iOS 17.5, *) {
-            roll = Self.degrees(recognizer.rollAngle)
+            rawRoll = Self.degrees(recognizer.rollAngle)
+            screenRoll = Self.degrees(PencilScreenAngle.roll(
+                fromAppleRaw: recognizer.rollAngle
+            ))
             if abs(recognizer.rollAngle) > 0.0001 {
                 PencilHardwareValidationStore.shared.detect(.barrelRoll)
             }
         } else {
-            roll = "n/a"
+            rawRoll = "n/a"
+            screenRoll = "n/a"
         }
         hoverLine = String(
-            format: "hover: %@ x=%.1f y=%.1f z=%.3f altitude=%@ azimuth=%@ roll=%@",
+            format: "hover: %@ x=%.1f y=%.1f z=%.3f altitude=%@ azimuth=%@ rawRoll=%@ screenRoll=%@",
             Self.gestureStateName(recognizer.state), point.x, point.y,
             recognizer.zOffset, Self.degrees(recognizer.altitudeAngle),
-            Self.degrees(recognizer.azimuthAngle(in: view)), roll
+            Self.degrees(recognizer.azimuthAngle(in: view)), rawRoll, screenRoll
         )
         render()
         log(hoverLine)
@@ -284,7 +298,7 @@ final class PencilRawEventMonitor: NSObject {
 
     @available(iOS 17.5, *)
     private static func poseDescription(_ pose: UIPencilHoverPose) -> String {
-        "pose=(x=\(number(pose.location.x)) y=\(number(pose.location.y)) z=\(number(pose.zOffset)) altitude=\(degrees(pose.altitudeAngle)) azimuth=\(degrees(pose.azimuthAngle)) roll=\(degrees(pose.rollAngle)))"
+        "pose=(x=\(number(pose.location.x)) y=\(number(pose.location.y)) z=\(number(pose.zOffset)) altitude=\(degrees(pose.altitudeAngle)) azimuth=\(degrees(pose.azimuthAngle)) rawRoll=\(degrees(pose.rollAngle)) screenRoll=\(degrees(PencilScreenAngle.roll(fromAppleRaw: pose.rollAngle))))"
     }
 }
 #endif
@@ -1760,6 +1774,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                 onDelete(deleted)
                 onSelectionChanged(selectedIDs)
                 debugInputOperation("ERASER COMMIT")
+            } else {
+                setErasePreview(ids: eraseIDs, hidden: false)
             }
             eraseIDs.removeAll()
             interactionState = .idle
@@ -1914,9 +1930,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         hit.formUnion(professor.ids(intersecting: segmentBounds))
         let fresh = hit.subtracting(eraseIDs)
         guard !fresh.isEmpty else { return }
-        // Erasure is accumulated as transient intent and committed only when
-        // the gesture ends. A recognizer cancellation can therefore discard
-        // the whole sequence without mutating canonical editor state.
+        // Visual feedback is immediate, while canonical deletion remains one
+        // batch at gesture end. Cancellation can therefore restore the exact
+        // pre-gesture presentation without touching editor state.
+        setErasePreview(ids: fresh, hidden: true)
         eraseIDs.formUnion(fresh)
         #if DEBUG
         print("[VBoard] ERASER HITS ids=\(Array(fresh))")
@@ -1937,6 +1954,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         case .lassoing:
             lassoWorldPoints.removeAll()
         case .erasing:
+            setErasePreview(ids: eraseIDs, hidden: false)
             eraseIDs.removeAll()
         case .idle, .panning, .pinching, .selecting:
             break
@@ -1946,6 +1964,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         activeInputContact = nil
         updateInteractionPath()
         updateInputHUD()
+    }
+
+    private func setErasePreview(ids: Set<String>, hidden: Bool) {
+        guard !ids.isEmpty else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for id in ids { userObjectLayers[id]?.isHidden = hidden }
+        CATransaction.commit()
+        professor.setTransientHidden(ids: ids, hidden: hidden)
     }
 
     private func hitTestIDs(at point: CGPoint) -> Set<String> {
