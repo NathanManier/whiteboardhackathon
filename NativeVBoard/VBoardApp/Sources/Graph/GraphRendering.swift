@@ -503,7 +503,8 @@ enum GraphFallbackRenderer {
         return layer
     }
 
-    static func layer(for graph: GraphObject, contentsScale: CGFloat) -> CALayer {
+    static func layer(for graph: GraphObject, contentsScale: CGFloat,
+                      showsMetadata: Bool = true) -> CALayer {
         let frame = CGRect(x: graph.frame.x, y: graph.frame.y,
                            width: graph.frame.width, height: graph.frame.height)
         let container = CALayer()
@@ -520,13 +521,17 @@ enum GraphFallbackRenderer {
         appendGridAndAxes(to: container, graph: graph, frame: plotFrame,
                           contentsScale: contentsScale)
         appendExpressions(to: container, graph: graph, frame: plotFrame,
-                          contentsScale: contentsScale)
-        appendReadableMetadata(to: container, graph: graph, frame: plotFrame,
-                               contentsScale: contentsScale)
+                          contentsScale: contentsScale,
+                          showsUnsupportedMessage: showsMetadata)
+        if showsMetadata {
+            appendReadableMetadata(to: container, graph: graph, frame: plotFrame,
+                                   contentsScale: contentsScale)
+        }
         return container
     }
 
-    static func image(for graph: GraphObject, scale: CGFloat = UIScreen.main.scale) -> UIImage {
+    static func image(for graph: GraphObject, scale: CGFloat = UIScreen.main.scale,
+                      showsMetadata: Bool = true) -> UIImage {
         // Render in the graph's real logical aspect. Independently enlarging
         // width and height to different minimums distorts valid narrow/tall or
         // short/wide graph frames when the resulting bitmap is stretched back
@@ -539,7 +544,8 @@ enum GraphFallbackRenderer {
             frame: GraphFrame(x: 0, y: 0,
                               width: Double(size.width), height: Double(size.height))
         )
-        let layer = layer(for: proxyGraph, contentsScale: scale)
+        let layer = layer(for: proxyGraph, contentsScale: scale,
+                          showsMetadata: showsMetadata)
         layer.frame = CGRect(origin: .zero, size: size)
         let format = UIGraphicsImageRendererFormat()
         format.scale = scale
@@ -598,10 +604,89 @@ enum GraphFallbackRenderer {
         axes.lineWidth = 1.25 / max(contentsScale, 1)
         axes.contentsScale = contentsScale
         container.addSublayer(axes)
+
+        appendTickLabels(to: container, graph: graph, frame: frame,
+                         contentsScale: contentsScale)
+    }
+
+    private static func appendTickLabels(to container: CALayer, graph: GraphObject,
+                                         frame: CGRect, contentsScale: CGFloat) {
+        let viewport = graph.viewport
+        let xTicks = GraphTickPolicy.ticks(
+            min: viewport.xMin, max: viewport.xMax,
+            pixelLength: Double(frame.width), minimumSpacing: 64
+        )
+        let yTicks = GraphTickPolicy.ticks(
+            min: viewport.yMin, max: viewport.yMax,
+            pixelLength: Double(frame.height), minimumSpacing: 48
+        )
+        let xAxisY: CGFloat = viewport.yMin <= 0 && viewport.yMax >= 0
+            ? map(x: 0, y: 0, viewport: viewport, frame: frame).y
+            : frame.maxY - 18
+        let yAxisX: CGFloat = viewport.xMin <= 0 && viewport.xMax >= 0
+            ? map(x: 0, y: 0, viewport: viewport, frame: frame).x
+            : frame.minX + 4
+
+        let markPath = CGMutablePath()
+        for tick in xTicks {
+            let x = map(x: tick.value, y: viewport.yMin,
+                        viewport: viewport, frame: frame).x
+            guard x >= frame.minX, x <= frame.maxX else { continue }
+            markPath.move(to: CGPoint(x: x, y: xAxisY - 3))
+            markPath.addLine(to: CGPoint(x: x, y: xAxisY + 3))
+        }
+        for tick in yTicks {
+            let y = map(x: viewport.xMin, y: tick.value,
+                        viewport: viewport, frame: frame).y
+            guard y >= frame.minY, y <= frame.maxY else { continue }
+            markPath.move(to: CGPoint(x: yAxisX - 3, y: y))
+            markPath.addLine(to: CGPoint(x: yAxisX + 3, y: y))
+        }
+        let marks = CAShapeLayer()
+        marks.path = markPath
+        marks.fillColor = UIColor.clear.cgColor
+        marks.strokeColor = CanvasDesignTokens.canvasSecondaryText.cgColor
+        marks.lineWidth = 0.8 / max(contentsScale, 1)
+        marks.contentsScale = contentsScale
+        container.addSublayer(marks)
+
+        for tick in xTicks where abs(tick.value) > tick.step * 1e-8 {
+            let x = map(x: tick.value, y: viewport.yMin,
+                        viewport: viewport, frame: frame).x
+            guard x > frame.minX + 24, x < frame.maxX - 24 else { continue }
+            let label = CATextLayer()
+            label.frame = CGRect(x: x - 28,
+                                 y: min(frame.maxY - 16, max(frame.minY + 2, xAxisY + 3)),
+                                 width: 56, height: 14)
+            label.string = tick.label
+            label.alignmentMode = .center
+            label.fontSize = 10
+            label.foregroundColor = CanvasDesignTokens.canvasSecondaryText.cgColor
+            label.contentsScale = contentsScale
+            container.addSublayer(label)
+        }
+        for tick in yTicks where abs(tick.value) > tick.step * 1e-8 {
+            let y = map(x: viewport.xMin, y: tick.value,
+                        viewport: viewport, frame: frame).y
+            guard y > frame.minY + 9, y < frame.maxY - 9 else { continue }
+            let label = CATextLayer()
+            let prefersLeft = yAxisX > frame.midX
+            label.frame = CGRect(
+                x: prefersLeft ? yAxisX - 58 : yAxisX + 5,
+                y: y - 7, width: 52, height: 14
+            )
+            label.string = tick.label
+            label.alignmentMode = prefersLeft ? .right : .left
+            label.fontSize = 10
+            label.foregroundColor = CanvasDesignTokens.canvasSecondaryText.cgColor
+            label.contentsScale = contentsScale
+            container.addSublayer(label)
+        }
     }
 
     private static func appendExpressions(to container: CALayer, graph: GraphObject,
-                                          frame: CGRect, contentsScale: CGFloat) {
+                                          frame: CGRect, contentsScale: CGFloat,
+                                          showsUnsupportedMessage: Bool) {
         var unsupported: [String] = []
         let environment = GraphMathEnvironment.build(
             from: graph.expressions, angleMode: graph.settings.angleMode
@@ -641,7 +726,7 @@ enum GraphFallbackRenderer {
             container.addSublayer(shape)
             if path.isEmpty { unsupported.append(expression.latex) }
         }
-        if !unsupported.isEmpty {
+        if showsUnsupportedMessage, !unsupported.isEmpty {
             let label = CATextLayer()
             label.frame = frame.insetBy(dx: 10, dy: 10)
             label.alignmentMode = .left
@@ -701,6 +786,12 @@ enum GraphFallbackRenderer {
 }
 
 enum GraphTickPolicy {
+    struct Tick: Equatable {
+        let value: Double
+        let step: Double
+        let label: String
+    }
+
     static func step(for range: Double) -> Double {
         guard range.isFinite, range > 0 else { return 1 }
         let raw = range / 10
@@ -723,6 +814,38 @@ enum GraphTickPolicy {
             value += step
         }
         return result
+    }
+
+    static func ticks(min: Double, max: Double, pixelLength: Double,
+                      minimumSpacing: Double) -> [Tick] {
+        guard pixelLength.isFinite, pixelLength > 0,
+              minimumSpacing.isFinite, minimumSpacing > 0,
+              max > min else { return [] }
+        let targetCount = Swift.max(2, Swift.min(14, Int(pixelLength / minimumSpacing)))
+        let range = max - min
+        let raw = range / Double(targetCount)
+        let magnitude = pow(10, floor(log10(raw)))
+        let normalized = raw / magnitude
+        let nice: Double
+        if normalized <= 1 { nice = 1 }
+        else if normalized <= 2 { nice = 2 }
+        else if normalized <= 5 { nice = 5 }
+        else { nice = 10 }
+        let tickStep = nice * magnitude
+        return values(min: min, max: max, step: tickStep).map {
+            Tick(value: abs($0) < tickStep * 1e-10 ? 0 : $0,
+                 step: tickStep, label: label(for: $0, step: tickStep))
+        }
+    }
+
+    private static func label(for value: Double, step: Double) -> String {
+        let clean = abs(value) < step * 1e-10 ? 0 : value
+        if abs(clean) >= 1_000_000 || (abs(clean) > 0 && abs(clean) < 0.001) {
+            return clean.formatted(.number.notation(.scientific)
+                .precision(.significantDigits(1...3)))
+        }
+        let decimals = max(0, min(6, Int(ceil(-log10(step)))))
+        return clean.formatted(.number.precision(.fractionLength(0...decimals)))
     }
 }
 
@@ -1078,12 +1201,15 @@ struct GraphMathEnvironment: Equatable, Sendable {
 
     func undefinedSliderParameters(in source: String) -> [String] {
         let normalized = GraphLatexNormalizer.normalize(source)
-        let rightHandSource: String
+        var rightHandSource: String
         if let relation = GraphEquationClassifier.relation(in: normalized),
            relation.left == "y" || relation.left.hasSuffix("(x)") {
             rightHandSource = relation.right
         } else {
             rightHandSource = normalized
+        }
+        if rightHandSource.hasPrefix("d/dx("), rightHandSource.hasSuffix(")") {
+            rightHandSource = String(rightHandSource.dropFirst(5).dropLast())
         }
         let characters = Array(rightHandSource)
         var result = Set<String>()
@@ -1093,7 +1219,12 @@ struct GraphMathEnvironment: Equatable, Sendable {
             let start = index
             while index < characters.count, characters[index].isLetter { index += 1 }
             let name = String(characters[start..<index])
-            let isCall = index < characters.count && characters[index] == "("
+            let isCall = index < characters.count && (
+                characters[index] == "("
+                || (characters[index] == "'"
+                    && index + 1 < characters.count
+                    && characters[index + 1] == "(")
+            )
             if Self.isSliderIdentifier(name), !isCall,
                variables[name] == nil, name != "x", name != "y",
                name != "e", name != "pi" {

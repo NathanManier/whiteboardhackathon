@@ -1267,20 +1267,11 @@ private struct LightweightGraphSurface: View {
     let onEdit: () -> Void
     let onDone: () -> Void
 
-    @State private var viewport: GraphViewport
-    @State private var expressions: [GraphExpression]
-    @State private var selectedExpressionID: String?
-    @State private var draft: String
-    @State private var keypadInsertion: MathKeyInsertion?
-    @State private var mathResult: NativeGraphMathResult?
-    @State private var resultDomain: ClosedRange<Double>?
-    @State private var resultError: String?
-    @State private var evaluationX = 0.0
-    @State private var integralLower = 0.0
-    @State private var integralUpper = 1.0
+    @StateObject private var model: GraphWorkspaceModel
+    @State private var keypadInsertion: GraphMathKeyCommand?
     @State private var dragStart: GraphViewport?
     @State private var magnificationStart: GraphViewport?
-    @State private var compactShowsGraph = false
+    @State private var compactShowsGraph = true
 
     init(graph: GraphObject, onCommitViewport: @escaping (GraphViewport) -> Void,
          onCommitGraph: @escaping (GraphObject) -> Void,
@@ -1299,508 +1290,688 @@ private struct LightweightGraphSurface: View {
         self.onDelete = onDelete
         self.onEdit = onEdit
         self.onDone = onDone
-        _viewport = State(initialValue: graph.viewport)
-        _expressions = State(initialValue: graph.expressions)
-        _selectedExpressionID = State(initialValue: graph.expressions.first?.id)
-        _draft = State(initialValue: graph.expressions.first?.latex ?? "y=x")
+        _model = StateObject(wrappedValue: GraphWorkspaceModel(
+            graph: graph, onExpressionMutation: onCommitGraph
+        ))
     }
 
     var body: some View {
         GeometryReader { proxy in
             VStack(spacing: 0) {
-                graphToolbar
-                if proxy.size.width >= 720 {
+                toolbar
+                Divider()
+                if proxy.size.width >= 700 {
                     HStack(spacing: 0) {
-                        mathPanel
-                            .frame(width: max(280, min(proxy.size.width * 0.36, 430)))
+                        expressionPanel
+                            .frame(width: max(280, min(proxy.size.width * 0.34, 420)))
                         Divider()
-                        plot(size: CGSize(
-                            width: proxy.size.width - max(280, min(proxy.size.width * 0.36, 430)),
-                            height: proxy.size.height - 54
-                        ))
+                        plot
                     }
                 } else {
-                    VStack(spacing: 0) {
-                        Picker("Graph workspace pane", selection: $compactShowsGraph) {
-                            Label("Math", systemImage: "function").tag(false)
-                            Label("Graph", systemImage: "chart.xyaxis.line").tag(true)
-                        }
-                        .pickerStyle(.segmented)
-                        .padding(.horizontal, 10).padding(.vertical, 6)
-                        Divider()
-                        if compactShowsGraph {
-                            plot(size: CGSize(width: proxy.size.width,
-                                              height: max(proxy.size.height - 94, 1)))
-                        } else {
-                            mathPanel
-                        }
-                    }
+                    compactPaneSwitch
+                    Divider()
+                    if compactShowsGraph { plot } else { expressionPanel }
+                }
+                if model.isEditing {
+                    Divider()
+                    mathInputTray
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
         }
         .background(Color(uiColor: CanvasDesignTokens.boardSurface))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .environment(\.colorScheme, VBoardCanvasTheme.colorScheme)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(GraphAccessibility.label(for: graph))
+        .accessibilityLabel(GraphAccessibility.label(for: model.workingGraph))
         .onAppear(perform: onBeginEditing)
-        .onDisappear(perform: onEndEditing)
-        .onChange(of: graph) { _, value in
-            viewport = value.viewport
-            expressions = value.expressions
-            if !expressions.contains(where: { $0.id == selectedExpressionID }) {
-                selectExpression(expressions.first)
-            }
+        .onDisappear {
+            model.finishEditing()
+            onEndEditing()
         }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didEnterBackgroundNotification
+        )) { _ in
+            commitViewport()
+            onEndEditing()
+        }
+        .animation(.easeOut(duration: 0.14), value: model.isEditing)
     }
 
-    private var graphToolbar: some View {
-        HStack(spacing: 8) {
-            Button("Explain", systemImage: "text.magnifyingglass", action: onExplain)
-            Button("Practice", systemImage: "list.bullet.clipboard", action: onPractice)
-            Button("Calculate / Solve", systemImage: "equal.circle", action: calculateOrSolve)
+    private var toolbar: some View {
+        HStack(spacing: 16) {
+            Text("Graph")
+                .font(.headline)
             Spacer()
-            Button("More", systemImage: "slider.horizontal.3", action: onEdit)
-            Button("Delete", systemImage: "trash", role: .destructive) {
-                onDelete(); onDone()
+            Menu {
+                Button("Explain this graph", systemImage: "text.magnifyingglass",
+                       action: onExplain)
+                Button("Practice from this graph", systemImage: "list.bullet.clipboard",
+                       action: onPractice)
+                Divider()
+                Button("Graph settings", systemImage: "slider.horizontal.3",
+                       action: onEdit)
+                Button("Delete graph", systemImage: "trash", role: .destructive) {
+                    onEndEditing()
+                    onDelete()
+                    onDone()
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 44, height: 44)
             }
-            Button("Done") { commit(); onEndEditing(); onDone() }
-                .buttonStyle(.borderedProminent)
+            .accessibilityLabel("More graph actions")
+            .help("More graph actions")
+
+            Button("Reset View") {
+                model.resetViewport()
+                commitViewport()
+            }
+            .frame(minHeight: 44)
+            .accessibilityHint("Restores the standard x and y range without changing expressions")
+            .help("Reset only the graph viewport")
+
+            Button("Done") {
+                commitViewport()
+                onEndEditing()
+                onDone()
+            }
+            .frame(minHeight: 44)
+            .buttonStyle(.borderedProminent)
         }
-        .buttonStyle(.bordered)
-        .labelStyle(.iconOnly)
-        .padding(10)
-        .frame(height: 54)
+        .buttonStyle(.plain)
+        .frame(minHeight: 44)
+        .padding(.horizontal, 16)
+        .frame(height: 52)
         .background(Color(uiColor: CanvasDesignTokens.toolbarSurface))
-        .accessibilityElement(children: .contain)
     }
 
-    private func plot(size: CGSize) -> some View {
-        ZStack(alignment: .bottom) {
-            GraphNativeFallbackSurface(graph: workingGraph)
-                .contentShape(Rectangle())
-                .gesture(panGesture(size: size))
-                .simultaneousGesture(zoomGesture)
-            GraphIndirectNavigationCapture(
-                onPan: { state, translation in
-                    switch state {
-                    case .began:
-                        dragStart = viewport
-                    case .changed:
-                        updatePan(translation: translation, size: size)
-                    case .ended:
-                        dragStart = nil; commit()
-                    case .cancelled, .failed:
-                        if let dragStart { viewport = dragStart }
-                        dragStart = nil
-                    default:
-                        break
-                    }
-                },
-                onWheel: { factor, anchor, finished in
-                    if factor != 1 {
-                        viewport = scaled(viewport, by: factor,
-                                          anchoredAt: anchor, size: size)
-                    }
-                    if finished { commit() }
-                }
-            )
-            ForEach(Array(solutionPoints.enumerated()), id: \.offset) { _, point in
-                Circle()
-                    .fill(Color.red)
-                    .overlay(Circle().stroke(Color.white, lineWidth: 2))
-                    .frame(width: 12, height: 12)
-                    .position(GraphFallbackSampler.map(
-                        x: point.x, y: point.y, viewport: viewport,
-                        frame: CGRect(origin: .zero, size: size)
-                    ))
-                    .accessibilityLabel(
-                        "Solution at x \(point.x.formatted()), y \(point.y.formatted())"
-                    )
+    private var compactPaneSwitch: some View {
+        HStack(spacing: 20) {
+            compactPaneButton("Expressions", showsGraph: false)
+            compactPaneButton("Graph", showsGraph: true)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 44)
+        .background(Color(uiColor: CanvasDesignTokens.toolbarSurface))
+    }
+
+    private func compactPaneButton(_ title: String, showsGraph: Bool) -> some View {
+        Button {
+            compactShowsGraph = showsGraph
+        } label: {
+            VStack(spacing: 5) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Rectangle()
+                    .fill(compactShowsGraph == showsGraph ? Color.accentColor : .clear)
+                    .frame(height: 2)
             }
-            HStack(spacing: 8) {
-                Text(viewportSummary)
-                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var expressionPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("EXPRESSIONS")
+                    .font(.caption.weight(.semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(.secondary)
                 Spacer()
-                Button { zoom(by: 1.35) } label: { Image(systemName: "minus.magnifyingglass") }
-                Button { viewport = graph.viewport; commit() } label: { Image(systemName: "scope") }
-                Button { zoom(by: 0.74) } label: { Image(systemName: "plus.magnifyingglass") }
+                Text("\(model.expressions.count)/\(GraphRecognitionController.maximumExpressions)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
             }
-            .buttonStyle(.bordered)
-            .padding(8)
-            .background(.ultraThinMaterial)
+            .padding(.horizontal, 16)
+            .frame(height: 42)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    if model.expressions.isEmpty {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Add an expression")
+                                .font(.body.weight(.medium))
+                            Button("Expression", systemImage: "plus") {
+                                _ = model.addExpression()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                    } else {
+                        ForEach(Array(model.expressions.enumerated()), id: \.element.id) {
+                            index, expression in
+                            expressionRow(expression, index: index)
+                            if index < model.expressions.count - 1 { Divider() }
+                        }
+                    }
+
+                    if !model.expressions.isEmpty {
+                        Button {
+                            _ = model.addExpression()
+                        } label: {
+                            Label("Expression", systemImage: "plus")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 16)
+                                .frame(height: 48)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.expressions.count
+                                  >= GraphRecognitionController.maximumExpressions)
+                        .accessibilityLabel("Add Expression")
+                    }
+                }
+            }
+        }
+        .background(Color(uiColor: CanvasDesignTokens.toolbarSurface).opacity(0.34))
+    }
+
+    private func expressionRow(_ expression: GraphExpression, index: Int) -> some View {
+        let feedback = model.feedback(for: expression)
+        let slider = model.slider(for: expression)
+        let isEditing = model.editingExpressionID == expression.id
+        return HStack(alignment: .top, spacing: 10) {
+            Button {
+                model.toggleVisibility(id: expression.id)
+            } label: {
+                Circle()
+                    .fill(curveColor(expression, index: index)
+                        .opacity(expression.visible ? 1 : 0.18))
+                    .overlay {
+                        if !expression.visible {
+                            Image(systemName: "eye.slash.fill")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(width: 18, height: 18)
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                expression.visible ? "Hide expression \(index + 1)" : "Show expression \(index + 1)"
+            )
+
+            VStack(alignment: .leading, spacing: 6) {
+                if isEditing {
+                    GraphMathEditorField(
+                        text: expression.latex,
+                        insertion: keypadInsertion,
+                        isFocused: true,
+                        onChange: { model.updateSource(id: expression.id, source: $0) },
+                        onSubmit: { model.finishEditing() }
+                    )
+                    .frame(height: 44)
+                    .accessibilityLabel("Expression \(index + 1) source")
+                } else if let slider {
+                    parameterSlider(slider, expressionID: expression.id)
+                        .contentShape(Rectangle())
+                        .onTapGesture { model.beginEditing(expression.id) }
+                } else {
+                    Button {
+                        model.beginEditing(expression.id)
+                    } label: {
+                        Group {
+                            if feedback?.isError == true {
+                                Text(expression.latex.isEmpty ? "Empty expression" : expression.latex)
+                                    .font(.body.monospaced())
+                                    .foregroundStyle(.primary)
+                            } else {
+                                StudyContentView(
+                                    source: "\\(\(expression.latex)\\)",
+                                    maximumWidth: 310
+                                )
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if let feedback, slider == nil {
+                    HStack(spacing: 8) {
+                        if feedback.isError {
+                            Image(systemName: "exclamationmark.circle")
+                                .accessibilityHidden(true)
+                        }
+                        Text(feedback.message)
+                            .font(feedback.isError ? .caption : .callout.monospacedDigit())
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(feedback.isError ? Color.red : Color.secondary)
+                }
+
+                if feedback?.isError == true,
+                   let parameter = model.undefinedParameters(for: expression).first {
+                    Button("Add slider for \(parameter)") {
+                        _ = model.addParameter(named: parameter)
+                    }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                }
+            }
+            .padding(.vertical, 10)
+
+            expressionMenu(expression, index: index)
+                .padding(.top, 12)
+        }
+        .padding(.horizontal, 10)
+        .background(
+            model.selectedExpressionID == expression.id
+                ? Color.accentColor.opacity(0.055) : Color.clear
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(
+            "Expression \(index + 1), \(CompactStudyPresentation.readableText(from: expression.latex)), \(expression.visible ? "visible" : "hidden")"
+        )
+    }
+
+    private func parameterSlider(_ slider: GraphParameterSlider,
+                                 expressionID: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(slider.name)
+                    .font(.body.monospaced().weight(.semibold))
+                Spacer()
+                Text(GraphWorkspaceModel.format(slider.value))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(
+                value: Binding(
+                    get: { model.slider(for: model.expression(id: expressionID)
+                        ?? GraphExpression(id: expressionID, latex: "", type: .unknown))?.value
+                        ?? slider.value },
+                    set: { model.updateSlider(id: expressionID, value: $0) }
+                ),
+                in: slider.minimum...slider.maximum,
+                step: slider.step
+            )
+            .accessibilityLabel("Parameter \(slider.name)")
+            .accessibilityValue(GraphWorkspaceModel.format(slider.value))
+            HStack {
+                Text(GraphWorkspaceModel.format(slider.minimum))
+                Spacer()
+                Text(GraphWorkspaceModel.format(slider.maximum))
+            }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.tertiary)
         }
     }
 
-    private var mathPanel: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-            ScrollView {
-                VStack(spacing: 5) {
-                    ForEach(expressions) { expression in expressionRow(expression) }
-                    Button("Add expression", systemImage: "plus") { addExpression() }
-                        .disabled(expressions.count >= GraphRecognitionController.maximumExpressions)
+    private func expressionMenu(_ expression: GraphExpression, index: Int) -> some View {
+        Menu {
+            Button("Edit", systemImage: "pencil") { model.beginEditing(expression.id) }
+            Button("Duplicate", systemImage: "plus.square.on.square") {
+                _ = model.duplicateExpression(id: expression.id)
+            }
+            Menu("Curve color") {
+                ForEach(Array(Self.curveColors.enumerated()), id: \.offset) { colorIndex, hex in
+                    Button("Color \(colorIndex + 1)") { model.setColor(hex, id: expression.id) }
                 }
             }
-            .frame(maxHeight: 150)
-
-            CursorAwareMathField(text: $draft, insertion: keypadInsertion) {
-                updateDraft($0)
+            if let function = GraphMathEnvironment.functionDefinition(in: expression.latex) {
+                Divider()
+                Button("Add derivative") { _ = model.addExpression(source: "\(function.name)'()") }
+                Button("Add definite integral") {
+                    _ = model.addExpression(source: "integral(\(function.name)(x),,)")
+                }
             }
-            .frame(height: 40)
-
-            if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                StudyContentView(source: "\\(\(draft)\\)", maximumWidth: 390)
-                    .frame(minHeight: 30, maxHeight: 50, alignment: .leading)
-                    .clipped()
+            Divider()
+            Button("Delete expression", systemImage: "trash", role: .destructive) {
+                model.deleteExpression(id: expression.id)
             }
+        } label: {
+            Image(systemName: "ellipsis")
+                .frame(width: 44, height: 44)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("More actions for expression \(index + 1)")
+    }
 
-            if let mathResult {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 5) {
-                        Text(mathResult.isExact ? "Exact" : "Approximate")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Color.blue.opacity(0.12), in: Capsule())
-                        Text(resultLabel(mathResult.kind))
-                            .font(.caption2).foregroundStyle(.secondary)
+    private var plot: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .topTrailing) {
+                GraphNativeFallbackSurface(graph: model.workingGraph, showsMetadata: false)
+                    .contentShape(Rectangle())
+                    .gesture(panGesture(size: proxy.size))
+                    .simultaneousGesture(zoomGesture)
+
+                GraphIndirectNavigationCapture(
+                    onPan: { state, translation in
+                        switch state {
+                        case .began: dragStart = model.viewport
+                        case .changed: updatePan(translation: translation, size: proxy.size)
+                        case .ended:
+                            dragStart = nil
+                            commitViewport()
+                        case .cancelled, .failed:
+                            if let dragStart { model.updateViewport(dragStart) }
+                            dragStart = nil
+                        default: break
+                        }
+                    },
+                    onWheel: { factor, anchor, finished in
+                        if factor != 1 {
+                            model.updateViewport(scaled(
+                                model.viewport, by: factor,
+                                anchoredAt: anchor, size: proxy.size
+                            ))
+                        }
+                        if finished { commitViewport() }
                     }
-                    Text(mathResult.message)
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.primary)
-                    if let resultDomain {
-                        Text("Visible-domain search: x = \(resultDomain.lowerBound.formatted(.number.precision(.significantDigits(1...5))))…\(resultDomain.upperBound.formatted(.number.precision(.significantDigits(1...5))))")
-                            .font(.caption2).foregroundStyle(.secondary)
+                )
+
+                VStack(spacing: 0) {
+                    Button { zoom(by: 0.74) } label: {
+                        Image(systemName: "plus")
+                            .frame(width: 44, height: 44)
+                    }
+                    Divider().frame(width: 44)
+                    Button { zoom(by: 1.35) } label: {
+                        Image(systemName: "minus")
+                            .frame(width: 44, height: 44)
                     }
                 }
-                .padding(7)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                .buttonStyle(.plain)
+                .background(Color(uiColor: CanvasDesignTokens.toolbarSurface))
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 7).stroke(
+                    Color(uiColor: CanvasDesignTokens.boardBorder).opacity(0.55), lineWidth: 1
+                ))
+                .padding(12)
+                .accessibilityElement(children: .contain)
             }
-            if let resultError {
-                Text(resultError)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .padding(7)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-            }
-
-            HStack(spacing: 6) {
-                TextField("x", value: $evaluationX, format: .number).frame(width: 55)
-                    .textFieldStyle(.roundedBorder)
-                Button("f′") { runDerivative() }.accessibilityLabel("Derivative at x")
-                TextField("a", value: $integralLower, format: .number).frame(width: 48)
-                    .textFieldStyle(.roundedBorder)
-                TextField("b", value: $integralUpper, format: .number).frame(width: 48)
-                    .textFieldStyle(.roundedBorder)
-                Button("∫") { runIntegral() }.accessibilityLabel("Definite integral")
-                if expressions.filter(\.visible).count >= 2 {
-                    Button("∩") { runIntersections() }.accessibilityLabel("Intersections")
-                }
-            }
-            .buttonStyle(.bordered)
-
-                mathKeypad
-            }
-            .padding(10)
         }
         .background(Color(uiColor: CanvasDesignTokens.boardSurface))
     }
 
-    private func expressionRow(_ expression: GraphExpression) -> some View {
-        HStack(spacing: 6) {
-            Button {
-                replaceExpression(expression, visible: !expression.visible)
-            } label: {
-                Image(systemName: expression.visible ? "eye.fill" : "eye.slash")
-            }
-            .buttonStyle(.plain)
-            Button {
-                selectExpression(expression)
-            } label: {
-                Text(CompactStudyPresentation.readableText(from: expression.latex))
-                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(7)
-                    .background(selectedExpressionID == expression.id
-                                ? Color.accentColor.opacity(0.13) : Color.black.opacity(0.035),
-                                in: RoundedRectangle(cornerRadius: 7))
-            }
-            .buttonStyle(.plain)
-            Button(role: .destructive) { removeExpression(expression.id) } label: {
-                Image(systemName: "minus.circle")
-            }
-            .buttonStyle(.plain)
-            .disabled(expressions.count <= 1)
-        }
-    }
-
-    private var mathKeypad: some View {
-        let keys = [
-            "7", "8", "9", "(", ")", "⌫",
-            "4", "5", "6", "+", "−", "^",
-            "1", "2", "3", "×", "÷", "x²",
-            "0", ".", "x", "y", "=", "π",
-            "sin", "cos", "tan", "√", "ln", "log",
-            "<", ">", "≤", "≥", "abs", "e",
-            "asin", "acos", "atan", "exp", "a/b", "C",
-        ]
-        return LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 6),
-                         spacing: 4) {
-            ForEach(keys, id: \.self) { key in
-                Button(key) {
-                    if key == "C" { updateDraft("") }
-                    else { keypadInsertion = MathKeyInsertion(text: insertion(for: key)) }
+    private var mathInputTray: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 20) {
+                ForEach(GraphMathKeyboardCategory.allCases) { category in
+                    Button {
+                        model.keyboardCategory = category
+                    } label: {
+                        VStack(spacing: 5) {
+                            Text(category.rawValue)
+                                .font(.subheadline.weight(.semibold))
+                            Rectangle()
+                                .fill(model.keyboardCategory == category
+                                      ? Color.accentColor : .clear)
+                                .frame(height: 2)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .frame(minHeight: 44)
                 }
-                    .buttonStyle(.bordered)
-                    .font(.caption.weight(.medium))
-                    .frame(maxWidth: .infinity)
+                Spacer()
+                Button {
+                    model.finishEditing()
+                } label: {
+                    Image(systemName: "keyboard.chevron.compact.down")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Hide math keyboard")
             }
+
+            let keys = keys(for: model.keyboardCategory)
+            let columns = columnCount(for: model.keyboardCategory)
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: columns),
+                spacing: 6
+            ) {
+                ForEach(keys) { key in
+                    Button {
+                        keypadInsertion = GraphMathKeyCommand(action: key.action)
+                    } label: {
+                        Text(key.label)
+                            .font(.callout.weight(key.emphasized ? .semibold : .regular))
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .background(
+                                key.emphasized
+                                    ? Color.accentColor.opacity(0.10)
+                                    : Color(uiColor: CanvasDesignTokens.boardSurface),
+                                in: RoundedRectangle(cornerRadius: 7)
+                            )
+                            .overlay(RoundedRectangle(cornerRadius: 7).stroke(
+                                Color(uiColor: CanvasDesignTokens.boardBorder).opacity(0.45),
+                                lineWidth: 1
+                            ))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(key.accessibilityLabel)
+                }
+            }
+            // Keep the plot and expression list stationary when the user
+            // switches between categories with different key counts.
+            .frame(
+                minHeight: CGFloat(5 * 44 + 4 * 6),
+                alignment: .top
+            )
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(uiColor: CanvasDesignTokens.toolbarSurface))
+    }
+
+    private func columnCount(for category: GraphMathKeyboardCategory) -> Int {
+        switch category {
+        case .basic: return 6
+        case .functions: return 3
+        case .calculus: return 2
         }
     }
 
-    private var workingGraph: GraphObject {
-        graph.replacing(expressions: expressions).replacing(viewport: viewport)
-    }
-
-    private var solutionPoints: [CGPoint] {
-        guard let mathResult else { return [] }
-        switch mathResult.kind {
-        case .linear, .quadratic, .numericalRoots:
-            return mathResult.values.compactMap { x in
-                guard x >= viewport.xMin, x <= viewport.xMax,
-                      0 >= viewport.yMin, 0 <= viewport.yMax else { return nil }
-                return CGPoint(x: x, y: 0)
-            }
-        case .intersections:
-            return stride(from: 0, to: mathResult.values.count - 1, by: 2).compactMap { index in
-                let x = mathResult.values[index], y = mathResult.values[index + 1]
-                guard x >= viewport.xMin, x <= viewport.xMax,
-                      y >= viewport.yMin, y <= viewport.yMax else { return nil }
-                return CGPoint(x: x, y: y)
-            }
-        default:
-            return []
+    private func keys(for category: GraphMathKeyboardCategory) -> [GraphMathKey] {
+        switch category {
+        case .basic:
+            return [
+                .text("7"), .text("8"), .text("9"), .template("(", "(", 0),
+                .template(")", ")", 0), .action("⌫", "delete backward", .backspace, true),
+                .text("4"), .text("5"), .text("6"), .text("+", emphasized: true),
+                .template("−", "-", 0, emphasized: true), .text("^", emphasized: true),
+                .text("1"), .text("2"), .text("3"),
+                .template("×", "*", 0, emphasized: true),
+                .template("÷", "/", 0, emphasized: true), .text("x"),
+                .text("0"), .text("."), .template("π", "pi", 0), .text("e"),
+                .text("="), .action("Clear", "clear expression", .clear, false),
+                .text("<"), .text(">"), .template("≤", "<=", 0),
+                .template("≥", ">=", 0), .text(","), .text("y"),
+            ]
+        case .functions:
+            return [
+                .function("sin"), .function("cos"), .function("tan"),
+                .function("sec"), .function("csc"), .function("cot"),
+                .function("asin", spoken: "inverse sine"),
+                .function("acos", spoken: "inverse cosine"),
+                .function("atan", spoken: "inverse tangent"),
+                .function("sqrt", label: "√", spoken: "square root"),
+                .function("abs", spoken: "absolute value"), .function("ln"),
+                .function("log"), .function("exp"),
+                .template("x²", "^2", 0),
+            ]
+        case .calculus:
+            return [
+                .template("f′( )", "f'()", 1, spoken: "derivative at a point", emphasized: true),
+                .template("d/dx", "d/dx()", 1, spoken: "derivative expression", emphasized: true),
+                .template("∫ bounds", "integral(,,)", 3,
+                          spoken: "definite integral with bounds", emphasized: true),
+                .template("f(x)=", "f(x)=", 0, spoken: "define function f"),
+                .template("g(x)=", "g(x)=", 0, spoken: "define function g"),
+                .template("a=", "a=", 0, spoken: "define parameter a"),
+                .template("x²", "^2", 0),
+                .function("sqrt", label: "√", spoken: "square root"),
+                .text("x"), .text(","),
+            ]
         }
     }
 
-    private var viewportSummary: String {
-        "x \(viewport.xMin.formatted(.number.precision(.fractionLength(1))))…\(viewport.xMax.formatted(.number.precision(.fractionLength(1))))  y \(viewport.yMin.formatted(.number.precision(.fractionLength(1))))…\(viewport.yMax.formatted(.number.precision(.fractionLength(1))))"
+    private func curveColor(_ expression: GraphExpression, index: Int) -> Color {
+        if let hex = expression.displayStyle?.color {
+            return Color(uiColor: UIColor(svgHex: hex))
+        }
+        return Color(uiColor: GraphFallbackPalette.colors[index % GraphFallbackPalette.colors.count])
     }
 
     private func panGesture(size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
-                if dragStart == nil { dragStart = viewport }
+                if dragStart == nil { dragStart = model.viewport }
                 updatePan(translation: value.translation, size: size)
             }
-            .onEnded { _ in dragStart = nil; commit() }
+            .onEnded { _ in
+                dragStart = nil
+                commitViewport()
+            }
     }
 
     private var zoomGesture: some Gesture {
         MagnificationGesture()
             .onChanged { value in
-                let start = magnificationStart ?? viewport
+                let start = magnificationStart ?? model.viewport
                 if magnificationStart == nil { magnificationStart = start }
                 let scale = min(20, max(0.05, Double(value)))
-                viewport = scaled(start, by: 1 / scale)
+                model.updateViewport(GraphViewportNavigation.zoomed(start, by: 1 / scale))
             }
-            .onEnded { _ in magnificationStart = nil; commit() }
+            .onEnded { _ in
+                magnificationStart = nil
+                commitViewport()
+            }
     }
 
     private func zoom(by factor: Double) {
-        viewport = scaled(viewport, by: factor)
-        commit()
+        model.updateViewport(GraphViewportNavigation.zoomed(model.viewport, by: factor))
+        commitViewport()
     }
 
     private func updatePan(translation: CGSize, size: CGSize) {
-        let start = dragStart ?? viewport
-        let xRange = start.xMax - start.xMin
-        let yRange = start.yMax - start.yMin
-        let dx = -Double(translation.width / max(size.width, 1)) * xRange
-        let dy = Double(translation.height / max(size.height, 1)) * yRange
-        viewport = start.replacingBounds(with: GraphViewport(
-            xMin: start.xMin + dx, xMax: start.xMax + dx,
-            yMin: start.yMin + dy, yMax: start.yMax + dy
-        ))
-    }
-
-    private func scaled(_ source: GraphViewport, by factor: Double) -> GraphViewport {
-        let safe = min(4, max(0.25, factor))
-        let centerX = (source.xMin + source.xMax) / 2
-        let centerY = (source.yMin + source.yMax) / 2
-        let halfX = min(500_000, max(0.0005, (source.xMax - source.xMin) * safe / 2))
-        let halfY = min(500_000, max(0.0005, (source.yMax - source.yMin) * safe / 2))
-        return source.replacingBounds(with: GraphViewport(
-            xMin: centerX - halfX, xMax: centerX + halfX,
-            yMin: centerY - halfY, yMax: centerY + halfY
+        let start = dragStart ?? model.viewport
+        model.updateViewport(GraphViewportNavigation.panned(
+            start, by: translation, size: size
         ))
     }
 
     private func scaled(_ source: GraphViewport, by factor: Double,
                         anchoredAt point: CGPoint, size: CGSize) -> GraphViewport {
-        let safe = min(4, max(0.25, factor))
-        let xFraction = min(1, max(0, Double(point.x / max(size.width, 1))))
-        let yFraction = min(1, max(0, Double(point.y / max(size.height, 1))))
-        let oldWidth = source.xMax - source.xMin
-        let oldHeight = source.yMax - source.yMin
-        let anchorX = source.xMin + oldWidth * xFraction
-        let anchorY = source.yMax - oldHeight * yFraction
-        let newWidth = min(1_000_000, max(0.001, oldWidth * safe))
-        let newHeight = min(1_000_000, max(0.001, oldHeight * safe))
-        return source.replacingBounds(with: GraphViewport(
-            xMin: anchorX - newWidth * xFraction,
-            xMax: anchorX + newWidth * (1 - xFraction),
-            yMin: anchorY - newHeight * (1 - yFraction),
-            yMax: anchorY + newHeight * yFraction
-        ))
+        GraphViewportNavigation.zoomed(source, by: factor, anchor: point, size: size)
     }
 
-    private func commit() { onCommitViewport(viewport) }
+    private func commitViewport() { onCommitViewport(model.viewport) }
 
-    private func commitLiveGraph() { onCommitGraph(workingGraph) }
+    private static let curveColors = [
+        "#2d70b3", "#c74440", "#388c46", "#6042a6", "#fa7e19", "#0d8f9c",
+    ]
+}
 
-    private func selectExpression(_ expression: GraphExpression?) {
-        selectedExpressionID = expression?.id
-        draft = expression?.latex ?? ""
-        mathResult = nil
-        resultDomain = nil
-        resultError = nil
+private struct GraphMathKey: Identifiable {
+    let id = UUID()
+    let label: String
+    let accessibilityLabel: String
+    let action: GraphMathKeyAction
+    let emphasized: Bool
+
+    static func text(_ value: String, emphasized: Bool = false) -> Self {
+        Self(label: value, accessibilityLabel: value,
+             action: .insert(text: value), emphasized: emphasized)
     }
 
-    private func updateDraft(_ value: String) {
-        draft = value
-        mathResult = nil
-        resultDomain = nil
-        resultError = nil
-        guard let id = selectedExpressionID,
-              let index = expressions.firstIndex(where: { $0.id == id }) else { return }
-        let existing = expressions[index]
-        expressions[index] = GraphExpression(
-            id: existing.id, latex: value,
-            type: GraphExpressionInference.type(for: value), visible: existing.visible,
-            displayStyle: existing.displayStyle, restrictions: existing.restrictions,
-            additionalFields: existing.additionalFields
+    static func template(_ label: String, _ text: String, _ cursorBacktrack: Int,
+                         spoken: String? = nil, emphasized: Bool = false) -> Self {
+        Self(label: label, accessibilityLabel: spoken ?? label,
+             action: .insert(text: text, cursorBacktrack: cursorBacktrack),
+             emphasized: emphasized)
+    }
+
+    static func function(_ name: String, label: String? = nil,
+                         spoken: String? = nil) -> Self {
+        template(label ?? name, "\(name)()", 1, spoken: spoken ?? name)
+    }
+
+    static func action(_ label: String, _ spoken: String,
+                       _ action: GraphMathKeyAction, _ emphasized: Bool) -> Self {
+        Self(label: label, accessibilityLabel: spoken,
+             action: action, emphasized: emphasized)
+    }
+}
+
+private struct GraphMathKeyCommand: Equatable {
+    let id = UUID()
+    let action: GraphMathKeyAction
+}
+
+private struct GraphMathEditorField: UIViewRepresentable {
+    let text: String
+    let insertion: GraphMathKeyCommand?
+    let isFocused: Bool
+    let onChange: (String) -> Void
+    let onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.borderStyle = .none
+        field.font = .monospacedSystemFont(ofSize: 17, weight: .regular)
+        field.autocapitalizationType = .none
+        field.autocorrectionType = .no
+        field.spellCheckingType = .no
+        field.returnKeyType = .done
+        field.clearButtonMode = .never
+        field.placeholder = "y=x²"
+        field.delegate = context.coordinator
+        field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)),
+                        for: .editingChanged)
+        return field
+    }
+
+    func updateUIView(_ field: UITextField, context: Context) {
+        context.coordinator.parent = self
+        if field.text != text { field.text = text }
+        if isFocused, !field.isFirstResponder {
+            DispatchQueue.main.async { field.becomeFirstResponder() }
+        } else if !isFocused, field.isFirstResponder {
+            field.resignFirstResponder()
+        }
+        guard let insertion,
+              context.coordinator.lastInsertionID != insertion.id else { return }
+        context.coordinator.lastInsertionID = insertion.id
+        let selected = field.selectedTextRange.map {
+            NSRange(location: field.offset(from: field.beginningOfDocument, to: $0.start),
+                    length: field.offset(from: $0.start, to: $0.end))
+        } ?? NSRange(location: (field.text ?? "").utf16.count, length: 0)
+        let result = GraphMathInsertionPlan.apply(
+            insertion.action, to: field.text ?? "", selection: selected
         )
-        commitLiveGraph()
-    }
-
-    private func replaceExpression(_ expression: GraphExpression, visible: Bool) {
-        guard let index = expressions.firstIndex(where: { $0.id == expression.id }) else { return }
-        expressions[index] = GraphExpression(
-            id: expression.id, latex: expression.latex, type: expression.type,
-            visible: visible, displayStyle: expression.displayStyle,
-            restrictions: expression.restrictions, additionalFields: expression.additionalFields
-        )
-        commitLiveGraph()
-    }
-
-    private func addExpression() {
-        guard expressions.count < GraphRecognitionController.maximumExpressions else { return }
-        let expression = GraphExpression(id: "native-\(UUID().uuidString.lowercased())",
-                                         latex: "y=x", type: .explicitFunction)
-        expressions.append(expression)
-        selectExpression(expression)
-        commitLiveGraph()
-    }
-
-    private func removeExpression(_ id: String) {
-        guard expressions.count > 1 else { return }
-        expressions.removeAll { $0.id == id }
-        if selectedExpressionID == id { selectExpression(expressions.first) }
-        commitLiveGraph()
-    }
-
-    private func insertion(for key: String) -> String {
-        switch key {
-        case "−": return "-"
-        case "×": return "*"
-        case "÷": return "/"
-        case "x²": return "^2"
-        case "√": return "sqrt("
-        case "π": return "pi"
-        case "≤": return "<="
-        case "≥": return ">="
-        case "a/b": return "/"
-        case "sin", "cos", "tan", "asin", "acos", "atan", "exp", "ln", "log", "abs":
-            return key + "("
-        default: return key
+        field.text = result.source
+        if let start = field.position(from: field.beginningOfDocument,
+                                      offset: result.selection.location),
+           let end = field.position(from: start, offset: result.selection.length) {
+            field.selectedTextRange = field.textRange(from: start, to: end)
         }
+        context.coordinator.parent.onChange(result.source)
     }
 
-    private func resultLabel(_ kind: NativeGraphSolutionKind) -> String {
-        switch kind {
-        case .calculation: return "Calculation"
-        case .linear: return "Linear solution"
-        case .quadratic: return "Quadratic solutions"
-        case .numericalRoots: return "Roots"
-        case .intersections: return "Intersections"
-        case .derivative: return "Numerical derivative"
-        case .definiteIntegral: return "Definite integral"
-        case .unsupportedIndefiniteIntegral: return "Needs bounds"
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: GraphMathEditorField
+        var lastInsertionID: UUID?
+
+        init(parent: GraphMathEditorField) { self.parent = parent }
+
+        @objc func changed(_ field: UITextField) {
+            parent.onChange(field.text ?? "")
         }
-    }
 
-    private func calculateOrSolve() {
-        do {
-            if draft.contains("=") || (try? SafeGraphExpression(source: draft).usesVariable) == true {
-                mathResult = try NativeGraphMath.solve(
-                    draft, domain: viewport.xMin...viewport.xMax,
-                    angleMode: graph.settings.angleMode
-                )
-                resultDomain = viewport.xMin...viewport.xMax
-            } else {
-                mathResult = try NativeGraphMath.calculate(
-                    draft, angleMode: graph.settings.angleMode
-                )
-                resultDomain = nil
-            }
-            resultError = nil
-        } catch {
-            mathResult = nil; resultDomain = nil
-            resultError = "Check the expression and its domain."
-        }
-    }
-
-    private func runDerivative() {
-        do {
-            mathResult = try NativeGraphMath.derivative(
-                draft, at: evaluationX, angleMode: graph.settings.angleMode
-            )
-            resultDomain = nil; resultError = nil
-        } catch {
-            mathResult = nil; resultDomain = nil
-            resultError = "The derivative is undefined here."
-        }
-    }
-
-    private func runIntegral() {
-        do {
-            mathResult = try NativeGraphMath.integral(
-                draft, from: integralLower, to: integralUpper,
-                angleMode: graph.settings.angleMode
-            )
-            resultDomain = nil; resultError = nil
-        } catch {
-            mathResult = nil; resultDomain = nil
-            resultError = "Enter valid bounds where the function is defined."
-        }
-    }
-
-    private func runIntersections() {
-        let visible = expressions.filter(\.visible)
-        guard visible.count >= 2 else { return }
-        do {
-            mathResult = try NativeGraphMath.intersections(
-                visible[0].latex, visible[1].latex,
-                domain: viewport.xMin...viewport.xMax,
-                angleMode: graph.settings.angleMode
-            )
-            resultDomain = viewport.xMin...viewport.xMax
-            resultError = nil
-        } catch {
-            mathResult = nil; resultDomain = nil
-            resultError = "Those expressions cannot be intersected locally."
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            parent.onSubmit()
+            textField.resignFirstResponder()
+            return false
         }
     }
 }
@@ -1883,67 +2054,66 @@ private final class GraphIndirectNavigationView: UIView, UIGestureRecognizerDele
         -> Bool { true }
 }
 
-private struct MathKeyInsertion: Equatable {
-    let id = UUID()
-    let text: String
-}
+#if DEBUG
+/// Launch-only visual acceptance fixture. It is excluded from Release and
+/// keeps screenshots deterministic without requiring an account or server.
+struct GraphWorkspaceReviewView: View {
+    let state: String
 
-private struct CursorAwareMathField: UIViewRepresentable {
-    @Binding var text: String
-    let insertion: MathKeyInsertion?
-    let onChange: (String) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
-
-    func makeUIView(context: Context) -> UITextField {
-        let field = UITextField()
-        field.borderStyle = .roundedRect
-        field.font = .monospacedSystemFont(ofSize: 17, weight: .regular)
-        field.autocapitalizationType = .none
-        field.autocorrectionType = .no
-        field.spellCheckingType = .no
-        field.placeholder = "y = x^2"
-        field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)),
-                        for: .editingChanged)
-        return field
+    var body: some View {
+        GraphInteractiveSurface(
+            graph: graph,
+            pencilAnnotationEnabled: false,
+            onPencilRequestsPassiveMode: {},
+            onCommitViewport: { _, _, _ in },
+            onCommitGraph: { _ in },
+            onEdit: {},
+            onDone: {}
+        )
+        .padding(16)
+        .background(Color(uiColor: CanvasDesignTokens.canvasBackground))
     }
 
-    func updateUIView(_ field: UITextField, context: Context) {
-        context.coordinator.parent = self
-        if field.text != text { field.text = text }
-        guard let insertion, context.coordinator.lastInsertionID != insertion.id else { return }
-        context.coordinator.lastInsertionID = insertion.id
-        if insertion.text == "⌫" {
-            if let range = field.selectedTextRange, !range.isEmpty {
-                field.replace(range, withText: "")
-            } else if let start = field.selectedTextRange?.start,
-                      let previous = field.position(from: start, offset: -1),
-                      let range = field.textRange(from: previous, to: start) {
-                field.replace(range, withText: "")
-            }
-        } else if let range = field.selectedTextRange {
-            field.replace(range, withText: insertion.text)
-        } else {
-            field.text = (field.text ?? "") + insertion.text
-        }
-        let updated = field.text ?? ""
-        DispatchQueue.main.async {
-            context.coordinator.parent.text = updated
-            context.coordinator.parent.onChange(updated)
+    private var graph: GraphObject {
+        GraphObject(
+            id: "graph-review", owningBoardID: "603f5213ab0a249716833214c5ab88da",
+            frame: GraphFrame(x: 0, y: 0, width: 900, height: 620),
+            expressions: expressions,
+            viewport: GraphViewport(xMin: -10, xMax: 10, yMin: -8, yMax: 12),
+            settings: GraphSettings(showXAxis: true, showYAxis: true, showGrid: true)
+        )
+    }
+
+    private var expressions: [GraphExpression] {
+        switch state {
+        case "multiple":
+            return [expression("f(x)=sin(x)", id: "f", color: "#2d70b3"),
+                    expression("g(x)=0.5x^2-2", id: "g", color: "#c74440"),
+                    expression("y=2", id: "line", color: "#388c46")]
+        case "parameter":
+            return [expression("f(x)=a*sin(x)", id: "curve", color: "#2d70b3"),
+                    expression("a=1", id: "parameter", color: "#c74440")]
+        case "derivative":
+            return [expression("f(x)=x^2", id: "function", color: "#2d70b3"),
+                    expression("f'(2)", id: "derivative", color: "#c74440")]
+        case "integral":
+            return [expression("f(x)=x^2", id: "function", color: "#2d70b3"),
+                    expression("integral(f(x),0,2)", id: "integral", color: "#c74440")]
+        case "error":
+            return [expression("f(x)=sin(", id: "invalid", color: "#c74440")]
+        default:
+            return [expression("f(x)=sin(x)", id: "f", color: "#2d70b3")]
         }
     }
 
-    final class Coordinator: NSObject {
-        var parent: CursorAwareMathField
-        var lastInsertionID: UUID?
-        init(parent: CursorAwareMathField) { self.parent = parent }
-        @objc func changed(_ field: UITextField) {
-            let updated = field.text ?? ""
-            parent.text = updated
-            parent.onChange(updated)
-        }
+    private func expression(_ source: String, id: String, color: String) -> GraphExpression {
+        GraphExpression(
+            id: id, latex: source, type: GraphExpressionInference.type(for: source),
+            displayStyle: GraphExpressionDisplayStyle(color: color, lineWidth: 2.5)
+        )
     }
 }
+#endif
 
 #if DEBUG
 private struct GraphPromotionDebugStatus: View {
@@ -2639,13 +2809,14 @@ private struct GraphProviderHost: UIViewRepresentable {
 @MainActor
 struct GraphNativeFallbackSurface: UIViewRepresentable {
     let graph: GraphObject
+    var showsMetadata = true
 
     func makeUIView(context: Context) -> GraphFallbackHostView {
-        GraphFallbackHostView(graph: graph)
+        GraphFallbackHostView(graph: graph, showsMetadata: showsMetadata)
     }
 
     func updateUIView(_ uiView: GraphFallbackHostView, context: Context) {
-        uiView.update(graph: graph)
+        uiView.update(graph: graph, showsMetadata: showsMetadata)
     }
 }
 
@@ -2654,9 +2825,11 @@ final class GraphFallbackHostView: UIView {
     private var graph: GraphObject
     private var renderedSize = CGSize.zero
     private var graphLayer: CALayer?
+    private var showsMetadata: Bool
 
-    init(graph: GraphObject) {
+    init(graph: GraphObject, showsMetadata: Bool = true) {
         self.graph = graph
+        self.showsMetadata = showsMetadata
         super.init(frame: .zero)
         overrideUserInterfaceStyle = VBoardCanvasTheme.interfaceStyle
         backgroundColor = CanvasDesignTokens.boardSurface
@@ -2675,9 +2848,11 @@ final class GraphFallbackHostView: UIView {
         rebuild()
     }
 
-    func update(graph: GraphObject) {
-        guard self.graph != graph else { return }
+    func update(graph: GraphObject, showsMetadata: Bool? = nil) {
+        let nextShowsMetadata = showsMetadata ?? self.showsMetadata
+        guard self.graph != graph || self.showsMetadata != nextShowsMetadata else { return }
         self.graph = graph
+        self.showsMetadata = nextShowsMetadata
         rebuild()
     }
 
@@ -2685,10 +2860,21 @@ final class GraphFallbackHostView: UIView {
         guard bounds.width > 1, bounds.height > 1 else { return }
         renderedSize = bounds.size
         let scale = window?.screen.scale ?? UIScreen.main.scale
-        let image = GraphProxyCache.shared.nativeImage(
-            for: graph, size: bounds.size, scale: scale,
-            appearance: VBoardCanvasTheme.interfaceStyle
-        )
+        let image: UIImage
+        if showsMetadata {
+            image = GraphProxyCache.shared.nativeImage(
+                for: graph, size: bounds.size, scale: scale,
+                appearance: VBoardCanvasTheme.interfaceStyle
+            )
+        } else {
+            let localGraph = graph.replacing(frame: GraphFrame(
+                x: 0, y: 0, width: Double(max(bounds.width, GraphFrame.minimumDimension)),
+                height: Double(max(bounds.height, GraphFrame.minimumDimension))
+            ))
+            image = GraphFallbackRenderer.image(
+                for: localGraph, scale: scale, showsMetadata: false
+            )
+        }
         let replacement = CALayer()
         replacement.name = "graph:\(graph.id):cached-proxy"
         replacement.contents = image.cgImage

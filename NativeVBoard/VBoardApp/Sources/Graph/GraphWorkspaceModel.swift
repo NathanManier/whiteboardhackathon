@@ -92,6 +92,46 @@ enum GraphMathInsertionPlan {
     }
 }
 
+enum GraphViewportNavigation {
+    static func zoomed(_ source: GraphViewport, by factor: Double,
+                       anchor: CGPoint? = nil, size: CGSize? = nil) -> GraphViewport {
+        let safe = min(4, max(0.25, factor))
+        let oldWidth = source.xMax - source.xMin
+        let oldHeight = source.yMax - source.yMin
+        let xFraction: Double
+        let yFraction: Double
+        if let anchor, let size {
+            xFraction = min(1, max(0, Double(anchor.x / max(size.width, 1))))
+            yFraction = min(1, max(0, Double(anchor.y / max(size.height, 1))))
+        } else {
+            xFraction = 0.5
+            yFraction = 0.5
+        }
+        let anchorX = source.xMin + oldWidth * xFraction
+        let anchorY = source.yMax - oldHeight * yFraction
+        let newWidth = min(1_000_000, max(0.001, oldWidth * safe))
+        let newHeight = min(1_000_000, max(0.001, oldHeight * safe))
+        return source.replacingBounds(with: GraphViewport(
+            xMin: anchorX - newWidth * xFraction,
+            xMax: anchorX + newWidth * (1 - xFraction),
+            yMin: anchorY - newHeight * (1 - yFraction),
+            yMax: anchorY + newHeight * yFraction
+        ))
+    }
+
+    static func panned(_ source: GraphViewport, by translation: CGSize,
+                       size: CGSize) -> GraphViewport {
+        let xRange = source.xMax - source.xMin
+        let yRange = source.yMax - source.yMin
+        let dx = -Double(translation.width / max(size.width, 1)) * xRange
+        let dy = Double(translation.height / max(size.height, 1)) * yRange
+        return source.replacingBounds(with: GraphViewport(
+            xMin: source.xMin + dx, xMax: source.xMax + dx,
+            yMin: source.yMin + dy, yMax: source.yMax + dy
+        ))
+    }
+}
+
 @MainActor
 final class GraphWorkspaceModel: ObservableObject {
     typealias ExpressionMutationSink = (GraphObject) -> Void
@@ -226,11 +266,25 @@ final class GraphWorkspaceModel: ObservableObject {
         }
         let environment = mathEnvironment
         guard let value = environment.variables[definition.name] else { return nil }
+        let suppliedMinimum = number(expression.additionalFields["slider_min"]) ?? -10
+        let suppliedMaximum = number(expression.additionalFields["slider_max"]) ?? 10
+        let minimum: Double
+        let maximum: Double
+        if suppliedMinimum < suppliedMaximum {
+            minimum = suppliedMinimum
+            maximum = suppliedMaximum
+        } else if suppliedMaximum < suppliedMinimum {
+            minimum = suppliedMaximum
+            maximum = suppliedMinimum
+        } else {
+            minimum = suppliedMinimum - 1
+            maximum = suppliedMaximum + 1
+        }
+        let suppliedStep = number(expression.additionalFields["slider_step"]) ?? 0.1
         return GraphParameterSlider(
             name: definition.name, value: value,
-            minimum: number(expression.additionalFields["slider_min"]) ?? -10,
-            maximum: number(expression.additionalFields["slider_max"]) ?? 10,
-            step: max(0.000_001, number(expression.additionalFields["slider_step"]) ?? 0.1)
+            minimum: minimum, maximum: maximum,
+            step: max(0.000_001, suppliedStep)
         )
     }
 
@@ -243,7 +297,7 @@ final class GraphWorkspaceModel: ObservableObject {
 
     @discardableResult
     func addParameter(named name: String, value: Double = 1) -> String? {
-        guard GraphMathEnvironment.empty.undefinedSliderParameters(in: name) == [name],
+        guard GraphMathEnvironment.scalarDefinition(in: "\(name)=1")?.name == name,
               mathEnvironment.variables[name] == nil else { return nil }
         return addExpression(source: "\(name)=\(Self.format(value))")
     }
