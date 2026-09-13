@@ -31,9 +31,9 @@ final class WorkspaceAppearanceTests: XCTestCase {
         let high = PencilPressureResponse.curved(0.9)
         XCTAssertLessThan(low, middle)
         XCTAssertLessThan(middle, high)
-        XCTAssertEqual(PencilPressureResponse.widthMultiplier(for: 0), 0.55,
+        XCTAssertEqual(PencilPressureResponse.widthMultiplier(for: 0), 0.45,
                        accuracy: 0.000_01)
-        XCTAssertEqual(PencilPressureResponse.widthMultiplier(for: 1), 1.65,
+        XCTAssertEqual(PencilPressureResponse.widthMultiplier(for: 1), 1.85,
                        accuracy: 0.000_01)
         let smoothed = PencilPressureResponse.smoothed(previous: 0.2, sample: 1)
         XCTAssertGreaterThan(smoothed, 0.2)
@@ -84,6 +84,49 @@ final class WorkspaceAppearanceTests: XCTestCase {
         XCTAssertEqual(source, CGRect(x: 0, y: 0, width: 3024, height: 4032))
         XCTAssertEqual(workspace.width, source.width)
         XCTAssertEqual(workspace.height, source.height * 1.5)
+    }
+
+    func testBoardExpansionTriggers160ScreenPointsBeforeBottomAndGrowsByWidthChunk() throws {
+        let source = CGSize(width: 1_000, height: 600)
+        let current = BoardSurfaceGeometry.workspaceRegion(sourceSize: source)
+        XCTAssertNil(BoardAutoExpansionPolicy.expandedLocalRegion(
+            current: current, sourceSize: source,
+            contactY: current.maxY - 161, cameraScale: 1
+        ))
+        let expanded = try XCTUnwrap(BoardAutoExpansionPolicy.expandedLocalRegion(
+            current: current, sourceSize: source,
+            contactY: current.maxY - 159, cameraScale: 1
+        ))
+        XCTAssertEqual(expanded.minX, 0)
+        XCTAssertEqual(expanded.width, source.width)
+        XCTAssertEqual(expanded.height, current.height + source.width * 0.33,
+                       accuracy: 0.001)
+    }
+
+    func testBoardExpansionConvertsScreenMarginThroughCameraAndNeverGrowsSideways() throws {
+        let source = CGSize(width: 800, height: 500)
+        let current = CGRect(x: -300, y: -200, width: 1_500, height: 950)
+        let expanded = try XCTUnwrap(BoardAutoExpansionPolicy.expandedLocalRegion(
+            current: current, sourceSize: source,
+            contactY: current.maxY - 310, cameraScale: 0.5
+        ))
+        XCTAssertEqual(expanded, CGRect(x: 0, y: 0, width: 800,
+                                       height: current.maxY + 800 * 0.33))
+        let preserved = BoardAutoExpansionPolicy.fixedWidthLocalRegion(
+            current: expanded, content: CGRect(x: -2_000, y: 0, width: 5_000, height: 400),
+            sourceSize: source
+        )
+        XCTAssertEqual(preserved.minX, 0)
+        XCTAssertEqual(preserved.width, 800)
+        XCTAssertEqual(preserved.height, expanded.height)
+    }
+
+    func testOnlyPhysicalAndBlankBoardsUseDownwardAutoExpansion() {
+        XCTAssertTrue(BoardAutoExpansionPolicy.isEligible(.physicalWhiteboard))
+        XCTAssertTrue(BoardAutoExpansionPolicy.isEligible(.blankBoard))
+        XCTAssertFalse(BoardAutoExpansionPolicy.isEligible(.genericPDF))
+        XCTAssertFalse(BoardAutoExpansionPolicy.isEligible(.freeformPDF))
+        XCTAssertFalse(BoardAutoExpansionPolicy.isEligible(.image))
     }
 
     func testThumbnailAspectFillCropsPortraitLandscapeSquareAndTallSources() {

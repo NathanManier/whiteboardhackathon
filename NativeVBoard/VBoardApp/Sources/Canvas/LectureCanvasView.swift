@@ -239,6 +239,7 @@ struct LectureCanvasView: UIViewRepresentable {
     var onSelectionChanged: (Set<SelectionKey>, [String: CGRect]) -> Void
     var onSelectionScreenBoundsChanged: (CGRect?) -> Void
     var onStroke: (UserStroke, String) -> Void
+    var onBoardExpansionRequested: (String, CGRect) -> Void = { _, _ in }
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeSelection: (Set<SelectionKey>, CGPoint, CGFloat) -> Void
     var onDelete: (Set<SelectionKey>) -> Void
@@ -290,6 +291,7 @@ struct LectureCanvasView: UIViewRepresentable {
                                onSelectionChanged: onSelectionChanged,
                                onSelectionScreenBoundsChanged: onSelectionScreenBoundsChanged,
                                onStroke: onStroke,
+                               onBoardExpansionRequested: onBoardExpansionRequested,
                                onMoveSelection: onMoveSelection,
                                onResizeSelection: onResizeSelection,
                                onDelete: onDelete,
@@ -311,6 +313,7 @@ struct LectureCanvasCallbacks {
     var onSelectionChanged: (Set<SelectionKey>, [String: CGRect]) -> Void
     var onSelectionScreenBoundsChanged: (CGRect?) -> Void
     var onStroke: (UserStroke, String) -> Void
+    var onBoardExpansionRequested: (String, CGRect) -> Void = { _, _ in }
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeSelection: (Set<SelectionKey>, CGPoint, CGFloat) -> Void
     var onDelete: (Set<SelectionKey>) -> Void
@@ -1347,6 +1350,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             return sample(sampleLocal, touch: $0)
         })
         liveStrokePoints = strokeAccumulator.canonicalPoints
+        requestAutoExpansion(boardID: item.boardID, points: liveStrokePoints)
         boardViews[item.boardID]?.showLiveStroke(points: liveStrokePoints,
                                                 color: strokeColor,
                                                 width: strokeWidth,
@@ -1387,6 +1391,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             })
             liveStrokePoints = strokeAccumulator.canonicalPoints
             predictedStrokePoints = strokeAccumulator.predicted
+            requestAutoExpansion(boardID: boardID, points: liveStrokePoints)
             boardViews[boardID]?.showLiveStroke(points: strokeAccumulator.livePoints,
                                                 color: strokeColor,
                                                 width: strokeWidth,
@@ -1452,6 +1457,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                     return sample(sampleLocal, touch: $0)
                 })
                 liveStrokePoints = strokeAccumulator.canonicalPoints
+                requestAutoExpansion(boardID: boardID, points: liveStrokePoints)
             }
             if !liveStrokePoints.isEmpty {
                 let stroke = UserStroke(id: strokeID,
@@ -1697,6 +1703,20 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             setErasePreview(keys: fresh, hidden: true)
             interaction = .erasing(boardID: boardID ?? fresh.first?.boardID, erased: already.union(fresh))
         }
+    }
+
+    private func requestAutoExpansion(boardID: String, points: [StrokePoint]) {
+        guard let contactY = points.lazy.map(\.y).max(),
+              let item = workspace.items.first(where: { $0.boardID == boardID }),
+              BoardAutoExpansionPolicy.isEligible(item.sourceKind) else { return }
+        let currentLocal = item.effectiveFrame.offsetBy(dx: -CGFloat(item.canvasX),
+                                                        dy: -CGFloat(item.canvasY))
+        guard let expanded = BoardAutoExpansionPolicy.expandedLocalRegion(
+            current: currentLocal,
+            sourceSize: CGSize(width: item.boardWidth, height: item.boardHeight),
+            contactY: CGFloat(contactY), cameraScale: worldTransform.scale
+        ) else { return }
+        callbacks.onBoardExpansionRequested(boardID, expanded)
     }
 
     private func setErasePreview(keys: Set<SelectionKey>, hidden: Bool) {

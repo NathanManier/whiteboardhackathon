@@ -319,6 +319,11 @@ struct LectureWorkspaceView: View {
                         }
                     },
                     onStroke: { stroke, boardID in store.applyStroke(stroke, boardID: boardID, api: api) },
+                    onBoardExpansionRequested: { boardID, localRegion in
+                        store.expandBoardDownward(boardID: boardID,
+                                                  to: localRegion,
+                                                  api: api)
+                    },
                     onMoveSelection: { keys, delta in store.moveSelection(keys, by: delta, api: api) },
                     onResizeSelection: { keys, anchor, scale in
                         store.resizeSelection(keys, around: anchor, by: scale, api: api)

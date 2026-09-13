@@ -387,6 +387,41 @@ enum BoardSurfaceGeometry {
     }
 }
 
+/// Downward-only writing-room policy for photographed and blank boards. The
+/// source rectangle remains immutable; only the separately persisted workspace
+/// region grows, so professor pixels/paths and every existing object keep the
+/// same board-local coordinates.
+enum BoardAutoExpansionPolicy {
+    static let triggerScreenPoints: CGFloat = 160
+    static let chunkSourceWidthFraction: CGFloat = 0.33
+
+    static func isEligible(_ sourceKind: BoardSourceKind) -> Bool {
+        sourceKind == .physicalWhiteboard || sourceKind == .blankBoard
+    }
+
+    static func expandedLocalRegion(current: CGRect, sourceSize: CGSize,
+                                    contactY: CGFloat, cameraScale: CGFloat) -> CGRect? {
+        guard sourceSize.width > 0, sourceSize.height > 0,
+              contactY.isFinite, cameraScale.isFinite, cameraScale > 0 else { return nil }
+        let base = BoardSurfaceGeometry.workspaceRegion(sourceSize: sourceSize)
+        let currentBottom = max(base.maxY, current.maxY)
+        let triggerMargin = triggerScreenPoints / cameraScale
+        guard contactY >= currentBottom - triggerMargin else { return nil }
+
+        let chunk = max(1, sourceSize.width * chunkSourceWidthFraction)
+        var nextBottom = currentBottom + chunk
+        while nextBottom - contactY < triggerMargin { nextBottom += chunk }
+        return CGRect(x: 0, y: 0, width: sourceSize.width, height: nextBottom)
+    }
+
+    static func fixedWidthLocalRegion(current: CGRect, content: CGRect,
+                                      sourceSize: CGSize) -> CGRect {
+        let base = BoardSurfaceGeometry.workspaceRegion(sourceSize: sourceSize)
+        return CGRect(x: 0, y: 0, width: base.width,
+                      height: max(base.maxY, current.maxY, content.maxY))
+    }
+}
+
 enum ThumbnailCropPolicy {
     /// Aspect-fill geometry used only by cards/previews. Canonical board
     /// dimensions and the professor source rectangle are never changed.

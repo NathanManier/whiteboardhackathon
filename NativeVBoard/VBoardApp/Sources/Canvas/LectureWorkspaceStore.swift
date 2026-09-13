@@ -374,6 +374,28 @@ final class LectureWorkspaceStore: ObservableObject {
         refreshSceneSnapshot(boardID, api: api)
     }
 
+    func expandBoardDownward(boardID: String, to localRegion: CGRect, api: APIClient) {
+        guard var current = workspace,
+              let index = current.items.firstIndex(where: { $0.boardID == boardID }) else { return }
+        let item = current.items[index]
+        guard BoardAutoExpansionPolicy.isEligible(item.sourceKind),
+              localRegion.width.isFinite, localRegion.height.isFinite else { return }
+        let existingLocal = item.effectiveFrame.offsetBy(dx: -CGFloat(item.canvasX),
+                                                         dy: -CGFloat(item.canvasY))
+        let nextLocal = BoardAutoExpansionPolicy.fixedWidthLocalRegion(
+            current: existingLocal, content: localRegion,
+            sourceSize: CGSize(width: item.boardWidth, height: item.boardHeight)
+        )
+        let nextLecture = LectureCoordinateTransform.boardLocalToLectureWorld(nextLocal,
+                                                                               board: item)
+        let next = CameraRect(x: nextLecture.minX, y: nextLecture.minY,
+                              width: nextLecture.width, height: nextLecture.height)
+        guard next != item.effectiveContentBounds else { return }
+        current.items[index].effectiveContentBounds = next
+        workspace = current
+        markDirty(api: api)
+    }
+
     func moveSelection(_ keys: Set<SelectionKey>, by lectureDelta: CGPoint, api: APIClient) {
         let grouped = Dictionary(grouping: keys, by: \.boardID)
         let affected = grouped.keys.filter { boardStores[$0] != nil }.sorted()
@@ -805,6 +827,14 @@ final class LectureWorkspaceStore: ObservableObject {
             guard
                   let transformed = path.copy(using: &affine) else { continue }
             local = local.union(transformed.boundingBoxOfPath)
+        }
+        if BoardAutoExpansionPolicy.isEligible(item.sourceKind) {
+            let existingLocal = item.effectiveFrame.offsetBy(dx: -CGFloat(item.canvasX),
+                                                             dy: -CGFloat(item.canvasY))
+            local = BoardAutoExpansionPolicy.fixedWidthLocalRegion(
+                current: existingLocal, content: local,
+                sourceSize: CGSize(width: item.boardWidth, height: item.boardHeight)
+            )
         }
         let lecture = LectureCoordinateTransform.boardLocalToLectureWorld(local, board: item)
         let next = CameraRect(x: lecture.minX, y: lecture.minY,
