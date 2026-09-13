@@ -372,6 +372,24 @@ struct LectureWorkspaceView: View {
                             store.replaceGraph(updated, boardID: owningBoardID, api: api)
                             if interactiveGraph?.id == graphID { interactiveGraph = updated }
                         },
+                        onCommitGraph: { updated in
+                            guard updated.id == graph.id,
+                                  updated.owningBoardID == graph.owningBoardID else { return }
+                            store.replaceGraph(
+                                updated, boardID: updated.owningBoardID, api: api
+                            )
+                            interactiveGraph = updated
+                        },
+                        onExplain: { openStudy(action: "explain") },
+                        onPractice: { openStudy(action: "practice_problems") },
+                        onDelete: {
+                            store.deleteSelection(Set([SelectionKey(
+                                boardID: graph.owningBoardID,
+                                objectID: graph.id,
+                                kind: .editorObject,
+                                objectType: "graph"
+                            )]), api: api)
+                        },
                         onEdit: {
                             editingGraph = store.scenes[graph.owningBoardID]?.editor.objects
                                 .first(where: { $0.id == graph.id })?.graph ?? graph
@@ -379,8 +397,9 @@ struct LectureWorkspaceView: View {
                         },
                         onDone: { interactiveGraph = nil }
                     )
-                    .frame(width: max(rect.width, 1), height: max(rect.height, 1))
-                    .position(x: rect.midX, y: rect.midY)
+                    .frame(width: max(proxy.size.width - 32, 1),
+                           height: max(proxy.size.height - 112, 1))
+                    .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
                     .shadow(color: .black.opacity(0.16), radius: 10, y: 4)
                     .zIndex(20)
                 }

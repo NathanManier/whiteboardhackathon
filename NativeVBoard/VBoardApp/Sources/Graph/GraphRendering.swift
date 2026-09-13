@@ -594,7 +594,7 @@ enum GraphFallbackRenderer {
         axes.frame = frame
         axes.path = axesPath.cgPath
         axes.fillColor = UIColor.clear.cgColor
-        axes.strokeColor = UIColor.label.withAlphaComponent(0.64).cgColor
+        axes.strokeColor = CanvasDesignTokens.canvasPrimaryText.withAlphaComponent(0.64).cgColor
         axes.lineWidth = 1.25 / max(contentsScale, 1)
         axes.contentsScale = contentsScale
         container.addSublayer(axes)
@@ -641,7 +641,7 @@ enum GraphFallbackRenderer {
             let label = CATextLayer()
             label.frame = frame.insetBy(dx: 10, dy: 10)
             label.alignmentMode = .left
-            label.foregroundColor = UIColor.secondaryLabel.cgColor
+            label.foregroundColor = CanvasDesignTokens.canvasSecondaryText.cgColor
             label.fontSize = 11
             label.contentsScale = contentsScale
             label.isWrapped = true
@@ -660,7 +660,7 @@ enum GraphFallbackRenderer {
         if !readable.isEmpty {
             let background = CALayer()
             background.frame = CGRect(x: 7, y: 7, width: max(1, frame.width - 14), height: 25)
-            background.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.86).cgColor
+            background.backgroundColor = CanvasDesignTokens.toolbarSurface.withAlphaComponent(0.86).cgColor
             background.cornerRadius = 6
             container.addSublayer(background)
 
@@ -668,7 +668,7 @@ enum GraphFallbackRenderer {
             label.frame = background.bounds.insetBy(dx: 7, dy: 4)
             label.string = readable
             label.fontSize = 11
-            label.foregroundColor = UIColor.label.cgColor
+            label.foregroundColor = CanvasDesignTokens.canvasPrimaryText.cgColor
             label.truncationMode = .end
             label.contentsScale = contentsScale
             background.addSublayer(label)
@@ -746,7 +746,8 @@ enum GraphFallbackSampler {
             path.append(UIBezierPath(ovalIn: CGRect(x: center.x - 4, y: center.y - 4,
                                                     width: 8, height: 8)))
         case GraphExpressionType.implicitEquation.rawValue:
-            appendSimpleImplicit(expression.latex, to: path, viewport: viewport, frame: frame)
+            appendImplicit(expression.latex, to: path, viewport: viewport, frame: frame,
+                           angleMode: angleMode)
         case GraphExpressionType.inequality.rawValue:
             if let relation = GraphEquationClassifier.relation(in: expression.latex),
                relation.left == "x",
@@ -865,22 +866,59 @@ enum GraphFallbackSampler {
                        y: frame.maxY - CGFloat(ny) * frame.height)
     }
 
-    private static func appendSimpleImplicit(_ latex: String, to path: UIBezierPath,
-                                             viewport: GraphViewport, frame: CGRect) {
-        // Useful offline support for the common classroom circle form. More
-        // general implicit relations remain available through the provider.
-        guard let radius = GraphEquationClassifier.originCircleRadius(in: latex), radius > 0 else {
-            return
+    private static func appendImplicit(_ latex: String, to path: UIBezierPath,
+                                       viewport: GraphViewport, frame: CGRect,
+                                       angleMode: String?) {
+        guard let relation = GraphEquationClassifier.relation(in: latex),
+              relation.operation == "=",
+              let lhs = try? SafeGraphExpression(source: relation.left,
+                                                  angleMode: angleMode),
+              let rhs = try? SafeGraphExpression(source: relation.right,
+                                                  angleMode: angleMode) else { return }
+        // Marching squares is derived display geometry. A bounded grid keeps
+        // it deterministic and safe while supporting general classroom
+        // relations such as x^2+y^2=1 without provider code or network access.
+        let columns = max(36, min(120, Int(frame.width / 5)))
+        let rows = max(36, min(120, Int(frame.height / 5)))
+        let dx = (viewport.xMax - viewport.xMin) / Double(columns)
+        let dy = (viewport.yMax - viewport.yMin) / Double(rows)
+        func value(_ x: Double, _ y: Double) -> Double {
+            lhs.evaluate(x: x, y: y) - rhs.evaluate(x: x, y: y)
         }
-        let rect = CGRect(
-            x: map(x: -radius, y: 0, viewport: viewport, frame: frame).x,
-            y: map(x: 0, y: radius, viewport: viewport, frame: frame).y,
-            width: abs(map(x: radius, y: 0, viewport: viewport, frame: frame).x
-                       - map(x: -radius, y: 0, viewport: viewport, frame: frame).x),
-            height: abs(map(x: 0, y: -radius, viewport: viewport, frame: frame).y
-                        - map(x: 0, y: radius, viewport: viewport, frame: frame).y)
-        )
-        path.append(UIBezierPath(ovalIn: rect))
+        func crossing(_ a: (Double, Double, Double),
+                      _ b: (Double, Double, Double)) -> CGPoint? {
+            guard a.2.isFinite, b.2.isFinite,
+                  (a.2 == 0 || b.2 == 0 || (a.2 < 0) != (b.2 < 0)) else { return nil }
+            let denominator = abs(a.2) + abs(b.2)
+            let t = denominator > 1e-14 ? abs(a.2) / denominator : 0.5
+            return map(x: a.0 + (b.0 - a.0) * t,
+                       y: a.1 + (b.1 - a.1) * t,
+                       viewport: viewport, frame: frame)
+        }
+        for row in 0..<rows {
+            let y0 = viewport.yMin + Double(row) * dy
+            let y1 = y0 + dy
+            for column in 0..<columns {
+                let x0 = viewport.xMin + Double(column) * dx
+                let x1 = x0 + dx
+                let corners = [
+                    (x0, y0, value(x0, y0)), (x1, y0, value(x1, y0)),
+                    (x1, y1, value(x1, y1)), (x0, y1, value(x0, y1)),
+                ]
+                let edgePoints = [crossing(corners[0], corners[1]),
+                                  crossing(corners[1], corners[2]),
+                                  crossing(corners[2], corners[3]),
+                                  crossing(corners[3], corners[0])].compactMap { $0 }
+                if edgePoints.count == 2 {
+                    path.move(to: edgePoints[0]); path.addLine(to: edgePoints[1])
+                } else if edgePoints.count == 4 {
+                    // Ambiguous saddle: pair adjacent crossings. This avoids
+                    // drawing a false diagonal through the cell center.
+                    path.move(to: edgePoints[0]); path.addLine(to: edgePoints[1])
+                    path.move(to: edgePoints[2]); path.addLine(to: edgePoints[3])
+                }
+            }
+        }
     }
 }
 
@@ -971,6 +1009,7 @@ enum GraphLatexNormalizer {
             ("\\geq", ">="), ("\\ge", ">="), ("\\leq", "<="), ("\\le", "<="),
             ("\\pi", "pi"), ("π", "pi"), ("²", "^2"), ("³", "^3"),
             ("\\sin", "sin"), ("\\cos", "cos"), ("\\tan", "tan"),
+            ("\\arcsin", "asin"), ("\\arccos", "acos"), ("\\arctan", "atan"),
             ("\\log", "log"), ("\\ln", "ln"), ("\\exp", "exp"),
             ("\\abs", "abs")
         ]
@@ -1038,19 +1077,19 @@ struct SafeGraphExpression {
 
     private indirect enum Node {
         case number(Double)
-        case variable
+        case variable(String)
         case negated(Node)
         case binary(Character, Node, Node)
         case function(String, Node)
 
-        func evaluate(x: Double, usesDegrees: Bool) -> Double {
+        func evaluate(x: Double, y: Double, usesDegrees: Bool) -> Double {
             switch self {
             case .number(let value): return value
-            case .variable: return x
-            case .negated(let value): return -value.evaluate(x: x, usesDegrees: usesDegrees)
+            case .variable(let name): return name == "y" ? y : x
+            case .negated(let value): return -value.evaluate(x: x, y: y, usesDegrees: usesDegrees)
             case .binary(let operation, let lhs, let rhs):
-                let a = lhs.evaluate(x: x, usesDegrees: usesDegrees)
-                let b = rhs.evaluate(x: x, usesDegrees: usesDegrees)
+                let a = lhs.evaluate(x: x, y: y, usesDegrees: usesDegrees)
+                let b = rhs.evaluate(x: x, y: y, usesDegrees: usesDegrees)
                 switch operation {
                 case "+": return a + b
                 case "-": return a - b
@@ -1064,12 +1103,23 @@ struct SafeGraphExpression {
                 default: return .nan
                 }
             case .function(let name, let value):
-                let argument = value.evaluate(x: x, usesDegrees: usesDegrees)
+                let argument = value.evaluate(x: x, y: y, usesDegrees: usesDegrees)
                 let trigArgument = usesDegrees ? argument * .pi / 180 : argument
                 switch name {
                 case "sin": return Foundation.sin(trigArgument)
                 case "cos": return Foundation.cos(trigArgument)
                 case "tan": return Foundation.tan(trigArgument)
+                case "asin":
+                    guard (-1...1).contains(argument) else { return .nan }
+                    let result = Foundation.asin(argument)
+                    return usesDegrees ? result * 180 / .pi : result
+                case "acos":
+                    guard (-1...1).contains(argument) else { return .nan }
+                    let result = Foundation.acos(argument)
+                    return usesDegrees ? result * 180 / .pi : result
+                case "atan":
+                    let result = Foundation.atan(argument)
+                    return usesDegrees ? result * 180 / .pi : result
                 case "sqrt": return argument < 0 ? .nan : Foundation.sqrt(argument)
                 case "abs": return Swift.abs(argument)
                 case "exp": return Foundation.exp(argument)
@@ -1113,14 +1163,22 @@ struct SafeGraphExpression {
     }
 
     func evaluate(x: Double) -> Double {
+        evaluate(x: x, y: 0)
+    }
+
+    func evaluate(x: Double, y: Double) -> Double {
         guard x.isFinite, abs(x) <= 10_000_000 else { return .nan }
-        let result = root.evaluate(x: x, usesDegrees: usesDegrees)
+        guard y.isFinite, abs(y) <= 10_000_000 else { return .nan }
+        let result = root.evaluate(x: x, y: y, usesDegrees: usesDegrees)
         guard result.isFinite, abs(result) <= Self.maximumMagnitude else { return .nan }
         return result
     }
 
     private struct Parser {
-        private static let functions = Set(["sin", "cos", "tan", "sqrt", "abs", "exp", "log", "ln"])
+        private static let functions = Set([
+            "sin", "cos", "tan", "asin", "acos", "atan",
+            "sqrt", "abs", "exp", "log", "ln"
+        ])
         private var tokens: [Token]
         private var index = 0
         private var nodeCount = 0
@@ -1195,7 +1253,7 @@ struct SafeGraphExpression {
             case .number(let value): consume(); return try make(.number(value))
             case .identifier(let name):
                 consume()
-                if name == "x" { return try make(.variable) }
+                if name == "x" || name == "y" { return try make(.variable(name)) }
                 if name == "pi" { return try make(.number(.pi)) }
                 if name == "e" { return try make(.number(M_E)) }
                 guard Self.functions.contains(name) else {
@@ -1283,5 +1341,233 @@ struct SafeGraphExpression {
             }
             return result
         }
+    }
+}
+
+enum NativeGraphSolutionKind: String, Equatable, Sendable {
+    case calculation, linear, quadratic, numericalRoots, intersections,
+         derivative, definiteIntegral, unsupportedIndefiniteIntegral
+}
+
+struct NativeGraphMathResult: Equatable, Sendable {
+    let kind: NativeGraphSolutionKind
+    let values: [Double]
+    let message: String
+    let isExact: Bool
+}
+
+/// Local, typed-AST-backed classroom math tools. Every operation is bounded;
+/// input is parsed by SafeGraphExpression and is never passed to eval, a web
+/// provider, Python, or another arbitrary-code runtime.
+enum NativeGraphMath {
+    static func calculate(_ source: String, angleMode: String? = "radians")
+        throws -> NativeGraphMathResult {
+        let expression = try SafeGraphExpression(source: source, angleMode: angleMode)
+        guard !expression.usesVariable else {
+            throw GraphRendererError.invalidExpression("numeric expression contains a variable")
+        }
+        let value = expression.evaluate(x: 0, y: 0)
+        guard value.isFinite else { throw GraphRendererError.invalidExpression("undefined result") }
+        return NativeGraphMathResult(kind: .calculation, values: [value],
+                                     message: format(value), isExact: false)
+    }
+
+    static func solve(_ equation: String, domain: ClosedRange<Double>,
+                      angleMode: String? = "radians") throws -> NativeGraphMathResult {
+        if isUnboundedIntegral(equation) {
+            return NativeGraphMathResult(
+                kind: .unsupportedIndefiniteIntegral, values: [],
+                message: "This is an indefinite integral. Graph the integrand, enter bounds, or edit the expression.",
+                isExact: false
+            )
+        }
+        let evaluator = try equationEvaluator(equation, angleMode: angleMode)
+        let f0 = evaluator(0), f1 = evaluator(1), fm1 = evaluator(-1), f2 = evaluator(2)
+        if [f0, f1, fm1, f2].allSatisfy(\.isFinite) {
+            let a = (f1 + fm1) / 2 - f0
+            let b = (f1 - fm1) / 2
+            let c = f0
+            let predictedF2 = 4 * a + 2 * b + c
+            let tolerance = 1e-8 * max(1, abs(f2), abs(predictedF2))
+            let validationXs = [-2.0, 0.5, 1.5, 3.0]
+            let fitsQuadratic = abs(f2 - predictedF2) <= tolerance
+                && validationXs.allSatisfy { x in
+                    let actual = evaluator(x)
+                    let predicted = a * x * x + b * x + c
+                    return actual.isFinite
+                        && abs(actual - predicted)
+                            <= 1e-8 * max(1, abs(actual), abs(predicted))
+                }
+            if fitsQuadratic {
+                if abs(a) <= 1e-10, abs(b) > 1e-10 {
+                    let root = -c / b
+                    return NativeGraphMathResult(kind: .linear, values: [root],
+                                                 message: "x = \(format(root))",
+                                                 isExact: true)
+                }
+                if abs(a) > 1e-10 {
+                    let discriminant = b * b - 4 * a * c
+                    if discriminant < -tolerance {
+                        return NativeGraphMathResult(kind: .quadratic, values: [],
+                                                     message: "No real solutions",
+                                                     isExact: true)
+                    }
+                    let root = sqrt(max(0, discriminant))
+                    // Stable form avoids catastrophic cancellation when |b|
+                    // is much larger than the discriminant contribution.
+                    let q = -0.5 * (b + (b >= 0 ? root : -root))
+                    let roots: [Double]
+                    if abs(q) <= 1e-14 {
+                        roots = [-b / (2 * a)]
+                    } else {
+                        roots = deduplicated([q / a, c / q])
+                    }
+                    return NativeGraphMathResult(kind: .quadratic, values: roots,
+                                                 message: roots.map { "x = \(format($0))" }
+                                                    .joined(separator: ", "),
+                                                 isExact: true)
+                }
+            }
+        }
+        let roots = scanRoots(evaluator, domain: domain)
+        return NativeGraphMathResult(
+            kind: .numericalRoots, values: roots,
+            message: roots.isEmpty ? "No roots found in \(format(domain.lowerBound))…\(format(domain.upperBound))"
+                : roots.map { "x ≈ \(format($0))" }.joined(separator: ", "),
+            isExact: false
+        )
+    }
+
+    static func intersections(_ first: String, _ second: String,
+                              domain: ClosedRange<Double>,
+                              angleMode: String? = "radians") throws -> NativeGraphMathResult {
+        let lhs = try explicitExpression(first, angleMode: angleMode)
+        let rhs = try explicitExpression(second, angleMode: angleMode)
+        let roots = scanRoots({ lhs.evaluate(x: $0) - rhs.evaluate(x: $0) }, domain: domain)
+        var coordinates: [Double] = []
+        for x in roots { coordinates.append(contentsOf: [x, lhs.evaluate(x: x)]) }
+        let message = roots.enumerated().map { index, x in
+            "(\(format(x)), \(format(coordinates[index * 2 + 1])))"
+        }.joined(separator: ", ")
+        return NativeGraphMathResult(kind: .intersections, values: coordinates,
+                                     message: message.isEmpty ? "No intersections in the visible domain" : message,
+                                     isExact: false)
+    }
+
+    static func derivative(_ source: String, at x: Double,
+                           angleMode: String? = "radians") throws -> NativeGraphMathResult {
+        let expression = try explicitExpression(source, angleMode: angleMode)
+        let h = max(1e-6, abs(x) * 1e-5)
+        let value = (expression.evaluate(x: x - 2 * h)
+                     - 8 * expression.evaluate(x: x - h)
+                     + 8 * expression.evaluate(x: x + h)
+                     - expression.evaluate(x: x + 2 * h)) / (12 * h)
+        guard value.isFinite else { throw GraphRendererError.invalidExpression("derivative undefined") }
+        return NativeGraphMathResult(kind: .derivative, values: [value],
+                                     message: "f′(\(format(x))) ≈ \(format(value))", isExact: false)
+    }
+
+    static func integral(_ source: String, from a: Double, to b: Double,
+                         angleMode: String? = "radians") throws -> NativeGraphMathResult {
+        let expression = try explicitExpression(source, angleMode: angleMode)
+        let f: (Double) -> Double = { expression.evaluate(x: $0) }
+        let whole = simpson(f, a, b)
+        let value = adaptiveSimpson(f, a, b, epsilon: 1e-8, whole: whole, depth: 14)
+        guard value.isFinite else { throw GraphRendererError.invalidExpression("integral undefined") }
+        return NativeGraphMathResult(kind: .definiteIntegral, values: [value],
+                                     message: "∫ ≈ \(format(value))", isExact: false)
+    }
+
+    private static func explicitExpression(_ source: String, angleMode: String?) throws
+        -> SafeGraphExpression {
+        let rhs = GraphEquationClassifier.explicitRightHandSide(source) ?? source
+        return try SafeGraphExpression(source: rhs, angleMode: angleMode)
+    }
+
+    private static func equationEvaluator(_ source: String, angleMode: String?) throws
+        -> (Double) -> Double {
+        if let rhs = GraphEquationClassifier.explicitRightHandSide(source) {
+            let expression = try SafeGraphExpression(source: rhs, angleMode: angleMode)
+            return { expression.evaluate(x: $0) }
+        }
+        if let relation = GraphEquationClassifier.relation(in: source) {
+            let left = try SafeGraphExpression(source: relation.left, angleMode: angleMode)
+            let right = try SafeGraphExpression(source: relation.right, angleMode: angleMode)
+            return { left.evaluate(x: $0) - right.evaluate(x: $0) }
+        }
+        let expression = try SafeGraphExpression(source: source, angleMode: angleMode)
+        return { expression.evaluate(x: $0) }
+    }
+
+    private static func scanRoots(_ f: (Double) -> Double,
+                                  domain: ClosedRange<Double>) -> [Double] {
+        guard domain.lowerBound.isFinite, domain.upperBound.isFinite,
+              domain.upperBound > domain.lowerBound else { return [] }
+        let count = 1_024
+        let step = (domain.upperBound - domain.lowerBound) / Double(count)
+        var roots: [Double] = []
+        var x0 = domain.lowerBound
+        var y0 = f(x0)
+        for index in 1...count {
+            let x1 = index == count ? domain.upperBound : domain.lowerBound + Double(index) * step
+            let y1 = f(x1)
+            if y0.isFinite, abs(y0) < 1e-8 { roots.append(x0) }
+            if y0.isFinite, y1.isFinite, (y0 < 0) != (y1 < 0) {
+                var lower = x0, upper = x1, lowerValue = y0
+                for _ in 0..<64 {
+                    let midpoint = (lower + upper) / 2
+                    let middleValue = f(midpoint)
+                    guard middleValue.isFinite else { break }
+                    if abs(middleValue) < 1e-12 { lower = midpoint; upper = midpoint; break }
+                    if (lowerValue < 0) != (middleValue < 0) {
+                        upper = midpoint
+                    } else {
+                        lower = midpoint; lowerValue = middleValue
+                    }
+                }
+                roots.append((lower + upper) / 2)
+            }
+            x0 = x1; y0 = y1
+        }
+        if y0.isFinite, abs(y0) < 1e-8 { roots.append(domain.upperBound) }
+        return deduplicated(roots, tolerance: max(1e-7, step * 0.2))
+    }
+
+    private static func simpson(_ f: (Double) -> Double, _ a: Double, _ b: Double) -> Double {
+        let midpoint = (a + b) / 2
+        return (b - a) * (f(a) + 4 * f(midpoint) + f(b)) / 6
+    }
+
+    private static func adaptiveSimpson(_ f: (Double) -> Double, _ a: Double, _ b: Double,
+                                        epsilon: Double, whole: Double, depth: Int) -> Double {
+        let midpoint = (a + b) / 2
+        let left = simpson(f, a, midpoint)
+        let right = simpson(f, midpoint, b)
+        let delta = left + right - whole
+        if depth <= 0 || !delta.isFinite || abs(delta) <= 15 * epsilon {
+            return left + right + delta / 15
+        }
+        return adaptiveSimpson(f, a, midpoint, epsilon: epsilon / 2,
+                               whole: left, depth: depth - 1)
+            + adaptiveSimpson(f, midpoint, b, epsilon: epsilon / 2,
+                              whole: right, depth: depth - 1)
+    }
+
+    private static func deduplicated(_ values: [Double], tolerance: Double = 1e-8) -> [Double] {
+        values.sorted().reduce(into: []) { result, value in
+            if result.last.map({ abs($0 - value) > tolerance }) ?? true { result.append(value) }
+        }
+    }
+
+    private static func isUnboundedIntegral(_ source: String) -> Bool {
+        let compact = source.filter { !$0.isWhitespace }.lowercased()
+        return (compact.contains("∫") || compact.contains("\\int"))
+            && !compact.contains("_") && !compact.contains("from")
+    }
+
+    private static func format(_ value: Double) -> String {
+        guard value.isFinite else { return "undefined" }
+        if abs(value.rounded() - value) < 1e-10 { return String(Int(value.rounded())) }
+        return value.formatted(.number.precision(.significantDigits(1...8)))
     }
 }

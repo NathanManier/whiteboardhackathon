@@ -181,6 +181,9 @@ struct EditorNavigationGestureGuard: UIViewControllerRepresentable {
     @MainActor
     final class HostController: UIViewController {
         private let ownership = EditorBackSwipeOwnership()
+        #if DEBUG
+        private var loggedNavigationHierarchy = false
+        #endif
 
         override func viewWillAppear(_ animated: Bool) {
             super.viewWillAppear(animated)
@@ -198,13 +201,56 @@ struct EditorNavigationGestureGuard: UIViewControllerRepresentable {
         }
 
         func acquireNavigationGestureIfAvailable() {
-            guard let gesture = navigationController?.interactivePopGestureRecognizer else { return }
+            guard let navigationController,
+                  let gesture = navigationController.interactivePopGestureRecognizer else { return }
+            #if DEBUG
+            if !loggedNavigationHierarchy {
+                loggedNavigationHierarchy = true
+                logNavigationHierarchy(active: navigationController, gesture: gesture)
+            }
+            #endif
             ownership.acquire(gesture)
+            #if DEBUG
+            let navigationID = ObjectIdentifier(navigationController)
+            let popID = ObjectIdentifier(gesture)
+            let delegateDescription = String(describing: gesture.delegate)
+            print("[VBoard] NAV EDITOR GUARD activeNavigation=\(navigationID) pop=\(popID) enabledAfterAcquire=\(gesture.isEnabled) delegate=\(delegateDescription)")
+            #endif
         }
 
         func restoreNavigationGesture() {
             ownership.restore()
         }
+
+        #if DEBUG
+        private func logNavigationHierarchy(active: UINavigationController,
+                                            gesture: UIGestureRecognizer) {
+            var root: UIViewController = self
+            while let parent = root.parent { root = parent }
+            if let windowRoot = view.window?.rootViewController { root = windowRoot }
+            var visited = Set<ObjectIdentifier>()
+            var stack = [root]
+            var descriptions: [String] = []
+            while let controller = stack.popLast() {
+                let identifier = ObjectIdentifier(controller)
+                guard visited.insert(identifier).inserted else { continue }
+                if let navigation = controller as? UINavigationController {
+                    let pop = navigation.interactivePopGestureRecognizer
+                    let visibleID = String(describing: navigation.visibleViewController.map {
+                        ObjectIdentifier($0)
+                    })
+                    let popID = String(describing: pop.map { ObjectIdentifier($0) })
+                    let enabled = pop?.isEnabled.description ?? "missing"
+                    let delegate = String(describing: pop?.delegate)
+                    descriptions.append("nav=\(identifier) active=\(navigation === active) visible=\(visibleID) pop=\(popID) enabled=\(enabled) delegate=\(delegate)")
+                }
+                stack.append(contentsOf: controller.children)
+                if let presented = controller.presentedViewController { stack.append(presented) }
+            }
+            let summary = descriptions.joined(separator: " | ")
+            print("[VBoard] NAV CONTROLLER HIERARCHY host=\(ObjectIdentifier(self)) activePop=\(ObjectIdentifier(gesture)) controllers={\(summary)}")
+        }
+        #endif
     }
 }
 
@@ -476,6 +522,18 @@ private struct BoardEditorSurface: View {
                         store.replaceGraph(updated, api: api)
                         if interactiveGraph?.id == graphID { interactiveGraph = updated }
                     },
+                    onCommitGraph: { updated in
+                        guard updated.id == graph.id,
+                              updated.owningBoardID == board.id else { return }
+                        store.replaceGraph(updated, api: api)
+                        interactiveGraph = updated
+                    },
+                    onExplain: { openStudy("explain") },
+                    onPractice: { openStudy("practice_problems") },
+                    onDelete: {
+                        selectedIDs.remove(graph.id)
+                        store.deleteObjects(ids: Set([graph.id]), api: api)
+                    },
                     onEdit: {
                         editingGraph = store.editor.objects
                             .first(where: { $0.id == graph.id })?.graph ?? graph
@@ -483,8 +541,9 @@ private struct BoardEditorSurface: View {
                     },
                     onDone: { interactiveGraph = nil }
                 )
-                .frame(width: max(rect.width, 1), height: max(rect.height, 1))
-                .position(x: rect.midX, y: rect.midY)
+                .frame(width: max(proxy.size.width - 32, 1),
+                       height: max(proxy.size.height - 112, 1))
+                .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
                 .shadow(color: .black.opacity(0.16), radius: 10, y: 4)
                 .zIndex(20)
                 }

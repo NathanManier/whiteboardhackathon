@@ -591,7 +591,7 @@ final class GraphInteractiveSession: ObservableObject {
         if activeDemotionID == demotionID,
            activeDemotionAllowsSnapshot,
            snapshotMatchesFinalState,
-           let snapshot, let hostView {
+           let snapshot {
             GraphProxyCache.shared.storeProviderSnapshot(
                 snapshot, for: finalizedGraph,
                 appearance: VBoardCanvasTheme.interfaceStyle,
@@ -978,6 +978,10 @@ struct GraphInteractiveSurface: View {
     let onPencilStroke: (UserStroke) -> Void
     let onPencilRequestsPassiveMode: () -> Void
     let onCommitViewport: (String, String, GraphViewport) -> Void
+    let onCommitGraph: (GraphObject) -> Void
+    let onExplain: () -> Void
+    let onPractice: () -> Void
+    let onDelete: () -> Void
     let onEdit: () -> Void
     let onDone: () -> Void
     private let usesLightweightRenderer: Bool
@@ -994,6 +998,10 @@ struct GraphInteractiveSurface: View {
          onPencilStroke: @escaping (UserStroke) -> Void = { _ in },
          onPencilRequestsPassiveMode: @escaping () -> Void,
          onCommitViewport: @escaping (String, String, GraphViewport) -> Void,
+         onCommitGraph: @escaping (GraphObject) -> Void = { _ in },
+         onExplain: @escaping () -> Void = {},
+         onPractice: @escaping () -> Void = {},
+         onDelete: @escaping () -> Void = {},
          onEdit: @escaping () -> Void,
          onDone: @escaping () -> Void) {
         self.init(
@@ -1008,6 +1016,10 @@ struct GraphInteractiveSurface: View {
             onPencilStroke: onPencilStroke,
             onPencilRequestsPassiveMode: onPencilRequestsPassiveMode,
             onCommitViewport: onCommitViewport,
+            onCommitGraph: onCommitGraph,
+            onExplain: onExplain,
+            onPractice: onPractice,
+            onDelete: onDelete,
             onEdit: onEdit,
             onDone: onDone
         )
@@ -1024,6 +1036,10 @@ struct GraphInteractiveSurface: View {
          onPencilStroke: @escaping (UserStroke) -> Void = { _ in },
          onPencilRequestsPassiveMode: @escaping () -> Void,
          onCommitViewport: @escaping (String, String, GraphViewport) -> Void,
+         onCommitGraph: @escaping (GraphObject) -> Void = { _ in },
+         onExplain: @escaping () -> Void = {},
+         onPractice: @escaping () -> Void = {},
+         onDelete: @escaping () -> Void = {},
          onEdit: @escaping () -> Void,
          onDone: @escaping () -> Void) {
         _session = StateObject(wrappedValue: GraphInteractiveSession(
@@ -1039,6 +1055,10 @@ struct GraphInteractiveSurface: View {
         self.onPencilStroke = onPencilStroke
         self.onPencilRequestsPassiveMode = onPencilRequestsPassiveMode
         self.onCommitViewport = onCommitViewport
+        self.onCommitGraph = onCommitGraph
+        self.onExplain = onExplain
+        self.onPractice = onPractice
+        self.onDelete = onDelete
         self.onEdit = onEdit
         self.onDone = onDone
         self.usesLightweightRenderer = usesLightweightRenderer
@@ -1052,6 +1072,10 @@ struct GraphInteractiveSurface: View {
                 onCommitViewport: { viewport in
                     onCommitViewport(graph.owningBoardID, graph.id, viewport)
                 },
+                onCommitGraph: onCommitGraph,
+                onExplain: onExplain,
+                onPractice: onPractice,
+                onDelete: onDelete,
                 onEdit: onEdit,
                 onDone: onDone
             )
@@ -1218,62 +1242,77 @@ struct GraphInteractiveSurface: View {
 private struct LightweightGraphSurface: View {
     let graph: GraphObject
     let onCommitViewport: (GraphViewport) -> Void
+    let onCommitGraph: (GraphObject) -> Void
+    let onExplain: () -> Void
+    let onPractice: () -> Void
+    let onDelete: () -> Void
     let onEdit: () -> Void
     let onDone: () -> Void
 
     @State private var viewport: GraphViewport
+    @State private var expressions: [GraphExpression]
+    @State private var selectedExpressionID: String?
+    @State private var draft: String
+    @State private var keypadInsertion: MathKeyInsertion?
+    @State private var mathResult: NativeGraphMathResult?
+    @State private var resultDomain: ClosedRange<Double>?
+    @State private var resultError: String?
+    @State private var evaluationX = 0.0
+    @State private var integralLower = 0.0
+    @State private var integralUpper = 1.0
     @State private var dragStart: GraphViewport?
     @State private var magnificationStart: GraphViewport?
+    @State private var compactShowsGraph = false
 
     init(graph: GraphObject, onCommitViewport: @escaping (GraphViewport) -> Void,
+         onCommitGraph: @escaping (GraphObject) -> Void,
+         onExplain: @escaping () -> Void, onPractice: @escaping () -> Void,
+         onDelete: @escaping () -> Void,
          onEdit: @escaping () -> Void, onDone: @escaping () -> Void) {
         self.graph = graph
         self.onCommitViewport = onCommitViewport
+        self.onCommitGraph = onCommitGraph
+        self.onExplain = onExplain
+        self.onPractice = onPractice
+        self.onDelete = onDelete
         self.onEdit = onEdit
         self.onDone = onDone
         _viewport = State(initialValue: graph.viewport)
+        _expressions = State(initialValue: graph.expressions)
+        _selectedExpressionID = State(initialValue: graph.expressions.first?.id)
+        _draft = State(initialValue: graph.expressions.first?.latex ?? "y=x")
     }
 
     var body: some View {
         GeometryReader { proxy in
-            ZStack {
-                GraphNativeFallbackSurface(graph: graph.replacing(viewport: viewport))
-                    .contentShape(Rectangle())
-                    .gesture(panGesture(size: proxy.size))
-                    .simultaneousGesture(zoomGesture)
-
-                VStack(spacing: 0) {
-                    HStack(spacing: 8) {
-                        StudyContentView(source: expressionSource, maximumWidth: 320)
-                            .frame(maxHeight: 44)
-                            .clipped()
-                        Spacer()
-                        Button("Edit", systemImage: "pencil", action: onEdit)
-                            .buttonStyle(.bordered)
-                        Button("Done", action: onDone)
-                            .buttonStyle(.borderedProminent)
+            VStack(spacing: 0) {
+                graphToolbar
+                if proxy.size.width >= 720 {
+                    HStack(spacing: 0) {
+                        mathPanel
+                            .frame(width: max(280, min(proxy.size.width * 0.36, 430)))
+                        Divider()
+                        plot(size: CGSize(
+                            width: proxy.size.width - max(280, min(proxy.size.width * 0.36, 430)),
+                            height: proxy.size.height - 54
+                        ))
                     }
-                    .padding(10)
-                    .background(.ultraThinMaterial)
-                    Spacer()
-                    HStack(spacing: 8) {
-                        Text(viewportSummary)
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button { zoom(by: 1.35) } label: {
-                            Image(systemName: "minus.magnifyingglass")
+                } else {
+                    VStack(spacing: 0) {
+                        Picker("Graph workspace pane", selection: $compactShowsGraph) {
+                            Label("Math", systemImage: "function").tag(false)
+                            Label("Graph", systemImage: "chart.xyaxis.line").tag(true)
                         }
-                        Button { viewport = graph.viewport; commit() } label: {
-                            Image(systemName: "scope")
-                        }
-                        Button { zoom(by: 0.74) } label: {
-                            Image(systemName: "plus.magnifyingglass")
+                        .pickerStyle(.segmented)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        Divider()
+                        if compactShowsGraph {
+                            plot(size: CGSize(width: proxy.size.width,
+                                              height: max(proxy.size.height - 94, 1)))
+                        } else {
+                            mathPanel
                         }
                     }
-                    .buttonStyle(.bordered)
-                    .padding(10)
-                    .background(.ultraThinMaterial)
                 }
             }
         }
@@ -1282,14 +1321,243 @@ private struct LightweightGraphSurface: View {
         .environment(\.colorScheme, VBoardCanvasTheme.colorScheme)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(GraphAccessibility.label(for: graph))
-        .onChange(of: graph) { _, value in viewport = value.viewport }
+        .onChange(of: graph) { _, value in
+            viewport = value.viewport
+            expressions = value.expressions
+            if !expressions.contains(where: { $0.id == selectedExpressionID }) {
+                selectExpression(expressions.first)
+            }
+        }
     }
 
-    private var expressionSource: String {
-        let expressions = graph.expressions.filter(\.visible).prefix(2).map {
-            "\\(\($0.latex)\\)"
+    private var graphToolbar: some View {
+        HStack(spacing: 8) {
+            Button("Explain", systemImage: "text.magnifyingglass", action: onExplain)
+            Button("Practice", systemImage: "list.bullet.clipboard", action: onPractice)
+            Button("Calculate / Solve", systemImage: "equal.circle", action: calculateOrSolve)
+            Spacer()
+            Button("More", systemImage: "slider.horizontal.3", action: onEdit)
+            Button("Delete", systemImage: "trash", role: .destructive) {
+                onDelete(); onDone()
+            }
+            Button("Done") { commitGraph(); onDone() }
+                .buttonStyle(.borderedProminent)
         }
-        return expressions.isEmpty ? "Graph" : expressions.joined(separator: " · ")
+        .buttonStyle(.bordered)
+        .labelStyle(.iconOnly)
+        .padding(10)
+        .frame(height: 54)
+        .background(Color(uiColor: CanvasDesignTokens.toolbarSurface))
+        .accessibilityElement(children: .contain)
+    }
+
+    private func plot(size: CGSize) -> some View {
+        ZStack(alignment: .bottom) {
+            GraphNativeFallbackSurface(graph: workingGraph)
+                .contentShape(Rectangle())
+                .gesture(panGesture(size: size))
+                .simultaneousGesture(zoomGesture)
+            GraphIndirectNavigationCapture(
+                onPan: { state, translation in
+                    switch state {
+                    case .began:
+                        dragStart = viewport
+                    case .changed:
+                        updatePan(translation: translation, size: size)
+                    case .ended:
+                        dragStart = nil; commit()
+                    case .cancelled, .failed:
+                        if let dragStart { viewport = dragStart }
+                        dragStart = nil
+                    default:
+                        break
+                    }
+                },
+                onWheel: { factor, anchor, finished in
+                    if factor != 1 {
+                        viewport = scaled(viewport, by: factor,
+                                          anchoredAt: anchor, size: size)
+                    }
+                    if finished { commit() }
+                }
+            )
+            ForEach(Array(solutionPoints.enumerated()), id: \.offset) { _, point in
+                Circle()
+                    .fill(Color.red)
+                    .overlay(Circle().stroke(Color.white, lineWidth: 2))
+                    .frame(width: 12, height: 12)
+                    .position(GraphFallbackSampler.map(
+                        x: point.x, y: point.y, viewport: viewport,
+                        frame: CGRect(origin: .zero, size: size)
+                    ))
+                    .accessibilityLabel(
+                        "Solution at x \(point.x.formatted()), y \(point.y.formatted())"
+                    )
+            }
+            HStack(spacing: 8) {
+                Text(viewportSummary)
+                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                Spacer()
+                Button { zoom(by: 1.35) } label: { Image(systemName: "minus.magnifyingglass") }
+                Button { viewport = graph.viewport; commit() } label: { Image(systemName: "scope") }
+                Button { zoom(by: 0.74) } label: { Image(systemName: "plus.magnifyingglass") }
+            }
+            .buttonStyle(.bordered)
+            .padding(8)
+            .background(.ultraThinMaterial)
+        }
+    }
+
+    private var mathPanel: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+            ScrollView {
+                VStack(spacing: 5) {
+                    ForEach(expressions) { expression in expressionRow(expression) }
+                    Button("Add expression", systemImage: "plus") { addExpression() }
+                        .disabled(expressions.count >= GraphRecognitionController.maximumExpressions)
+                }
+            }
+            .frame(maxHeight: 150)
+
+            CursorAwareMathField(text: $draft, insertion: keypadInsertion) {
+                updateDraft($0)
+            }
+            .frame(height: 40)
+
+            if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                StudyContentView(source: "\\(\(draft)\\)", maximumWidth: 390)
+                    .frame(minHeight: 30, maxHeight: 50, alignment: .leading)
+                    .clipped()
+            }
+
+            if let mathResult {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Text(mathResult.isExact ? "Exact" : "Approximate")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.12), in: Capsule())
+                        Text(resultLabel(mathResult.kind))
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Text(mathResult.message)
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.primary)
+                    if let resultDomain {
+                        Text("Visible-domain search: x = \(resultDomain.lowerBound.formatted(.number.precision(.significantDigits(1...5))))…\(resultDomain.upperBound.formatted(.number.precision(.significantDigits(1...5))))")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
+            if let resultError {
+                Text(resultError)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .padding(7)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            HStack(spacing: 6) {
+                TextField("x", value: $evaluationX, format: .number).frame(width: 55)
+                    .textFieldStyle(.roundedBorder)
+                Button("f′") { runDerivative() }.accessibilityLabel("Derivative at x")
+                TextField("a", value: $integralLower, format: .number).frame(width: 48)
+                    .textFieldStyle(.roundedBorder)
+                TextField("b", value: $integralUpper, format: .number).frame(width: 48)
+                    .textFieldStyle(.roundedBorder)
+                Button("∫") { runIntegral() }.accessibilityLabel("Definite integral")
+                if expressions.filter(\.visible).count >= 2 {
+                    Button("∩") { runIntersections() }.accessibilityLabel("Intersections")
+                }
+            }
+            .buttonStyle(.bordered)
+
+                mathKeypad
+            }
+            .padding(10)
+        }
+        .background(Color(uiColor: CanvasDesignTokens.boardSurface))
+    }
+
+    private func expressionRow(_ expression: GraphExpression) -> some View {
+        HStack(spacing: 6) {
+            Button {
+                replaceExpression(expression, visible: !expression.visible)
+            } label: {
+                Image(systemName: expression.visible ? "eye.fill" : "eye.slash")
+            }
+            .buttonStyle(.plain)
+            Button {
+                selectExpression(expression)
+            } label: {
+                Text(CompactStudyPresentation.readableText(from: expression.latex))
+                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(7)
+                    .background(selectedExpressionID == expression.id
+                                ? Color.accentColor.opacity(0.13) : Color.black.opacity(0.035),
+                                in: RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+            Button(role: .destructive) { removeExpression(expression.id) } label: {
+                Image(systemName: "minus.circle")
+            }
+            .buttonStyle(.plain)
+            .disabled(expressions.count <= 1)
+        }
+    }
+
+    private var mathKeypad: some View {
+        let keys = [
+            "7", "8", "9", "(", ")", "⌫",
+            "4", "5", "6", "+", "−", "^",
+            "1", "2", "3", "×", "÷", "x²",
+            "0", ".", "x", "y", "=", "π",
+            "sin", "cos", "tan", "√", "ln", "log",
+            "<", ">", "≤", "≥", "abs", "e",
+            "asin", "acos", "atan", "exp", "a/b", "C",
+        ]
+        return LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 6),
+                         spacing: 4) {
+            ForEach(keys, id: \.self) { key in
+                Button(key) {
+                    if key == "C" { updateDraft("") }
+                    else { keypadInsertion = MathKeyInsertion(text: insertion(for: key)) }
+                }
+                    .buttonStyle(.bordered)
+                    .font(.caption.weight(.medium))
+                    .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private var workingGraph: GraphObject {
+        graph.replacing(expressions: expressions).replacing(viewport: viewport)
+    }
+
+    private var solutionPoints: [CGPoint] {
+        guard let mathResult else { return [] }
+        switch mathResult.kind {
+        case .linear, .quadratic, .numericalRoots:
+            return mathResult.values.compactMap { x in
+                guard x >= viewport.xMin, x <= viewport.xMax,
+                      0 >= viewport.yMin, 0 <= viewport.yMax else { return nil }
+                return CGPoint(x: x, y: 0)
+            }
+        case .intersections:
+            return stride(from: 0, to: mathResult.values.count - 1, by: 2).compactMap { index in
+                let x = mathResult.values[index], y = mathResult.values[index + 1]
+                guard x >= viewport.xMin, x <= viewport.xMax,
+                      y >= viewport.yMin, y <= viewport.yMax else { return nil }
+                return CGPoint(x: x, y: y)
+            }
+        default:
+            return []
+        }
     }
 
     private var viewportSummary: String {
@@ -1299,16 +1567,8 @@ private struct LightweightGraphSurface: View {
     private func panGesture(size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
-                let start = dragStart ?? viewport
-                if dragStart == nil { dragStart = start }
-                let xRange = start.xMax - start.xMin
-                let yRange = start.yMax - start.yMin
-                let dx = -Double(value.translation.width / max(size.width, 1)) * xRange
-                let dy = Double(value.translation.height / max(size.height, 1)) * yRange
-                viewport = start.replacingBounds(with: GraphViewport(
-                    xMin: start.xMin + dx, xMax: start.xMax + dx,
-                    yMin: start.yMin + dy, yMax: start.yMax + dy
-                ))
+                if dragStart == nil { dragStart = viewport }
+                updatePan(translation: value.translation, size: size)
             }
             .onEnded { _ in dragStart = nil; commit() }
     }
@@ -1329,6 +1589,18 @@ private struct LightweightGraphSurface: View {
         commit()
     }
 
+    private func updatePan(translation: CGSize, size: CGSize) {
+        let start = dragStart ?? viewport
+        let xRange = start.xMax - start.xMin
+        let yRange = start.yMax - start.yMin
+        let dx = -Double(translation.width / max(size.width, 1)) * xRange
+        let dy = Double(translation.height / max(size.height, 1)) * yRange
+        viewport = start.replacingBounds(with: GraphViewport(
+            xMin: start.xMin + dx, xMax: start.xMax + dx,
+            yMin: start.yMin + dy, yMax: start.yMax + dy
+        ))
+    }
+
     private func scaled(_ source: GraphViewport, by factor: Double) -> GraphViewport {
         let safe = min(4, max(0.25, factor))
         let centerX = (source.xMin + source.xMax) / 2
@@ -1341,7 +1613,311 @@ private struct LightweightGraphSurface: View {
         ))
     }
 
+    private func scaled(_ source: GraphViewport, by factor: Double,
+                        anchoredAt point: CGPoint, size: CGSize) -> GraphViewport {
+        let safe = min(4, max(0.25, factor))
+        let xFraction = min(1, max(0, Double(point.x / max(size.width, 1))))
+        let yFraction = min(1, max(0, Double(point.y / max(size.height, 1))))
+        let oldWidth = source.xMax - source.xMin
+        let oldHeight = source.yMax - source.yMin
+        let anchorX = source.xMin + oldWidth * xFraction
+        let anchorY = source.yMax - oldHeight * yFraction
+        let newWidth = min(1_000_000, max(0.001, oldWidth * safe))
+        let newHeight = min(1_000_000, max(0.001, oldHeight * safe))
+        return source.replacingBounds(with: GraphViewport(
+            xMin: anchorX - newWidth * xFraction,
+            xMax: anchorX + newWidth * (1 - xFraction),
+            yMin: anchorY - newHeight * (1 - yFraction),
+            yMax: anchorY + newHeight * yFraction
+        ))
+    }
+
     private func commit() { onCommitViewport(viewport) }
+
+    private func commitGraph() {
+        onCommitGraph(workingGraph)
+        onCommitViewport(viewport)
+    }
+
+    private func selectExpression(_ expression: GraphExpression?) {
+        selectedExpressionID = expression?.id
+        draft = expression?.latex ?? ""
+        mathResult = nil
+        resultDomain = nil
+        resultError = nil
+    }
+
+    private func updateDraft(_ value: String) {
+        draft = value
+        mathResult = nil
+        resultDomain = nil
+        resultError = nil
+        guard let id = selectedExpressionID,
+              let index = expressions.firstIndex(where: { $0.id == id }) else { return }
+        let existing = expressions[index]
+        expressions[index] = GraphExpression(
+            id: existing.id, latex: value,
+            type: GraphExpressionInference.type(for: value), visible: existing.visible,
+            displayStyle: existing.displayStyle, restrictions: existing.restrictions,
+            additionalFields: existing.additionalFields
+        )
+    }
+
+    private func replaceExpression(_ expression: GraphExpression, visible: Bool) {
+        guard let index = expressions.firstIndex(where: { $0.id == expression.id }) else { return }
+        expressions[index] = GraphExpression(
+            id: expression.id, latex: expression.latex, type: expression.type,
+            visible: visible, displayStyle: expression.displayStyle,
+            restrictions: expression.restrictions, additionalFields: expression.additionalFields
+        )
+    }
+
+    private func addExpression() {
+        guard expressions.count < GraphRecognitionController.maximumExpressions else { return }
+        let expression = GraphExpression(id: "native-\(UUID().uuidString.lowercased())",
+                                         latex: "y=x", type: .explicitFunction)
+        expressions.append(expression)
+        selectExpression(expression)
+    }
+
+    private func removeExpression(_ id: String) {
+        guard expressions.count > 1 else { return }
+        expressions.removeAll { $0.id == id }
+        if selectedExpressionID == id { selectExpression(expressions.first) }
+    }
+
+    private func insertion(for key: String) -> String {
+        switch key {
+        case "−": return "-"
+        case "×": return "*"
+        case "÷": return "/"
+        case "x²": return "^2"
+        case "√": return "sqrt("
+        case "π": return "pi"
+        case "≤": return "<="
+        case "≥": return ">="
+        case "a/b": return "/"
+        case "sin", "cos", "tan", "asin", "acos", "atan", "exp", "ln", "log", "abs":
+            return key + "("
+        default: return key
+        }
+    }
+
+    private func resultLabel(_ kind: NativeGraphSolutionKind) -> String {
+        switch kind {
+        case .calculation: return "Calculation"
+        case .linear: return "Linear solution"
+        case .quadratic: return "Quadratic solutions"
+        case .numericalRoots: return "Roots"
+        case .intersections: return "Intersections"
+        case .derivative: return "Numerical derivative"
+        case .definiteIntegral: return "Definite integral"
+        case .unsupportedIndefiniteIntegral: return "Needs bounds"
+        }
+    }
+
+    private func calculateOrSolve() {
+        do {
+            if draft.contains("=") || (try? SafeGraphExpression(source: draft).usesVariable) == true {
+                mathResult = try NativeGraphMath.solve(
+                    draft, domain: viewport.xMin...viewport.xMax,
+                    angleMode: graph.settings.angleMode
+                )
+                resultDomain = viewport.xMin...viewport.xMax
+            } else {
+                mathResult = try NativeGraphMath.calculate(
+                    draft, angleMode: graph.settings.angleMode
+                )
+                resultDomain = nil
+            }
+            resultError = nil
+        } catch {
+            mathResult = nil; resultDomain = nil
+            resultError = "Check the expression and its domain."
+        }
+    }
+
+    private func runDerivative() {
+        do {
+            mathResult = try NativeGraphMath.derivative(
+                draft, at: evaluationX, angleMode: graph.settings.angleMode
+            )
+            resultDomain = nil; resultError = nil
+        } catch {
+            mathResult = nil; resultDomain = nil
+            resultError = "The derivative is undefined here."
+        }
+    }
+
+    private func runIntegral() {
+        do {
+            mathResult = try NativeGraphMath.integral(
+                draft, from: integralLower, to: integralUpper,
+                angleMode: graph.settings.angleMode
+            )
+            resultDomain = nil; resultError = nil
+        } catch {
+            mathResult = nil; resultDomain = nil
+            resultError = "Enter valid bounds where the function is defined."
+        }
+    }
+
+    private func runIntersections() {
+        let visible = expressions.filter(\.visible)
+        guard visible.count >= 2 else { return }
+        do {
+            mathResult = try NativeGraphMath.intersections(
+                visible[0].latex, visible[1].latex,
+                domain: viewport.xMin...viewport.xMax,
+                angleMode: graph.settings.angleMode
+            )
+            resultDomain = viewport.xMin...viewport.xMax
+            resultError = nil
+        } catch {
+            mathResult = nil; resultDomain = nil
+            resultError = "Those expressions cannot be intersected locally."
+        }
+    }
+}
+
+/// UIKit exposes trackpad scroll and discrete mouse-wheel streams separately
+/// from direct finger pans. This transparent peer handles only indirect input;
+/// direct touches fall through to the SwiftUI pan/pinch gestures above.
+private struct GraphIndirectNavigationCapture: UIViewRepresentable {
+    let onPan: (UIGestureRecognizer.State, CGSize) -> Void
+    let onWheel: (Double, CGPoint, Bool) -> Void
+
+    func makeUIView(context: Context) -> GraphIndirectNavigationView {
+        GraphIndirectNavigationView(onPan: onPan, onWheel: onWheel)
+    }
+
+    func updateUIView(_ view: GraphIndirectNavigationView, context: Context) {
+        view.onPan = onPan
+        view.onWheel = onWheel
+    }
+}
+
+private final class GraphIndirectNavigationView: UIView, UIGestureRecognizerDelegate {
+    var onPan: (UIGestureRecognizer.State, CGSize) -> Void
+    var onWheel: (Double, CGPoint, Bool) -> Void
+
+    init(onPan: @escaping (UIGestureRecognizer.State, CGSize) -> Void,
+         onWheel: @escaping (Double, CGPoint, Bool) -> Void) {
+        self.onPan = onPan
+        self.onWheel = onWheel
+        super.init(frame: .zero)
+        backgroundColor = .clear
+
+        let scroll = UIPanGestureRecognizer(target: self, action: #selector(trackpadPan(_:)))
+        scroll.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        scroll.allowedScrollTypesMask = .continuous
+        scroll.cancelsTouchesInView = false
+        scroll.delegate = self
+        addGestureRecognizer(scroll)
+
+        let wheel = UIPanGestureRecognizer(target: self, action: #selector(mouseWheel(_:)))
+        wheel.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        wheel.allowedScrollTypesMask = .discrete
+        wheel.cancelsTouchesInView = false
+        wheel.delegate = self
+        addGestureRecognizer(wheel)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        guard super.point(inside: point, with: event) else { return false }
+        guard let touch = event?.allTouches?.first else { return true }
+        return touch.type == .indirectPointer
+    }
+
+    @objc private func trackpadPan(_ gesture: UIPanGestureRecognizer) {
+        let translation = gesture.translation(in: self)
+        onPan(gesture.state, CGSize(width: translation.x, height: translation.y))
+    }
+
+    @objc private func mouseWheel(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .changed:
+            let delta = gesture.translation(in: self).y
+            gesture.setTranslation(.zero, in: self)
+            guard delta.isFinite, abs(delta) > 0.001 else { return }
+            let factor = min(1.8, max(0.55, exp(Double(delta) * 0.006)))
+            onWheel(factor, gesture.location(in: self), false)
+        case .ended:
+            onWheel(1, gesture.location(in: self), true)
+        case .cancelled, .failed:
+            onWheel(1, gesture.location(in: self), true)
+        default:
+            break
+        }
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer)
+        -> Bool { true }
+}
+
+private struct MathKeyInsertion: Equatable {
+    let id = UUID()
+    let text: String
+}
+
+private struct CursorAwareMathField: UIViewRepresentable {
+    @Binding var text: String
+    let insertion: MathKeyInsertion?
+    let onChange: (String) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.borderStyle = .roundedRect
+        field.font = .monospacedSystemFont(ofSize: 17, weight: .regular)
+        field.autocapitalizationType = .none
+        field.autocorrectionType = .no
+        field.spellCheckingType = .no
+        field.placeholder = "y = x^2"
+        field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)),
+                        for: .editingChanged)
+        return field
+    }
+
+    func updateUIView(_ field: UITextField, context: Context) {
+        context.coordinator.parent = self
+        if field.text != text { field.text = text }
+        guard let insertion, context.coordinator.lastInsertionID != insertion.id else { return }
+        context.coordinator.lastInsertionID = insertion.id
+        if insertion.text == "⌫" {
+            if let range = field.selectedTextRange, !range.isEmpty {
+                field.replace(range, withText: "")
+            } else if let start = field.selectedTextRange?.start,
+                      let previous = field.position(from: start, offset: -1),
+                      let range = field.textRange(from: previous, to: start) {
+                field.replace(range, withText: "")
+            }
+        } else if let range = field.selectedTextRange {
+            field.replace(range, withText: insertion.text)
+        } else {
+            field.text = (field.text ?? "") + insertion.text
+        }
+        let updated = field.text ?? ""
+        DispatchQueue.main.async {
+            context.coordinator.parent.text = updated
+            context.coordinator.parent.onChange(updated)
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var parent: CursorAwareMathField
+        var lastInsertionID: UUID?
+        init(parent: CursorAwareMathField) { self.parent = parent }
+        @objc func changed(_ field: UITextField) {
+            let updated = field.text ?? ""
+            parent.text = updated
+            parent.onChange(updated)
+        }
+    }
 }
 
 #if DEBUG
@@ -1411,7 +1987,8 @@ final class GraphProviderContainerView: UIView {
         }
         addGestureRecognizer(pencilRecognizer)
         pencilHoverLayer.fillColor = UIColor.clear.cgColor
-        pencilHoverLayer.strokeColor = UIColor.label.withAlphaComponent(0.62).cgColor
+        pencilHoverLayer.strokeColor = CanvasDesignTokens.canvasPrimaryText
+            .withAlphaComponent(0.62).cgColor
         pencilHoverLayer.lineWidth = 1
         pencilHoverLayer.zPosition = 11_000
         pencilHoverLayer.isHidden = true

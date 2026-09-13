@@ -495,6 +495,88 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         XCTAssertEqual(selection.selectedTextObjects.first?.text, "y=x^2\ny=2x+1")
         XCTAssertEqual(selection.localBBox.cgRect, graph.frame.cgRect)
     }
+
+    func testNativeParserHonorsPrecedenceUnaryMinusAndRightAssociativePower() throws {
+        XCTAssertEqual(try SafeGraphExpression(source: "2+3*4").evaluate(x: 0), 14,
+                       accuracy: 1e-12)
+        XCTAssertEqual(try SafeGraphExpression(source: "-2^2").evaluate(x: 0), -4,
+                       accuracy: 1e-12)
+        XCTAssertEqual(try SafeGraphExpression(source: "2^3^2").evaluate(x: 0), 512,
+                       accuracy: 1e-12)
+        XCTAssertEqual(try SafeGraphExpression(source: "3(x+1)").evaluate(x: 2), 9,
+                       accuracy: 1e-12)
+        XCTAssertEqual(try SafeGraphExpression(source: "x+y").evaluate(x: 2, y: 5), 7,
+                       accuracy: 1e-12)
+    }
+
+    func testNativeCalculatorSupportsClassroomConstantsAndFunctions() throws {
+        XCTAssertEqual(try NativeGraphMath.calculate("2+3*4").values.first!, 14,
+                       accuracy: 1e-12)
+        XCTAssertEqual(try NativeGraphMath.calculate("sqrt(81)").values.first!, 9,
+                       accuracy: 1e-12)
+        XCTAssertEqual(try NativeGraphMath.calculate("sin(pi/2)").values.first!, 1,
+                       accuracy: 1e-12)
+        XCTAssertEqual(try NativeGraphMath.calculate("asin(1)", angleMode: "degrees")
+            .values.first!, 90, accuracy: 1e-10)
+    }
+
+    func testNativeLinearAndStableQuadraticSolvers() throws {
+        let linear = try NativeGraphMath.solve("2x+3=7", domain: -10...10)
+        XCTAssertEqual(linear.kind, .linear)
+        XCTAssertEqual(linear.values, [2])
+        XCTAssertTrue(linear.isExact)
+
+        let quadratic = try NativeGraphMath.solve("x²-5x+6=0", domain: -10...10)
+        XCTAssertEqual(quadratic.kind, .quadratic)
+        XCTAssertEqual(quadratic.values.count, 2)
+        XCTAssertEqual(quadratic.values[0], 2, accuracy: 1e-10)
+        XCTAssertEqual(quadratic.values[1], 3, accuracy: 1e-10)
+        XCTAssertTrue(quadratic.isExact)
+    }
+
+    func testNativeNumericalRootsAndIntersectionsStayInsideRequestedDomain() throws {
+        let roots = try NativeGraphMath.solve("sin(x)=0.5", domain: 0...Double.pi)
+        XCTAssertEqual(roots.kind, .numericalRoots)
+        XCTAssertEqual(roots.values.count, 2)
+        XCTAssertEqual(roots.values[0], Double.pi / 6, accuracy: 1e-7)
+        XCTAssertEqual(roots.values[1], 5 * Double.pi / 6, accuracy: 1e-7)
+
+        let intersections = try NativeGraphMath.intersections(
+            "y=x", "y=2-x", domain: -10...10
+        )
+        XCTAssertEqual(intersections.kind, .intersections)
+        XCTAssertEqual(intersections.values.count, 2)
+        XCTAssertEqual(intersections.values[0], 1, accuracy: 1e-7)
+        XCTAssertEqual(intersections.values[1], 1, accuracy: 1e-7)
+    }
+
+    func testNativeNumericalCalculusAndHonestIndefiniteIntegral() throws {
+        let derivative = try NativeGraphMath.derivative("y=x^2", at: 3)
+        XCTAssertEqual(derivative.values.first!, 6, accuracy: 1e-7)
+
+        let integral = try NativeGraphMath.integral("y=x", from: 0, to: 1)
+        XCTAssertEqual(integral.values.first!, 0.5, accuracy: 1e-9)
+
+        let unsupported = try NativeGraphMath.solve(
+            #"\int 1/(1+x^2) dx"#, domain: -10...10
+        )
+        XCTAssertEqual(unsupported.kind, .unsupportedIndefiniteIntegral)
+        XCTAssertTrue(unsupported.values.isEmpty)
+        XCTAssertTrue(unsupported.message.localizedCaseInsensitiveContains("indefinite"))
+    }
+
+    func testNativeMarchingSquaresRendersGeneralImplicitCircle() {
+        let expression = GraphExpression(
+            id: "implicit-circle", latex: "x²+y²=1", type: .implicitEquation
+        )
+        let path = GraphFallbackSampler.path(
+            for: expression, viewport: GraphViewport(xMin: -2, xMax: 2, yMin: -2, yMax: 2),
+            frame: CGRect(x: 0, y: 0, width: 400, height: 400)
+        )
+        XCTAssertFalse(path.isEmpty)
+        XCTAssertGreaterThan(path.bounds.width, 150)
+        XCTAssertGreaterThan(path.bounds.height, 150)
+    }
 }
 
 private final class GraphURLProtocolStub: URLProtocol, @unchecked Sendable {
