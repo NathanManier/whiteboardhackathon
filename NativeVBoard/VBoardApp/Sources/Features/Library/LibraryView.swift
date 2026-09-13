@@ -438,8 +438,7 @@ private struct LectureCard: View {
             if list {
                 HStack(spacing: 16) {
                     LectureMontage(boards: boards)
-                        .frame(width: compact ? 72 : 150,
-                               height: compact ? 54 : 82)
+                        .frame(width: compact ? 88 : 150)
                     labels
                     Spacer()
                     Image(systemName: "chevron.right").foregroundStyle(.tertiary)
@@ -448,7 +447,7 @@ private struct LectureCard: View {
                 .overlay(alignment: .bottom) { Divider() }
             } else {
                 VStack(alignment: .leading, spacing: 12) {
-                    LectureMontage(boards: boards).frame(height: 148)
+                    LectureMontage(boards: boards)
                     labels
                 }
                 .padding(12)
@@ -477,7 +476,7 @@ private struct BoardCard: View {
         Group {
             if list {
                 HStack(spacing: 16) {
-                    RemoteBoardThumbnail(board: board).frame(width: 150, height: 82)
+                    BoardThumbnailView(board: board).frame(width: 150)
                     labels
                     Spacer()
                     Image(systemName: "chevron.right").foregroundStyle(.tertiary)
@@ -485,7 +484,7 @@ private struct BoardCard: View {
                 .padding(.vertical, 12).overlay(alignment: .bottom) { Divider() }
             } else {
                 VStack(alignment: .leading, spacing: 9) {
-                    RemoteBoardThumbnail(board: board).frame(height: 132)
+                    BoardThumbnailView(board: board)
                     labels
                 }
                 .padding(10)
@@ -537,7 +536,7 @@ private struct LectureMontage: View {
                 } else {
                     HStack(spacing: 2) {
                         ForEach(shown) { board in
-                            RemoteBoardThumbnail(board: board)
+                            BoardThumbnailView(board: board)
                                 .frame(width: (proxy.size.width - CGFloat(max(shown.count - 1, 0)) * 2) / CGFloat(shown.count))
                         }
                     }
@@ -545,10 +544,18 @@ private struct LectureMontage: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
+        .aspectRatio(LibraryThumbnailPolicy.aspectRatio, contentMode: .fit)
     }
 }
 
-private struct RemoteBoardThumbnail: View {
+enum LibraryThumbnailPolicy {
+    static let aspectRatio: CGFloat = 16 / 9
+}
+
+/// Every library board card shares this one fixed-ratio, aspect-fill image
+/// surface. Loading, blank-board, and remote-image states occupy the same
+/// geometry, so neither the title nor the card moves when the image arrives.
+struct BoardThumbnailView: View {
     @EnvironmentObject private var api: APIClient
     let board: LibraryBoard
     @State private var thumbnail: UIImage?
@@ -565,6 +572,7 @@ private struct RemoteBoardThumbnail: View {
                     .font(.title3).foregroundStyle(.secondary)
             }
         }
+        .aspectRatio(LibraryThumbnailPolicy.aspectRatio, contentMode: .fit)
         .clipped()
         .task(id: board.thumbnailURL) {
             guard let path = board.thumbnailURL else { return }

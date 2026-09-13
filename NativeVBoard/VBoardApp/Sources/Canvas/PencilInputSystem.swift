@@ -259,7 +259,7 @@ struct PencilPaletteStateMachine: Equatable, Sendable {
 }
 
 enum PencilRadialPaletteModel {
-    static let tools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso]
+    static let tools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso, .select]
 
     static func index(for tool: CanvasTool) -> Int {
         tools.firstIndex(of: tool) ?? 0

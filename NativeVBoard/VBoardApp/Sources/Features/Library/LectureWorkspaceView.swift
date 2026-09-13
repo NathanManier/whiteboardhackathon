@@ -22,7 +22,7 @@ struct LectureWorkspaceView: View {
     @State private var exportURL: URL?
     @State private var actionError: String?
     @State private var selectionScreenBounds: CGRect?
-    @State private var studyInitialAction: String?
+    @State private var studyInitialAction: StudyAction?
     @State private var studyInteractionsByBoard: [String: [StudyInteraction]] = [:]
     @State private var reopenedStudy: StudyInteraction?
     @State private var previousPencilTool: CanvasTool = .pen
@@ -80,7 +80,7 @@ struct LectureWorkspaceView: View {
                     .disabled(!store.canUndo)
                 Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }
                     .disabled(!store.canRedo)
-                Button { showNavigator = true } label: { Image(systemName: "sidebar.left") }
+                Button { showNavigator.toggle() } label: { Image(systemName: "sidebar.left") }
                     .accessibilityLabel("Class navigator")
                 Menu {
                     Button { createBlankBoard() } label: {
@@ -161,7 +161,7 @@ struct LectureWorkspaceView: View {
         .sheet(item: $reopenedStudy) { interaction in
             SavedStudyInteractionView(interaction: interaction) {
                 reopenedStudy = nil
-                DispatchQueue.main.async { openStudy(action: "explain", forceNew: true) }
+                DispatchQueue.main.async { openStudy(action: .explain, forceNew: true) }
             }
         }
         .sheet(isPresented: $showNote) {
@@ -403,8 +403,8 @@ struct LectureWorkspaceView: View {
                         onEndGraphEditing: { owningBoardID, graphID in
                             store.endGraphEditing(id: graphID, boardID: owningBoardID)
                         },
-                        onExplain: { openStudy(action: "explain") },
-                        onPractice: { openStudy(action: "practice_problems") },
+                        onExplain: { openStudy(action: .explain) },
+                        onPractice: { openStudy(action: .practice) },
                         onDelete: {
                             store.deleteSelection(Set([SelectionKey(
                                 boardID: graph.owningBoardID,
@@ -442,9 +442,9 @@ struct LectureWorkspaceView: View {
                         selectionGeneration: store.selectionGeneration,
                         graphPrimaryTitle: graphPrimaryTitle,
                         graphIsLoading: false,
-                        explain: { openStudy(action: "explain") },
-                        practice: { openStudy(action: "practice_problems") },
-                        check: { openStudy(action: "check_my_work") },
+                        explain: { openStudy(action: .explain) },
+                        practice: { openStudy(action: .practice) },
+                        check: { openStudy(action: .checkWork) },
                         graphPrimary: { performPrimaryGraphAction() },
                         graphSelection: { openGraphCreation() },
                         editGraph: selectedGraph.map { graph in { editingGraph = graph } },
@@ -617,7 +617,7 @@ struct LectureWorkspaceView: View {
     }
 
     @ViewBuilder private func studyContent(compact: Bool) -> some View {
-        if selectedBoardIDs.count > 1 {
+        if selectedBoardIDs.count > 1, studyInitialAction == .explain {
             LectureSelectionStudyView(folderID: folder.id,
                                       selectedObjectIDsByBoard: selectedObjectIDsByBoard,
                                       compact: compact)
@@ -629,8 +629,21 @@ struct LectureWorkspaceView: View {
                              compact: compact,
                              onInteractionSaved: { upsertStudyInteraction($0, boardID: boardID) },
                              onPracticeProblems: { problems, interactionID in
-                                 store.applyPracticeProblems(problems, interactionID: interactionID,
-                                                             boardID: boardID, api: api)
+                                 let scale: CGFloat
+                                 if canvasSize.width > 0, canvasSize.height > 0,
+                                    let workspace = store.workspace {
+                                     scale = WorldScreenTransform(
+                                         camera: workspace.camera, viewport: canvasSize
+                                     ).scale
+                                 } else {
+                                     scale = 1
+                                 }
+                                 store.applyPracticeProblems(
+                                     problems, interactionID: interactionID,
+                                     boardID: boardID,
+                                     sourceBounds: selection.localBBox.cgRect,
+                                     cameraScale: scale, api: api
+                                 )
                              })
         } else {
             ContentUnavailableView("Select ink to study", systemImage: "lasso",
@@ -638,8 +651,8 @@ struct LectureWorkspaceView: View {
         }
     }
 
-    private func openStudy(action: String?, forceNew: Bool = false) {
-        if action == "explain", !forceNew, let boardID = studyBoardID,
+    private func openStudy(action: StudyAction, forceNew: Bool = false) {
+        if action == .explain, !forceNew, let boardID = studyBoardID,
            let selection = store.studySelection(for: boardID),
            let existing = studyInteractionsByBoard[boardID]?.first(where: {
                Set($0.selectedObjectIDs ?? []) == Set(selection.canonicalObjectIDs)
@@ -647,7 +660,7 @@ struct LectureWorkspaceView: View {
             reopenedStudy = existing
             return
         }
-        studyInitialAction = action == "explain" ? nil : action
+        studyInitialAction = action
         studyPanelCollapsed = false
         showStudy = true
     }
@@ -678,6 +691,13 @@ struct LectureWorkspaceView: View {
         guard let id = interaction.id else { return }
         var interactions = studyInteractionsByBoard[boardID] ?? []
         if let index = interactions.firstIndex(where: { $0.id == id }) {
+            interactions[index] = interaction
+        } else if interaction.action == nil || interaction.action == "explain",
+                  let index = interactions.firstIndex(where: {
+                      ($0.action == nil || $0.action == "explain")
+                          && Set($0.selectedObjectIDs ?? [])
+                              == Set(interaction.selectedObjectIDs ?? [])
+                  }) {
             interactions[index] = interaction
         } else {
             interactions.append(interaction)
@@ -813,13 +833,11 @@ struct LectureWorkspaceView: View {
     }
 
     private var selectionCanCheckWork: Bool {
-        let selectedObjects = store.selectedKeys.compactMap { key in
-            store.scenes[key.boardID]?.editor.objects.first(where: { $0.id == key.objectID })
+        let selectedObjects = store.selectedKeys.compactMap { key -> (String, CanvasObject)? in
+            store.scenes[key.boardID]?.editor.objects
+                .first(where: { $0.id == key.objectID }).map { (key.boardID, $0) }
         }
-        let hasProblem = selectedObjects.contains { $0.role == "ai_practice_problem" }
-        let hasWork = selectedObjects.contains { $0.role != "ai_practice_problem" }
-            || store.selectedKeys.contains { $0.kind == .professorPath }
-        return hasProblem && hasWork
+        return CheckWorkVisibilityPolicy.isVisible(selected: selectedObjects)
     }
 
     private var activeUnitLabel: String {
@@ -884,6 +902,34 @@ struct LectureWorkspaceView: View {
 
 }
 
+enum EditorStatusPresentation: Equatable, Sendable {
+    case saved, saving, unsaved, offline, error, loading
+
+    init(_ status: String) {
+        let value = status.lowercased()
+        if value.contains("saving") { self = .saving }
+        else if value.contains("unsaved") || value.contains("dirty") { self = .unsaved }
+        else if value.contains("locally") || value.contains("offline") { self = .offline }
+        else if value.contains("fail") || value.contains("review") || value.contains("couldn") {
+            self = .error
+        } else if value.contains("loading") { self = .loading }
+        else { self = .saved }
+    }
+
+    var compactLabel: String {
+        switch self {
+        case .saved: return "Saved"
+        case .saving: return "Saving"
+        case .unsaved: return "Unsaved"
+        case .offline: return "Offline"
+        case .error: return "Error"
+        case .loading: return "Loading"
+        }
+    }
+
+    var isProgress: Bool { self == .saving || self == .loading }
+}
+
 struct WorkspaceToolPalette: View {
     @Binding var activeTool: CanvasTool
     let status: String
@@ -894,93 +940,81 @@ struct WorkspaceToolPalette: View {
     @Binding var markerOpacity: Double
     let undo: () -> Void
     let redo: () -> Void
-    @State private var showOptions = false
     @State private var showStatus = false
 
     var body: some View {
-        HStack(spacing: 4) {
-            ForEach(CanvasTool.allCases, id: \.self) { tool in
-                WorkspaceToolButton(tool: tool, selected: activeTool == tool) {
-                    if activeTool == tool && (tool == .pen || tool == .highlighter) { showOptions = true }
-                    activeTool = tool
-                }
-            }
-            if activeTool == .pen || activeTool == .highlighter {
-                Button { showOptions = true } label: { Image(systemName: "slider.horizontal.3").frame(width: 30, height: 30) }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Tool options")
-                    .popover(isPresented: $showOptions, arrowEdge: .bottom) {
-                        CanvasToolOptions(
-                            title: activeTool == .pen ? "Pen" : "Marker",
-                            color: activeTool == .pen ? $penColor : $markerColor,
-                            width: activeTool == .pen ? $penWidth : $markerWidth,
-                            opacity: activeTool == .pen ? .constant(1) : $markerOpacity,
-                            showsOpacity: activeTool == .highlighter
-                        )
-                        .presentationCompactAdaptation(.popover)
-                    }
-            }
-            Divider().frame(height: 24).padding(.horizontal, 3)
-            Button { showStatus.toggle() } label: {
-                HStack(spacing: 5) {
+        Button { showStatus.toggle() } label: {
+            HStack(spacing: 6) {
+                if presentation.isProgress {
+                    ProgressView().controlSize(.mini)
+                } else {
                     Circle().fill(statusColor).frame(width: 7, height: 7)
-                    Text(compactStatus)
-                        .font(.caption2.weight(.medium))
-                        .lineLimit(1)
                 }
-                .padding(.horizontal, 7)
-                .frame(height: 28)
-                .background(Color.black.opacity(0.045), in: Capsule())
+                Text(presentation.compactLabel)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Save status: \(status)")
-            .popover(isPresented: $showStatus, arrowEdge: .bottom) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Label(status, systemImage: statusIcon)
-                        .font(.callout.weight(.semibold))
-                    Label(toolName, systemImage: toolIcon)
-                        .font(.callout)
-                    HStack {
-                        Button("Undo", systemImage: "arrow.uturn.backward", action: undo)
-                        Button("Redo", systemImage: "arrow.uturn.forward", action: redo)
-                    }
-                    .buttonStyle(.bordered)
-                }
-                .padding(14)
-                .frame(minWidth: 210, alignment: .leading)
-                .presentationCompactAdaptation(.popover)
-                .environment(\.colorScheme, .light)
-            }
+            .padding(.horizontal, 11)
+            .frame(height: 34)
+            .background(Color(uiColor: CanvasDesignTokens.toolbarSurface), in: Capsule())
+            .overlay(Capsule().stroke(.separator.opacity(0.45), lineWidth: 0.5))
         }
-        .padding(6)
-        .background(Color(uiColor: CanvasDesignTokens.toolbarSurface), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay { RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.separator.opacity(0.45), lineWidth: 0.5) }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Save status: \(status). Current tool: \(toolName)")
+        .accessibilityHint("Opens drawing tools and save details")
+        .popover(isPresented: $showStatus, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 14) {
+                Label(status, systemImage: statusIcon)
+                    .font(.callout.weight(.semibold))
+                Divider()
+                Text("Tool").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 8) {
+                    ForEach(CanvasTool.allCases, id: \.self) { tool in
+                        WorkspaceToolButton(tool: tool, selected: activeTool == tool) {
+                            activeTool = tool
+                        }
+                    }
+                }
+                if activeTool == .pen || activeTool == .highlighter {
+                    CanvasToolOptions(
+                        title: activeTool == .pen ? "Pen" : "Marker",
+                        color: activeTool == .pen ? $penColor : $markerColor,
+                        width: activeTool == .pen ? $penWidth : $markerWidth,
+                        opacity: activeTool == .pen ? .constant(1) : $markerOpacity,
+                        showsOpacity: activeTool == .highlighter
+                    )
+                    .padding(-18)
+                }
+                Divider()
+                HStack {
+                    Button("Undo", systemImage: "arrow.uturn.backward", action: undo)
+                    Button("Redo", systemImage: "arrow.uturn.forward", action: redo)
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding(16)
+            .frame(width: 330, alignment: .leading)
+            .presentationCompactAdaptation(.popover)
+            .environment(\.colorScheme, .light)
+        }
         .environment(\.colorScheme, .light)
     }
 
-    private var compactStatus: String {
-        let value = status.lowercased()
-        if value.contains("saving") { return "Saving" }
-        if value.contains("unsaved") { return "Unsaved" }
-        if value.contains("locally") || value.contains("offline") { return "Offline" }
-        if value.contains("fail") || value.contains("review") || value.contains("couldn") { return "Error" }
-        if value.contains("loading") { return "Loading" }
-        return "Saved"
-    }
+    private var presentation: EditorStatusPresentation { EditorStatusPresentation(status) }
 
     private var statusColor: Color {
-        switch compactStatus {
-        case "Saving", "Loading": return .blue
-        case "Unsaved": return .orange
-        case "Offline": return .yellow
-        case "Error": return .red
-        default: return .green
+        switch presentation {
+        case .saving, .loading: return .blue
+        case .unsaved: return .orange
+        case .offline: return .yellow
+        case .error: return .red
+        case .saved: return .green
         }
     }
 
     private var statusIcon: String {
-        compactStatus == "Error" ? "exclamationmark.triangle" :
-            (compactStatus == "Offline" ? "icloud.slash" : "checkmark.circle")
+        presentation == .error ? "exclamationmark.triangle" :
+            (presentation == .offline ? "icloud.slash" : "checkmark.circle")
     }
 
     private var toolName: String {

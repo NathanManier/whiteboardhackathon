@@ -10,7 +10,7 @@
 | Mouse/trackpad drawing fallback | Indirect-pointer drags use canonical `UserStroke` | Verified | Re-test |
 | Selection/lasso/object erase | World-coordinate tool routing with spatial candidate reduction | Verified | Re-test |
 | Local outbox/autosave | `BoardDocumentStore` Application Support snapshot | XCTest/integration pass | Re-test |
-| Practice problem persistence | `role=ai_practice_problem` editor objects | Generated two independent cards; move, resize, close, and reopen verified | Re-test |
+| Practice problem persistence | `role=ai_practice_problem` editor objects | Three-card contract and deterministic placement covered by automated tests; move, resize, close, and reopen need device re-test | Re-test |
 | Pencil hover | Pencil-only hover preview for pen, marker, eraser, lasso, and select | Code path compiled; simulator cannot generate Pencil hover | Required |
 | Pencil double-tap | `UIPencilInteraction` toggles the current tool and eraser | Code path compiled | Required |
 | Pencil Pro squeeze | iPadOS 17.5 compact transient palette near the hover location | Code path compiled | Required |
@@ -96,7 +96,7 @@ workspace:
 - [x] Photos selection, preview, upload, draggable corner confirmation,
       processing, automatic editor transition, and professor SVG rendering
       completed against the staging backend
-- [x] One-board Explain, follow-up, exactly two Practice cards, Check My Work,
+- [x] One-board Explain, follow-up, exactly three Practice cards, Check My Work,
       Study Guide, and cross-board Explain completed against staging
 - [x] Native Export SVG produced a 1,315,298-byte XML-valid file with 868 path
       elements and opened the native Share Sheet
