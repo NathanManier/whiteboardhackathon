@@ -110,6 +110,15 @@ enum PDFBoardSource {
     static let logicalID = "pdf-page-1"
     static let imageLogicalID = "image-source-1"
 
+    /// Establish source geometry before applying any persisted transform.
+    /// `frame` is intentionally never used here because UIKit derives it from
+    /// transformed bounds and would make repeated layouts drift or resize.
+    static func pinTopLeft(_ view: UIView, size: CGSize, origin: CGPoint = .zero) {
+        view.layer.anchorPoint = .zero
+        view.bounds = CGRect(origin: .zero, size: size)
+        view.layer.position = origin
+    }
+
     /// The SVG reader deliberately ignores image nodes. Add one transparent
     /// geometry proxy to the native scene so selection, lasso, transforms,
     /// and study bbox construction use the same stable ID as the server-side

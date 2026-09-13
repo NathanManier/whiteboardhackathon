@@ -14,6 +14,22 @@ struct CanvasStrokeStyle: Equatable, Sendable {
     static let marker = CanvasStrokeStyle(colorHex: "#FFD60A", width: 22, opacity: 0.32)
 }
 
+/// Whiteboard content uses a stable light-surface palette even when the app's
+/// surrounding chrome follows system Dark Mode. This prevents source ink,
+/// labels, dots, and transient controls from inheriting low-contrast semantic
+/// colors intended for a dark application background.
+enum CanvasDesignTokens {
+    static let canvasBackground = UIColor(red: 0.955, green: 0.96, blue: 0.965, alpha: 1)
+    static let boardSurface = UIColor(red: 0.992, green: 0.992, blue: 0.985, alpha: 1)
+    static let boardBorder = UIColor(red: 0.20, green: 0.25, blue: 0.30, alpha: 0.40)
+    static let canvasPrimaryText = UIColor(red: 0.075, green: 0.10, blue: 0.14, alpha: 1)
+    static let canvasSecondaryText = UIColor(red: 0.28, green: 0.33, blue: 0.38, alpha: 1)
+    static let toolbarSurface = UIColor(white: 1, alpha: 0.96)
+    static let toolbarPrimaryText = canvasPrimaryText
+    static let selectionAccent = UIColor(red: 0.04, green: 0.43, blue: 0.91, alpha: 1)
+    static let dotColor = UIColor(red: 0.18, green: 0.25, blue: 0.32, alpha: 1)
+}
+
 private enum InputSource: String { case pencil, touch, indirectPointer, mouse, trackpad }
 private enum InteractionState: String { case idle = "IDLE", drawing = "DRAWING", panning = "PANNING", pinching = "PINCHING", lassoing = "LASSOING", erasing = "ERASING", selecting = "SELECTING", movingSelection = "MOVING_SELECTION", resizingSelection = "RESIZING_SELECTION" }
 
@@ -420,6 +436,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     private var isSpacePressed = false
     private var interactionState: InteractionState = .idle
     private var activeInputSource: InputSource = .touch
+    private var activeInputOwner: CanvasInputOwner = .none
+    private var activeInputContact: CanvasInputContact?
     private var eraseIDs = Set<String>()
     private var pinchStartCamera = CameraRect(x: 0, y: 0, width: 1, height: 1)
     private var pinchStartMidpoint = CGPoint.zero
@@ -467,11 +485,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         controller = CameraController(camera: camera)
         persistedCamera = camera
         super.init(frame: .zero)
-        backgroundColor = UIColor { traits in
-            traits.userInterfaceStyle == .dark
-                ? UIColor(red: 0.075, green: 0.08, blue: 0.09, alpha: 1)
-                : UIColor(red: 0.965, green: 0.968, blue: 0.972, alpha: 1)
-        }
+        backgroundColor = CanvasDesignTokens.canvasBackground
         isMultipleTouchEnabled = true
         clipsToBounds = true
         gridLayer.fillColor = UIColor.clear.cgColor
@@ -479,7 +493,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         gridLayer.contentsScale = UIScreen.main.scale
         layer.addSublayer(gridLayer)
         pencilHoverLayer.fillColor = UIColor.clear.cgColor
-        pencilHoverLayer.strokeColor = UIColor.label.withAlphaComponent(0.62).cgColor
+        pencilHoverLayer.strokeColor = CanvasDesignTokens.canvasPrimaryText
+            .withAlphaComponent(0.62).cgColor
         pencilHoverLayer.lineWidth = 1
         pencilHoverLayer.isHidden = true
         layer.addSublayer(pencilHoverLayer)
@@ -501,8 +516,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         pdfSource.layer.name = "VBoardPDFSource"
         professor.layer.name = "VBoardProfessorSource"
         userLayer.name = "VBoardUserContent"
-        interactionLayer.fillColor = UIColor.systemBlue.withAlphaComponent(0.08).cgColor
-        interactionLayer.strokeColor = UIColor.systemBlue.cgColor; interactionLayer.lineWidth = 2
+        interactionLayer.fillColor = CanvasDesignTokens.selectionAccent.withAlphaComponent(0.08).cgColor
+        interactionLayer.strokeColor = CanvasDesignTokens.selectionAccent.cgColor; interactionLayer.lineWidth = 2
         interactionLayer.lineDashPattern = [6, 4]; interactionLayer.isHidden = true
         // This is a world-space diagnostic/selection overlay. It is kept in
         // the world container so it follows the exact same camera transform
@@ -567,10 +582,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
                                  to: previewSource)
         }
         let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
-        pan.minimumNumberOfTouches = 1; pan.maximumNumberOfTouches = 2
+        pan.minimumNumberOfTouches = CanvasInputArbitrationPolicy
+            .minimumDirectNavigationTouches(tool: tool)
+        pan.maximumNumberOfTouches = 2
         pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
         pan.allowedScrollTypesMask = []
-        pan.cancelsTouchesInView = false
+        // When a second finger converts a one-contact edit into navigation,
+        // UIKit must cancel the edit sequence so transient state is rolled
+        // back before the camera takes ownership.
+        pan.cancelsTouchesInView = true
         pan.delegate = self; panGesture = pan; addGestureRecognizer(pan)
         #if targetEnvironment(simulator)
         // Simulator pointer drags are owned by the root touch overrides
@@ -594,7 +614,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         // trackpad pinch share the same authoritative CameraController path.
         pinch.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue),
                                    NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
-        pinch.cancelsTouchesInView = false
+        pinch.cancelsTouchesInView = true
         pinch.delegate = self; pinchGesture = pinch; addGestureRecognizer(pinch)
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(pencilHover(_:)))
         hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
@@ -810,10 +830,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         worldContainer.bounds = CGRect(origin: .zero, size: bounds.size)
         worldContainer.layer.position = .zero
         professor.frame = worldContainer.bounds
-        previewSource.bounds = CGRect(origin: .zero, size: document.viewBox.size)
-        previewSource.layer.position = document.viewBox.origin
-        pdfSource.bounds = CGRect(origin: .zero, size: document.viewBox.size)
-        pdfSource.layer.position = document.viewBox.origin
+        PDFBoardSource.pinTopLeft(previewSource, size: document.viewBox.size,
+                                  origin: document.viewBox.origin)
+        PDFBoardSource.pinTopLeft(pdfSource, size: document.viewBox.size,
+                                  origin: document.viewBox.origin)
         userLayer.bounds = worldContainer.bounds
         userLayer.position = .zero
         paperLayer.bounds = worldContainer.bounds
@@ -885,6 +905,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         }
         self.onStroke = onStroke
         if self.activeTool != tool {
+            // A toolbar change is a hard ownership boundary. Discard any
+            // presentation-only edit and restore an interrupted camera gesture
+            // before the next tool is allowed to consume input.
+            if interactionState != .idle { clearTransientInput() }
             pencilFeedback.request(.toolSelection(nil))
             #if DEBUG
             print("[VBoard] TOOL CHANGED \(self.activeTool.rawValue) -> \(tool.rawValue) board=\(boardID)")
@@ -896,6 +920,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         self.onPencilAction = onPencilAction
         self.onPencilPaletteMoved = onPencilPaletteMoved
         self.onPencilPaletteDismiss = onPencilPaletteDismiss
+        panGesture.minimumNumberOfTouches = CanvasInputArbitrationPolicy
+            .minimumDirectNavigationTouches(tool: tool)
         // Hand and simulator Space-pan own the root touch stream directly.
         // This keeps one camera owner for indirect-pointer drags; physical
         // devices retain the recognizer path below.
@@ -914,8 +940,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         if documentChanged { professor.display(document, transform: worldTransform, importedTransforms: importedTransforms, composition: composition) }
         if previewChanged || documentChanged || pdfChanged {
             previewSource.image = previewImage
-            previewSource.bounds = CGRect(origin: .zero, size: document.viewBox.size)
-            previewSource.layer.position = document.viewBox.origin
+            PDFBoardSource.pinTopLeft(previewSource, size: document.viewBox.size,
+                                      origin: document.viewBox.origin)
             previewSource.isHidden = (sourceKind != .image
                 && !documentChanged && professor.hasVisiblePresentation)
                 || previewImage == nil || pdfData != nil
@@ -1008,30 +1034,15 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     }
 
     private func boardSurfaceColor(showsPaper: Bool) -> UIColor {
-        UIColor { traits in
-            if traits.userInterfaceStyle == .dark {
-                return showsPaper
-                    ? UIColor(red: 0.105, green: 0.11, blue: 0.12, alpha: 1)
-                    : UIColor(red: 0.09, green: 0.095, blue: 0.105, alpha: 1)
-            }
-            return showsPaper
-                ? UIColor(red: 0.982, green: 0.982, blue: 0.975, alpha: 1)
-                : UIColor(red: 0.972, green: 0.974, blue: 0.973, alpha: 1)
-        }
+        showsPaper ? CanvasDesignTokens.boardSurface : CanvasDesignTokens.canvasBackground
     }
 
     private func boardBoundaryColor() -> UIColor {
-        UIColor { traits in
-            traits.userInterfaceStyle == .dark
-                ? UIColor.white.withAlphaComponent(0.30)
-                : UIColor(red: 0.25, green: 0.29, blue: 0.32, alpha: 0.42)
-        }
+        CanvasDesignTokens.boardBorder
     }
 
     private func workspaceGridColor(alpha: CGFloat) -> UIColor {
-        traitCollection.userInterfaceStyle == .dark
-            ? UIColor.white.withAlphaComponent(alpha)
-            : UIColor(red: 0.18, green: 0.25, blue: 0.32, alpha: alpha)
+        CanvasDesignTokens.dotColor.withAlphaComponent(alpha)
     }
 
     private func resolveInitialCameraIfNeeded() {
@@ -1093,6 +1104,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         let translation = gesture.translation(in: self)
         switch gesture.state {
         case .began:
+            if activeInputContact == .finger, activeInputOwner != .navigation {
+                cancelActiveContentInteraction()
+            }
+            activeInputOwner = .navigation
+            activeInputContact = .finger
             interactionState = .panning; debugInputOperation("PAN BEGIN")
             panStart = translation; panStartCamera = controller.camera; professor.beginNavigation(); debugPan("BEGIN", screen: translation); updateInputHUD()
         case .changed:
@@ -1105,6 +1121,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             professor.endNavigation(worldTransform); applyCamera(interacting: false)
             onCameraChanged(controller.camera)
             interactionState = .idle; debugInputOperation("PAN END"); debugPan("END"); updateInputHUD()
+            activeInputOwner = .none; activeInputContact = nil
             panStart = .zero
         case .cancelled, .failed:
             guard interactionState == .panning else { return }
@@ -1112,6 +1129,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             professor.endNavigation(worldTransform); applyCamera(interacting: false)
             onCameraChanged(controller.camera)
             interactionState = .idle; debugInputOperation("PAN CANCEL"); debugPan("CANCEL"); updateInputHUD()
+            activeInputOwner = .none; activeInputContact = nil
             panStart = .zero
         default: break
         }
@@ -1148,6 +1166,11 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
     @objc private func didPinch(_ gesture: UIPinchGestureRecognizer) {
         switch gesture.state {
         case .began:
+            if activeInputContact == .finger, activeInputOwner != .navigation {
+                cancelActiveContentInteraction()
+            }
+            activeInputOwner = .navigation
+            activeInputContact = .finger
             pinchStartCamera = controller.camera
             pinchStartMidpoint = gesture.location(in: self)
             interactionState = .pinching
@@ -1166,12 +1189,14 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             professor.endNavigation(worldTransform); applyCamera(interacting: false)
             onCameraChanged(controller.camera)
             interactionState = .idle; pinchStartMidpoint = .zero; debugInputOperation("PINCH END"); updateInputHUD()
+            activeInputOwner = .none; activeInputContact = nil
         case .cancelled, .failed:
             guard interactionState == .pinching else { return }
             setCamera(pinchStartCamera, reason: .pinch)
             professor.endNavigation(worldTransform); applyCamera(interacting: false)
             onCameraChanged(controller.camera)
             interactionState = .idle; pinchStartMidpoint = .zero; debugInputOperation("PINCH CANCEL"); updateInputHUD()
+            activeInputOwner = .none; activeInputContact = nil
         default: break
         }
     }
@@ -1185,21 +1210,54 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         })
     }
 
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldReceive touch: UITouch) -> Bool {
+        CanvasGestureHitTestPolicy.allowsCanvasGesture(from: touch.view, canvasRoot: self)
+    }
+
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         if gestureRecognizer === panGesture || gestureRecognizer === scrollPanGesture
             || gestureRecognizer === wheelZoomGesture { return true }
         return true
     }
 
-    // Pencil owns direct drawing. Simulator mouse/touch uses the same
-    // canonical Stroke model with deterministic pressure=1.
-    private func isDrawingTouch(_ touch: UITouch) -> Bool {
-        if touch.type == .pencil { return true }
+    private var drawsWithFinger: Bool {
         #if targetEnvironment(simulator)
-        return touch.type == .indirectPointer || touch.type == .direct
+        // Simulator primary-click streams may be synthesized as `.direct`.
+        return true
         #else
-        return false
+        // iPhone has no Pencil path, so editing tools remain usable. iPad Pen
+        // and Marker reserve one-finger drawing until a visible preference is
+        // introduced; Lasso/Eraser/Select still edit with one finger.
+        return UIDevice.current.userInterfaceIdiom == .phone
         #endif
+    }
+
+    private func contact(for touch: UITouch) -> CanvasInputContact {
+        if touch.type == .pencil { return .pencil }
+        #if targetEnvironment(simulator)
+        if touch.type == .direct || touch.type == .indirectPointer { return .primaryPointer }
+        #else
+        if touch.type == .direct { return .finger }
+        if touch.type == .indirectPointer { return .primaryPointer }
+        #endif
+        return .navigationPointer
+    }
+
+    private func directContactCount(event: UIEvent?) -> Int {
+        max(1, event?.allTouches?.filter {
+            $0.type == .direct && $0.phase != .ended && $0.phase != .cancelled
+        }.count ?? 1)
+    }
+
+    // Pencil, enabled finger drawing, and simulator primary-click input use
+    // the same canonical Stroke model.
+    private func isDrawingTouch(_ touch: UITouch) -> Bool {
+        CanvasInputArbitrationPolicy.owner(
+            tool: activeTool,
+            contact: contact(for: touch),
+            drawsWithFinger: drawsWithFinger
+        ) == .stroke
     }
 
     private func source(for touch: UITouch) -> InputSource {
@@ -1225,6 +1283,42 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         print("[VBoard] INPUT \(phase) source=\(activeInputSource.rawValue) tool=\(activeTool.rawValue) rawPoint=(\(raw.x),\(raw.y)) canvasPoint=(\(screen.x),\(screen.y)) worldPoint=(\(world.x),\(world.y)) roundTrip=(\(roundTrip.x),\(roundTrip.y)) error=\(error) canvasFrame=\(self.frame) canvasFrameInWindow=\(String(describing: windowFrame)) canvasBounds=\(self.bounds) canvasTransform=\(self.transform) professorFrame=\(professor.frame) professorTransform=\(professor.layer.affineTransform()) camera=\(controller.camera) state=\(interactionState.rawValue)")
         if error >= 0.5 { print("[VBoard] ROUND_TRIP_FAILURE error=\(error) raw=\(raw) canvas=\(screen) world=\(world) roundTrip=\(roundTrip)") }
         if showsDeveloperDiagnostics { updateCrosshair(screen: screen, roundTrip: roundTrip) }
+    }
+    private func debugOwnership(_ phase: String, touch: UITouch,
+                                owner: CanvasInputOwner, contactCount: Int) {
+        let point = touch.location(in: self)
+        let hit = hitTest(point, with: nil)
+        let hitName = hit.map { String(describing: type(of: $0)) } ?? "none"
+        let renderState = vectorIndicator.state
+        let pop = nearestNavigationController()?.interactivePopGestureRecognizer
+        let recognizers = "pan=\(Self.gestureStateName(panGesture.state)),pinch=\(Self.gestureStateName(pinchGesture.state)),scroll=\(Self.gestureStateName(scrollPanGesture.state))"
+        print("[VBoard] INPUT_OWNER phase=\(phase) board=\(boardID) source=\(sourceKind.rawValue) render=\(renderState) tool=\(activeTool.rawValue) contact=\(contact(for: touch).rawValue) contacts=\(contactCount) screen=(\(point.x),\(point.y)) world=\(worldPoint(point, from: self)) hit=\(hitName) recognizers={\(recognizers)} candidate=\(owner.rawValue) owner=\(activeInputOwner.rawValue) camera=\(controller.camera) popEnabled=\(pop?.isEnabled.description ?? "missing") popState=\(pop.map { Self.gestureStateName($0.state) } ?? "missing")")
+        if owner == .navigation, contactCount == 1,
+           activeTool == .lasso || activeTool == .objectEraser
+            || activeTool == .pen || activeTool == .highlighter {
+            assertionFailure("Unexpected navigation ownership while \(activeTool.rawValue) selected")
+        }
+    }
+    private static func gestureStateName(_ state: UIGestureRecognizer.State) -> String {
+        switch state {
+        case .possible: return "possible"
+        case .began: return "began"
+        case .changed: return "changed"
+        case .ended: return "ended"
+        case .cancelled: return "cancelled"
+        case .failed: return "failed"
+        @unknown default: return "unknown"
+        }
+    }
+    private func nearestNavigationController() -> UINavigationController? {
+        var responder: UIResponder? = self
+        while let current = responder {
+            if let controller = current as? UIViewController {
+                return controller.navigationController
+            }
+            responder = current.next
+        }
+        return nil
     }
     private func debugInputOperation(_ operation: String) {
         print("[VBoard] \(operation) tool=\(activeTool.rawValue) state=\(interactionState.rawValue) selected=\(selectedIDs.count)")
@@ -1293,22 +1387,35 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         isSpacePressed = false
-        if interactionState == .panning {
-            professor.endNavigation(worldTransform)
-            interactionState = .idle
-            panStart = .zero
-        }
-        updateInputHUD()
+        clearTransientInput()
         super.pressesCancelled(presses, with: event)
     }
 
     @objc private func clearTransientInput() {
         isSpacePressed = false
-        if interactionState == .panning { professor.endNavigation(worldTransform) }
-        interactionState = .idle; panStart = .zero
-        activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
-        activePoints.removeAll(); predictedPoints.removeAll(); strokeAccumulator.reset(); activeID = nil
-        lassoWorldPoints.removeAll(); updateInteractionPath(); updateInputHUD()
+        switch interactionState {
+        case .panning:
+            setCamera(panStartCamera, reason: .handPan)
+            professor.endNavigation(worldTransform)
+            applyCamera(interacting: false)
+            onCameraChanged(controller.camera)
+        case .pinching:
+            setCamera(pinchStartCamera, reason: .pinch)
+            professor.endNavigation(worldTransform)
+            applyCamera(interacting: false)
+            onCameraChanged(controller.camera)
+        default:
+            break
+        }
+        cancelActiveContentInteraction()
+        panStart = .zero
+        pinchStartMidpoint = .zero
+        eraseIDs.removeAll()
+        moveDelta = .zero
+        moveActive = false
+        resizeSession = nil
+        resizePreviewBounds = nil
+        updateSelectionOverlay()
     }
 
     private func applyKeyboardZoom(_ factor: CGFloat) {
@@ -1338,35 +1445,43 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
+        pencilHoverLayer.isHidden = true
+        pencilHoverLayer.path = nil
+        let inputContact = contact(for: touch)
+        let contactCount = inputContact == .finger ? directContactCount(event: event) : 1
+        let owner = CanvasInputArbitrationPolicy.owner(
+            tool: isSpacePressed ? .navigation : activeTool,
+            contact: inputContact,
+            contactCount: contactCount,
+            drawsWithFinger: drawsWithFinger
+        )
+        activeInputContact = inputContact
+        activeInputOwner = owner
         #if DEBUG
         pencilRawMonitor.recordTouch("BEGIN", touch: touch, event: event, in: self,
                                      tool: activeTool.rawValue, state: interactionState.rawValue)
+        debugOwnership("BEGIN", touch: touch, owner: owner, contactCount: contactCount)
         #endif
         debugInput("BEGIN", touch: touch)
-        #if !targetEnvironment(simulator)
-        // Direct touches belong to the two-finger camera recognizers. A lone
-        // finger or palm never enters drawing, lasso, eraser, move, or resize.
-        if touch.type == .direct {
+        if owner == .none {
             super.touchesBegan(touches, with: event)
             return
         }
-        #endif
         let screen = touch.location(in: self)
         let point = worldPoint(screen, from: self)
-        // Space is a modal simulator hand-pan override. It is checked before
-        // the active content tool so a Pen/Lasso/Eraser drag never mutates
-        // the document while the user is navigating.
-        if isSpacePressed {
+        if owner == .navigation {
+            // Direct-finger navigation is recognizer-owned: one finger for
+            // Hand, two fingers for every editing tool. Pointer/Pencil Hand
+            // input stays on the root touch path.
+            if inputContact == .finger {
+                super.touchesBegan(touches, with: event)
+                return
+            }
             panStart = screen; panStartCamera = controller.camera
             interactionState = .panning; professor.beginNavigation()
             debugInputOperation("PAN BEGIN"); debugPan("BEGIN", screen: screen); updateInputHUD(); return
         }
-        if activeTool == .navigation {
-            panStart = screen; panStartCamera = controller.camera
-            interactionState = .panning; professor.beginNavigation(); debugInputOperation("PAN BEGIN"); debugPan("BEGIN", screen: screen); updateInputHUD(); return
-        }
-        if activeTool != .pen && activeTool != .highlighter { beginEditing(at: point, screen: screen); return }
-        guard isDrawingTouch(touch) else { super.touchesBegan(touches, with: event); return }
+        if owner != .stroke { beginEditing(at: point, screen: screen); return }
         interactionState = .drawing; debugInputOperation("STROKE BEGIN"); updateInputHUD()
         recentlyCommittedStroke = nil
         strokeAccumulator.reset()
@@ -1406,8 +1521,13 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             mutateCamera(reason: .handPan) { $0.pan(screenTranslation: CGPoint(x: screen.x - panStart.x, y: screen.y - panStart.y), viewport: bounds.size) }
             applyCamera(interacting: true); debugInputOperation("PAN UPDATE"); debugPan("UPDATE", screen: screen); return
         }
-        if activeTool != .pen && activeTool != .highlighter { continueEditing(at: worldPoint(touch.location(in: self), from: self), screen: touch.location(in: self)); return }
-        guard isDrawingTouch(touch) else { return }
+        if activeInputOwner == .lasso || activeInputOwner == .eraser
+            || activeInputOwner == .selection {
+            continueEditing(at: worldPoint(touch.location(in: self), from: self),
+                            screen: touch.location(in: self))
+            return
+        }
+        guard activeInputOwner == .stroke, isDrawingTouch(touch) else { return }
         strokeAccumulator.appendConfirmed(samples(for: touch, event: event))
         strokeAccumulator.setPredicted(predictedSamples(for: touch, event: event))
         activePoints = strokeAccumulator.canonicalPoints
@@ -1439,16 +1559,21 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             setCamera(panStartCamera, reason: .handPan)
             mutateCamera(reason: .handPan) { $0.pan(screenTranslation: CGPoint(x: screen.x - panStart.x, y: screen.y - panStart.y), viewport: bounds.size) }
             professor.endNavigation(worldTransform); applyCamera(interacting: false); onCameraChanged(controller.camera)
-            interactionState = .idle; panStart = .zero; debugInputOperation("PAN END"); debugPan("END", screen: screen); updateInputHUD(); return
+            interactionState = .idle; panStart = .zero
+            activeInputOwner = .none; activeInputContact = nil
+            debugInputOperation("PAN END"); debugPan("END", screen: screen); updateInputHUD(); return
         }
-        if activeTool != .pen && activeTool != .highlighter {
-            finishEditing(at: worldPoint(touch.location(in: self), from: self)); return
+        if activeInputOwner == .lasso || activeInputOwner == .eraser
+            || activeInputOwner == .selection {
+            finishEditing(at: worldPoint(touch.location(in: self), from: self))
+            activeInputOwner = .none; activeInputContact = nil
+            return
         }
-        guard isDrawingTouch(touch) else { return }
+        guard activeInputOwner == .stroke, isDrawingTouch(touch) else { return }
         strokeAccumulator.appendConfirmed(samples(for: touch, event: event))
         activePoints = strokeAccumulator.canonicalPoints
         commitActiveStroke()
-        interactionState = .idle; updateInputHUD()
+        interactionState = .idle; activeInputOwner = .none; activeInputContact = nil; updateInputHUD()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1462,13 +1587,21 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             setCamera(panStartCamera, reason: .handPan)
             professor.endNavigation(worldTransform); applyCamera(interacting: false)
             onCameraChanged(controller.camera)
-            interactionState = .idle; panStart = .zero; updateInputHUD(); return
+            interactionState = .idle; panStart = .zero
+            activeInputOwner = .none; activeInputContact = nil
+            updateInputHUD(); return
         }
-        if activeTool != .pen && activeTool != .highlighter { finishEditing(at: nil); return }
-        if touches.contains(where: { isDrawingTouch($0) }) {
+        if activeInputOwner == .lasso || activeInputOwner == .eraser
+            || activeInputOwner == .selection {
+            finishEditing(at: nil)
+            activeInputOwner = .none; activeInputContact = nil
+            return
+        }
+        if activeInputOwner == .stroke, touches.contains(where: { isDrawingTouch($0) }) {
             activeStrokeLayer?.removeFromSuperlayer(); activeStrokeLayer = nil
             activePoints.removeAll(); predictedPoints.removeAll(); strokeAccumulator.reset(); activeID = nil
         }
+        interactionState = .idle; activeInputOwner = .none; activeInputContact = nil
     }
 
     override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
@@ -1619,6 +1752,20 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             interactionState = .idle; updateSelectionOverlay(); updateInputHUD()
             return
         }
+        if interactionState == .erasing {
+            if endpoint != nil, !eraseIDs.isEmpty {
+                let deleted = eraseIDs
+                selectedIDs.subtract(deleted)
+                onSelectionRegionChanged(nil)
+                onDelete(deleted)
+                onSelectionChanged(selectedIDs)
+                debugInputOperation("ERASER COMMIT")
+            }
+            eraseIDs.removeAll()
+            interactionState = .idle
+            updateSelectionOverlay(); updateInputHUD()
+            return
+        }
         if interactionState == .lassoing, let endpoint, lassoWorldPoints.count == 1 { lassoWorldPoints.append(endpoint) }
         if interactionState == .lassoing, lassoWorldPoints.count >= 2 {
             // A simulator drag is delivered as a begin/end pair by the Mac
@@ -1767,10 +1914,38 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         hit.formUnion(professor.ids(intersecting: segmentBounds))
         let fresh = hit.subtracting(eraseIDs)
         guard !fresh.isEmpty else { return }
-        eraseIDs.formUnion(fresh); selectedIDs.formUnion(fresh); onSelectionRegionChanged(nil); onDelete(fresh); onSelectionChanged(selectedIDs)
+        // Erasure is accumulated as transient intent and committed only when
+        // the gesture ends. A recognizer cancellation can therefore discard
+        // the whole sequence without mutating canonical editor state.
+        eraseIDs.formUnion(fresh)
         #if DEBUG
         print("[VBoard] ERASER HITS ids=\(Array(fresh))")
         #endif
+    }
+
+    private func cancelActiveContentInteraction() {
+        switch interactionState {
+        case .drawing:
+            activeStrokeLayer?.removeFromSuperlayer()
+            activeStrokeLayer = nil
+            activePoints.removeAll(); predictedPoints.removeAll()
+            strokeAccumulator.reset(); activeID = nil
+        case .movingSelection:
+            clearMovePreview()
+        case .resizingSelection:
+            clearResizePreview()
+        case .lassoing:
+            lassoWorldPoints.removeAll()
+        case .erasing:
+            eraseIDs.removeAll()
+        case .idle, .panning, .pinching, .selecting:
+            break
+        }
+        interactionState = .idle
+        activeInputOwner = .none
+        activeInputContact = nil
+        updateInteractionPath()
+        updateInputHUD()
     }
 
     private func hitTestIDs(at point: CGPoint) -> Set<String> {

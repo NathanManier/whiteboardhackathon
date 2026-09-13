@@ -447,6 +447,33 @@ final class PDFBoardContractTests: XCTestCase {
         XCTAssertEqual(first.viewBox, CGRect(x: -800, y: -400, width: 4000, height: 12000))
     }
 
+    func testRasterSourceGeometryStaysTopLeftAnchoredAcrossAspectRatiosAndTransforms() {
+        let sizes = [
+            CGSize(width: 400, height: 1_200),
+            CGSize(width: 1_200, height: 400),
+            CGSize(width: 800, height: 800),
+        ]
+        for size in sizes {
+            let view = UIView()
+            let origin = CGPoint(x: -320, y: 175)
+            PDFBoardSource.pinTopLeft(view, size: size, origin: origin)
+            PDFBoardSource.apply(
+                transform: ObjectTransform(x: -90, y: 55, scaleX: 0.625,
+                                           scaleY: 1.25, deleted: nil),
+                to: view
+            )
+
+            XCTAssertEqual(view.layer.anchorPoint, .zero)
+            XCTAssertEqual(view.bounds, CGRect(origin: .zero, size: size))
+            XCTAssertEqual(view.layer.position, origin)
+            let affine = view.layer.affineTransform()
+            XCTAssertEqual(affine.a, 0.625, accuracy: 0.000_001)
+            XCTAssertEqual(affine.d, 1.25, accuracy: 0.000_001)
+            XCTAssertEqual(affine.tx, -90, accuracy: 0.000_001)
+            XCTAssertEqual(affine.ty, 55, accuracy: 0.000_001)
+        }
+    }
+
     func testTransformedImageProxySupportsNegativeWorldSelectionAndRegionalStudyBBox() throws {
         let source = try SVGDocument.parse("<svg viewBox='0 0 400 1200'><image width='400' height='1200'/></svg>")
         let document = PDFBoardSource.selectableDocument(source, sourceKind: .image)

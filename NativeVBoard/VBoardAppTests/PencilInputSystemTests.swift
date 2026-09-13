@@ -154,6 +154,51 @@ final class PencilGeometryAndPressureTests: XCTestCase {
         XCTAssertGreaterThan(horizontalBounds.width, horizontalBounds.height)
         XCTAssertGreaterThan(verticalBounds.height, verticalBounds.width)
     }
+
+    func testMarkerGeometryHasNoGapBetweenWidelySpacedSamples() {
+        let points = [
+            StrokePoint(x: 0, y: 0, pressure: 0.2, altitude: 0.7,
+                        azimuth: 0.1, roll: 0.2),
+            StrokePoint(x: 160, y: 40, pressure: 0.9, altitude: 1.2,
+                        azimuth: 1.0, roll: 1.1)
+        ]
+        let path = PencilStrokeGeometry.path(points: points, tool: .marker, baseWidth: 24)
+        for step in 0...20 {
+            let fraction = CGFloat(step) / 20
+            XCTAssertTrue(path.contains(CGPoint(x: 160 * fraction, y: 40 * fraction)),
+                          "Marker left a gap at interpolation step \(step)")
+        }
+    }
+}
+
+final class CanvasAppearanceContractTests: XCTestCase {
+    func testCanvasTokensDoNotInvertWithSystemAppearance() {
+        let light = UITraitCollection(userInterfaceStyle: .light)
+        let dark = UITraitCollection(userInterfaceStyle: .dark)
+        for color in [CanvasDesignTokens.canvasBackground,
+                      CanvasDesignTokens.boardSurface,
+                      CanvasDesignTokens.canvasPrimaryText,
+                      CanvasDesignTokens.dotColor] {
+            XCTAssertEqual(color.resolvedColor(with: light), color.resolvedColor(with: dark))
+        }
+    }
+
+    func testCanvasTextContrastsWithWhiteboardSurface() {
+        let background = relativeLuminance(CanvasDesignTokens.boardSurface)
+        let foreground = relativeLuminance(CanvasDesignTokens.canvasPrimaryText)
+        let lighter = max(background, foreground)
+        let darker = min(background, foreground)
+        XCTAssertGreaterThanOrEqual((lighter + 0.05) / (darker + 0.05), 4.5)
+    }
+
+    private func relativeLuminance(_ color: UIColor) -> CGFloat {
+        var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0
+        XCTAssertTrue(color.getRed(&red, green: &green, blue: &blue, alpha: nil))
+        func linear(_ channel: CGFloat) -> CGFloat {
+            channel <= 0.04045 ? channel / 12.92 : pow((channel + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
 }
 
 final class PencilPaletteAndArbitrationTests: XCTestCase {
@@ -196,21 +241,77 @@ final class PencilPaletteAndArbitrationTests: XCTestCase {
         XCTAssertTrue(bounds.contains(CGRect(origin: corner, size: size)))
     }
 
-    func testPencilEditsFingerNavigatesAndPalmNeverDraws() {
-        XCTAssertTrue(PencilInputArbitration.allows(.pencil, intent: .draw,
-                                                    pencilOwnsStroke: false))
-        XCTAssertTrue(PencilInputArbitration.allows(.pencil, intent: .edit,
-                                                    pencilOwnsStroke: false))
-        XCTAssertFalse(PencilInputArbitration.allows(.finger, intent: .draw,
-                                                     pencilOwnsStroke: false))
-        XCTAssertTrue(PencilInputArbitration.allows(.finger, intent: .navigate,
-                                                    pencilOwnsStroke: false))
-        XCTAssertTrue(PencilInputArbitration.allows(.finger, intent: .navigate,
-                                                    pencilOwnsStroke: true))
-        XCTAssertFalse(PencilInputArbitration.allows(.palm, intent: .navigate,
-                                                     pencilOwnsStroke: true))
-        XCTAssertTrue(PencilInputArbitration.allows(.finger, intent: .graph,
-                                                    pencilOwnsStroke: false))
+    func testToolContactMatrixHasOneDeterministicOwner() {
+        let expected: [CanvasTool: [CanvasInputOwner]] = [
+            .navigation: [.navigation, .navigation, .navigation],
+            .pen: [.stroke, .stroke, .stroke],
+            .highlighter: [.stroke, .stroke, .stroke],
+            .objectEraser: [.eraser, .eraser, .eraser],
+            .lasso: [.lasso, .lasso, .lasso],
+            .select: [.selection, .selection, .selection]
+        ]
+        let contacts: [CanvasInputContact] = [.pencil, .finger, .primaryPointer]
+        for tool in CanvasTool.allCases {
+            XCTAssertEqual(contacts.map {
+                CanvasInputArbitrationPolicy.owner(tool: tool, contact: $0,
+                                                   drawsWithFinger: true)
+            }, expected[tool], "Unexpected owner for \(tool)")
+        }
+    }
+
+    func testEditingOwnershipDoesNotDependOnBoardRenderState() {
+        enum RenderState: CaseIterable { case blank, image, pdf, vectorPreview, vectorExact }
+        for state in RenderState.allCases {
+            _ = state
+            XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
+                tool: .lasso, contact: .finger, drawsWithFinger: false
+            ), .lasso)
+            XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
+                tool: .objectEraser, contact: .finger, drawsWithFinger: false
+            ), .eraser)
+            XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
+                tool: .select, contact: .primaryPointer, drawsWithFinger: false
+            ), .selection)
+        }
+    }
+
+    func testOneFingerNeverNavigatesWhileEditingToolSelected() {
+        for tool in CanvasTool.allCases where tool != .navigation {
+            XCTAssertEqual(CanvasInputArbitrationPolicy.minimumDirectNavigationTouches(tool: tool), 2)
+        }
+        XCTAssertEqual(CanvasInputArbitrationPolicy.minimumDirectNavigationTouches(tool: .navigation), 1)
+        XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
+            tool: .pen, contact: .finger, drawsWithFinger: false
+        ), .none)
+        XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
+            tool: .lasso, contact: .finger, drawsWithFinger: false
+        ), .lasso)
+        XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
+            tool: .lasso, contact: .finger, contactCount: 2, drawsWithFinger: false
+        ), .navigation)
+        XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
+            tool: .pen, contact: .palm, drawsWithFinger: true
+        ), .none)
+    }
+
+    func testCanvasGesturesRejectVisibleControlDescendantsButAcceptCanvasContent() {
+        let canvas = UIView()
+        let content = UIView()
+        let button = UIButton(type: .system)
+        let buttonLabelContainer = UIView()
+        canvas.addSubview(content)
+        canvas.addSubview(button)
+        button.addSubview(buttonLabelContainer)
+
+        XCTAssertTrue(CanvasGestureHitTestPolicy.allowsCanvasGesture(
+            from: content, canvasRoot: canvas
+        ))
+        XCTAssertFalse(CanvasGestureHitTestPolicy.allowsCanvasGesture(
+            from: button, canvasRoot: canvas
+        ))
+        XCTAssertFalse(CanvasGestureHitTestPolicy.allowsCanvasGesture(
+            from: buttonLabelContainer, canvasRoot: canvas
+        ))
     }
 }
 

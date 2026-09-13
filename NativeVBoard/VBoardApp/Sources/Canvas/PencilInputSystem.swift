@@ -457,18 +457,74 @@ enum PencilStrokeCorrection {
     }
 }
 
-enum PencilInputArbitration {
-    enum Contact: Sendable { case pencil, finger, palm, indirect }
-    enum Intent: Sendable { case draw, edit, navigate, graph }
+/// The single policy used by both the isolated-board canvas and the class
+/// workspace canvas. UIKit adapters classify a contact once, then route the
+/// complete sequence to exactly one owner from begin through end/cancel.
+enum CanvasInputContact: String, CaseIterable, Sendable {
+    case pencil
+    case finger
+    case primaryPointer
+    case navigationPointer
+    case palm
+}
 
-    static func allows(_ contact: Contact, intent: Intent, pencilOwnsStroke: Bool) -> Bool {
-        switch (contact, intent) {
-        case (.pencil, .draw), (.pencil, .edit): return true
-        case (.finger, .navigate), (.indirect, .navigate), (.finger, .graph): return true
-        case (.finger, .draw), (.finger, .edit): return false
-        case (.palm, _): return false
-        default: return false
+enum CanvasInputOwner: String, Equatable, Sendable {
+    case none
+    case navigation
+    case stroke
+    case eraser
+    case lasso
+    case selection
+}
+
+enum CanvasInputArbitrationPolicy {
+    static func owner(tool: CanvasTool,
+                      contact: CanvasInputContact,
+                      contactCount: Int = 1,
+                      drawsWithFinger: Bool) -> CanvasInputOwner {
+        if contact == .palm { return .none }
+        if contact == .navigationPointer { return .navigation }
+        if contact == .finger, contactCount >= 2 { return .navigation }
+
+        switch tool {
+        case .navigation:
+            return .navigation
+        case .pen, .highlighter:
+            if contact == .finger, !drawsWithFinger { return .none }
+            return contact == .pencil || contact == .finger || contact == .primaryPointer
+                ? .stroke : .none
+        case .objectEraser:
+            return contact == .pencil || contact == .finger || contact == .primaryPointer
+                ? .eraser : .none
+        case .lasso:
+            return contact == .pencil || contact == .finger || contact == .primaryPointer
+                ? .lasso : .none
+        case .select:
+            return contact == .pencil || contact == .finger || contact == .primaryPointer
+                ? .selection : .none
         }
+    }
+
+    /// A one-finger pan exists only while Hand is selected. Every editing
+    /// tool reserves the first direct contact for editing (or an intentional
+    /// no-op when Draw with Finger is disabled); navigation requires two.
+    static func minimumDirectNavigationTouches(tool: CanvasTool) -> Int {
+        tool == .navigation ? 1 : 2
+    }
+}
+
+enum CanvasGestureHitTestPolicy {
+    /// Canvas recognizers must not steal taps from visible controls embedded
+    /// above the drawing surface. Stop at the canvas root so unrelated
+    /// controls elsewhere in the hierarchy do not influence routing.
+    static func allowsCanvasGesture(from hitView: UIView?, canvasRoot: UIView) -> Bool {
+        var candidate = hitView
+        while let view = candidate {
+            if view is UIControl { return false }
+            if view === canvasRoot { break }
+            candidate = view.superview
+        }
+        return true
     }
 }
 
