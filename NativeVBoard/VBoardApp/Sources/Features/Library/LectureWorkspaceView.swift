@@ -101,7 +101,9 @@ struct LectureWorkspaceView: View {
                     if activeBoard != nil {
                         Button { showRenameBoard = true } label: { Label("Rename Whiteboard", systemImage: "pencil") }
                         Button { showSetUnit = true } label: { Label("Set Unit", systemImage: "tag") }
-                        Button { Task { await exportActiveBoard() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }
+                        Button { Task { await exportActiveBoard(.svg) } } label: { Label("Export SVG", systemImage: "doc.text") }
+                        Button { Task { await exportActiveBoard(.png) } } label: { Label("Save Image", systemImage: "photo") }
+                        Button { Task { await exportActiveBoard(.pdf) } } label: { Label("Export PDF", systemImage: "doc.richtext") }
                         Divider()
                     }
                     Button { showNote = true } label: { Label("Add Note", systemImage: "note.text.badge.plus") }
@@ -806,19 +808,22 @@ struct LectureWorkspaceView: View {
         }
     }
 
-    private func exportActiveBoard() async {
+    private func exportActiveBoard(_ format: APIClient.BoardExportFormat) async {
         guard let board = activeBoard else { return }
         do {
-            let data = try await api.exportSVG(boardID: board.id)
+            await store.activeBoardStore?.saveNow(api: api)
+            let data = try await api.exportBoard(boardID: board.id, format: format)
             let safe = board.name.replacingOccurrences(of: "[^A-Za-z0-9 _-]", with: "", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VBoardExports", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let url = directory.appendingPathComponent((safe.isEmpty ? "V-Board" : safe) + ".svg")
+            let url = directory.appendingPathComponent(
+                (safe.isEmpty ? "V-Board" : safe) + ".\(format.rawValue)"
+            )
             try data.write(to: url, options: .atomic)
             exportURL = url
             showShare = true
-        } catch { actionError = "The SVG could not be exported right now." }
+        } catch { actionError = "The board could not be exported right now." }
     }
 
 }

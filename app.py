@@ -3380,6 +3380,22 @@ def append_professor_svg(
             continue
         copied = deepcopy(child)
         original_id = copied.get("id")
+        # Raster-backed sources are represented by one stable logical object
+        # in native and web editors. Older generated source SVGs did not put
+        # that ID on their sole <image>, so export previously ignored the
+        # persisted source transform while the live editor applied it.
+        if tag == "image" and not isinstance(original_id, str):
+            source_kind = str(
+                metadata.get("source_kind")
+                or (metadata.get("source") or {}).get("kind")
+                or ""
+            )
+            if source_kind == "image":
+                original_id = "image-source-1"
+            elif source_kind in {"freeform_pdf", "generic_pdf"}:
+                original_id = "pdf-page-1"
+            if original_id:
+                copied.set("id", original_id)
         object_id = original_id
         if isinstance(original_id, str) and id_prefix:
             object_id = f"{id_prefix}{original_id}"[:64]
@@ -3921,7 +3937,7 @@ def _graph_frame_bounds(
 
 
 def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
-    from study.rendering import content_bounds, union_boxes
+    from study.rendering import content_bounds, pad_bbox, union_boxes
 
     dimensions = metadata.get("dimensions", {})
     width = int(dimensions.get("width") or metadata.get("source", {}).get("width") or 1)
@@ -4046,6 +4062,8 @@ def combined_svg(metadata: dict[str, Any], board_dir: Path) -> bytes:
         rendered_bounds,
         *_graph_frame_bounds(objects, groups, parent_by_child),
     ]) or board_bounds
+    padding = max(24.0, min(96.0, max(scene_bounds["width"], scene_bounds["height"]) * 0.02))
+    scene_bounds = pad_bbox(scene_bounds, padding)
     left = math.floor(scene_bounds["x"])
     top = math.floor(scene_bounds["y"])
     right = math.ceil(scene_bounds["x"] + scene_bounds["width"])
@@ -6074,6 +6092,58 @@ def board_svg(board_id: str) -> Response:
         mimetype="image/svg+xml",
         headers={
             "Content-Disposition": f'attachment; filename="whiteboard-{board_id}.svg"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.get("/board/<board_id>/png")
+@require_authenticated
+def board_png(board_id: str) -> Response:
+    from study.rendering import rasterize_svg_bytes
+
+    require_board_owner(board_id)
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    png = rasterize_svg_bytes(combined_svg(metadata, board_dir), max_px=4096)
+    return Response(
+        png,
+        mimetype="image/png",
+        headers={
+            "Content-Disposition": f'attachment; filename="whiteboard-{board_id}.png"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.get("/board/<board_id>/pdf")
+@require_authenticated
+def board_pdf(board_id: str) -> Response:
+    require_board_owner(board_id)
+    board_dir = require_board_id(board_id)
+    metadata = read_metadata(board_dir)
+    svg = combined_svg(metadata, board_dir)
+    try:
+        import cairosvg
+
+        # Preserve vector source/annotation quality when the deployment has a
+        # compatible native Cairo runtime.
+        pdf = cairosvg.svg2pdf(bytestring=svg)
+    except (ImportError, OSError):
+        # Some local/CI macOS environments can install the Python package but
+        # not a matching Cairo dylib. Keep export functional with a bounded,
+        # high-resolution full-composition page instead of returning 500.
+        from study.rendering import rasterize_svg_bytes
+
+        image = Image.open(io.BytesIO(rasterize_svg_bytes(svg, max_px=4096))).convert("RGB")
+        output = io.BytesIO()
+        image.save(output, format="PDF", resolution=144.0)
+        pdf = output.getvalue()
+    return Response(
+        pdf,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="whiteboard-{board_id}.pdf"',
             "X-Content-Type-Options": "nosniff",
         },
     )

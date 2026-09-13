@@ -298,7 +298,9 @@ private struct BoardEditorSurface: View {
                 Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo)
                 Button { showImport = true } label: { Image(systemName: "plus") }.accessibilityLabel("Add Whiteboard")
                 Menu {
-                    Button { Task { await export() } } label: { Label("Export SVG", systemImage: "square.and.arrow.up") }
+                    Button { Task { await export(.svg) } } label: { Label("Export SVG", systemImage: "doc.text") }
+                    Button { Task { await export(.png) } } label: { Label("Save Image", systemImage: "photo") }
+                    Button { Task { await export(.pdf) } } label: { Label("Export PDF", systemImage: "doc.richtext") }
                     Picker("Workspace Background", selection: $backgroundRaw) {
                         ForEach(WorkspaceBackgroundStyle.allCases) { style in Text(style.title).tag(style.rawValue) }
                     }
@@ -700,17 +702,20 @@ private struct BoardEditorSurface: View {
         return selectedObjects.contains(where: { $0.role == "ai_practice_problem" })
             && selectedObjects.contains(where: { $0.role != "ai_practice_problem" })
     }
-    private func export() async {
+    private func export(_ format: APIClient.BoardExportFormat) async {
         do {
-            let data = try await api.exportSVG(boardID: board.id)
+            // Flush the board-owned autosave outbox so every export format is
+            // generated from the current canonical composition.
+            await store.saveNow(api: api)
+            let data = try await api.exportBoard(boardID: board.id, format: format)
             let safeName = board.name.replacingOccurrences(of: "[^A-Za-z0-9 _-]", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
-            let name = (safeName.isEmpty ? "V-Board" : safeName) + ".svg"
+            let name = (safeName.isEmpty ? "V-Board" : safeName) + ".\(format.rawValue)"
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VBoardExports", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let url = directory.appendingPathComponent(name)
             try data.write(to: url, options: .atomic)
             exportURL = url; showShare = true
-        } catch { exportError = "The SVG could not be exported right now." }
+        } catch { exportError = "The board could not be exported right now." }
     }
     private func deleteBoard() async { do { try await api.deleteBoard(id: board.id); dismiss() } catch { exportError = "The board could not be deleted." } }
 }

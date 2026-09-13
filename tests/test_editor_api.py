@@ -267,6 +267,73 @@ class EditorApiTests(unittest.TestCase):
         self.assertIn("Editable text", markup)
         self.assertIn('stroke="#123456"', markup)
 
+    def test_raster_source_transform_and_off_source_content_define_export_bounds(self):
+        self.metadata["source_kind"] = "image"
+        self.metadata["source"]["kind"] = "image"
+        self.metadata["assets"]["svg"] = "board.svg"
+        (self.board_dir / "board.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">'
+            '<image width="1200" height="800" '
+            'href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC'
+            'AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="/></svg>',
+            encoding="utf-8",
+        )
+        board_app.atomic_json(self.board_dir / "board.json", self.metadata)
+        state = self.editor_state()
+        state["imported_transforms"] = {
+            "image-source-1": {
+                "x": -420, "y": 75, "scaleX": 0.5, "scaleY": 0.5,
+                "deleted": False,
+            }
+        }
+        state["objects"][0]["points"] = [
+            {"x": -700, "y": 20}, {"x": 1400, "y": 1800}
+        ]
+        self.assertEqual(
+            self.client.put(f"/api/boards/{self.board_id}/editor", json=state).status_code,
+            200,
+        )
+
+        response = self.client.get(f"/board/{self.board_id}/svg")
+        root = ET.fromstring(response.data)
+        image = next(item for item in root.iter() if item.tag.endswith("image"))
+        self.assertEqual(image.get("id"), "image-source-1")
+        parent = next(
+            parent for parent in root.iter()
+            if image in list(parent)
+        )
+        self.assertIn("translate(-420.0000 75.0000)", parent.get("transform", ""))
+        view_box = [float(value) for value in root.get("viewBox", "").split()]
+        self.assertLess(view_box[0], -700)
+        self.assertGreater(view_box[1] + view_box[3], 1300)
+
+    def test_png_and_pdf_export_complete_composed_board(self):
+        self.metadata["assets"]["svg"] = "board.svg"
+        (self.board_dir / "board.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">'
+            '<path id="professor" d="M 0 0 L 1200 800" stroke="#111"/></svg>',
+            encoding="utf-8",
+        )
+        board_app.atomic_json(self.board_dir / "board.json", self.metadata)
+        self.assertEqual(
+            self.client.put(
+                f"/api/boards/{self.board_id}/editor", json=self.editor_state()
+            ).status_code,
+            200,
+        )
+
+        png = self.client.get(f"/board/{self.board_id}/png")
+        self.assertEqual(png.status_code, 200)
+        self.assertEqual(png.mimetype, "image/png")
+        rendered = Image.open(io.BytesIO(png.data))
+        self.assertGreater(rendered.width, 0)
+        self.assertGreater(rendered.height, 0)
+
+        pdf = self.client.get(f"/board/{self.board_id}/pdf")
+        self.assertEqual(pdf.status_code, 200)
+        self.assertEqual(pdf.mimetype, "application/pdf")
+        self.assertTrue(pdf.data.startswith(b"%PDF-"))
+
     def test_graph_object_round_trips_with_defaults_provenance_and_safe_extensions(self):
         state = self.editor_state()
         state["objects"].append(self.graph_object())

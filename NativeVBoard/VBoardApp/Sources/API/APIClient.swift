@@ -408,11 +408,28 @@ final class APIClient: ObservableObject {
         return data
     }
 
-    func exportSVG(boardID: String) async throws -> Data {
-        let request = try request(path: "/board/\(boardID)/svg", accept: "image/svg+xml")
+    enum BoardExportFormat: String, CaseIterable, Sendable {
+        case svg, png, pdf
+
+        var mimeType: String {
+            switch self {
+            case .svg: return "image/svg+xml"
+            case .png: return "image/png"
+            case .pdf: return "application/pdf"
+            }
+        }
+    }
+
+    func exportBoard(boardID: String, format: BoardExportFormat) async throws -> Data {
+        let request = try request(path: "/board/\(boardID)/\(format.rawValue)",
+                                  accept: format.mimeType)
         let (data, response) = try await data(for: request)
         try validate(response, data: data)
         return data
+    }
+
+    func exportSVG(boardID: String) async throws -> Data {
+        try await exportBoard(boardID: boardID, format: .svg)
     }
 
     func save(editor: EditorState, boardID: String) async throws -> EditorState {
