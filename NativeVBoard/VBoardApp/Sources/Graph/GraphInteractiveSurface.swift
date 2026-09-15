@@ -2151,6 +2151,10 @@ private struct GraphMathEditorField: UIViewRepresentable {
         field.clearButtonMode = .never
         field.placeholder = "y=x²"
         field.delegate = context.coordinator
+        // A newly focused expression may be created while the tray still
+        // stores the previous row's last command. Mark that command consumed
+        // for this new field so switching rows never replays an old key.
+        context.coordinator.lastInsertionID = insertion?.id
         field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)),
                         for: .editingChanged)
         return field
