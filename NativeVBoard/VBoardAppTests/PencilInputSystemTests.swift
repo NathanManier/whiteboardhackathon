@@ -21,29 +21,26 @@ final class PencilCapabilityContractTests: XCTestCase {
         XCTAssertTrue(pro.doubleTap && pro.squeeze && pro.barrelRoll && pro.pencilHaptics)
     }
 
-    func testEverySystemDoubleTapActionMapsExactlyOnce() {
-        let mappings: [(PencilPreferredAction, PencilLogicalAction)] = [
-            (.ignore, .none), (.switchEraser, .switchEraser),
-            (.switchPrevious, .switchPrevious), (.showColorPalette, .showColorPalette),
-            (.showInkAttributes, .showInkAttributes),
-            (.showContextualPalette, .showToolPalette),
-            (.runSystemShortcut, .runSystemShortcut), (.unknown, .none)
+    func testEverySystemDoubleTapActionMapsDirectlyToLasso() {
+        let systemActions: [PencilPreferredAction] = [
+            .ignore, .switchEraser, .switchPrevious, .showColorPalette,
+            .showInkAttributes, .showContextualPalette, .runSystemShortcut, .unknown,
         ]
-        for (system, expected) in mappings {
+        for system in systemActions {
             XCTAssertEqual(PencilActionResolver.doubleTap(setting: .followSystem,
-                                                           system: system), expected)
+                                                           system: system), .switchLasso)
         }
     }
 
-    func testExplicitActionOverridesAndUnsupportedCapability() {
+    func testLegacyDoubleTapSettingsCannotOverrideLassoAndUnsupportedIsNoOp() {
         XCTAssertEqual(PencilActionResolver.doubleTap(setting: .previousTool,
-                                                       system: .ignore), .switchPrevious)
+                                                       system: .ignore), .switchLasso)
         XCTAssertEqual(PencilActionResolver.doubleTap(setting: .eraser,
-                                                       system: .showColorPalette), .switchEraser)
+                                                       system: .showColorPalette), .switchLasso)
         XCTAssertEqual(PencilActionResolver.doubleTap(setting: .palette,
-                                                       system: .ignore), .showToolPalette)
+                                                       system: .ignore), .switchLasso)
         XCTAssertEqual(PencilActionResolver.doubleTap(setting: .off,
-                                                       system: .switchEraser), .none)
+                                                       system: .switchEraser), .switchLasso)
         XCTAssertEqual(PencilActionResolver.doubleTap(setting: .eraser,
                                                        system: .switchEraser,
                                                        supported: false), .none)
@@ -532,12 +529,12 @@ final class PencilPaletteAndArbitrationTests: XCTestCase {
 
     func testToolContactMatrixHasOneDeterministicOwner() {
         let expected: [CanvasTool: [CanvasInputOwner]] = [
-            .navigation: [.navigation, .navigation, .navigation],
-            .pen: [.stroke, .stroke, .stroke],
-            .highlighter: [.stroke, .stroke, .stroke],
-            .objectEraser: [.eraser, .eraser, .eraser],
-            .lasso: [.lasso, .lasso, .lasso],
-            .select: [.selection, .selection, .selection]
+            .navigation: [.stroke, .navigation, .selection],
+            .pen: [.stroke, .navigation, .selection],
+            .highlighter: [.stroke, .navigation, .selection],
+            .objectEraser: [.eraser, .navigation, .selection],
+            .lasso: [.lasso, .navigation, .selection],
+            .select: [.lasso, .navigation, .selection],
         ]
         let contacts: [CanvasInputContact] = [.pencil, .finger, .primaryPointer]
         for tool in CanvasTool.allCases {
@@ -554,33 +551,39 @@ final class PencilPaletteAndArbitrationTests: XCTestCase {
             _ = state
             XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
                 tool: .lasso, contact: .finger, drawsWithFinger: false
-            ), .lasso)
+            ), .navigation)
             XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
                 tool: .objectEraser, contact: .finger, drawsWithFinger: false
-            ), .eraser)
+            ), .navigation)
             XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
                 tool: .select, contact: .primaryPointer, drawsWithFinger: false
             ), .selection)
         }
     }
 
-    func testOneFingerNeverNavigatesWhileEditingToolSelected() {
-        for tool in CanvasTool.allCases where tool != .navigation {
-            XCTAssertEqual(CanvasInputArbitrationPolicy.minimumDirectNavigationTouches(tool: tool), 2)
+    func testOneFingerAlwaysNavigatesAndPencilNeverOwnsCameraPan() {
+        for tool in CanvasTool.allCases {
+            XCTAssertEqual(CanvasInputArbitrationPolicy.minimumDirectNavigationTouches(tool: tool), 1)
+            XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
+                tool: tool, contact: .finger, drawsWithFinger: true
+            ), .navigation)
+            XCTAssertNotEqual(CanvasInputArbitrationPolicy.owner(
+                tool: tool, contact: .pencil, drawsWithFinger: false
+            ), .navigation)
         }
-        XCTAssertEqual(CanvasInputArbitrationPolicy.minimumDirectNavigationTouches(tool: .navigation), 1)
-        XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
-            tool: .pen, contact: .finger, drawsWithFinger: false
-        ), .none)
-        XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
-            tool: .lasso, contact: .finger, drawsWithFinger: false
-        ), .lasso)
         XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
             tool: .lasso, contact: .finger, contactCount: 2, drawsWithFinger: false
         ), .navigation)
         XCTAssertEqual(CanvasInputArbitrationPolicy.owner(
             tool: .pen, contact: .palm, drawsWithFinger: true
         ), .none)
+    }
+
+    func testVisibleToolSetAndLegacyMigrationAreExact() {
+        XCTAssertEqual(CanvasTool.visibleTools,
+                       [.pen, .highlighter, .objectEraser, .lasso])
+        XCTAssertEqual(CanvasTool.navigation.migratedForCurrentInputModel, .pen)
+        XCTAssertEqual(CanvasTool.select.migratedForCurrentInputModel, .lasso)
     }
 
     func testCanvasGesturesRejectVisibleControlDescendantsButAcceptCanvasContent() {

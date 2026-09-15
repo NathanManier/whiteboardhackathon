@@ -121,6 +121,27 @@ final class WorkspaceAppearanceTests: XCTestCase {
         XCTAssertEqual(preserved.height, expanded.height)
     }
 
+    func testCommittedContentReconciliationShrinksInChunksButNeverBelowMinimum() {
+        let source = CGSize(width: 1_000, height: 600)
+        let minimum = BoardSurfaceGeometry.workspaceRegion(sourceSize: source)
+        let expanded = CGRect(x: 0, y: 0, width: source.width,
+                              height: minimum.height + 660)
+
+        let shrunk = BoardAutoExpansionPolicy.reconciledLocalRegion(
+            current: expanded, content: minimum, sourceSize: source
+        )
+        XCTAssertEqual(shrunk, minimum)
+        XCTAssertEqual(shrunk.width, source.width)
+
+        let lowContent = CGRect(x: -4_000, y: 0, width: 9_000, height: 1_180)
+        let required = BoardAutoExpansionPolicy.reconciledLocalRegion(
+            current: minimum, content: lowContent, sourceSize: source
+        )
+        XCTAssertEqual(required.width, source.width,
+                       "Horizontal content must never widen a board")
+        XCTAssertGreaterThan(required.height, minimum.height)
+    }
+
     func testOnlyPhysicalAndBlankBoardsUseDownwardAutoExpansion() {
         XCTAssertTrue(BoardAutoExpansionPolicy.isEligible(.physicalWhiteboard))
         XCTAssertTrue(BoardAutoExpansionPolicy.isEligible(.blankBoard))
@@ -2221,6 +2242,112 @@ final class LectureWorkspaceModelTests: XCTestCase {
         let items = [item(0, x: -1_000), item(1, x: 0), item(2, x: 5_000)]
         let index = WorkspaceSpatialIndex(items: items)
         XCTAssertEqual(index.query(CGRect(x: -50, y: -50, width: 900, height: 700)).map(\.boardID), [items[1].boardID])
+    }
+
+    func testWorkspaceSpatialIndexFindsGraphBeyondOwningBoardRectangle() throws {
+        let board = item(0, x: 100, width: 800, height: 600)
+        let graph = GraphObject(
+            id: "outside-graph", owningBoardID: board.boardID,
+            frame: GraphFrame(x: 940, y: 120, width: 420, height: 300),
+            expressions: [GraphExpression(
+                id: "curve", latex: "y=x", type: .explicitFunction
+            )]
+        )
+        let editor = EditorState(
+            schemaVersion: 4, revision: 1, updatedAt: nil,
+            viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+            objects: [CanvasObject(graph: graph)], groups: [],
+            importedTransforms: [:], sourceBoards: [], mergedBoardIDs: []
+        )
+        let document = try SVGDocument.parse(
+            "<svg viewBox='0 0 800 600'></svg>"
+        )
+        let scene = WorkspaceBoardScene(
+            boardID: board.boardID, document: document, pdfData: nil,
+            editor: editor,
+            composition: SceneComposition.build(
+                boardID: board.boardID, document: document, editor: editor
+            )
+        )
+        let index = WorkspaceSpatialIndex(
+            items: [board], scenes: [board.boardID: scene]
+        )
+        let graphWorld = LectureCoordinateTransform.boardLocalToLectureWorld(
+            graph.frame.cgRect, board: board
+        )
+
+        XCTAssertGreaterThan(graphWorld.minX, board.frame.maxX)
+        XCTAssertEqual(index.query(graphWorld.insetBy(dx: 20, dy: 20)).map(\.boardID),
+                       [board.boardID])
+    }
+
+    func testAdjacentBlankBoardPolicyUsesThresholdAndPreventsDuplicates() {
+        let source = item(0, x: 0, width: 800, height: 600)
+        XCTAssertNil(WorkspaceBoardCreationPolicy.crossingSide(
+            worldPoint: CGPoint(x: 870, y: 200), source: source, cameraScale: 1
+        ))
+        XCTAssertEqual(WorkspaceBoardCreationPolicy.crossingSide(
+            worldPoint: CGPoint(x: 872, y: 200), source: source, cameraScale: 1
+        ), .right)
+        XCTAssertEqual(WorkspaceBoardCreationPolicy.crossingSide(
+            worldPoint: CGPoint(x: -72, y: 200), source: source, cameraScale: 1
+        ), .left)
+
+        let origin = WorkspaceBoardCreationPolicy.origin(nextTo: source, side: .right)
+        XCTAssertEqual(origin.x, source.frame.maxX + 96)
+        XCTAssertEqual(WorkspaceBoardCreationPolicy.generatedBoardSize,
+                       CGSize(width: 1_600, height: 2_000))
+        XCTAssertFalse(WorkspaceBoardCreationPolicy.hasBoard(
+            at: origin, items: [source]
+        ))
+
+        let adjacent = item(1, x: Double(origin.x), y: Double(origin.y),
+                            width: 1_600, height: 2_000)
+        XCTAssertTrue(WorkspaceBoardCreationPolicy.hasBoard(
+            at: origin, items: [source, adjacent]
+        ))
+        XCTAssertNotNil(WorkspaceBoardCreationPolicy.emptySpaceOrigin(
+            near: CGPoint(x: 1_100, y: 250), items: [source], cameraScale: 1
+        ))
+    }
+
+    func testStudyMarkerWorldAnchorIsInvariantAcrossCameraChanges() throws {
+        let document = try SVGDocument.parse(
+            "<svg viewBox='0 0 800 600'></svg>"
+        )
+        let editor = EditorState(
+            schemaVersion: 4, revision: 0, updatedAt: nil,
+            viewport: CameraRect(x: 0, y: 0, width: 800, height: 600),
+            objects: [], groups: [], importedTransforms: [:],
+            sourceBoards: [], mergedBoardIDs: []
+        )
+        let interaction = StudyInteraction(
+            title: "Saved note", answer: "Answer", id: "marker",
+            followUps: nil, boardID: "board", selectedObjectIDs: nil,
+            selectionBBox: nil, anchorX: 980, anchorY: 720,
+            anchorOffsetNX: nil, anchorOffsetNY: nil, question: nil,
+            createdAt: nil, action: "explain"
+        )
+        let anchor = try XCTUnwrap(StudyMarkerGeometry.boardLocalAnchor(
+            for: interaction, document: document, editor: editor
+        ))
+        let viewport = CGSize(width: 1_000, height: 700)
+        let first = WorldScreenTransform(
+            camera: CameraRect(x: 0, y: 0, width: 1_000, height: 700),
+            viewport: viewport
+        )
+        let second = WorldScreenTransform(
+            camera: CameraRect(x: 300, y: 180, width: 2_000, height: 1_400),
+            viewport: viewport
+        )
+        let firstScreen = first.screenPoint(for: anchor)
+        let secondScreen = second.screenPoint(for: anchor)
+
+        XCTAssertNotEqual(firstScreen, secondScreen)
+        XCTAssertEqual(first.worldPoint(for: firstScreen).x, anchor.x, accuracy: 0.000_001)
+        XCTAssertEqual(first.worldPoint(for: firstScreen).y, anchor.y, accuracy: 0.000_001)
+        XCTAssertEqual(second.worldPoint(for: secondScreen).x, anchor.x, accuracy: 0.000_001)
+        XCTAssertEqual(second.worldPoint(for: secondScreen).y, anchor.y, accuracy: 0.000_001)
     }
 
     func testFullDetailBudgetNeverPromotesMoreThanThreeBoards() {

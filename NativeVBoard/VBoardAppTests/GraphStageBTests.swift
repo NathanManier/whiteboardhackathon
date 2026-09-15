@@ -623,6 +623,33 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         XCTAssertEqual(model.viewport, .conventional)
     }
 
+    func testTypingPreservesRowIdentityFocusCategoryAndViewport() throws {
+        let viewport = GraphViewport(xMin: -19, xMax: 7, yMin: -4, yMax: 13)
+        let expression = GraphExpression(
+            id: "stable-row", latex: "y=sin(x)", type: .explicitFunction
+        )
+        let graph = GraphObject(
+            id: "stable-editor", owningBoardID: boardID,
+            frame: GraphFrame(x: 0, y: 0, width: 640, height: 420),
+            expressions: [expression], viewport: viewport
+        )
+        let model = GraphWorkspaceModel(graph: graph)
+        model.beginEditing(expression.id)
+        model.keyboardCategory = .functions
+
+        model.updateSource(id: expression.id, source: "y=asin(x)")
+
+        XCTAssertEqual(model.expressions.first?.id, expression.id)
+        XCTAssertEqual(model.editingExpressionID, expression.id)
+        XCTAssertEqual(model.selectedExpressionID, expression.id)
+        XCTAssertEqual(model.keyboardCategory, .functions)
+        XCTAssertEqual(model.viewport, viewport)
+
+        _ = try XCTUnwrap(model.addExpression(source: "y=x^2"))
+        XCTAssertEqual(model.viewport, viewport)
+        XCTAssertEqual(model.keyboardCategory, .functions)
+    }
+
     func testGraphWorkspaceDirectDerivativeIntegralAndParameterSlider() throws {
         let function = GraphExpression(
             id: "function", latex: "f(x)=x^2", type: .explicitFunction
@@ -894,6 +921,35 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         XCTAssertEqual(integral.selection, NSRange(location: 9, length: 0))
     }
 
+    func testMathKeyboardCaretButtonsMoveExactlyOnePositionAndClamp() {
+        let left = GraphMathInsertionPlan.apply(
+            .moveCaret(offset: -1), to: "y=sin(x)",
+            selection: NSRange(location: 5, length: 0)
+        )
+        XCTAssertEqual(left.source, "y=sin(x)")
+        XCTAssertEqual(left.selection, NSRange(location: 4, length: 0))
+
+        let right = GraphMathInsertionPlan.apply(
+            .moveCaret(offset: 1), to: left.source, selection: left.selection
+        )
+        XCTAssertEqual(right.selection, NSRange(location: 5, length: 0))
+        XCTAssertEqual(GraphMathInsertionPlan.apply(
+            .moveCaret(offset: -1), to: "x", selection: NSRange(location: 0, length: 0)
+        ).selection.location, 0)
+        XCTAssertEqual(GraphMathInsertionPlan.apply(
+            .moveCaret(offset: 1), to: "x", selection: NSRange(location: 99, length: 4)
+        ).selection.location, 1)
+    }
+
+    func testSupportedInverseTrigLatexNormalizesWithoutChangingReciprocalSine() {
+        XCTAssertEqual(GraphLatexNormalizer.normalize(#"\arcsin(x)"#), "asin(x)")
+        XCTAssertEqual(GraphLatexNormalizer.normalize(#"\sin^{-1}(x)"#), "asin(x)")
+        XCTAssertEqual(GraphLatexNormalizer.normalize(#"\cos^{-1}(x)"#), "acos(x)")
+        XCTAssertEqual(GraphLatexNormalizer.normalize(#"\tan^{-1}(x)"#), "atan(x)")
+        XCTAssertEqual(GraphLatexNormalizer.normalize(#"\sin(x)"#), "sin(x)")
+        XCTAssertEqual(GraphLatexNormalizer.normalize("sin(x)^-1"), "sin(x)^-1")
+    }
+
     func testGraphViewportNavigationAndTicksRemainIndependentAndReadable() {
         let source = GraphViewport(xMin: -10, xMax: 10, yMin: -8, yMax: 12)
         let zoomed = GraphViewportNavigation.zoomed(source, by: 0.5)
@@ -949,6 +1005,22 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         XCTAssertEqual(try? encoder.encode(model.expressions), bytesBefore)
     }
 
+    func testGraphPlacementStaysBelowSourceClearsCollisionsAndFitsFixedWidth() {
+        let source = CGRect(x: 780, y: 120, width: 180, height: 60)
+        let firstObstacle = CGRect(x: 580, y: 200, width: 420, height: 320)
+        let secondObstacle = CGRect(x: 580, y: 540, width: 420, height: 260)
+        let frame = GraphPlacementPolicy.frame(
+            source: source, occupied: [firstObstacle, secondObstacle],
+            cameraScale: 1, containerWidth: 1_000
+        ).cgRect
+
+        XCTAssertGreaterThan(frame.minY, source.maxY)
+        XCTAssertFalse(frame.intersects(firstObstacle))
+        XCTAssertFalse(frame.intersects(secondObstacle))
+        XCTAssertLessThanOrEqual(frame.maxX, 1_000)
+        XCTAssertEqual(frame.width, 420)
+    }
+
     func testPassiveGraphOpenPolicyUsesFingerOnceAndNeverConsumesPencil() {
         XCTAssertEqual(PassiveGraphOpenPolicy.tapCount(for: .direct), 1)
         XCTAssertEqual(PassiveGraphOpenPolicy.tapCount(for: .indirectPointer), 2)
@@ -990,7 +1062,29 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         XCTAssertEqual(EditorStatusPresentation("Saved locally"), .offline)
         XCTAssertEqual(EditorStatusPresentation("Save failed"), .error)
         XCTAssertEqual(LibraryThumbnailPolicy.aspectRatio, 16.0 / 9.0)
-        XCTAssertTrue(PencilRadialPaletteModel.tools.contains(.select))
+        XCTAssertEqual(PencilRadialPaletteModel.tools,
+                       [.pen, .highlighter, .objectEraser, .lasso])
+        XCTAssertEqual(EditorStatusPresentation("Saved").indicatorRole, .saved)
+        XCTAssertEqual(EditorStatusPresentation("Saving…").indicatorRole, .pending)
+        XCTAssertEqual(EditorStatusPresentation("Saved locally").indicatorRole, .pending)
+        XCTAssertEqual(EditorStatusPresentation("Save failed").indicatorRole, .error)
+
+        XCTAssertEqual(CanvasColorPalette.skyPink, "#F2C4D7")
+        XCTAssertEqual(CanvasColorPalette.name(for: CanvasColorPalette.skyPink),
+                       "Sky Pink")
+        XCTAssertEqual(CanvasColorPalette.accessibilityValue(
+            for: CanvasColorPalette.skyPink
+        ), "F2C4D7")
+        XCTAssertTrue(CanvasColorPalette.standard.contains("#F2C4D7"))
+
+        XCTAssertEqual(LibraryTilePolicy.outerWidth, 272)
+        XCTAssertEqual(LibraryTilePolicy.outerHeight, 240)
+        XCTAssertGreaterThanOrEqual(
+            LibraryTilePolicy.outerHeight,
+            LibraryTilePolicy.padding * 2
+                + LibraryTilePolicy.thumbnailHeight
+                + LibraryTilePolicy.labelHeight + 12
+        )
     }
 
     func testCheckWorkIsContextualToPracticeAndStudentInkOnSameBoard() {
