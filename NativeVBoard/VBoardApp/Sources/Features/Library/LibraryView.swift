@@ -191,7 +191,7 @@ struct LibraryView: View {
             }
         } else {
             VStack(alignment: .leading, spacing: 18) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 280, maximum: 380), spacing: 18)], spacing: 18) {
+                LazyVGrid(columns: LibraryTilePolicy.columns, spacing: LibraryTilePolicy.spacing) {
                     ForEach(library.folders) { folder in
                         lectureLink(folder, library: library, list: false, compact: false)
                     }
@@ -199,7 +199,7 @@ struct LibraryView: View {
                 if !unfiled.isEmpty {
                     Text("Unfiled")
                         .font(.headline)
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 18)], spacing: 18) {
+                    LazyVGrid(columns: LibraryTilePolicy.columns, spacing: LibraryTilePolicy.spacing) {
                         ForEach(unfiled) { board in
                             boardLink(board, library: library, list: false)
                         }
@@ -221,7 +221,7 @@ struct LibraryView: View {
                 ForEach(recent) { board in boardLink(board, library: library, list: true) }
             }
         } else {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 18)], spacing: 18) {
+            LazyVGrid(columns: LibraryTilePolicy.columns, spacing: LibraryTilePolicy.spacing) {
                 ForEach(recent) { board in boardLink(board, library: library, list: false) }
             }
         }
@@ -448,9 +448,14 @@ private struct LectureCard: View {
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     LectureMontage(boards: boards)
+                        .frame(height: LibraryTilePolicy.thumbnailHeight)
                     labels
+                        .frame(height: LibraryTilePolicy.labelHeight, alignment: .top)
                 }
-                .padding(12)
+                .padding(LibraryTilePolicy.padding)
+                .frame(width: LibraryTilePolicy.outerWidth,
+                       height: LibraryTilePolicy.outerHeight,
+                       alignment: .topLeading)
                 .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(.separator.opacity(0.35), lineWidth: 0.5) }
             }
@@ -485,9 +490,14 @@ private struct BoardCard: View {
             } else {
                 VStack(alignment: .leading, spacing: 9) {
                     BoardThumbnailView(board: board)
+                        .frame(height: LibraryTilePolicy.thumbnailHeight)
                     labels
+                        .frame(height: LibraryTilePolicy.labelHeight, alignment: .top)
                 }
-                .padding(10)
+                .padding(LibraryTilePolicy.padding)
+                .frame(width: LibraryTilePolicy.outerWidth,
+                       height: LibraryTilePolicy.outerHeight,
+                       alignment: .topLeading)
                 .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(.separator.opacity(0.35), lineWidth: 0.5) }
             }
@@ -550,6 +560,19 @@ private struct LectureMontage: View {
 
 enum LibraryThumbnailPolicy {
     static let aspectRatio: CGFloat = 16 / 9
+}
+
+enum LibraryTilePolicy {
+    static let outerWidth: CGFloat = 272
+    static let outerHeight: CGFloat = 240
+    static let padding: CGFloat = 10
+    static let spacing: CGFloat = 18
+    static let thumbnailHeight: CGFloat = (outerWidth - padding * 2)
+        / LibraryThumbnailPolicy.aspectRatio
+    static let labelHeight: CGFloat = 64
+    static let columns = [GridItem(
+        .adaptive(minimum: outerWidth, maximum: outerWidth), spacing: spacing
+    )]
 }
 
 /// Every library board card shares this one fixed-ratio, aspect-fill image
