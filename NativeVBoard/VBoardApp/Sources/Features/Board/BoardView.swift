@@ -342,6 +342,7 @@ private struct BoardEditorSurface: View {
         }
         .navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
+                EditorToolMenu(activeTool: $activeTool)
                 Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo)
                 Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo)
                 Button { showImport = true } label: { Image(systemName: "plus") }.accessibilityLabel("Add Whiteboard")
@@ -403,8 +404,12 @@ private struct BoardEditorSurface: View {
         } message: { Text("Your local edits are preserved locally. Choose which version should remain.") }
         .onChange(of: store.status) { _, status in if status == .conflict { showConflict = true } }
         .onChange(of: activeTool) { oldTool, tool in
+            if tool != tool.migratedForCurrentInputModel {
+                activeTool = tool.migratedForCurrentInputModel
+                return
+            }
             if oldTool != tool && oldTool != .objectEraser { previousPencilTool = oldTool }
-            if tool != .select, tool != .lasso,
+            if tool != .lasso,
                !selectedIDs.isEmpty || selectedPDFRegion != nil {
                 selectedIDs.removeAll()
                 selectedPDFRegion = nil
@@ -569,12 +574,10 @@ private struct BoardEditorSurface: View {
                 .zIndex(20)
                 }
             }
-            WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
-                                 penColor: $penColor, penWidth: $penWidth,
-                                 markerColor: $markerColor, markerWidth: $markerWidth,
-                                 markerOpacity: $markerOpacity,
+            WorkspaceToolPalette(status: store.status.userLabel,
                                  undo: { store.undo(api: api) },
-                                 redo: { store.redo(api: api) })
+                                 redo: { store.redo(api: api) },
+                                 retry: { Task { await store.saveNow(api: api) } })
             .padding(.bottom, 12)
             .zIndex(30)
 
@@ -680,6 +683,7 @@ private struct BoardEditorSurface: View {
     private func handlePencilAction(_ action: PencilLogicalAction, anchor: CGPoint?) {
         switch action {
         case .none, .runSystemShortcut: break
+        case .switchLasso: activeTool = .lasso
         case .switchEraser: togglePencilEraser()
         case .switchPrevious:
             let next = previousPencilTool == activeTool ? .pen : previousPencilTool
@@ -814,11 +818,17 @@ private struct BoardEditorSurface: View {
         let scale = canvasSize.width > 0 && canvasSize.height > 0
             ? WorldScreenTransform(camera: liveCamera ?? store.editor.viewport,
                                    viewport: canvasSize).scale : 1
-        let occupied = store.editor.objects.map { BoardHitTestPolicy.bounds(of: $0) }
+        var occupied = store.editor.objects.map { BoardHitTestPolicy.bounds(of: $0) }
+        if let professorBounds = GraphPlacementGeometry.professorBounds(
+            document: document, editor: store.editor
+        ) {
+            occupied.append(professorBounds)
+        }
         let graph = GraphObjectFactory.make(
             boardID: board.id, selection: selection, expressions: expressions,
             recognitionRequestID: requestID, cameraScale: scale, occupied: occupied,
-            sourceBoardIDs: sourceBoardIDs, selectedObjectKeys: selectedObjectKeys
+            sourceBoardIDs: sourceBoardIDs, selectedObjectKeys: selectedObjectKeys,
+            containerWidth: document.viewBox.width
         )
         store.addGraph(graph, api: api)
         selectedIDs = [graph.id]

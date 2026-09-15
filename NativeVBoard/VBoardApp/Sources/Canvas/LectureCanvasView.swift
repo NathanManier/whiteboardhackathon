@@ -237,6 +237,7 @@ private enum LectureInteraction {
     case idle
     case panning(startScreen: CGPoint, startCamera: CameraRect)
     case drawing(boardID: String, strokeID: String)
+    case drawingInEmptySpace(strokeID: String, origin: CGPoint)
     case lassoing
     case erasing(boardID: String?, erased: Set<SelectionKey>)
     case movingSelection(startWorld: CGPoint, clickSelection: Set<SelectionKey>?)
@@ -266,6 +267,7 @@ struct LectureCanvasView: UIViewRepresentable {
     var onSelectionScreenBoundsChanged: (CGRect?) -> Void
     var onStroke: (UserStroke, String) -> Void
     var onBoardExpansionRequested: (String, CGRect) -> Void = { _, _ in }
+    var onBlankBoardCreationRequested: (BlankBoardCreationRequest) -> Void = { _ in }
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeSelection: (Set<SelectionKey>, CGPoint, CGFloat) -> Void
     var onResizeGraphHeight: (SelectionKey, CGFloat, CGFloat) -> Void = { _, _, _ in }
@@ -320,6 +322,7 @@ struct LectureCanvasView: UIViewRepresentable {
                                onSelectionScreenBoundsChanged: onSelectionScreenBoundsChanged,
                                onStroke: onStroke,
                                onBoardExpansionRequested: onBoardExpansionRequested,
+                               onBlankBoardCreationRequested: onBlankBoardCreationRequested,
                                onMoveSelection: onMoveSelection,
                                onResizeSelection: onResizeSelection,
                                onResizeGraphHeight: onResizeGraphHeight,
@@ -344,6 +347,7 @@ struct LectureCanvasCallbacks {
     var onSelectionScreenBoundsChanged: (CGRect?) -> Void
     var onStroke: (UserStroke, String) -> Void
     var onBoardExpansionRequested: (String, CGRect) -> Void = { _, _ in }
+    var onBlankBoardCreationRequested: (BlankBoardCreationRequest) -> Void = { _ in }
     var onMoveSelection: (Set<SelectionKey>, CGPoint) -> Void
     var onResizeSelection: (Set<SelectionKey>, CGPoint, CGFloat) -> Void
     var onResizeGraphHeight: (SelectionKey, CGFloat, CGFloat) -> Void = { _, _, _ in }
@@ -365,6 +369,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private let regionContainer = UIView()
     private let interactionLayer = CAShapeLayer()
     private let pencilHoverLayer = CAShapeLayer()
+    private let emptySpaceStrokeLayer = CAShapeLayer()
     private var boardViews: [String: LectureBoardRenderView] = [:]
     private var regionLayers: [String: CAShapeLayer] = [:]
     private var sourceSurfaceLayers: [String: CAShapeLayer] = [:]
@@ -394,6 +399,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     private var strokeAccumulator = PencilStrokeAccumulator()
     private var liveStrokeBoardID: String?
     private var recentlyCommittedStroke: (stroke: UserStroke, boardID: String)?
+    private var adjacentCreationRequestedForStroke = false
     private var movePreviewDelta = CGPoint.zero
     private var resizePreviewBounds: CGRect?
     private var lastEraseWorld: CGPoint?
@@ -453,7 +459,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         self.loadAsset = loadAsset
         self.callbacks = callbacks
         controller = CameraController(camera: workspace.camera)
-        spatialIndex = WorkspaceSpatialIndex(items: workspace.items)
+        spatialIndex = WorkspaceSpatialIndex(items: workspace.items, scenes: scenes)
         super.init(frame: .zero)
 
         backgroundColor = CanvasDesignTokens.canvasBackground
@@ -485,6 +491,11 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         pencilHoverLayer.lineWidth = 1
         pencilHoverLayer.isHidden = true
         layer.addSublayer(pencilHoverLayer)
+
+        emptySpaceStrokeLayer.fillRule = .nonZero
+        emptySpaceStrokeLayer.zPosition = 1_000_000
+        emptySpaceStrokeLayer.isHidden = true
+        worldContainer.layer.addSublayer(emptySpaceStrokeLayer)
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(twoFingerPan(_:)))
         pan.minimumNumberOfTouches = CanvasInputArbitrationPolicy
@@ -783,6 +794,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         gridMinorLayer.frame = bounds
         pencilHoverLayer.frame = bounds
         WorldOverlayLayerLayout.pin(interactionLayer, to: worldContainer.bounds)
+        WorldOverlayLayerLayout.pin(emptySpaceStrokeLayer, to: worldContainer.bounds)
         #if DEBUG
         pencilRawMonitor.layout(in: bounds, top: 8)
         #endif
@@ -812,18 +824,19 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         self.selectedKeys = selectedKeys
         self.isPencilPalettePresented = isPencilPalettePresented
         if !isPencilPalettePresented { _ = squeezeState.dismiss() }
-        if self.activeTool != tool {
+        let migratedTool = tool.migratedForCurrentInputModel
+        if self.activeTool != migratedTool {
             if isInteracting { clearTransientInput() }
             pencilFeedback.request(.toolSelection(nil))
-            if tool != .select, tool != .lasso, !self.selectedKeys.isEmpty {
+            if migratedTool != .lasso, !self.selectedKeys.isEmpty {
                 self.selectedKeys.removeAll()
                 callbacks.onSelectionChanged([], [:])
                 updateSelectionOverlay()
             }
         }
-        self.activeTool = tool
+        self.activeTool = migratedTool
         panRecognizer.minimumNumberOfTouches = CanvasInputArbitrationPolicy
-            .minimumDirectNavigationTouches(tool: tool)
+            .minimumDirectNavigationTouches(tool: migratedTool)
         let appearanceChanged = self.backgroundStyle != backgroundStyle
             || self.physicalBoardShowsPaper != physicalBoardShowsPaper
         self.backgroundStyle = backgroundStyle
@@ -843,7 +856,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         if controller.camera != workspace.camera, !isInteracting {
             controller.setCamera(workspace.camera)
         }
-        if placementsChanged { spatialIndex = WorkspaceSpatialIndex(items: workspace.items) }
+        if placementsChanged || scenesChanged {
+            spatialIndex = WorkspaceSpatialIndex(items: workspace.items, scenes: scenes)
+        }
         if placementsChanged || scenesChanged || appearanceChanged { refineRepresentations(force: true) }
         updateSelectionOverlay()
         if let focusRequest, focusRequest.id != lastFocusRequestID, bounds.width > 0, bounds.height > 0 {
@@ -871,7 +886,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         switch interaction {
         case .idle: return "IDLE"
         case .panning: return "PANNING"
-        case .drawing: return "DRAWING"
+        case .drawing, .drawingInEmptySpace: return "DRAWING"
         case .lassoing: return "LASSOING"
         case .erasing: return "ERASING"
         case .movingSelection: return "MOVING_SELECTION"
@@ -905,11 +920,9 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         let pop = nearestNavigationController()?.interactivePopGestureRecognizer
         let recognizers = "pan=\(Self.gestureStateName(panRecognizer.state)),pinch=\(Self.gestureStateName(pinchRecognizer.state)),scroll=\(Self.gestureStateName(scrollPanRecognizer.state))"
         print("[VBoard] INPUT_OWNER phase=\(phase) board=\(boardID) source=\(source) render=\(render) tool=\(activeTool.rawValue) contact=\(contact(for: touch).rawValue) contacts=\(contactCount) screen=\(touch.location(in: self)) world=\(world) hit=\(hitName) recognizers={\(recognizers)} candidate=\(owner.rawValue) owner=\(activeInputOwner.rawValue) camera=\(controller.camera) popEnabled=\(pop?.isEnabled.description ?? "missing") popState=\(pop.map { Self.gestureStateName($0.state) } ?? "missing")")
-        if owner == .navigation, contactCount == 1,
-           activeTool == .lasso || activeTool == .objectEraser
-            || activeTool == .pen || activeTool == .highlighter {
-            assertionFailure("Unexpected navigation ownership while \(activeTool.rawValue) selected")
-        }
+        // A single direct finger navigating while any Pencil tool is selected
+        // is now the intended product contract. The ownership log above is the
+        // DEBUG proof; do not convert that valid route into an assertion.
     }
 
     private static func gestureStateName(_ state: UIGestureRecognizer.State) -> String {
@@ -1297,16 +1310,23 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     private func graphSelection(at screenPoint: CGPoint) -> SelectionKey? {
         let world = screenToWorld(screenPoint)
-        guard let item = boardItem(at: world),
-              let graph = scenes[item.boardID]?.editor.objects.reversed().first(where: {
+        let tolerance = 12 / max(worldTransform.scale, 0.001)
+        let candidates = spatialIndex.query(CGRect(
+            x: world.x - tolerance, y: world.y - tolerance,
+            width: tolerance * 2, height: tolerance * 2
+        )).sorted { $0.zIndex > $1.zIndex }
+        for item in candidates {
+            guard let graph = scenes[item.boardID]?.editor.objects.reversed().first(where: {
                 $0.graph != nil && BoardHitTestPolicy.bounds(of: $0).contains(
                     LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item)
                 )
-              })?.graph else { return nil }
-        return SelectionKey(boardID: item.boardID,
-                            objectID: graph.id,
-                            kind: .editorObject,
-                            objectType: "graph")
+              })?.graph else { continue }
+            return SelectionKey(boardID: item.boardID,
+                                objectID: graph.id,
+                                kind: .editorObject,
+                                objectType: "graph")
+        }
+        return nil
     }
 
     // MARK: - Pointer, Pencil, and tool routing
@@ -1321,7 +1341,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         let inputContact = contact(for: touch)
         let contactCount = inputContact == .finger ? directContactCount(event: event) : 1
         let owner = CanvasInputArbitrationPolicy.owner(
-            tool: isSpacePressed ? .navigation : activeTool,
+            tool: isSpacePressed ? .navigation : activeTool.migratedForCurrentInputModel,
             contact: inputContact,
             contactCount: contactCount,
             drawsWithFinger: drawsWithFinger
@@ -1346,6 +1366,10 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             }
             interaction = .panning(startScreen: screen, startCamera: controller.camera)
             boardViews.values.forEach { $0.beginNavigation() }
+            return
+        }
+        if owner == .selection, inputContact == .primaryPointer {
+            beginPointerInteraction(at: world, screen: screen)
             return
         }
         if owner == .selection || owner == .lasso,
@@ -1418,6 +1442,26 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             if let item = boardItem(at: world) {
                 callbacks.onActiveBoardChanged(item.boardID)
                 callbacks.onDetailDemand([item.boardID])
+            } else if owner == .stroke,
+                      let origin = WorkspaceBoardCreationPolicy.emptySpaceOrigin(
+                        near: world, items: workspace.items,
+                        cameraScale: worldTransform.scale
+                      ), !WorkspaceBoardCreationPolicy.hasBoard(
+                        at: origin, items: workspace.items
+                      ) {
+                adjacentCreationRequestedForStroke = true
+                recentlyCommittedStroke = nil
+                strokeAccumulator.reset()
+                predictedStrokePoints.removeAll(keepingCapacity: true)
+                let initialTouches = event?.coalescedTouches(for: touch) ?? [touch]
+                strokeAccumulator.appendConfirmed(initialTouches.map {
+                    sample(screenToWorld($0.preciseLocation(in: self)), touch: $0)
+                })
+                liveStrokePoints = strokeAccumulator.canonicalPoints
+                showEmptySpaceStroke(strokeAccumulator.livePoints)
+                interaction = .drawingInEmptySpace(
+                    strokeID: UUID().uuidString, origin: origin
+                )
             }
             return
         }
@@ -1427,6 +1471,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         callbacks.onDetailDemand([item.boardID])
         let strokeID = UUID().uuidString
         recentlyCommittedStroke = nil
+        adjacentCreationRequestedForStroke = false
         strokeAccumulator.reset()
         predictedStrokePoints.removeAll(keepingCapacity: true)
         liveStrokeBoardID = item.boardID
@@ -1438,6 +1483,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         })
         liveStrokePoints = strokeAccumulator.canonicalPoints
         requestAutoExpansion(boardID: item.boardID, points: liveStrokePoints)
+        requestAdjacentBoardIfNeeded(boardID: item.boardID,
+                                     localPoints: liveStrokePoints)
         boardViews[item.boardID]?.showLiveStroke(points: liveStrokePoints,
                                                 color: strokeColor,
                                                 width: strokeWidth,
@@ -1479,11 +1526,24 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             liveStrokePoints = strokeAccumulator.canonicalPoints
             predictedStrokePoints = strokeAccumulator.predicted
             requestAutoExpansion(boardID: boardID, points: liveStrokePoints)
+            requestAdjacentBoardIfNeeded(boardID: boardID,
+                                         localPoints: liveStrokePoints)
             boardViews[boardID]?.showLiveStroke(points: strokeAccumulator.livePoints,
                                                 color: strokeColor,
                                                 width: strokeWidth,
                                                 opacity: strokeOpacity,
                                                 tool: activePencilStrokeTool)
+        case .drawingInEmptySpace:
+            let samples = event?.coalescedTouches(for: touch) ?? [touch]
+            strokeAccumulator.appendConfirmed(samples.map {
+                sample(screenToWorld($0.preciseLocation(in: self)), touch: $0)
+            })
+            strokeAccumulator.setPredicted((event?.predictedTouches(for: touch) ?? []).map {
+                sample(screenToWorld($0.preciseLocation(in: self)), touch: $0)
+            })
+            liveStrokePoints = strokeAccumulator.canonicalPoints
+            predictedStrokePoints = strokeAccumulator.predicted
+            showEmptySpaceStroke(strokeAccumulator.livePoints)
         case .lassoing:
             lassoPoints.append(world)
             updateInteractionOverlay()
@@ -1545,6 +1605,8 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                 })
                 liveStrokePoints = strokeAccumulator.canonicalPoints
                 requestAutoExpansion(boardID: boardID, points: liveStrokePoints)
+                requestAdjacentBoardIfNeeded(boardID: boardID,
+                                             localPoints: liveStrokePoints)
             }
             if !liveStrokePoints.isEmpty {
                 let stroke = UserStroke(id: strokeID,
@@ -1561,6 +1623,27 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             predictedStrokePoints.removeAll()
             strokeAccumulator.reset()
             liveStrokeBoardID = nil
+        case .drawingInEmptySpace(let strokeID, let origin):
+            let finalTouches = event?.coalescedTouches(for: touch) ?? [touch]
+            strokeAccumulator.appendConfirmed(finalTouches.map {
+                sample(screenToWorld($0.preciseLocation(in: self)), touch: $0)
+            })
+            liveStrokePoints = strokeAccumulator.canonicalPoints
+            if !liveStrokePoints.isEmpty {
+                callbacks.onBlankBoardCreationRequested(BlankBoardCreationRequest(
+                    requestKey: "empty:\(strokeID)", sourceBoardID: nil, side: nil,
+                    origin: origin,
+                    worldStroke: UserStroke(
+                        id: strokeID, color: strokeColor, width: strokeWidth,
+                        opacity: strokeOpacity, points: liveStrokePoints,
+                        pencilTool: activePencilStrokeTool
+                    )
+                ))
+            }
+            clearEmptySpaceStroke()
+            liveStrokePoints.removeAll()
+            predictedStrokePoints.removeAll()
+            strokeAccumulator.reset()
         case .lassoing:
             finishLasso(endpoint: world)
         case .erasing:
@@ -1649,6 +1732,13 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                                                 color: strokeColor, width: strokeWidth,
                                                 opacity: strokeOpacity,
                                                 tool: activePencilStrokeTool)
+        } else if case .drawingInEmptySpace = interaction {
+            let corrected = touches.filter(isDrawingTouch).map {
+                sample(screenToWorld($0.preciseLocation(in: self)), touch: $0)
+            }
+            strokeAccumulator.replaceEstimated(corrected)
+            liveStrokePoints = strokeAccumulator.canonicalPoints
+            showEmptySpaceStroke(strokeAccumulator.livePoints)
         } else if let recent = recentlyCommittedStroke,
                   let item = workspace.items.first(where: { $0.boardID == recent.boardID }) {
             let corrections = touches.filter(isDrawingTouch).map {
@@ -1666,6 +1756,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
 
     private func cancelContentInteraction() {
         if case .drawing(let boardID, _) = interaction { boardViews[boardID]?.clearLiveStroke() }
+        if case .drawingInEmptySpace = interaction { clearEmptySpaceStroke() }
         if case .panning = interaction { boardViews.values.forEach { $0.endNavigation() } }
         if case .movingSelection = interaction { clearSelectionMovePreview() }
         if case .resizingSelection(let session) = interaction {
@@ -1722,6 +1813,17 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
     }
 
     private func finishLasso(endpoint: CGPoint) {
+        if let start = lassoPoints.first,
+           hypot(endpoint.x - start.x, endpoint.y - start.y) * worldTransform.scale < 6 {
+            selectedKeys = hitTest(endpoint)
+            lassoPoints.removeAll()
+            callbacks.onSelectionChanged(selectedKeys, [:])
+            if let boardID = selectedKeys.first?.boardID {
+                callbacks.onActiveBoardChanged(boardID)
+            }
+            updateSelectionOverlay()
+            return
+        }
         if lassoPoints.count == 1 { lassoPoints.append(endpoint) }
         let polygon: [CGPoint]
         if lassoPoints.count == 2 {
@@ -1764,16 +1866,53 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         updateSelectionOverlay()
     }
 
+    private func beginPointerInteraction(at world: CGPoint, screen: CGPoint) {
+        if let bounds = selectionWorldBounds(),
+           let handle = resizeHandle(at: world, bounds: bounds) {
+            resizePreviewBounds = bounds
+            interaction = .resizingSelection(SelectionResizeSession(
+                keys: selectedKeys, startBounds: bounds, handle: handle,
+                startPointer: world,
+                mode: selectedGraphForVerticalResize == nil ? .uniform : .graphVertical
+            ))
+            return
+        }
+        let hit = hitTest(world)
+        guard !hit.isEmpty else {
+            selectedKeys.removeAll()
+            callbacks.onSelectionChanged([], [:])
+            updateSelectionOverlay()
+            activeInputOwner = .navigation
+            interaction = .panning(startScreen: screen, startCamera: controller.camera)
+            boardViews.values.forEach { $0.beginNavigation() }
+            return
+        }
+        if hit.isDisjoint(with: selectedKeys) { selectedKeys = hit }
+        callbacks.onSelectionChanged(selectedKeys, [:])
+        interaction = .movingSelection(startWorld: world, clickSelection: hit)
+        if let boardID = selectedKeys.first?.boardID {
+            callbacks.onActiveBoardChanged(boardID)
+        }
+        updateSelectionOverlay()
+    }
+
     private func hitTest(_ world: CGPoint) -> Set<SelectionKey> {
-        guard let item = boardItem(at: world), let view = boardViews[item.boardID], view.hasFullScene else {
-            if let item = boardItem(at: world) {
+        let tolerance = 16 / max(worldTransform.scale, 0.001)
+        let candidates = spatialIndex.query(CGRect(
+            x: world.x - tolerance, y: world.y - tolerance,
+            width: tolerance * 2, height: tolerance * 2
+        )).sorted { $0.zIndex > $1.zIndex }
+        for item in candidates {
+            guard let view = boardViews[item.boardID], view.hasFullScene else {
                 callbacks.onActiveBoardChanged(item.boardID)
                 callbacks.onDetailDemand([item.boardID])
+                continue
             }
-            return []
+            let local = LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item)
+            let hit = view.hitTestKeys(at: local)
+            if !hit.isEmpty { return hit }
         }
-        let local = LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: item)
-        return view.hitTestKeys(at: local)
+        return []
     }
 
     private func erase(from start: CGPoint, to end: CGPoint) {
@@ -1809,6 +1948,45 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             contactY: CGFloat(contactY), cameraScale: worldTransform.scale
         ) else { return }
         callbacks.onBoardExpansionRequested(boardID, expanded)
+    }
+
+    private func requestAdjacentBoardIfNeeded(boardID: String,
+                                              localPoints: [StrokePoint]) {
+        guard !adjacentCreationRequestedForStroke,
+              let point = localPoints.last,
+              let item = workspace.items.first(where: { $0.boardID == boardID }) else {
+            return
+        }
+        let world = LectureCoordinateTransform.boardLocalToLectureWorld(
+            CGPoint(x: point.x, y: point.y), board: item
+        )
+        guard let side = WorkspaceBoardCreationPolicy.crossingSide(
+            worldPoint: world, source: item, cameraScale: worldTransform.scale
+        ) else { return }
+        let origin = WorkspaceBoardCreationPolicy.origin(nextTo: item, side: side)
+        guard !WorkspaceBoardCreationPolicy.hasBoard(
+            at: origin, items: workspace.items
+        ) else { return }
+        adjacentCreationRequestedForStroke = true
+        callbacks.onBlankBoardCreationRequested(BlankBoardCreationRequest(
+            requestKey: "cross:\(boardID):\(side.rawValue):\(UUID().uuidString)",
+            sourceBoardID: boardID, side: side, origin: origin, worldStroke: nil
+        ))
+    }
+
+    private func showEmptySpaceStroke(_ points: [StrokePoint]) {
+        emptySpaceStrokeLayer.path = PencilStrokeGeometry.path(
+            points: points, tool: activePencilStrokeTool,
+            baseWidth: CGFloat(strokeWidth)
+        )
+        emptySpaceStrokeLayer.fillColor = UIColor(svgHex: strokeColor)
+            .withAlphaComponent(strokeOpacity).cgColor
+        emptySpaceStrokeLayer.isHidden = false
+    }
+
+    private func clearEmptySpaceStroke() {
+        emptySpaceStrokeLayer.path = nil
+        emptySpaceStrokeLayer.isHidden = true
     }
 
     private func setErasePreview(keys: Set<SelectionKey>, hidden: Bool) {

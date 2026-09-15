@@ -152,6 +152,7 @@ final class LectureWorkspaceStore: ObservableObject {
     private var graphEditingBoardID: String?
     private var graphEditingGraphID: String?
     private var graphEditingHasWorkspaceUndo = false
+    private var pendingInitialStrokes: [String: UserStroke] = [:]
 
     init(folderID: String) {
         self.folderID = folderID
@@ -220,7 +221,8 @@ final class LectureWorkspaceStore: ObservableObject {
         }
     }
 
-    func refreshAfterImport(boardID: String, api: APIClient) async {
+    func refreshAfterImport(boardID: String, api: APIClient,
+                            requestFocus: Bool = true) async {
         do {
             let refreshedLecture = try await api.lecture(id: folderID)
             let refreshed: LectureWorkspace
@@ -235,7 +237,7 @@ final class LectureWorkspaceStore: ObservableObject {
             baseWorkspace = refreshed
             status = .clean
             removeOutbox()
-            setActiveBoard(boardID, api: api, requestFocus: true)
+            setActiveBoard(boardID, api: api, requestFocus: requestFocus)
         } catch {
             status = .offlinePending
         }
@@ -303,6 +305,39 @@ final class LectureWorkspaceStore: ObservableObject {
         current.activeBoardID = boardID
         workspace = current
         markDirty(api: api)
+    }
+
+    func placeGeneratedBoard(_ boardID: String, at origin: CGPoint,
+                             api: APIClient) {
+        guard var current = workspace,
+              let index = current.items.firstIndex(where: { $0.boardID == boardID }) else {
+            return
+        }
+        let item = current.items[index]
+        current.items[index].canvasX = Double(origin.x)
+        current.items[index].canvasY = Double(origin.y)
+        let initial = BoardSurfaceGeometry.workspaceRegion(
+            origin: origin,
+            sourceSize: CGSize(width: item.boardWidth, height: item.boardHeight)
+        )
+        current.items[index].effectiveContentBounds = CameraRect(
+            x: initial.minX, y: initial.minY,
+            width: initial.width, height: initial.height
+        )
+        current.activeBoardID = boardID
+        workspace = current
+        markDirty(api: api)
+        requestDetail(for: [boardID], api: api)
+    }
+
+    func applyStrokeWhenSceneReady(_ stroke: UserStroke, boardID: String,
+                                   api: APIClient) {
+        if boardStores[boardID] != nil {
+            applyStroke(stroke, boardID: boardID, api: api)
+        } else {
+            pendingInitialStrokes[boardID] = stroke
+            requestDetail(for: [boardID], api: api)
+        }
     }
 
     func setUnit(boardID: String, label: String, number: Int?, api: APIClient) {
@@ -888,6 +923,9 @@ final class LectureWorkspaceStore: ObservableObject {
                     composition: SceneComposition.build(boardID: boardID, document: document, editor: effectiveEditor)
                 )
                 self.refreshEffectiveBounds(boardID: boardID, api: api)
+                if let pending = self.pendingInitialStrokes.removeValue(forKey: boardID) {
+                    self.applyStroke(pending, boardID: boardID, api: api)
+                }
                 self.lastSceneUse[boardID] = Date().timeIntervalSinceReferenceDate
                 self.sceneLoadTasks.removeValue(forKey: boardID)
                 self.sceneLoadTokens.removeValue(forKey: boardID)
@@ -941,7 +979,7 @@ final class LectureWorkspaceStore: ObservableObject {
         if BoardAutoExpansionPolicy.isEligible(item.sourceKind) {
             let existingLocal = item.effectiveFrame.offsetBy(dx: -CGFloat(item.canvasX),
                                                              dy: -CGFloat(item.canvasY))
-            local = BoardAutoExpansionPolicy.fixedWidthLocalRegion(
+            local = BoardAutoExpansionPolicy.reconciledLocalRegion(
                 current: existingLocal, content: local,
                 sourceSize: CGSize(width: item.boardWidth, height: item.boardHeight)
             )

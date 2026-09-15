@@ -326,10 +326,38 @@ struct WorkspaceSpatialIndex: Sendable {
     private var index = SpatialIndex(cellSize: 2_048)
     private var itemsByID: [String: WorkspaceBoardItem] = [:]
 
-    init(items: [WorkspaceBoardItem]) {
+    init(items: [WorkspaceBoardItem], scenes: [String: WorkspaceBoardScene] = [:]) {
         for item in items {
             itemsByID[item.boardID] = item
-            index.insert(id: item.boardID, bounds: item.effectiveFrame.union(item.frame))
+            var content = item.effectiveFrame.union(item.frame)
+            if let scene = scenes[item.boardID] {
+                for object in SceneComposition.canonicalEditorObjects(scene.editor.objects) {
+                    let local = BoardHitTestPolicy.bounds(of: object)
+                    guard !local.isNull, !local.isInfinite else { continue }
+                    content = content.union(
+                        LectureCoordinateTransform.boardLocalToLectureWorld(local, board: item)
+                    )
+                }
+                let paths = Dictionary(uniqueKeysWithValues: scene.document.paths.compactMap {
+                    path in path.id.map { ($0, path) }
+                })
+                for (pathID, transform) in scene.editor.importedTransforms
+                    where transform.deleted != true {
+                    guard let source = paths[pathID],
+                          let path = try? SVGPathParser.cachedPath(from: source.d) else {
+                        continue
+                    }
+                    var affine = CGAffineTransform.identity
+                        .translatedBy(x: CGFloat(transform.x), y: CGFloat(transform.y))
+                        .scaledBy(x: CGFloat(transform.scaleX ?? 1),
+                                  y: CGFloat(transform.scaleY ?? 1))
+                    guard let transformed = path.copy(using: &affine) else { continue }
+                    content = content.union(LectureCoordinateTransform.boardLocalToLectureWorld(
+                        transformed.boundingBoxOfPath, board: item
+                    ))
+                }
+            }
+            index.insert(id: item.boardID, bounds: content)
         }
     }
 
@@ -348,6 +376,76 @@ enum WorkspaceLayout {
         let rightmost = items.map { max($0.frame.maxX, $0.effectiveFrame.maxX) }.max() ?? 0
         let top = items.map(\.frame.minY).min() ?? 0
         return CGPoint(x: rightmost + CGFloat(gap), y: top)
+    }
+}
+
+enum WorkspaceBoardSide: String, Sendable { case left, right }
+
+struct BlankBoardCreationRequest: Sendable {
+    let requestKey: String
+    let sourceBoardID: String?
+    let side: WorkspaceBoardSide?
+    let origin: CGPoint
+    let worldStroke: UserStroke?
+}
+
+enum WorkspaceBoardCreationPolicy {
+    static let crossingThresholdScreenPoints: CGFloat = 72
+    static let generatedBoardSize = CGSize(width: 1_600, height: 2_000)
+
+    static func crossingSide(worldPoint: CGPoint, source: WorkspaceBoardItem,
+                             cameraScale: CGFloat) -> WorkspaceBoardSide? {
+        let threshold = crossingThresholdScreenPoints / max(cameraScale, 0.001)
+        guard worldPoint.y >= source.frame.minY - threshold,
+              worldPoint.y <= source.effectiveFrame.maxY + threshold else { return nil }
+        if worldPoint.x >= source.frame.maxX + threshold { return .right }
+        if worldPoint.x <= source.frame.minX - threshold { return .left }
+        return nil
+    }
+
+    static func origin(nextTo source: WorkspaceBoardItem,
+                       side: WorkspaceBoardSide,
+                       size: CGSize = generatedBoardSize) -> CGPoint {
+        switch side {
+        case .right:
+            return CGPoint(x: source.frame.maxX + CGFloat(WorkspaceLayout.defaultBoardGap),
+                           y: source.frame.minY)
+        case .left:
+            return CGPoint(x: source.frame.minX - size.width
+                           - CGFloat(WorkspaceLayout.defaultBoardGap),
+                           y: source.frame.minY)
+        }
+    }
+
+    static func hasBoard(at origin: CGPoint, size: CGSize = generatedBoardSize,
+                         items: [WorkspaceBoardItem]) -> Bool {
+        let proposed = CGRect(origin: origin, size: size)
+            .insetBy(dx: -CGFloat(WorkspaceLayout.defaultBoardGap) * 0.45,
+                     dy: -CGFloat(WorkspaceLayout.defaultBoardGap) * 0.45)
+        return items.contains { $0.frame.intersects(proposed) }
+    }
+
+    static func emptySpaceOrigin(near worldPoint: CGPoint,
+                                 items: [WorkspaceBoardItem],
+                                 cameraScale: CGFloat) -> CGPoint? {
+        guard !items.contains(where: { $0.effectiveFrame.contains(worldPoint) }) else {
+            return nil
+        }
+        let nearbyDistance = 520 / max(cameraScale, 0.001)
+        if let source = items.min(by: {
+            abs($0.frame.midX - worldPoint.x) < abs($1.frame.midX - worldPoint.x)
+        }) {
+            if worldPoint.x >= source.frame.maxX,
+               worldPoint.x - source.frame.maxX <= nearbyDistance {
+                return origin(nextTo: source, side: .right)
+            }
+            if worldPoint.x <= source.frame.minX,
+               source.frame.minX - worldPoint.x <= nearbyDistance {
+                return origin(nextTo: source, side: .left)
+            }
+        }
+        return CGPoint(x: worldPoint.x - generatedBoardSize.width * 0.1,
+                       y: worldPoint.y - generatedBoardSize.height * 0.1)
     }
 }
 
@@ -394,6 +492,8 @@ enum BoardSurfaceGeometry {
 enum BoardAutoExpansionPolicy {
     static let triggerScreenPoints: CGFloat = 160
     static let chunkSourceWidthFraction: CGFloat = 0.33
+    static let contentBottomPaddingFraction: CGFloat = 0.06
+    static let shrinkHysteresisSourceWidthFraction: CGFloat = 0.18
 
     static func isEligible(_ sourceKind: BoardSourceKind) -> Bool {
         sourceKind == .physicalWhiteboard || sourceKind == .blankBoard
@@ -419,6 +519,31 @@ enum BoardAutoExpansionPolicy {
         let base = BoardSurfaceGeometry.workspaceRegion(sourceSize: sourceSize)
         return CGRect(x: 0, y: 0, width: base.width,
                       height: max(base.maxY, current.maxY, content.maxY))
+    }
+
+    /// Reconciles committed content after an erase, delete, or transform.
+    /// Width is immutable. Growth happens immediately; contraction waits for
+    /// a meaningful empty tail and snaps to stable chunks so repeated saves do
+    /// not make the board breathe by a few pixels.
+    static func reconciledLocalRegion(current: CGRect, content: CGRect,
+                                      sourceSize: CGSize) -> CGRect {
+        let base = BoardSurfaceGeometry.workspaceRegion(sourceSize: sourceSize)
+        let chunk = max(1, sourceSize.width * chunkSourceWidthFraction)
+        let padding = max(24, sourceSize.width * contentBottomPaddingFraction)
+        let contentBottom = content.isNull || content.maxY <= base.maxY
+            ? base.maxY : content.maxY + padding
+        let requiredBottom = max(base.maxY, contentBottom)
+        let extra = max(0, requiredBottom - base.maxY)
+        let snappedBottom = base.maxY + ceil(extra / chunk) * chunk
+        let currentBottom = max(base.maxY, current.maxY)
+        if snappedBottom >= currentBottom {
+            return CGRect(x: 0, y: 0, width: base.width, height: snappedBottom)
+        }
+        let hysteresis = max(chunk * 0.5,
+                             sourceSize.width * shrinkHysteresisSourceWidthFraction)
+        let bottom = currentBottom - snappedBottom >= hysteresis
+            ? snappedBottom : currentBottom
+        return CGRect(x: 0, y: 0, width: base.width, height: bottom)
     }
 }
 

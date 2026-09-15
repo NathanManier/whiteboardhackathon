@@ -7,7 +7,7 @@ struct LectureWorkspaceView: View {
     let initialFocusBoardID: String?
     @StateObject private var store: LectureWorkspaceStore
     @StateObject private var graphRecognition = GraphRecognitionController()
-    @State private var activeTool: CanvasTool = .navigation
+    @State private var activeTool: CanvasTool = .pen
     @State private var showImporter = false
     @State private var showNavigator = false
     @State private var showGuide = false
@@ -32,6 +32,7 @@ struct LectureWorkspaceView: View {
     @State private var editingGraph: GraphObject?
     @State private var interactiveGraph: GraphObject?
     @State private var canvasSize = CGSize.zero
+    @State private var pendingGeneratedBoardOrigins = Set<String>()
     @AppStorage("vboard.workspace.background") private var backgroundRaw = WorkspaceBackgroundStyle.dots.rawValue
     @AppStorage("vboard.workspace.physicalPaper") private var physicalBoardShowsPaper = false
     @AppStorage("vboard.study.inspectorWidth") private var studyPanelWidth = 0.0
@@ -76,6 +77,7 @@ struct LectureWorkspaceView: View {
         .background(EditorNavigationGestureGuard())
         .toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
+                EditorToolMenu(activeTool: $activeTool)
                 Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }
                     .disabled(!store.canUndo)
                 Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }
@@ -215,8 +217,12 @@ struct LectureWorkspaceView: View {
             if status == .conflict { showConflict = true }
         }
         .onChange(of: activeTool) { oldValue, newValue in
+            if newValue != newValue.migratedForCurrentInputModel {
+                activeTool = newValue.migratedForCurrentInputModel
+                return
+            }
             if oldValue != newValue && oldValue != .objectEraser { previousPencilTool = oldValue }
-            if newValue != .select, newValue != .lasso, !store.selectedKeys.isEmpty {
+            if newValue != .lasso, !store.selectedKeys.isEmpty {
                 store.setSelection([], pdfRegions: [:])
                 graphRecognition.clear()
                 selectionScreenBounds = nil
@@ -327,6 +333,7 @@ struct LectureWorkspaceView: View {
                                                   to: localRegion,
                                                   api: api)
                     },
+                    onBlankBoardCreationRequested: createGeneratedBoard,
                     onMoveSelection: { keys, delta in store.moveSelection(keys, by: delta, api: api) },
                     onResizeSelection: { keys, anchor, scale in
                         store.resizeSelection(keys, around: anchor, by: scale, api: api)
@@ -427,12 +434,10 @@ struct LectureWorkspaceView: View {
                     .zIndex(20)
                 }
 
-                WorkspaceToolPalette(activeTool: $activeTool, status: store.status.userLabel,
-                                     penColor: $penColor, penWidth: $penWidth,
-                                     markerColor: $markerColor, markerWidth: $markerWidth,
-                                     markerOpacity: $markerOpacity,
+                WorkspaceToolPalette(status: store.status.userLabel,
                                      undo: { store.undo(api: api) },
-                                     redo: { store.redo(api: api) })
+                                     redo: { store.redo(api: api) },
+                                     retry: { Task { await store.saveNow(api: api) } })
                     .padding(.bottom, 12)
                     .zIndex(30)
 
@@ -600,6 +605,7 @@ struct LectureWorkspaceView: View {
     private func handlePencilAction(_ action: PencilLogicalAction, anchor: CGPoint?) {
         switch action {
         case .none, .runSystemShortcut: break
+        case .switchLasso: activeTool = .lasso
         case .switchEraser: togglePencilEraser()
         case .switchPrevious:
             let next = previousPencilTool == activeTool ? .pen : previousPencilTool
@@ -647,7 +653,7 @@ struct LectureWorkspaceView: View {
                              })
         } else {
             ContentUnavailableView("Select ink to study", systemImage: "lasso",
-                                   description: Text("Use Select or Lasso, then choose an action beside the selection."))
+                                   description: Text("Use Lasso, then choose an action beside the selection."))
         }
     }
 
@@ -790,7 +796,12 @@ struct LectureWorkspaceView: View {
         // translate those bounds into the owner document. Translation-only
         // board placement makes the score identical while keeping the created
         // GraphObject correctly board-local and board-owned.
-        var occupiedInLecture = workspace.items.map(\.effectiveFrame)
+        // Other boards are obstacles. The owning board is the container, not
+        // an obstacle; counting it here would force every graph below the
+        // board before the actual content-collision search even begins.
+        var occupiedInLecture = workspace.items
+            .filter { $0.boardID != item.boardID }
+            .map(\.effectiveFrame)
         for candidate in workspace.items {
             guard let candidateScene = store.scenes[candidate.boardID] else { continue }
             occupiedInLecture.append(contentsOf: candidateScene.editor.objects.map {
@@ -798,6 +809,15 @@ struct LectureWorkspaceView: View {
                     BoardHitTestPolicy.bounds(of: $0), board: candidate
                 )
             })
+            if let professorBounds = GraphPlacementGeometry.professorBounds(
+                document: candidateScene.document, editor: candidateScene.editor
+            ) {
+                occupiedInLecture.append(
+                    LectureCoordinateTransform.boardLocalToLectureWorld(
+                        professorBounds, board: candidate
+                    )
+                )
+            }
         }
         let occupiedInOwner = occupiedInLecture.map {
             LectureCoordinateTransform.lectureWorldToBoardLocal($0, board: item)
@@ -806,7 +826,8 @@ struct LectureWorkspaceView: View {
             boardID: item.boardID, selection: selection, expressions: expressions,
             recognitionRequestID: requestID, cameraScale: scale, occupied: occupiedInOwner,
             sourceBoardIDs: sourceBoardIDs, selectedObjectKeys: selectedObjectKeys,
-            placementSource: sourceInOwner
+            placementSource: sourceInOwner,
+            containerWidth: CGFloat(item.boardWidth)
         )
         store.addGraph(graph, boardID: item.boardID, api: api)
     }
@@ -882,6 +903,60 @@ struct LectureWorkspaceView: View {
         }
     }
 
+    private func createGeneratedBoard(_ request: BlankBoardCreationRequest) {
+        let originKey = "\(Int(request.origin.x.rounded())):\(Int(request.origin.y.rounded()))"
+        guard pendingGeneratedBoardOrigins.insert(originKey).inserted else { return }
+        if WorkspaceBoardCreationPolicy.hasBoard(
+            at: request.origin, items: store.workspace?.items ?? []
+        ) {
+            pendingGeneratedBoardOrigins.remove(originKey)
+            return
+        }
+        Task { @MainActor in
+            do {
+                // Re-check in the workspace owner immediately before the
+                // external mutation so two near-simultaneous strokes cannot
+                // create duplicate adjacent boards.
+                guard !WorkspaceBoardCreationPolicy.hasBoard(
+                    at: request.origin, items: store.workspace?.items ?? []
+                ) else {
+                    pendingGeneratedBoardOrigins.remove(originKey)
+                    return
+                }
+                let board = try await api.createBlankBoard(folderID: folder.id)
+                await store.refreshAfterImport(
+                    boardID: board.id, api: api, requestFocus: false
+                )
+                store.placeGeneratedBoard(board.id, at: request.origin, api: api)
+                if let worldStroke = request.worldStroke {
+                    let localPoints = worldStroke.points.map { point in
+                        StrokePoint(
+                            x: point.x - request.origin.x,
+                            y: point.y - request.origin.y,
+                            pressure: point.pressure,
+                            altitude: point.altitude,
+                            azimuth: point.azimuth,
+                            roll: point.roll,
+                            timestamp: point.timestamp,
+                            estimationUpdateIndex: point.estimationUpdateIndex
+                        )
+                    }
+                    let localStroke = UserStroke(
+                        id: worldStroke.id, color: worldStroke.color,
+                        width: worldStroke.width, opacity: worldStroke.opacity,
+                        points: localPoints, pencilTool: worldStroke.pencilTool
+                    )
+                    store.applyStrokeWhenSceneReady(
+                        localStroke, boardID: board.id, api: api
+                    )
+                }
+            } catch {
+                pendingGeneratedBoardOrigins.remove(originKey)
+                actionError = "The new writing board could not be created."
+            }
+        }
+    }
+
     private func exportActiveBoard(_ format: APIClient.BoardExportFormat) async {
         guard let board = activeBoard else { return }
         do {
@@ -931,62 +1006,46 @@ enum EditorStatusPresentation: Equatable, Sendable {
 }
 
 struct WorkspaceToolPalette: View {
-    @Binding var activeTool: CanvasTool
     let status: String
-    @Binding var penColor: String
-    @Binding var penWidth: Double
-    @Binding var markerColor: String
-    @Binding var markerWidth: Double
-    @Binding var markerOpacity: Double
     let undo: () -> Void
     let redo: () -> Void
+    let retry: () -> Void
     @State private var showStatus = false
+    @State private var lastSavedAt: Date?
 
     var body: some View {
         Button { showStatus.toggle() } label: {
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 if presentation.isProgress {
                     ProgressView().controlSize(.mini)
                 } else {
                     Circle().fill(statusColor).frame(width: 7, height: 7)
                 }
-                Text(presentation.compactLabel)
-                    .font(.caption.weight(.medium))
-                    .lineLimit(1)
+                Image(systemName: "ellipsis")
+                    .font(.caption.weight(.semibold))
             }
-            .padding(.horizontal, 11)
-            .frame(height: 34)
+            .padding(.horizontal, 10)
+            .frame(height: 32)
             .background(Color(uiColor: CanvasDesignTokens.toolbarSurface), in: Capsule())
             .overlay(Capsule().stroke(.separator.opacity(0.45), lineWidth: 0.5))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Save status: \(status). Current tool: \(toolName)")
-        .accessibilityHint("Opens drawing tools and save details")
+        .accessibilityLabel("Save status: \(status)")
+        .accessibilityHint("Opens save details and history actions")
         .popover(isPresented: $showStatus, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 14) {
                 Label(status, systemImage: statusIcon)
                     .font(.callout.weight(.semibold))
-                Divider()
-                Text("Tool").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 8) {
-                    ForEach(CanvasTool.allCases, id: \.self) { tool in
-                        WorkspaceToolButton(tool: tool, selected: activeTool == tool) {
-                            activeTool = tool
-                        }
-                    }
-                }
-                if activeTool == .pen || activeTool == .highlighter {
-                    CanvasToolOptions(
-                        title: activeTool == .pen ? "Pen" : "Marker",
-                        color: activeTool == .pen ? $penColor : $markerColor,
-                        width: activeTool == .pen ? $penWidth : $markerWidth,
-                        opacity: activeTool == .pen ? .constant(1) : $markerOpacity,
-                        showsOpacity: activeTool == .highlighter
-                    )
-                    .padding(-18)
+                if let lastSavedAt {
+                    Text("Last saved \(lastSavedAt.formatted(date: .omitted, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Divider()
                 HStack {
+                    if presentation == .error || presentation == .offline {
+                        Button("Retry", systemImage: "arrow.clockwise", action: retry)
+                    }
                     Button("Undo", systemImage: "arrow.uturn.backward", action: undo)
                     Button("Redo", systemImage: "arrow.uturn.forward", action: redo)
                 }
@@ -998,17 +1057,17 @@ struct WorkspaceToolPalette: View {
             .environment(\.colorScheme, .light)
         }
         .environment(\.colorScheme, .light)
+        .onAppear { recordSuccessfulSave(status) }
+        .onChange(of: status) { _, value in recordSuccessfulSave(value) }
     }
 
     private var presentation: EditorStatusPresentation { EditorStatusPresentation(status) }
 
     private var statusColor: Color {
-        switch presentation {
-        case .saving, .loading: return .blue
-        case .unsaved: return .orange
-        case .offline: return .yellow
-        case .error: return .red
+        switch presentation.indicatorRole {
         case .saved: return .green
+        case .pending: return .orange
+        case .error: return .red
         }
     }
 
@@ -1017,19 +1076,24 @@ struct WorkspaceToolPalette: View {
             (presentation == .offline ? "icloud.slash" : "checkmark.circle")
     }
 
-    private var toolName: String {
-        activeTool == .highlighter ? "Marker" :
-            (activeTool == .objectEraser ? "Eraser" : activeTool.rawValue.capitalized)
+    private func recordSuccessfulSave(_ value: String) {
+        if EditorStatusPresentation(value) == .saved { lastSavedAt = Date() }
     }
 
-    private var toolIcon: String {
-        switch activeTool {
-        case .navigation: return "hand.draw"
-        case .pen: return "pencil.tip"
-        case .highlighter: return "highlighter"
-        case .select: return "cursorarrow"
-        case .lasso: return "lasso"
-        case .objectEraser: return "eraser"
+}
+
+enum EditorStatusIndicatorRole: Equatable {
+    case saved
+    case pending
+    case error
+}
+
+extension EditorStatusPresentation {
+    var indicatorRole: EditorStatusIndicatorRole {
+        switch self {
+        case .saved: return .saved
+        case .error: return .error
+        case .saving, .unsaved, .offline, .loading: return .pending
         }
     }
 }
@@ -1040,20 +1104,16 @@ private struct CanvasToolOptions: View {
     @Binding var width: Double
     @Binding var opacity: Double
     let showsOpacity: Bool
-    private let colors = ["#183153", "#111111", "#C62828", "#1565C0", "#2E7D32", "#FFD60A", "#FF8A00"]
+    private let colors = CanvasColorPalette.standard
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.headline)
             HStack(spacing: 10) {
                 ForEach(colors, id: \.self) { value in
-                    Button { color = value } label: {
-                        Circle().fill(Color(uiColor: UIColor(svgHex: value)))
-                            .frame(width: 28, height: 28)
-                            .overlay { if color == value { Circle().stroke(.primary, lineWidth: 2).padding(-3) } }
+                    CanvasColorSwatch(hex: value, selected: color == value) {
+                        color = value
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Choose color")
                 }
             }
             VStack(alignment: .leading, spacing: 4) {
@@ -1069,6 +1129,91 @@ private struct CanvasToolOptions: View {
         }
         .padding(18)
         .frame(width: 300)
+    }
+
+}
+
+private struct CanvasColorSwatch: View {
+    let hex: String
+    let selected: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Circle().fill(Color(uiColor: UIColor(svgHex: hex)))
+                .frame(width: 28, height: 28)
+                .overlay {
+                    if selected {
+                        Circle().stroke(.primary, lineWidth: 2).padding(-3)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(CanvasColorPalette.name(for: hex))
+        .accessibilityValue(CanvasColorPalette.accessibilityValue(for: hex))
+        .help(hex == CanvasColorPalette.skyPink ? "Sky Pink\nF2C4D7" : hex)
+        .onHover { hovering = $0 }
+        .overlay(alignment: .bottom) {
+            if hovering, hex == CanvasColorPalette.skyPink {
+                VStack(spacing: 1) {
+                    Text("Sky Pink")
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                    Text("F2C4D7")
+                        .font(.system(size: 9).italic())
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(.regularMaterial,
+                            in: RoundedRectangle(cornerRadius: 6,
+                                                 style: .continuous))
+                .offset(y: -36)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+        }
+        .zIndex(hovering ? 1 : 0)
+    }
+}
+
+struct EditorToolMenu: View {
+    @Binding var activeTool: CanvasTool
+
+    var body: some View {
+        Menu {
+            ForEach(CanvasTool.visibleTools, id: \.self) { tool in
+                Button {
+                    activeTool = tool
+                } label: {
+                    Label(title(tool), systemImage: icon(tool))
+                }
+            }
+        } label: {
+            Image(systemName: icon(activeTool.migratedForCurrentInputModel))
+        }
+        .accessibilityLabel("Drawing tool: \(title(activeTool.migratedForCurrentInputModel))")
+    }
+
+    private func title(_ tool: CanvasTool) -> String {
+        switch tool.migratedForCurrentInputModel {
+        case .highlighter: return "Marker"
+        case .objectEraser: return "Eraser"
+        case .lasso: return "Lasso"
+        case .pen: return "Pen"
+        case .navigation, .select: return "Pen"
+        }
+    }
+
+    private func icon(_ tool: CanvasTool) -> String {
+        switch tool.migratedForCurrentInputModel {
+        case .pen: return "pencil.tip"
+        case .highlighter: return "highlighter"
+        case .objectEraser: return "eraser"
+        case .lasso: return "lasso"
+        case .navigation, .select: return "pencil.tip"
+        }
     }
 }
 
@@ -1430,46 +1575,6 @@ private struct LectureSelectionStudyView: View {
     }
 }
 
-private struct WorkspaceToolButton: View {
-    let tool: CanvasTool
-    let selected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 17, weight: .medium))
-                .frame(width: 36, height: 34)
-        }
-        .buttonStyle(.bordered)
-        .tint(selected ? .accentColor : .secondary)
-        .background(selected ? Color.accentColor.opacity(0.12) : .clear,
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .accessibilityLabel(title)
-        .help(title)
-    }
-
-    private var title: String {
-        switch tool {
-        case .navigation: return "Hand"
-        case .highlighter: return "Marker"
-        case .objectEraser: return "Erase"
-        default: return tool.rawValue.capitalized
-        }
-    }
-
-    private var icon: String {
-        switch tool {
-        case .navigation: return "hand.draw"
-        case .pen: return "pencil.tip"
-        case .highlighter: return "highlighter"
-        case .select: return "cursorarrow"
-        case .lasso: return "lasso"
-        case .objectEraser: return "eraser"
-        }
-    }
-}
-
 struct PencilQuickPalette: View {
     let activeTool: CanvasTool
     let highlightedIndex: Int
@@ -1481,8 +1586,7 @@ struct PencilQuickPalette: View {
     let redo: () -> Void
     let select: (CanvasTool) -> Void
     private let tools = PencilRadialPaletteModel.tools
-    private let colors = ["#111827", "#2563EB", "#DC2626", "#16A34A",
-                          "#7C3AED", "#EA580C", "#DB2777", "#F8FAFC"]
+    private let colors = CanvasColorPalette.pencilQuick
     private let center = CGPoint(x: 164, y: 166)
 
     var body: some View {
@@ -1502,8 +1606,11 @@ struct PencilQuickPalette: View {
                         Button {
                             color = option
                         } label: {
-                            Label(option, systemImage: option == color ? "checkmark.circle.fill" : "circle.fill")
+                            Label(CanvasColorPalette.name(for: option),
+                                  systemImage: option == color
+                                    ? "checkmark.circle.fill" : "circle.fill")
                         }
+                        .accessibilityValue(CanvasColorPalette.accessibilityValue(for: option))
                     }
                 } label: {
                     Circle()

@@ -118,6 +118,7 @@ enum PencilPreferredAction: Equatable, Sendable {
 
 enum PencilLogicalAction: Equatable, Sendable {
     case none
+    case switchLasso
     case switchEraser
     case switchPrevious
     case showColorPalette
@@ -131,13 +132,12 @@ enum PencilActionResolver {
                           system: PencilPreferredAction,
                           supported: Bool = true) -> PencilLogicalAction {
         guard supported else { return .none }
-        switch setting {
-        case .off: return .none
-        case .previousTool: return .switchPrevious
-        case .eraser: return .switchEraser
-        case .palette: return .showToolPalette
-        case .followSystem: return map(system)
-        }
+        // V-Board owns double tap as a direct, predictable selection gesture.
+        // Keep the legacy preference arguments decodable so older settings do
+        // not break launch, but do not let them change the product contract.
+        _ = setting
+        _ = system
+        return .switchLasso
     }
 
     static func squeeze(setting: PencilSqueezeSetting,
@@ -259,7 +259,7 @@ struct PencilPaletteStateMachine: Equatable, Sendable {
 }
 
 enum PencilRadialPaletteModel {
-    static let tools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso, .select]
+    static let tools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso]
 
     static func index(for tool: CanvasTool) -> Int {
         tools.firstIndex(of: tool) ?? 0
@@ -875,32 +875,30 @@ enum CanvasInputArbitrationPolicy {
                       drawsWithFinger: Bool) -> CanvasInputOwner {
         if contact == .palm { return .none }
         if contact == .navigationPointer { return .navigation }
-        if contact == .finger, contactCount >= 2 { return .navigation }
+        // A direct finger is always canvas navigation. Tool choice never
+        // changes that ownership, and a finger never creates or erases ink.
+        if contact == .finger { return .navigation }
+        // Mouse/trackpad uses conventional object-or-canvas behavior. The
+        // canvas resolves this owner against a world-space object hit: click
+        // selects an object, while an empty drag pans.
+        if contact == .primaryPointer { return .selection }
 
-        switch tool {
-        case .navigation:
-            return .navigation
+        switch tool.migratedForCurrentInputModel {
+        case .navigation, .select:
+            assertionFailure("Legacy tools must be migrated before arbitration")
+            return .none
         case .pen, .highlighter:
-            if contact == .finger, !drawsWithFinger { return .none }
-            return contact == .pencil || contact == .finger || contact == .primaryPointer
-                ? .stroke : .none
+            return contact == .pencil ? .stroke : .none
         case .objectEraser:
-            return contact == .pencil || contact == .finger || contact == .primaryPointer
-                ? .eraser : .none
+            return contact == .pencil ? .eraser : .none
         case .lasso:
-            return contact == .pencil || contact == .finger || contact == .primaryPointer
-                ? .lasso : .none
-        case .select:
-            return contact == .pencil || contact == .finger || contact == .primaryPointer
-                ? .selection : .none
+            return contact == .pencil ? .lasso : .none
         }
     }
 
-    /// A one-finger pan exists only while Hand is selected. Every editing
-    /// tool reserves the first direct contact for editing (or an intentional
-    /// no-op when Draw with Finger is disabled); navigation requires two.
+    /// One direct finger always pans, independent of the selected Pencil tool.
     static func minimumDirectNavigationTouches(tool: CanvasTool) -> Int {
-        tool == .navigation ? 1 : 2
+        1
     }
 }
 
@@ -1016,13 +1014,7 @@ struct PencilSettingsControls: View {
 
     var body: some View {
         Section("Apple Pencil") {
-            Picker("Double Tap", selection: $doubleTapRaw) {
-                Text("Follow System").tag(PencilDoubleTapSetting.followSystem.rawValue)
-                Text("Previous Tool").tag(PencilDoubleTapSetting.previousTool.rawValue)
-                Text("Eraser").tag(PencilDoubleTapSetting.eraser.rawValue)
-                Text("Palette").tag(PencilDoubleTapSetting.palette.rawValue)
-                Text("Off").tag(PencilDoubleTapSetting.off.rawValue)
-            }
+            LabeledContent("Double Tap", value: "Lasso")
             if #available(iOS 17.5, *) {
                 Picker("Squeeze", selection: $squeezeRaw) {
                     Text("Follow System").tag(PencilSqueezeSetting.followSystem.rawValue)

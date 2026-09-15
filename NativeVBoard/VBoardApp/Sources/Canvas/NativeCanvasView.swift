@@ -3,6 +3,18 @@ import UIKit
 
 enum CanvasTool: String, CaseIterable, Sendable {
     case navigation, pen, highlighter, select, lasso, objectEraser
+
+    static let visibleTools: [CanvasTool] = [.pen, .highlighter, .objectEraser, .lasso]
+
+    /// Pan and Select are legacy persisted/UI values. Finger navigation no
+    /// longer needs a tool, and Lasso now owns both tap and region selection.
+    var migratedForCurrentInputModel: CanvasTool {
+        switch self {
+        case .navigation: return .pen
+        case .select: return .lasso
+        default: return self
+        }
+    }
 }
 
 enum PassiveGraphOpenPolicy {
@@ -42,6 +54,26 @@ enum CanvasDesignTokens {
     static let toolbarPrimaryText = canvasPrimaryText
     static let selectionAccent = UIColor(red: 0.04, green: 0.43, blue: 0.91, alpha: 1)
     static let dotColor = UIColor(red: 0.18, green: 0.25, blue: 0.32, alpha: 1)
+}
+
+enum CanvasColorPalette {
+    static let skyPink = "#F2C4D7"
+    static let standard = [
+        "#183153", "#111111", "#C62828", "#1565C0", "#2E7D32",
+        "#FFD60A", "#FF8A00", skyPink,
+    ]
+    static let pencilQuick = [
+        "#111827", "#2563EB", "#DC2626", "#16A34A", "#7C3AED",
+        "#EA580C", "#DB2777", "#F8FAFC", skyPink,
+    ]
+
+    static func name(for hex: String) -> String {
+        hex.uppercased() == skyPink ? "Sky Pink" : "Color \(hex)"
+    }
+
+    static func accessibilityValue(for hex: String) -> String {
+        String(hex.uppercased().dropFirst())
+    }
 }
 
 /// Canvas content has an intentional appearance independent of app chrome.
@@ -1049,23 +1081,24 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             setCamera(camera, reason: .restorePersistedViewport)
         }
         self.onStroke = onStroke
-        if self.activeTool != tool {
+        let migratedTool = tool.migratedForCurrentInputModel
+        if self.activeTool != migratedTool {
             // A toolbar change is a hard ownership boundary. Discard any
             // presentation-only edit and restore an interrupted camera gesture
             // before the next tool is allowed to consume input.
             if interactionState != .idle { clearTransientInput() }
             pencilFeedback.request(.toolSelection(nil))
             #if DEBUG
-            print("[VBoard] TOOL CHANGED \(self.activeTool.rawValue) -> \(tool.rawValue) board=\(boardID)")
+            print("[VBoard] TOOL CHANGED \(self.activeTool.rawValue) -> \(migratedTool.rawValue) board=\(boardID)")
             #endif
-            if tool != .select, tool != .lasso, !selectedIDs.isEmpty {
+            if migratedTool != .lasso, !selectedIDs.isEmpty {
                 selectedIDs.removeAll()
                 onSelectionRegionChanged(nil)
                 onSelectionChanged([])
                 updateSelectionOverlay()
             }
         }
-        self.activeTool = tool; self.onSelectionChanged = onSelectionChanged
+        self.activeTool = migratedTool; self.onSelectionChanged = onSelectionChanged
         self.onSelectionRegionChanged = onSelectionRegionChanged
         self.onMove = onMove; self.onResize = onResize
         self.onResizeGraphHeight = onResizeGraphHeight
@@ -1077,10 +1110,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         self.onPencilPaletteCommit = onPencilPaletteCommit
         self.onPencilPaletteDismiss = onPencilPaletteDismiss
         panGesture.minimumNumberOfTouches = CanvasInputArbitrationPolicy
-            .minimumDirectNavigationTouches(tool: tool)
-        // Hand and simulator Space-pan own the root touch stream directly.
-        // This keeps one camera owner for indirect-pointer drags; physical
-        // devices retain the recognizer path below.
+            .minimumDirectNavigationTouches(tool: migratedTool)
+        // Simulator Space-pan/pointer input owns the root touch stream
+        // directly. Physical fingers retain the recognizer path below.
         #if targetEnvironment(simulator)
         panGesture.isEnabled = false
         #else
@@ -1402,9 +1434,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         // Simulator primary-click streams may be synthesized as `.direct`.
         return true
         #else
-        // iPhone has no Pencil path, so editing tools remain usable. iPad Pen
-        // and Marker reserve one-finger drawing until a visible preference is
-        // introduced; Lasso/Eraser/Select still edit with one finger.
+        // This legacy capability bit remains an argument for compatibility;
+        // the current arbitration contract always routes finger to navigation.
         return UIDevice.current.userInterfaceIdiom == .phone
         #endif
     }
@@ -1469,11 +1500,9 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         let pop = nearestNavigationController()?.interactivePopGestureRecognizer
         let recognizers = "pan=\(Self.gestureStateName(panGesture.state)),pinch=\(Self.gestureStateName(pinchGesture.state)),scroll=\(Self.gestureStateName(scrollPanGesture.state))"
         print("[VBoard] INPUT_OWNER phase=\(phase) board=\(boardID) source=\(sourceKind.rawValue) render=\(renderState) tool=\(activeTool.rawValue) contact=\(contact(for: touch).rawValue) contacts=\(contactCount) screen=(\(point.x),\(point.y)) world=\(worldPoint(point, from: self)) hit=\(hitName) recognizers={\(recognizers)} candidate=\(owner.rawValue) owner=\(activeInputOwner.rawValue) camera=\(controller.camera) popEnabled=\(pop?.isEnabled.description ?? "missing") popState=\(pop.map { Self.gestureStateName($0.state) } ?? "missing")")
-        if owner == .navigation, contactCount == 1,
-           activeTool == .lasso || activeTool == .objectEraser
-            || activeTool == .pen || activeTool == .highlighter {
-            assertionFailure("Unexpected navigation ownership while \(activeTool.rawValue) selected")
-        }
+        // A single direct finger navigating while any Pencil tool is selected
+        // is now the intended product contract. The ownership log above is the
+        // DEBUG proof; do not convert that valid route into an assertion.
     }
     private static func gestureStateName(_ state: UIGestureRecognizer.State) -> String {
         switch state {
@@ -1626,7 +1655,7 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         let inputContact = contact(for: touch)
         let contactCount = inputContact == .finger ? directContactCount(event: event) : 1
         let owner = CanvasInputArbitrationPolicy.owner(
-            tool: isSpacePressed ? .navigation : activeTool,
+            tool: isSpacePressed ? .navigation : activeTool.migratedForCurrentInputModel,
             contact: inputContact,
             contactCount: contactCount,
             drawsWithFinger: drawsWithFinger
@@ -1646,9 +1675,8 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         let screen = touch.location(in: self)
         let point = worldPoint(screen, from: self)
         if owner == .navigation {
-            // Direct-finger navigation is recognizer-owned: one finger for
-            // Hand, two fingers for every editing tool. Pointer/Pencil Hand
-            // input stays on the root touch path.
+            // Direct-finger navigation is recognizer-owned with every visible
+            // tool. Pointer empty-space panning stays on the root touch path.
             if inputContact == .finger {
                 super.touchesBegan(touches, with: event)
                 return
@@ -1656,6 +1684,10 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             panStart = screen; panStartCamera = controller.camera
             interactionState = .panning; professor.beginNavigation()
             debugInputOperation("PAN BEGIN"); debugPan("BEGIN", screen: screen); updateInputHUD(); return
+        }
+        if owner == .selection, inputContact == .primaryPointer {
+            beginPointerInteraction(at: point, screen: screen)
+            return
         }
         if owner != .stroke { beginEditing(at: point, screen: screen); return }
         interactionState = .drawing; debugInputOperation("STROKE BEGIN"); updateInputHUD()
@@ -1865,6 +1897,45 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
         }
     }
 
+    /// Mouse and trackpad do not impersonate Pencil tools. A hit selects and
+    /// can immediately become an object drag; an empty press becomes canvas
+    /// navigation using the same immutable-start camera path as Space-pan.
+    private func beginPointerInteraction(at point: CGPoint, screen: CGPoint) {
+        editStart = point
+        editStartScreen = screen
+        moveDelta = .zero
+        moveActive = false
+        if let bounds = selectionWorldBounds(),
+           let handle = resizeHandle(at: point, bounds: bounds) {
+            resizeSession = SelectionResizeSession(
+                keys: [], startBounds: bounds, handle: handle,
+                startPointer: point,
+                mode: selectedGraphForVerticalResize == nil ? .uniform : .graphVertical
+            )
+            resizePreviewBounds = bounds
+            interactionState = .resizingSelection
+            return
+        }
+        let hitIDs = hitTestIDs(at: point)
+        guard !hitIDs.isEmpty else {
+            selectedIDs.removeAll()
+            onSelectionRegionChanged(nil)
+            onSelectionChanged([])
+            updateSelectionOverlay()
+            activeInputOwner = .navigation
+            panStart = screen
+            panStartCamera = controller.camera
+            interactionState = .panning
+            professor.beginNavigation()
+            return
+        }
+        if hitIDs.isDisjoint(with: selectedIDs) { selectedIDs = hitIDs }
+        onSelectionRegionChanged(nil)
+        onSelectionChanged(selectedIDs)
+        interactionState = .movingSelection
+        updateSelectionOverlay()
+    }
+
     private func continueEditing(at point: CGPoint, screen: CGPoint) {
         if interactionState == .movingSelection {
             moveActive = true
@@ -1961,7 +2032,22 @@ final class InfiniteCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilI
             updateSelectionOverlay(); updateInputHUD()
             return
         }
-        if interactionState == .lassoing, let endpoint, lassoWorldPoints.count == 1 { lassoWorldPoints.append(endpoint) }
+        if interactionState == .lassoing, let endpoint {
+            let screenDistance = hypot(endpoint.x - editStart.x,
+                                       endpoint.y - editStart.y) * worldTransform.scale
+            if screenDistance < 6 {
+                selectedIDs = hitTestIDs(at: endpoint)
+                onSelectionRegionChanged(nil)
+                onSelectionChanged(selectedIDs)
+                lassoWorldPoints.removeAll()
+                interactionState = .idle
+                updateInteractionPath()
+                updateSelectionOverlay()
+                updateInputHUD()
+                return
+            }
+            if lassoWorldPoints.count == 1 { lassoWorldPoints.append(endpoint) }
+        }
         if interactionState == .lassoing, lassoWorldPoints.count >= 2 {
             // A simulator drag is delivered as a begin/end pair by the Mac
             // automation layer. Treat that two-point gesture as the natural
