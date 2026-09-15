@@ -1329,7 +1329,8 @@ struct GraphMathEnvironment: Equatable, Sendable {
 
 enum GraphLatexNormalizer {
     static func normalize(_ input: String) -> String {
-        var value = rewriteFractionsAndRoots(input)
+        var value = rewriteInverseTrigNotation(input)
+        value = rewriteFractionsAndRoots(value)
         let replacements: [(String, String)] = [
             ("$", ""), ("\\left", ""), ("\\right", ""),
             ("\\cdot", "*"), ("\\times", "*"), ("×", "*"),
@@ -1353,6 +1354,25 @@ enum GraphLatexNormalizer {
             .replacingOccurrences(of: "arcsin", with: "asin")
             .replacingOccurrences(of: "arccos", with: "acos")
             .replacingOccurrences(of: "arctan", with: "atan")
+    }
+
+    private static func rewriteInverseTrigNotation(_ input: String) -> String {
+        var value = input
+        let functions = [("sin", "asin"), ("cos", "acos"), ("tan", "atan")]
+        for (function, inverse) in functions {
+            let escaped = "\\\\\(function)"
+            let patterns = [
+                "\(escaped)\\s*\\^\\s*\\{\\s*-\\s*1\\s*\\}",
+                "(?<![A-Za-z])\(function)\\s*\\^\\s*\\{\\s*-\\s*1\\s*\\}"
+            ]
+            for pattern in patterns {
+                value = value.replacingOccurrences(
+                    of: pattern, with: inverse,
+                    options: [.regularExpression, .caseInsensitive]
+                )
+            }
+        }
+        return value
     }
 
     private static func rewriteFractionsAndRoots(_ input: String) -> String {

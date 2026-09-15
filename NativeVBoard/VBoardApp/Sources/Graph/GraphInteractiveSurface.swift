@@ -1361,6 +1361,16 @@ private struct LightweightGraphSurface: View {
         .environment(\.colorScheme, VBoardCanvasTheme.colorScheme)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(GraphAccessibility.label(for: model.workingGraph))
+        .accessibilityAction(named: "Zoom In") {
+            zoom(by: GraphViewportNavigation.zoomInFactor)
+        }
+        .accessibilityAction(named: "Zoom Out") {
+            zoom(by: GraphViewportNavigation.zoomOutFactor)
+        }
+        .accessibilityAction(named: "Reset View") {
+            model.resetViewport()
+            commitViewport()
+        }
         .onAppear(perform: onBeginEditing)
         .onDisappear {
             model.finishEditing()
@@ -1765,6 +1775,22 @@ private struct LightweightGraphSurface: View {
                 }
                 Spacer()
                 Button {
+                    keypadInsertion = GraphMathKeyCommand(action: .moveCaret(offset: -1))
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Move cursor left")
+                Button {
+                    keypadInsertion = GraphMathKeyCommand(action: .moveCaret(offset: 1))
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Move cursor right")
+                Button {
                     model.finishEditing()
                 } label: {
                     Image(systemName: "keyboard.chevron.compact.down")
@@ -1994,11 +2020,12 @@ private struct LightweightGraphSurface: View {
 }
 
 private struct GraphMathKey: Identifiable {
-    let id = UUID()
     let label: String
     let accessibilityLabel: String
     let action: GraphMathKeyAction
     let emphasized: Bool
+
+    var id: String { "\(label)|\(accessibilityLabel)" }
 
     static func text(_ value: String, emphasized: Bool = false) -> Self {
         Self(label: value, accessibilityLabel: value,

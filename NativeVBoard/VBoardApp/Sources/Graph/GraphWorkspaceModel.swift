@@ -52,6 +52,7 @@ enum GraphMathKeyAction: Equatable {
     case insert(text: String, cursorBacktrack: Int = 0)
     case backspace
     case clear
+    case moveCaret(offset: Int)
 }
 
 struct GraphMathInsertionResult: Equatable {
@@ -66,10 +67,10 @@ enum GraphMathInsertionPlan {
     static func apply(_ action: GraphMathKeyAction, to source: String,
                       selection proposedSelection: NSRange) -> GraphMathInsertionResult {
         let sourceLength = source.utf16.count
+        let location = min(max(0, proposedSelection.location), sourceLength)
         let selection = NSRange(
-            location: min(max(0, proposedSelection.location), sourceLength),
-            length: min(max(0, proposedSelection.length),
-                        max(0, sourceLength - proposedSelection.location))
+            location: location,
+            length: min(max(0, proposedSelection.length), sourceLength - location)
         )
         guard let range = Range(selection, in: source) else {
             return GraphMathInsertionResult(
@@ -77,6 +78,11 @@ enum GraphMathInsertionPlan {
             )
         }
         switch action {
+        case .moveCaret(let offset):
+            let cursor = min(sourceLength, max(0, selection.location + offset))
+            return GraphMathInsertionResult(
+                source: source, selection: NSRange(location: cursor, length: 0)
+            )
         case .clear:
             return GraphMathInsertionResult(source: "", selection: NSRange(location: 0, length: 0))
         case .backspace:

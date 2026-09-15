@@ -580,32 +580,59 @@ enum GraphExpressionInference {
 }
 
 enum GraphPlacementPolicy {
-    static func frame(source: CGRect, occupied: [CGRect], cameraScale: CGFloat) -> GraphFrame {
+    static func frame(source: CGRect, occupied: [CGRect], cameraScale: CGFloat,
+                      containerWidth: CGFloat? = nil) -> GraphFrame {
         let safeScale = max(cameraScale, 0.01)
         let width = min(1_200, max(260, 420 / safeScale))
         let height = min(900, max(195, 300 / safeScale))
         let gap = max(24, 28 / safeScale)
-        let candidates = [
-            CGRect(x: source.maxX + gap, y: source.minY, width: width, height: height),
-            CGRect(x: source.minX, y: source.maxY + gap, width: width, height: height),
-            CGRect(x: source.minX - width - gap, y: source.minY, width: width, height: height),
-            CGRect(x: source.minX, y: source.minY - height - gap, width: width, height: height),
-        ]
-        let winner = candidates.min { overlapScore($0, source: source, occupied: occupied)
-            < overlapScore($1, source: source, occupied: occupied) } ?? candidates[0]
-        return GraphFrame(x: Double(winner.minX), y: Double(winner.minY),
-                          width: Double(winner.width), height: Double(winner.height))
-    }
-
-    private static func overlapScore(_ candidate: CGRect, source: CGRect,
-                                     occupied: [CGRect]) -> CGFloat {
-        let sourceOverlap = candidate.intersection(source)
-        var result = sourceOverlap.isNull ? 0 : sourceOverlap.width * sourceOverlap.height * 10
-        for rect in occupied {
-            let intersection = candidate.intersection(rect)
-            if !intersection.isNull { result += intersection.width * intersection.height }
+        let x: CGFloat
+        if let containerWidth {
+            x = min(max(0, source.minX), max(0, containerWidth - width))
+        } else {
+            x = source.minX
         }
-        return result
+        var candidate = CGRect(x: x, y: source.maxY + gap,
+                               width: width, height: height)
+        // Placement is intentionally monotonic and deterministic: remain
+        // below the source and advance only far enough to clear each actual
+        // collision. It can never silently choose the right side of a board.
+        for _ in 0..<256 {
+            let collisions = occupied.filter {
+                !$0.isNull && !$0.isInfinite && candidate.intersects($0)
+            }
+            guard let bottom = collisions.map(\.maxY).max() else { break }
+            candidate.origin.y = bottom + gap
+        }
+        return GraphFrame(x: Double(candidate.minX), y: Double(candidate.minY),
+                          width: Double(candidate.width), height: Double(candidate.height))
+    }
+}
+
+enum GraphPlacementGeometry {
+    /// One conservative professor-ink obstacle is sufficient for placement.
+    /// Canonical paths and imported transforms are read only; no source
+    /// geometry is rewritten or moved into editor ownership.
+    static func professorBounds(document: SVGDocument,
+                                editor: EditorState) -> CGRect? {
+        var result = CGRect.null
+        for source in document.paths {
+            let transform = source.id.flatMap { editor.importedTransforms[$0] }
+            guard transform?.deleted != true,
+                  let path = try? SVGPathParser.cachedPath(from: source.d) else {
+                continue
+            }
+            var affine = CGAffineTransform.identity
+                .translatedBy(x: CGFloat(transform?.x ?? 0),
+                              y: CGFloat(transform?.y ?? 0))
+                .scaledBy(x: CGFloat(transform?.scaleX ?? 1),
+                          y: CGFloat(transform?.scaleY ?? 1))
+            let transformed = path.copy(using: &affine) ?? path
+            let bounds = transformed.boundingBoxOfPath
+            guard !bounds.isNull, !bounds.isInfinite else { continue }
+            result = result.union(bounds)
+        }
+        return result.isNull ? nil : result
     }
 }
 
@@ -615,7 +642,8 @@ enum GraphObjectFactory {
                      cameraScale: CGFloat, occupied: [CGRect],
                      sourceBoardIDs: [String]? = nil,
                      selectedObjectKeys: [String]? = nil,
-                     placementSource: CGRect? = nil) -> GraphObject {
+                     placementSource: CGRect? = nil,
+                     containerWidth: CGFloat? = nil) -> GraphObject {
         // Board screens use the canonical board-local selection directly.
         // Lecture callers may supply the same lecture-world source converted
         // into the owning board's coordinates after scoring all nearby boards.
@@ -627,7 +655,8 @@ enum GraphObjectFactory {
             id: stableID,
             owningBoardID: boardID,
             frame: GraphPlacementPolicy.frame(source: source, occupied: occupied,
-                                              cameraScale: cameraScale),
+                                              cameraScale: cameraScale,
+                                              containerWidth: containerWidth),
             expressions: Array(expressions.prefix(GraphRecognitionController.maximumExpressions)),
             viewport: .conventional,
             settings: GraphSettings(),
