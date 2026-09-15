@@ -230,9 +230,7 @@ struct LibraryView: View {
     private func lectureLink(_ folder: LectureFolder, library: LibraryResponse,
                              list: Bool, compact: Bool) -> some View {
         NavigationLink { LectureWorkspaceView(folder: folder) } label: {
-            LectureCard(folder: folder,
-                        boards: folder.boardOrder.compactMap { id in library.boards.first(where: { $0.id == id }) },
-                        list: list, compact: compact)
+            LectureCard(folder: folder, list: list, compact: compact)
         }
         .buttonStyle(.plain)
         .contextMenu {
@@ -429,7 +427,6 @@ private struct EmptyLibraryView: View {
 
 private struct LectureCard: View {
     let folder: LectureFolder
-    let boards: [LibraryBoard]
     let list: Bool
     let compact: Bool
 
@@ -437,8 +434,11 @@ private struct LectureCard: View {
         Group {
             if list {
                 HStack(spacing: 16) {
-                    LectureMontage(boards: boards)
-                        .frame(width: compact ? 88 : 150)
+                    LibraryIdentityPlate(
+                        symbol: "books.vertical.fill",
+                        detail: "\(folder.boardOrder.count) boards"
+                    )
+                    .frame(width: compact ? 88 : 150, height: 72)
                     labels
                     Spacer()
                     Image(systemName: "chevron.right").foregroundStyle(.tertiary)
@@ -447,8 +447,11 @@ private struct LectureCard: View {
                 .overlay(alignment: .bottom) { Divider() }
             } else {
                 VStack(alignment: .leading, spacing: 12) {
-                    LectureMontage(boards: boards)
-                        .frame(height: LibraryTilePolicy.thumbnailHeight)
+                    LibraryIdentityPlate(
+                        symbol: "books.vertical.fill",
+                        detail: "\(folder.boardOrder.count) boards"
+                    )
+                    .frame(height: LibraryTilePolicy.identityHeight)
                     labels
                         .frame(height: LibraryTilePolicy.labelHeight, alignment: .top)
                 }
@@ -481,16 +484,23 @@ private struct BoardCard: View {
         Group {
             if list {
                 HStack(spacing: 16) {
-                    BoardThumbnailView(board: board).frame(width: 150)
+                    LibraryIdentityPlate(
+                        symbol: board.sourceKind == .blankBoard
+                            ? "rectangle.and.pencil.and.ellipsis" : "rectangle.on.rectangle"
+                    )
+                    .frame(width: 150, height: 72)
                     labels
                     Spacer()
                     Image(systemName: "chevron.right").foregroundStyle(.tertiary)
                 }
                 .padding(.vertical, 12).overlay(alignment: .bottom) { Divider() }
             } else {
-                VStack(alignment: .leading, spacing: 9) {
-                    BoardThumbnailView(board: board)
-                        .frame(height: LibraryTilePolicy.thumbnailHeight)
+                VStack(alignment: .leading, spacing: 12) {
+                    LibraryIdentityPlate(
+                        symbol: board.sourceKind == .blankBoard
+                            ? "rectangle.and.pencil.and.ellipsis" : "rectangle.on.rectangle"
+                    )
+                    .frame(height: LibraryTilePolicy.identityHeight)
                     labels
                         .frame(height: LibraryTilePolicy.labelHeight, alignment: .top)
                 }
@@ -534,32 +544,29 @@ private struct BoardCard: View {
     }
 }
 
-private struct LectureMontage: View {
-    let boards: [LibraryBoard]
+private struct LibraryIdentityPlate: View {
+    let symbol: String
+    var detail: String? = nil
+
     var body: some View {
-        GeometryReader { proxy in
-            let shown = Array(boards.prefix(3))
-            ZStack {
-                RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.35))
-                if shown.isEmpty {
-                    Image(systemName: "rectangle.stack").font(.title2).foregroundStyle(.secondary)
-                } else {
-                    HStack(spacing: 2) {
-                        ForEach(shown) { board in
-                            BoardThumbnailView(board: board)
-                                .frame(width: (proxy.size.width - CGFloat(max(shown.count - 1, 0)) * 2) / CGFloat(shown.count))
-                        }
-                    }
+        ZStack {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.accentColor.opacity(0.075))
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.accentColor.opacity(0.12), lineWidth: 1)
+            VStack(spacing: 8) {
+                Image(systemName: symbol)
+                    .font(.system(size: 28, weight: .medium))
+                    .foregroundStyle(Color.accentColor.opacity(0.78))
+                if let detail {
+                    Text(detail)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
-        .aspectRatio(LibraryThumbnailPolicy.aspectRatio, contentMode: .fit)
+        .accessibilityHidden(true)
     }
-}
-
-enum LibraryThumbnailPolicy {
-    static let aspectRatio: CGFloat = 16 / 9
 }
 
 enum LibraryTilePolicy {
@@ -567,47 +574,11 @@ enum LibraryTilePolicy {
     static let outerHeight: CGFloat = 240
     static let padding: CGFloat = 10
     static let spacing: CGFloat = 18
-    static let thumbnailHeight: CGFloat = (outerWidth - padding * 2)
-        / LibraryThumbnailPolicy.aspectRatio
     static let labelHeight: CGFloat = 64
+    static let identityHeight: CGFloat = outerHeight - padding * 2 - labelHeight - 12
     static let columns = [GridItem(
         .adaptive(minimum: outerWidth, maximum: outerWidth), spacing: spacing
     )]
-}
-
-/// Every library board card shares this one fixed-ratio, aspect-fill image
-/// surface. Loading, blank-board, and remote-image states occupy the same
-/// geometry, so neither the title nor the card moves when the image arrives.
-struct BoardThumbnailView: View {
-    @EnvironmentObject private var api: APIClient
-    let board: LibraryBoard
-    @State private var thumbnail: UIImage?
-
-    var body: some View {
-        ZStack {
-            Color(uiColor: .tertiarySystemFill)
-            if let thumbnail {
-                Image(uiImage: thumbnail).resizable().scaledToFill()
-            } else if board.sourceKind == .blankBoard {
-                BlankBoardThumbnail()
-            } else {
-                Image(systemName: board.status == "ready" ? "scribble.variable" : "clock")
-                    .font(.title3).foregroundStyle(.secondary)
-            }
-        }
-        .aspectRatio(LibraryThumbnailPolicy.aspectRatio, contentMode: .fit)
-        .clipped()
-        .task(id: board.thumbnailURL) {
-            guard let path = board.thumbnailURL else { return }
-            let started = VBoardColdLaunchTrace.shared.thumbnailStarted(path: path)
-            let data = try? await api.authorizedAsset(path: path)
-            let rawImage = data.flatMap(UIImage.init(data:))
-            thumbnail = await rawImage?.byPreparingForDisplay() ?? rawImage
-            VBoardColdLaunchTrace.shared.thumbnailFinished(
-                startedAt: started, byteCount: data?.count ?? 0, decoded: thumbnail != nil
-            )
-        }
-    }
 }
 
 private struct LibraryFirstFrameProbe: UIViewRepresentable {
@@ -626,29 +597,6 @@ private struct LibraryFirstFrameProbe: UIViewRepresentable {
             DispatchQueue.main.async {
                 VBoardColdLaunchTrace.shared.firstLibraryFrameRendered()
             }
-        }
-    }
-}
-
-private struct BlankBoardThumbnail: View {
-    var body: some View {
-        Canvas { context, size in
-            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(uiColor: .systemBackground)))
-            let spacing: CGFloat = 22
-            var dots = Path()
-            var x = spacing / 2
-            while x < size.width {
-                var y = spacing / 2
-                while y < size.height {
-                    dots.addEllipse(in: CGRect(x: x - 0.8, y: y - 0.8, width: 1.6, height: 1.6))
-                    y += spacing
-                }
-                x += spacing
-            }
-            context.fill(dots, with: .color(.secondary.opacity(0.42)))
-        }
-        .overlay(alignment: .bottomTrailing) {
-            Image(systemName: "pencil.line").foregroundStyle(.secondary).padding(9)
         }
     }
 }

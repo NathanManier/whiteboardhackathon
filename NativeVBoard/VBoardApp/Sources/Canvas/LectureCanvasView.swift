@@ -1482,9 +1482,6 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             return sample(sampleLocal, touch: $0)
         })
         liveStrokePoints = strokeAccumulator.canonicalPoints
-        requestAutoExpansion(boardID: item.boardID, points: liveStrokePoints)
-        requestAdjacentBoardIfNeeded(boardID: item.boardID,
-                                     localPoints: liveStrokePoints)
         boardViews[item.boardID]?.showLiveStroke(points: liveStrokePoints,
                                                 color: strokeColor,
                                                 width: strokeWidth,
@@ -1525,9 +1522,6 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
             })
             liveStrokePoints = strokeAccumulator.canonicalPoints
             predictedStrokePoints = strokeAccumulator.predicted
-            requestAutoExpansion(boardID: boardID, points: liveStrokePoints)
-            requestAdjacentBoardIfNeeded(boardID: boardID,
-                                         localPoints: liveStrokePoints)
             boardViews[boardID]?.showLiveStroke(points: strokeAccumulator.livePoints,
                                                 color: strokeColor,
                                                 width: strokeWidth,
@@ -1604,7 +1598,7 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
                     return sample(sampleLocal, touch: $0)
                 })
                 liveStrokePoints = strokeAccumulator.canonicalPoints
-                requestAutoExpansion(boardID: boardID, points: liveStrokePoints)
+                requestCommittedAutoExpansion(boardID: boardID, points: liveStrokePoints)
                 requestAdjacentBoardIfNeeded(boardID: boardID,
                                              localPoints: liveStrokePoints)
             }
@@ -1936,33 +1930,85 @@ final class LectureCanvasUIView: UIView, UIGestureRecognizerDelegate, UIPencilIn
         }
     }
 
-    private func requestAutoExpansion(boardID: String, points: [StrokePoint]) {
-        guard let contactY = points.lazy.map(\.y).max(),
-              let item = workspace.items.first(where: { $0.boardID == boardID }),
+    private func requestCommittedAutoExpansion(boardID: String,
+                                               points: [StrokePoint]) {
+        guard let item = workspace.items.first(where: { $0.boardID == boardID }),
               BoardAutoExpansionPolicy.isEligible(item.sourceKind) else { return }
+        requestCommittedAutoExpansion(item: item, localPoints: points)
+    }
+
+    private func requestCommittedAutoExpansion(item: WorkspaceBoardItem,
+                                               localPoints: [StrokePoint]) {
+        guard BoardAutoExpansionPolicy.isEligible(item.sourceKind),
+              let contentBounds = committedStrokeBounds(localPoints) else { return }
         let currentLocal = item.effectiveFrame.offsetBy(dx: -CGFloat(item.canvasX),
                                                         dy: -CGFloat(item.canvasY))
-        guard let expanded = BoardAutoExpansionPolicy.expandedLocalRegion(
+        guard let expanded = BoardAutoExpansionPolicy.committedExpansion(
             current: currentLocal,
             sourceSize: CGSize(width: item.boardWidth, height: item.boardHeight),
-            contactY: CGFloat(contactY), cameraScale: worldTransform.scale
+            contentBounds: contentBounds
         ) else { return }
-        callbacks.onBoardExpansionRequested(boardID, expanded)
+        callbacks.onBoardExpansionRequested(item.boardID, expanded)
+    }
+
+    private func committedStrokeBounds(_ points: [StrokePoint]) -> CGRect? {
+        guard let first = points.first else { return nil }
+        var minX = CGFloat(first.x)
+        var maxX = minX
+        var minY = CGFloat(first.y)
+        var maxY = minY
+        for point in points.dropFirst() {
+            minX = min(minX, CGFloat(point.x))
+            maxX = max(maxX, CGFloat(point.x))
+            minY = min(minY, CGFloat(point.y))
+            maxY = max(maxY, CGFloat(point.y))
+        }
+        let radius = max(CGFloat(strokeWidth) * 0.5, 0.5)
+        return CGRect(x: minX, y: minY,
+                      width: maxX - minX, height: maxY - minY)
+            .insetBy(dx: -radius, dy: -radius)
     }
 
     private func requestAdjacentBoardIfNeeded(boardID: String,
                                               localPoints: [StrokePoint]) {
         guard !adjacentCreationRequestedForStroke,
-              let point = localPoints.last,
               let item = workspace.items.first(where: { $0.boardID == boardID }) else {
             return
         }
-        let world = LectureCoordinateTransform.boardLocalToLectureWorld(
-            CGPoint(x: point.x, y: point.y), board: item
-        )
+        let worldPoints = localPoints.map { point in
+            LectureCoordinateTransform.boardLocalToLectureWorld(
+                CGPoint(x: point.x, y: point.y), board: item
+            )
+        }
+        guard let world = worldPoints.last(where: {
+            WorkspaceBoardCreationPolicy.crossingSide(
+                worldPoint: $0, source: item, cameraScale: worldTransform.scale
+            ) != nil
+        }) else { return }
         guard let side = WorkspaceBoardCreationPolicy.crossingSide(
             worldPoint: world, source: item, cameraScale: worldTransform.scale
         ) else { return }
+        if let destination = WorkspaceBoardCreationPolicy.destinationBoard(
+            for: world, source: item, side: side, items: workspace.items
+        ) {
+            let destinationPoints: [StrokePoint] = zip(localPoints, worldPoints).compactMap {
+                pair -> StrokePoint? in
+                let worldPoint = pair.1
+                guard worldPoint.x >= destination.frame.minX,
+                      worldPoint.x <= destination.frame.maxX else { return nil }
+                let local = LectureCoordinateTransform.lectureWorldToBoardLocal(
+                    worldPoint, board: destination
+                )
+                return StrokePoint(
+                    x: Double(local.x), y: Double(local.y), pressure: nil,
+                    altitude: nil, azimuth: nil, roll: nil,
+                    timestamp: nil, estimationUpdateIndex: nil
+                )
+            }
+            requestCommittedAutoExpansion(item: destination,
+                                          localPoints: destinationPoints)
+            return
+        }
         let origin = WorkspaceBoardCreationPolicy.origin(nextTo: item, side: side)
         guard !WorkspaceBoardCreationPolicy.hasBoard(
             at: origin, items: workspace.items

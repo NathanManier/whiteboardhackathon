@@ -1306,8 +1306,13 @@ private struct LightweightGraphSurface: View {
 
     @StateObject private var model: GraphWorkspaceModel
     @State private var keypadInsertion: GraphMathKeyCommand?
-    @State private var dragStart: GraphViewport?
-    @State private var magnificationStart: GraphViewport?
+    @State private var indirectPanStart: GraphViewport?
+    @State private var directGestureStart: GraphViewport?
+    @State private var directPanTranslation: CGSize = .zero
+    @State private var directPinchScale = 1.0
+    @State private var directPinchAnchor: CGPoint = .zero
+    @State private var directPanIsActive = false
+    @State private var directPinchIsActive = false
     @State private var compactShowsGraph = true
 
     init(graph: GraphObject, onCommitViewport: @escaping (GraphViewport) -> Void,
@@ -1352,7 +1357,6 @@ private struct LightweightGraphSurface: View {
                 if model.isEditing {
                     Divider()
                     mathInputTray
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
         }
@@ -1382,7 +1386,6 @@ private struct LightweightGraphSurface: View {
             commitViewport()
             onEndEditing()
         }
-        .animation(.easeOut(duration: 0.14), value: model.isEditing)
     }
 
     private var toolbar: some View {
@@ -1577,6 +1580,9 @@ private struct LightweightGraphSurface: View {
                                     source: "\\(\(model.displaySource(for: expression))\\)",
                                     maximumWidth: 310
                                 )
+                                // The rendered math is presentation-only here. The retained
+                                // row button owns the tap that focuses its text field.
+                                .allowsHitTesting(false)
                             }
                         }
                         .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
@@ -1702,20 +1708,34 @@ private struct LightweightGraphSurface: View {
             ZStack(alignment: .topTrailing) {
                 GraphNativeFallbackSurface(graph: model.workingGraph, showsMetadata: false)
                     .contentShape(Rectangle())
-                    .gesture(panGesture(size: proxy.size))
-                    .simultaneousGesture(zoomGesture(size: proxy.size))
 
-                GraphIndirectNavigationCapture(
-                    onPan: { state, translation in
+                GraphViewportGestureCapture(
+                    onDirectPan: { state, translation in
+                        handleDirectPan(
+                            state: state, translation: translation, size: proxy.size
+                        )
+                    },
+                    onDirectPinch: { state, scale, anchor in
+                        handleDirectPinch(
+                            state: state, scale: scale, anchor: anchor, size: proxy.size
+                        )
+                    },
+                    onIndirectPan: { state, translation in
                         switch state {
-                        case .began: dragStart = model.viewport
-                        case .changed: updatePan(translation: translation, size: proxy.size)
+                        case .began: indirectPanStart = model.viewport
+                        case .changed:
+                            let start = indirectPanStart ?? model.viewport
+                            model.updateViewport(GraphViewportNavigation.panned(
+                                start, by: translation, size: proxy.size
+                            ))
                         case .ended:
-                            dragStart = nil
+                            indirectPanStart = nil
                             commitViewport()
                         case .cancelled, .failed:
-                            if let dragStart { model.updateViewport(dragStart) }
-                            dragStart = nil
+                            if let indirectPanStart {
+                                model.updateViewport(indirectPanStart)
+                            }
+                            indirectPanStart = nil
                         default: break
                         }
                     },
@@ -1963,48 +1983,101 @@ private struct LightweightGraphSurface: View {
         return Color(uiColor: GraphFallbackPalette.colors[index % GraphFallbackPalette.colors.count])
     }
 
-    private func panGesture(size: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 2)
-            .onChanged { value in
-                if dragStart == nil { dragStart = model.viewport }
-                updatePan(translation: value.translation, size: size)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                commitViewport()
-            }
-    }
-
-    private func zoomGesture(size: CGSize) -> some Gesture {
-        MagnifyGesture()
-            .onChanged { value in
-                let start = magnificationStart ?? model.viewport
-                if magnificationStart == nil { magnificationStart = start }
-                let scale = min(20, max(0.05, Double(value.magnification)))
-                let midpoint = CGPoint(
-                    x: value.startAnchor.x * size.width,
-                    y: value.startAnchor.y * size.height
-                )
-                model.updateViewport(GraphViewportNavigation.zoomed(
-                    start, by: 1 / scale, anchor: midpoint, size: size
-                ))
-            }
-            .onEnded { _ in
-                magnificationStart = nil
-                commitViewport()
-            }
-    }
-
     private func zoom(by factor: Double) {
         model.updateViewport(GraphViewportNavigation.zoomed(model.viewport, by: factor))
         commitViewport()
     }
 
-    private func updatePan(translation: CGSize, size: CGSize) {
-        let start = dragStart ?? model.viewport
-        model.updateViewport(GraphViewportNavigation.panned(
-            start, by: translation, size: size
+    private func handleDirectPan(state: UIGestureRecognizer.State,
+                                 translation: CGSize, size: CGSize) {
+        switch state {
+        case .began:
+            beginDirectGestureIfNeeded()
+            directPanIsActive = true
+            directPanTranslation = translation
+        case .changed:
+            beginDirectGestureIfNeeded()
+            directPanIsActive = true
+            directPanTranslation = translation
+            applyDirectGesture(size: size)
+        case .ended:
+            directPanTranslation = translation
+            applyDirectGesture(size: size)
+            directPanIsActive = false
+            finishDirectGestureIfNeeded()
+        case .cancelled, .failed:
+            directPanTranslation = .zero
+            directPanIsActive = false
+            cancelOrContinueDirectGesture(size: size)
+        default:
+            break
+        }
+    }
+
+    private func handleDirectPinch(state: UIGestureRecognizer.State,
+                                   scale: Double, anchor: CGPoint, size: CGSize) {
+        switch state {
+        case .began:
+            beginDirectGestureIfNeeded()
+            directPinchIsActive = true
+            directPinchScale = scale
+            directPinchAnchor = anchor
+        case .changed:
+            beginDirectGestureIfNeeded()
+            directPinchIsActive = true
+            directPinchScale = scale
+            directPinchAnchor = anchor
+            applyDirectGesture(size: size)
+        case .ended:
+            directPinchScale = scale
+            directPinchAnchor = anchor
+            applyDirectGesture(size: size)
+            directPinchIsActive = false
+            finishDirectGestureIfNeeded()
+        case .cancelled, .failed:
+            directPinchScale = 1
+            directPinchIsActive = false
+            cancelOrContinueDirectGesture(size: size)
+        default:
+            break
+        }
+    }
+
+    private func beginDirectGestureIfNeeded() {
+        guard directGestureStart == nil else { return }
+        directGestureStart = model.viewport
+        directPanTranslation = .zero
+        directPinchScale = 1
+    }
+
+    private func applyDirectGesture(size: CGSize) {
+        guard let directGestureStart else { return }
+        let panned = GraphViewportNavigation.panned(
+            directGestureStart, by: directPanTranslation, size: size
+        )
+        let clampedScale = min(20, max(0.05, directPinchScale))
+        model.updateViewport(GraphViewportNavigation.zoomed(
+            panned, by: 1 / clampedScale, anchor: directPinchAnchor, size: size
         ))
+    }
+
+    private func finishDirectGestureIfNeeded() {
+        guard !directPanIsActive, !directPinchIsActive else { return }
+        directGestureStart = nil
+        directPanTranslation = .zero
+        directPinchScale = 1
+        commitViewport()
+    }
+
+    private func cancelOrContinueDirectGesture(size: CGSize) {
+        if directPanIsActive || directPinchIsActive {
+            applyDirectGesture(size: size)
+        } else {
+            if let directGestureStart { model.updateViewport(directGestureStart) }
+            directGestureStart = nil
+            directPanTranslation = .zero
+            directPinchScale = 1
+        }
     }
 
     private func scaled(_ source: GraphViewport, by factor: Double,
@@ -2072,6 +2145,8 @@ private struct GraphMathEditorField: UIViewRepresentable {
         field.autocapitalizationType = .none
         field.autocorrectionType = .no
         field.spellCheckingType = .no
+        field.inputAssistantItem.leadingBarButtonGroups = []
+        field.inputAssistantItem.trailingBarButtonGroups = []
         field.returnKeyType = .done
         field.clearButtonMode = .never
         field.placeholder = "y=x²"
@@ -2126,33 +2201,67 @@ private struct GraphMathEditorField: UIViewRepresentable {
     }
 }
 
-/// UIKit exposes trackpad scroll and discrete mouse-wheel streams separately
-/// from direct finger pans. This transparent peer handles only indirect input;
-/// direct touches fall through to the SwiftUI pan/pinch gestures above.
-private struct GraphIndirectNavigationCapture: UIViewRepresentable {
-    let onPan: (UIGestureRecognizer.State, CGSize) -> Void
+/// One deliberate UIKit owner for direct finger pan/pinch and indirect pointer
+/// navigation. Keeping all plot gestures in one peer prevents a transparent
+/// pointer layer from intercepting the direct-touch stream before SwiftUI sees it.
+private struct GraphViewportGestureCapture: UIViewRepresentable {
+    let onDirectPan: (UIGestureRecognizer.State, CGSize) -> Void
+    let onDirectPinch: (UIGestureRecognizer.State, Double, CGPoint) -> Void
+    let onIndirectPan: (UIGestureRecognizer.State, CGSize) -> Void
     let onWheel: (Double, CGPoint, Bool) -> Void
 
-    func makeUIView(context: Context) -> GraphIndirectNavigationView {
-        GraphIndirectNavigationView(onPan: onPan, onWheel: onWheel)
+    func makeUIView(context: Context) -> GraphViewportGestureView {
+        GraphViewportGestureView(
+            onDirectPan: onDirectPan,
+            onDirectPinch: onDirectPinch,
+            onIndirectPan: onIndirectPan,
+            onWheel: onWheel
+        )
     }
 
-    func updateUIView(_ view: GraphIndirectNavigationView, context: Context) {
-        view.onPan = onPan
+    func updateUIView(_ view: GraphViewportGestureView, context: Context) {
+        view.onDirectPan = onDirectPan
+        view.onDirectPinch = onDirectPinch
+        view.onIndirectPan = onIndirectPan
         view.onWheel = onWheel
     }
 }
 
-private final class GraphIndirectNavigationView: UIView, UIGestureRecognizerDelegate {
-    var onPan: (UIGestureRecognizer.State, CGSize) -> Void
+private final class GraphViewportGestureView: UIView, UIGestureRecognizerDelegate {
+    var onDirectPan: (UIGestureRecognizer.State, CGSize) -> Void
+    var onDirectPinch: (UIGestureRecognizer.State, Double, CGPoint) -> Void
+    var onIndirectPan: (UIGestureRecognizer.State, CGSize) -> Void
     var onWheel: (Double, CGPoint, Bool) -> Void
+    private weak var directPan: UIPanGestureRecognizer?
+    private weak var directPinch: UIPinchGestureRecognizer?
 
-    init(onPan: @escaping (UIGestureRecognizer.State, CGSize) -> Void,
+    init(onDirectPan: @escaping (UIGestureRecognizer.State, CGSize) -> Void,
+         onDirectPinch: @escaping (UIGestureRecognizer.State, Double, CGPoint) -> Void,
+         onIndirectPan: @escaping (UIGestureRecognizer.State, CGSize) -> Void,
          onWheel: @escaping (Double, CGPoint, Bool) -> Void) {
-        self.onPan = onPan
+        self.onDirectPan = onDirectPan
+        self.onDirectPinch = onDirectPinch
+        self.onIndirectPan = onIndirectPan
         self.onWheel = onWheel
         super.init(frame: .zero)
         backgroundColor = .clear
+        isMultipleTouchEnabled = true
+
+        let fingerPan = UIPanGestureRecognizer(target: self, action: #selector(fingerPan(_:)))
+        fingerPan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        fingerPan.minimumNumberOfTouches = 1
+        fingerPan.maximumNumberOfTouches = 2
+        fingerPan.cancelsTouchesInView = true
+        fingerPan.delegate = self
+        addGestureRecognizer(fingerPan)
+        directPan = fingerPan
+
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(fingerPinch(_:)))
+        pinch.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        pinch.cancelsTouchesInView = true
+        pinch.delegate = self
+        addGestureRecognizer(pinch)
+        directPinch = pinch
 
         let scroll = UIPanGestureRecognizer(target: self, action: #selector(trackpadPan(_:)))
         scroll.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
@@ -2171,15 +2280,35 @@ private final class GraphIndirectNavigationView: UIView, UIGestureRecognizerDele
 
     required init?(coder: NSCoder) { nil }
 
-    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        guard super.point(inside: point, with: event) else { return false }
-        guard let touch = event?.allTouches?.first else { return true }
-        return touch.type == .indirectPointer
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard let touches = event?.allTouches, !touches.isEmpty else {
+            return super.hitTest(point, with: event)
+        }
+        let contacts = touches.map {
+            GraphOutsideInteractionPolicy.Contact(
+                point: $0.location(in: self), type: $0.type, phase: $0.phase
+            )
+        }
+        // Finger/trackpad input belongs to this graph surface. Pencil keeps
+        // flowing to the canonical annotation owner underneath it.
+        if GraphOutsideInteractionPolicy.shouldPassThrough(
+            contactAt: point, contacts: contacts
+        ) { return nil }
+        return super.hitTest(point, with: event)
+    }
+
+    @objc private func fingerPan(_ gesture: UIPanGestureRecognizer) {
+        let translation = gesture.translation(in: self)
+        onDirectPan(gesture.state, CGSize(width: translation.x, height: translation.y))
+    }
+
+    @objc private func fingerPinch(_ gesture: UIPinchGestureRecognizer) {
+        onDirectPinch(gesture.state, Double(gesture.scale), gesture.location(in: self))
     }
 
     @objc private func trackpadPan(_ gesture: UIPanGestureRecognizer) {
         let translation = gesture.translation(in: self)
-        onPan(gesture.state, CGSize(width: translation.x, height: translation.y))
+        onIndirectPan(gesture.state, CGSize(width: translation.x, height: translation.y))
     }
 
     @objc private func mouseWheel(_ gesture: UIPanGestureRecognizer) {
@@ -2201,7 +2330,10 @@ private final class GraphIndirectNavigationView: UIView, UIGestureRecognizerDele
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer)
-        -> Bool { true }
+        -> Bool {
+        (gestureRecognizer === directPan && otherGestureRecognizer === directPinch)
+            || (gestureRecognizer === directPinch && otherGestureRecognizer === directPan)
+    }
 }
 
 #if DEBUG

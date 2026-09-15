@@ -455,6 +455,36 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         })
     }
 
+    func testFallbackXInterceptDotsTrackExpressionAndViewport() {
+        let expression = GraphExpression(
+            id: "roots", latex: "y=x^2-4", type: .explicitFunction
+        )
+        let frame = CGRect(x: 0, y: 0, width: 600, height: 400)
+        let roots = GraphFallbackSampler.xIntercepts(
+            for: expression, viewport: .conventional, frame: frame
+        )
+        XCTAssertEqual(roots.count, 2)
+        let expected = [-2.0, 2.0].map {
+            GraphFallbackSampler.map(x: $0, y: 0,
+                                     viewport: .conventional, frame: frame)
+        }
+        XCTAssertEqual(roots[0].x, expected[0].x, accuracy: 2)
+        XCTAssertEqual(roots[1].x, expected[1].x, accuracy: 2)
+        XCTAssertTrue(roots.allSatisfy { abs($0.y - expected[0].y) < 0.01 })
+
+        let offscreen = GraphViewport(xMin: 3, xMax: 8, yMin: -5, yMax: 5)
+        XCTAssertTrue(GraphFallbackSampler.xIntercepts(
+            for: expression, viewport: offscreen, frame: frame
+        ).isEmpty)
+
+        let reciprocal = GraphExpression(
+            id: "asymptote", latex: "y=1/x", type: .explicitFunction
+        )
+        XCTAssertTrue(GraphFallbackSampler.xIntercepts(
+            for: reciprocal, viewport: .conventional, frame: frame
+        ).isEmpty)
+    }
+
     func testPassiveGraphLayerContainsNoWebView() {
         let graph = GraphObject(
             id: "graph-passive", owningBoardID: boardID,
@@ -1061,7 +1091,6 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
         XCTAssertTrue(EditorStatusPresentation("Saving…").isProgress)
         XCTAssertEqual(EditorStatusPresentation("Saved locally"), .offline)
         XCTAssertEqual(EditorStatusPresentation("Save failed"), .error)
-        XCTAssertEqual(LibraryThumbnailPolicy.aspectRatio, 16.0 / 9.0)
         XCTAssertEqual(PencilRadialPaletteModel.tools,
                        [.pen, .highlighter, .objectEraser, .lasso])
         XCTAssertEqual(EditorStatusPresentation("Saved").indicatorRole, .saved)
@@ -1076,14 +1105,22 @@ final class GraphRecognitionAndRenderingTests: XCTestCase {
             for: CanvasColorPalette.skyPink
         ), "F2C4D7")
         XCTAssertTrue(CanvasColorPalette.standard.contains("#F2C4D7"))
+        XCTAssertEqual(CanvasColorPalette.standardEntries.count, 8)
+        XCTAssertEqual(CanvasColorPalette.pencilQuickEntries.count, 9)
+        XCTAssertTrue((CanvasColorPalette.standardEntries
+                       + CanvasColorPalette.pencilQuickEntries).allSatisfy {
+            CanvasColorPalette.name(for: $0.hex) == $0.name
+                && !$0.name.localizedCaseInsensitiveContains("color #")
+        })
 
         XCTAssertEqual(LibraryTilePolicy.outerWidth, 272)
         XCTAssertEqual(LibraryTilePolicy.outerHeight, 240)
-        XCTAssertGreaterThanOrEqual(
+        XCTAssertEqual(
             LibraryTilePolicy.outerHeight,
             LibraryTilePolicy.padding * 2
-                + LibraryTilePolicy.thumbnailHeight
-                + LibraryTilePolicy.labelHeight + 12
+                + LibraryTilePolicy.identityHeight
+                + LibraryTilePolicy.labelHeight + 12,
+            accuracy: 0.001
         )
     }
 

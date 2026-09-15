@@ -86,16 +86,23 @@ final class WorkspaceAppearanceTests: XCTestCase {
         XCTAssertEqual(workspace.height, source.height * 1.5)
     }
 
-    func testBoardExpansionTriggers160ScreenPointsBeforeBottomAndGrowsByWidthChunk() throws {
+    func testBoardExpansionWaitsForCommittedContentToCrossBottom() throws {
         let source = CGSize(width: 1_000, height: 600)
         let current = BoardSurfaceGeometry.workspaceRegion(sourceSize: source)
-        XCTAssertNil(BoardAutoExpansionPolicy.expandedLocalRegion(
+        XCTAssertNil(BoardAutoExpansionPolicy.committedExpansion(
             current: current, sourceSize: source,
-            contactY: current.maxY - 161, cameraScale: 1
+            contentBounds: CGRect(x: 40, y: current.maxY - 80,
+                                  width: 100, height: 79)
         ))
-        let expanded = try XCTUnwrap(BoardAutoExpansionPolicy.expandedLocalRegion(
+        XCTAssertNil(BoardAutoExpansionPolicy.committedExpansion(
             current: current, sourceSize: source,
-            contactY: current.maxY - 159, cameraScale: 1
+            contentBounds: CGRect(x: 40, y: current.maxY - 80,
+                                  width: 100, height: 80)
+        ))
+        let expanded = try XCTUnwrap(BoardAutoExpansionPolicy.committedExpansion(
+            current: current, sourceSize: source,
+            contentBounds: CGRect(x: 40, y: current.maxY - 80,
+                                  width: 100, height: 81)
         ))
         XCTAssertEqual(expanded.minX, 0)
         XCTAssertEqual(expanded.width, source.width)
@@ -103,12 +110,13 @@ final class WorkspaceAppearanceTests: XCTestCase {
                        accuracy: 0.001)
     }
 
-    func testBoardExpansionConvertsScreenMarginThroughCameraAndNeverGrowsSideways() throws {
+    func testCommittedBoardExpansionIgnoresHorizontalOverflowAndNeverGrowsSideways() throws {
         let source = CGSize(width: 800, height: 500)
         let current = CGRect(x: -300, y: -200, width: 1_500, height: 950)
-        let expanded = try XCTUnwrap(BoardAutoExpansionPolicy.expandedLocalRegion(
+        let expanded = try XCTUnwrap(BoardAutoExpansionPolicy.committedExpansion(
             current: current, sourceSize: source,
-            contactY: current.maxY - 310, cameraScale: 0.5
+            contentBounds: CGRect(x: -2_000, y: current.maxY - 20,
+                                  width: 5_000, height: 21)
         ))
         XCTAssertEqual(expanded, CGRect(x: 0, y: 0, width: 800,
                                        height: current.maxY + 800 * 0.33))
@@ -2281,16 +2289,16 @@ final class LectureWorkspaceModelTests: XCTestCase {
                        [board.boardID])
     }
 
-    func testAdjacentBlankBoardPolicyUsesThresholdAndPreventsDuplicates() {
+    func testAdjacentBlankBoardPolicyRequiresActualCrossingAndPreventsDuplicates() {
         let source = item(0, x: 0, width: 800, height: 600)
         XCTAssertNil(WorkspaceBoardCreationPolicy.crossingSide(
-            worldPoint: CGPoint(x: 870, y: 200), source: source, cameraScale: 1
+            worldPoint: CGPoint(x: 800, y: 200), source: source, cameraScale: 1
         ))
         XCTAssertEqual(WorkspaceBoardCreationPolicy.crossingSide(
-            worldPoint: CGPoint(x: 872, y: 200), source: source, cameraScale: 1
+            worldPoint: CGPoint(x: 800.01, y: 200), source: source, cameraScale: 1
         ), .right)
         XCTAssertEqual(WorkspaceBoardCreationPolicy.crossingSide(
-            worldPoint: CGPoint(x: -72, y: 200), source: source, cameraScale: 1
+            worldPoint: CGPoint(x: -0.01, y: 200), source: source, cameraScale: 1
         ), .left)
 
         let origin = WorkspaceBoardCreationPolicy.origin(nextTo: source, side: .right)
@@ -2309,6 +2317,58 @@ final class LectureWorkspaceModelTests: XCTestCase {
         XCTAssertNotNil(WorkspaceBoardCreationPolicy.emptySpaceOrigin(
             near: CGPoint(x: 1_100, y: 250), items: [source], cameraScale: 1
         ))
+
+        let shorterAdjacent = item(2, x: Double(origin.x), y: 0,
+                                   width: 1_600, height: 300)
+        let destination = WorkspaceBoardCreationPolicy.destinationBoard(
+            for: CGPoint(x: origin.x + 100, y: 580), source: source,
+            side: .right, items: [source, shorterAdjacent]
+        )
+        XCTAssertEqual(destination?.boardID, shorterAdjacent.boardID)
+    }
+
+    func testDeletingBoardTransfersOnlyObjectsCrossingIntoAdjacentColumn() throws {
+        let source = item(0, x: 0, width: 800, height: 1_000)
+        let destination = item(1, x: 896, width: 800, height: 300)
+        let exclusive = CanvasObject(
+            id: "exclusive", type: "stroke", color: "#183153", width: 4,
+            opacity: 1,
+            points: [WorldPoint(x: 100, y: 100, pressure: 1),
+                     WorldPoint(x: 200, y: 160, pressure: 1)],
+            translation: nil, sourceMarkdown: nil, text: nil,
+            x: nil, y: nil, height: nil, fontSize: nil
+        )
+        let crossing = CanvasObject(
+            id: "crossing", type: "stroke", color: "#183153", width: 4,
+            opacity: 1,
+            points: [WorldPoint(x: 700, y: 650, pressure: 1),
+                     WorldPoint(x: 1_050, y: 900, pressure: 1)],
+            translation: nil, sourceMarkdown: nil, text: nil,
+            x: nil, y: nil, height: nil, fontSize: nil
+        )
+        let crossingGraph = CanvasObject(graph: GraphObject(
+            id: "crossing-graph", owningBoardID: source.boardID,
+            frame: GraphFrame(x: 760, y: 100, width: 300, height: 220),
+            expressions: [GraphExpression(
+                id: "f", latex: "f(x)=x", type: .explicitFunction
+            )],
+            sourceSelection: GraphSourceSelection(
+                sourceBoardIDs: [source.boardID, destination.boardID],
+                selectedObjectKeys: []
+            )
+        ))
+
+        let assignments = BoardDeletionTransferPlanner.assignments(
+            deleting: source, objects: [exclusive, crossing, crossingGraph],
+            surviving: [destination]
+        )
+        let transferred = try XCTUnwrap(assignments[destination.boardID])
+        XCTAssertEqual(transferred.map(\.id), ["crossing", "crossing-graph"])
+        XCTAssertEqual(transferred.first?.translation?.x, -896)
+        XCTAssertEqual(transferred.first?.translation?.y, 0)
+        let graph = try XCTUnwrap(transferred.last?.graph)
+        XCTAssertEqual(graph.owningBoardID, destination.boardID)
+        XCTAssertEqual(graph.sourceSelection?.sourceBoardIDs, [destination.boardID])
     }
 
     func testStudyMarkerWorldAnchorIsInvariantAcrossCameraChanges() throws {

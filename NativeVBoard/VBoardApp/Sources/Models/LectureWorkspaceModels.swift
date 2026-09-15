@@ -390,17 +390,42 @@ struct BlankBoardCreationRequest: Sendable {
 }
 
 enum WorkspaceBoardCreationPolicy {
-    static let crossingThresholdScreenPoints: CGFloat = 72
     static let generatedBoardSize = CGSize(width: 1_600, height: 2_000)
 
     static func crossingSide(worldPoint: CGPoint, source: WorkspaceBoardItem,
-                             cameraScale: CGFloat) -> WorkspaceBoardSide? {
-        let threshold = crossingThresholdScreenPoints / max(cameraScale, 0.001)
-        guard worldPoint.y >= source.frame.minY - threshold,
-              worldPoint.y <= source.effectiveFrame.maxY + threshold else { return nil }
-        if worldPoint.x >= source.frame.maxX + threshold { return .right }
-        if worldPoint.x <= source.frame.minX - threshold { return .left }
+                             cameraScale _: CGFloat) -> WorkspaceBoardSide? {
+        guard worldPoint.y >= source.frame.minY,
+              worldPoint.y <= source.effectiveFrame.maxY else { return nil }
+        if worldPoint.x > source.frame.maxX { return .right }
+        if worldPoint.x < source.frame.minX { return .left }
         return nil
+    }
+
+    /// Returns the existing board whose horizontal column owns a committed
+    /// crossing point. Vertical containment is intentionally not required:
+    /// writing below a shorter adjacent board grows that board instead of
+    /// creating a third board in the same column.
+    static func destinationBoard(for worldPoint: CGPoint,
+                                 source: WorkspaceBoardItem,
+                                 side: WorkspaceBoardSide,
+                                 items: [WorkspaceBoardItem]) -> WorkspaceBoardItem? {
+        items.filter { item in
+            guard item.boardID != source.boardID,
+                  worldPoint.x >= item.frame.minX,
+                  worldPoint.x <= item.frame.maxX else { return false }
+            switch side {
+            case .left: return item.frame.midX < source.frame.midX
+            case .right: return item.frame.midX > source.frame.midX
+            }
+        }.min { lhs, rhs in
+            let lhsGap = side == .right
+                ? abs(lhs.frame.minX - source.frame.maxX)
+                : abs(source.frame.minX - lhs.frame.maxX)
+            let rhsGap = side == .right
+                ? abs(rhs.frame.minX - source.frame.maxX)
+                : abs(source.frame.minX - rhs.frame.maxX)
+            return lhsGap < rhsGap
+        }
     }
 
     static func origin(nextTo source: WorkspaceBoardItem,
@@ -472,6 +497,108 @@ enum WorkspaceEffectiveBounds {
     }
 }
 
+/// Reassociates only user-created objects that visibly cross from the board
+/// being deleted into a surviving board's horizontal column. Professor source
+/// vectors remain immutable and exclusive objects remain with the deleted board.
+enum BoardDeletionTransferPlanner {
+    static func assignments(deleting source: WorkspaceBoardItem,
+                            objects: [CanvasObject],
+                            surviving: [WorkspaceBoardItem]) -> [String: [CanvasObject]] {
+        var result: [String: [CanvasObject]] = [:]
+        for object in SceneComposition.canonicalEditorObjects(objects) {
+            let localBounds = expandedBounds(of: object)
+            guard !localBounds.isNull, !localBounds.isInfinite else { continue }
+            let worldBounds = LectureCoordinateTransform.boardLocalToLectureWorld(
+                localBounds, board: source
+            )
+            let candidates = surviving.compactMap { item -> (WorkspaceBoardItem, CGFloat)? in
+                guard item.frame.midX > source.frame.maxX
+                        || item.frame.midX < source.frame.minX else { return nil }
+                let overlap = min(worldBounds.maxX, item.frame.maxX)
+                    - max(worldBounds.minX, item.frame.minX)
+                guard overlap > 0 else { return nil }
+                return (item, overlap)
+            }
+            guard let destination = candidates.max(by: { lhs, rhs in
+                if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+                let lhsDistance = abs(lhs.0.frame.midX - worldBounds.midX)
+                let rhsDistance = abs(rhs.0.frame.midX - worldBounds.midX)
+                return lhsDistance > rhsDistance
+            })?.0 else { continue }
+            let delta = CGPoint(
+                x: CGFloat(source.canvasX - destination.canvasX),
+                y: CGFloat(source.canvasY - destination.canvasY)
+            )
+            result[destination.boardID, default: []].append(
+                rehomed(object, from: source.boardID,
+                        to: destination.boardID, by: delta)
+            )
+        }
+        return result
+    }
+
+    static func foreignContentBounds(for target: WorkspaceBoardItem,
+                                     items: [WorkspaceBoardItem],
+                                     scenes: [String: WorkspaceBoardScene]) -> CGRect? {
+        var result = CGRect.null
+        for source in items where source.boardID != target.boardID {
+            guard target.frame.midX > source.frame.maxX
+                    || target.frame.midX < source.frame.minX else { continue }
+            guard let scene = scenes[source.boardID] else { continue }
+            for object in SceneComposition.canonicalEditorObjects(scene.editor.objects) {
+                let localBounds = expandedBounds(of: object)
+                guard !localBounds.isNull, !localBounds.isInfinite else { continue }
+                let world = LectureCoordinateTransform.boardLocalToLectureWorld(
+                    localBounds, board: source
+                )
+                let horizontalOverlap = min(world.maxX, target.frame.maxX)
+                    - max(world.minX, target.frame.minX)
+                guard horizontalOverlap > 0 else { continue }
+                result = result.union(
+                    LectureCoordinateTransform.lectureWorldToBoardLocal(world, board: target)
+                )
+            }
+        }
+        return result.isNull ? nil : result
+    }
+
+    private static func expandedBounds(of object: CanvasObject) -> CGRect {
+        let bounds = BoardHitTestPolicy.bounds(of: object)
+        guard !bounds.isNull, !bounds.isInfinite else { return bounds }
+        let lineLike = object.type == "stroke" || object.type == "path"
+        let padding = lineLike ? max(CGFloat(object.width ?? 2) * 0.5, 1) : 1
+        return bounds.insetBy(dx: -padding, dy: -padding)
+    }
+
+    private static func rehomed(_ object: CanvasObject,
+                                from sourceBoardID: String,
+                                to destinationBoardID: String,
+                                by delta: CGPoint) -> CanvasObject {
+        guard let graph = object.graph else { return object.translated(by: delta) }
+        let moved = graph.translated(by: delta)
+        let selection = graph.sourceSelection.map { source in
+            GraphSourceSelection(
+                interactionID: source.interactionID,
+                sourceBoardIDs: Array(Set(source.sourceBoardIDs.map {
+                    $0 == sourceBoardID ? destinationBoardID : $0
+                })).sorted(),
+                selectedObjectKeys: source.selectedObjectKeys,
+                originalRecognitionRequestID: source.originalRecognitionRequestID,
+                originalSelectionBBox: source.originalSelectionBBox,
+                additionalFields: source.additionalFields
+            )
+        }
+        return CanvasObject(graph: GraphObject(
+            id: moved.id, owningBoardID: destinationBoardID, frame: moved.frame,
+            expressions: moved.expressions, viewport: moved.viewport,
+            settings: moved.settings, sourceSelection: selection,
+            providerMetadata: moved.providerMetadata,
+            createdAt: moved.createdAt, updatedAt: Date().timeIntervalSince1970,
+            version: moved.version, additionalFields: moved.additionalFields
+        ))
+    }
+}
+
 enum BoardSurfaceGeometry {
     static func sourceContentRect(origin: CGPoint = .zero, size: CGSize) -> CGRect {
         CGRect(origin: origin,
@@ -490,7 +617,6 @@ enum BoardSurfaceGeometry {
 /// region grows, so professor pixels/paths and every existing object keep the
 /// same board-local coordinates.
 enum BoardAutoExpansionPolicy {
-    static let triggerScreenPoints: CGFloat = 160
     static let chunkSourceWidthFraction: CGFloat = 0.33
     static let contentBottomPaddingFraction: CGFloat = 0.06
     static let shrinkHysteresisSourceWidthFraction: CGFloat = 0.18
@@ -499,18 +625,22 @@ enum BoardAutoExpansionPolicy {
         sourceKind == .physicalWhiteboard || sourceKind == .blankBoard
     }
 
-    static func expandedLocalRegion(current: CGRect, sourceSize: CGSize,
-                                    contactY: CGFloat, cameraScale: CGFloat) -> CGRect? {
+    /// Grows only after committed content actually crosses the current bottom.
+    /// Predicted samples, hover/proximity and camera scale never enter this policy.
+    static func committedExpansion(current: CGRect, sourceSize: CGSize,
+                                   contentBounds: CGRect) -> CGRect? {
         guard sourceSize.width > 0, sourceSize.height > 0,
-              contactY.isFinite, cameraScale.isFinite, cameraScale > 0 else { return nil }
+              !contentBounds.isNull,
+              contentBounds.maxY.isFinite else { return nil }
         let base = BoardSurfaceGeometry.workspaceRegion(sourceSize: sourceSize)
         let currentBottom = max(base.maxY, current.maxY)
-        let triggerMargin = triggerScreenPoints / cameraScale
-        guard contactY >= currentBottom - triggerMargin else { return nil }
+        guard contentBounds.maxY > currentBottom else { return nil }
 
         let chunk = max(1, sourceSize.width * chunkSourceWidthFraction)
-        var nextBottom = currentBottom + chunk
-        while nextBottom - contactY < triggerMargin { nextBottom += chunk }
+        let padding = max(24, sourceSize.width * contentBottomPaddingFraction)
+        let requiredBottom = contentBounds.maxY + padding
+        var nextBottom = currentBottom
+        while nextBottom < requiredBottom { nextBottom += chunk }
         return CGRect(x: 0, y: 0, width: sourceSize.width, height: nextBottom)
     }
 

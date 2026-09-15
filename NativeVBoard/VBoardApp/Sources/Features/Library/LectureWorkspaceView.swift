@@ -17,7 +17,7 @@ struct LectureWorkspaceView: View {
     @State private var showConflict = false
     @State private var showRenameBoard = false
     @State private var showSetUnit = false
-    @State private var showDeleteBoard = false
+    @State private var pendingDeleteBoardID: String?
     @State private var showShare = false
     @State private var exportURL: URL?
     @State private var actionError: String?
@@ -77,6 +77,14 @@ struct LectureWorkspaceView: View {
         .background(EditorNavigationGestureGuard())
         .toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
+                if interactiveGraph == nil {
+                    WorkspaceToolPalette(
+                        status: store.status.userLabel,
+                        undo: { store.undo(api: api) },
+                        redo: { store.redo(api: api) },
+                        retry: { Task { await store.saveNow(api: api) } }
+                    )
+                }
                 EditorToolMenu(activeTool: $activeTool)
                 Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }
                     .disabled(!store.canUndo)
@@ -125,7 +133,9 @@ struct LectureWorkspaceView: View {
                     }
                     #endif
                     if activeBoard != nil {
-                        Button(role: .destructive) { showDeleteBoard = true } label: { Label("Delete Whiteboard", systemImage: "trash") }
+                        Button(role: .destructive) {
+                            pendingDeleteBoardID = store.activeBoardID
+                        } label: { Label("Delete Whiteboard", systemImage: "trash") }
                     }
                     Button(role: .destructive) { showDelete = true } label: { Label("Delete Class", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
@@ -206,10 +216,19 @@ struct LectureWorkspaceView: View {
         } message: {
             Text("Your local camera and whiteboard placements are saved on this iPad. Choose which layout should remain.")
         }
-        .confirmationDialog("Delete this whiteboard?", isPresented: $showDeleteBoard, titleVisibility: .visible) {
-            Button("Delete Whiteboard", role: .destructive) { deleteActiveBoard() }
-            Button("Cancel", role: .cancel) {}
-        } message: { Text("The selected whiteboard and its edits will be permanently removed.") }
+        .confirmationDialog("Delete this board?", isPresented: Binding(
+            get: { pendingDeleteBoardID != nil },
+            set: { if !$0 { pendingDeleteBoardID = nil } }
+        ), titleVisibility: .visible) {
+            Button("Delete Board", role: .destructive) {
+                guard let boardID = pendingDeleteBoardID else { return }
+                pendingDeleteBoardID = nil
+                deleteBoard(boardID)
+            }
+            Button("Cancel", role: .cancel) { pendingDeleteBoardID = nil }
+        } message: {
+            Text("This removes content that belongs only to this board. Content crossing into another board is preserved there.")
+        }
         .alert("Couldn’t complete that action", isPresented: Binding(
             get: { actionError != nil }, set: { if !$0 { actionError = nil } }
         )) { Button("OK", role: .cancel) {} } message: { Text(actionError ?? "") }
@@ -363,6 +382,9 @@ struct LectureWorkspaceView: View {
 
                 graphAccessibilityOverlays(workspace, viewport: proxy.size)
                 studyMarkerOverlays(workspace, viewport: proxy.size)
+                if interactiveGraph == nil {
+                    boardDeleteOverlays(workspace, viewport: proxy.size)
+                }
 
                 if interactiveGraph != nil {
                     GraphOutsideInteractionShield { interactiveGraph = nil }
@@ -433,13 +455,6 @@ struct LectureWorkspaceView: View {
                     .shadow(color: .black.opacity(0.16), radius: 10, y: 4)
                     .zIndex(20)
                 }
-
-                WorkspaceToolPalette(status: store.status.userLabel,
-                                     undo: { store.undo(api: api) },
-                                     redo: { store.redo(api: api) },
-                                     retry: { Task { await store.saveNow(api: api) } })
-                    .padding(.bottom, 12)
-                    .zIndex(30)
 
                 if interactiveGraph == nil, !store.selectedKeys.isEmpty, let selectionScreenBounds {
                     SelectionActionBar(
@@ -555,6 +570,23 @@ struct LectureWorkspaceView: View {
         let key = SelectionKey(boardID: graph.owningBoardID, objectID: graph.id,
                                kind: .editorObject, objectType: "graph")
         store.deleteSelection(Set([key]), api: api)
+    }
+
+    @ViewBuilder
+    private func boardDeleteOverlays(_ workspace: LectureWorkspace,
+                                     viewport: CGSize) -> some View {
+        let transform = WorldScreenTransform(camera: workspace.camera, viewport: viewport)
+        let visible = CGRect(origin: .zero, size: viewport).insetBy(dx: -30, dy: -30)
+        ForEach(workspace.items, id: \.boardID) { item in
+            let corner = transform.screenPoint(for: item.frame.origin)
+            if visible.contains(corner) {
+                BoardDeleteAffordance {
+                    pendingDeleteBoardID = item.boardID
+                }
+                .position(x: corner.x + 14, y: corner.y + 14)
+                .zIndex(12)
+            }
+        }
     }
 
     @ViewBuilder
@@ -882,11 +914,14 @@ struct LectureWorkspaceView: View {
         }
     }
 
-    private func deleteActiveBoard() {
-        guard let board = activeBoard else { return }
+    private func deleteBoard(_ boardID: String) {
         Task {
             do {
-                try await api.deleteBoard(id: board.id)
+                guard await store.prepareBoardDeletion(boardID, api: api) else {
+                    actionError = "The board was left intact because its cross-board content could not be saved safely."
+                    return
+                }
+                try await api.deleteBoard(id: boardID)
                 await store.load(api: api)
             } catch { actionError = "The whiteboard could not be deleted." }
         }
@@ -1082,6 +1117,26 @@ struct WorkspaceToolPalette: View {
 
 }
 
+struct BoardDeleteAffordance: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(Color(uiColor: CanvasDesignTokens.canvasSecondaryText))
+                .frame(width: 22, height: 22)
+                .background(Color(uiColor: CanvasDesignTokens.toolbarSurface), in: Circle())
+                .overlay(Circle().stroke(.separator.opacity(0.55), lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
+        .accessibilityLabel("Delete this board")
+        .help("Delete this board")
+    }
+}
+
 enum EditorStatusIndicatorRole: Equatable {
     case saved
     case pending
@@ -1152,15 +1207,15 @@ private struct CanvasColorSwatch: View {
         .buttonStyle(.plain)
         .accessibilityLabel(CanvasColorPalette.name(for: hex))
         .accessibilityValue(CanvasColorPalette.accessibilityValue(for: hex))
-        .help(hex == CanvasColorPalette.skyPink ? "Sky Pink\nF2C4D7" : hex)
+        .help("\(CanvasColorPalette.name(for: hex))\n\(CanvasColorPalette.accessibilityValue(for: hex))")
         .onHover { hovering = $0 }
         .overlay(alignment: .bottom) {
-            if hovering, hex == CanvasColorPalette.skyPink {
+            if hovering {
                 VStack(spacing: 1) {
-                    Text("Sky Pink")
+                    Text(CanvasColorPalette.name(for: hex))
                         .font(.caption)
                         .foregroundStyle(.primary)
-                    Text("F2C4D7")
+                    Text(CanvasColorPalette.accessibilityValue(for: hex))
                         .font(.system(size: 9).italic())
                         .foregroundStyle(.secondary)
                 }

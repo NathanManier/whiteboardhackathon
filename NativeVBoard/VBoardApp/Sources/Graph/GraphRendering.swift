@@ -724,6 +724,27 @@ enum GraphFallbackRenderer {
                 shape.lineDashPattern = [6, 4]
             }
             container.addSublayer(shape)
+            let intercepts = GraphFallbackSampler.xIntercepts(
+                for: expression, viewport: graph.viewport, frame: frame,
+                angleMode: graph.settings.angleMode, environment: environment
+            )
+            if !intercepts.isEmpty {
+                let dotsPath = UIBezierPath()
+                for intercept in intercepts {
+                    dotsPath.append(UIBezierPath(ovalIn: CGRect(
+                        x: intercept.x - 3.5, y: intercept.y - 3.5,
+                        width: 7, height: 7
+                    )))
+                }
+                let dots = CAShapeLayer()
+                dots.frame = frame
+                dots.path = dotsPath.cgPath
+                dots.fillColor = CanvasDesignTokens.boardSurface.cgColor
+                dots.strokeColor = color.withAlphaComponent(opacity).cgColor
+                dots.lineWidth = 1.75
+                dots.contentsScale = contentsScale
+                container.addSublayer(dots)
+            }
             if path.isEmpty { unsupported.append(expression.latex) }
         }
         if showsUnsupportedMessage, !unsupported.isEmpty {
@@ -850,6 +871,60 @@ enum GraphTickPolicy {
 }
 
 enum GraphFallbackSampler {
+    /// Small, derived x-intercept markers for explicit curves. Reuse the
+    /// bounded native solver and then validate every candidate against the
+    /// evaluator; a sign change across an asymptote is not a root.
+    static func xIntercepts(for expression: GraphExpression,
+                            viewport: GraphViewport, frame: CGRect,
+                            angleMode: String? = "radians",
+                            environment: GraphMathEnvironment = .empty) -> [CGPoint] {
+        guard expression.restrictions.isEmpty,
+              expression.type != .inequality,
+              expression.type != .implicitEquation,
+              expression.type != .verticalLine,
+              expression.type != .point,
+              viewport.yMin <= 0, viewport.yMax >= 0 else { return [] }
+        let source = GraphEquationClassifier.explicitRightHandSide(expression.latex)
+            ?? expression.latex
+        guard let solution = try? NativeGraphMath.solve(
+            source, domain: viewport.xMin...viewport.xMax,
+            angleMode: angleMode, variables: environment.variables,
+            functions: environment.functions
+        ) else { return [] }
+        let yTolerance = max((viewport.yMax - viewport.yMin)
+                             / Double(max(frame.height, 1)) * 0.5, 1e-8)
+        let probes = [viewport.xMin, (viewport.xMin + viewport.xMax) / 2, viewport.xMax]
+        let probeValues = probes.compactMap {
+            try? NativeGraphMath.evaluateForGraph(
+                source, at: $0, angleMode: angleMode,
+                variables: environment.variables, functions: environment.functions
+            )
+        }
+        guard probeValues.count == probes.count,
+              !probeValues.allSatisfy({ $0.isFinite && abs($0) <= yTolerance })
+        else { return [] }
+        let count = 1_024
+        let xTolerance = max((viewport.xMax - viewport.xMin) / Double(count) * 0.2, 1e-8)
+        let roots = solution.values.filter { root in
+            guard root.isFinite, root >= viewport.xMin, root <= viewport.xMax,
+                  let residual = try? NativeGraphMath.evaluateForGraph(
+                    source, at: root, angleMode: angleMode,
+                    variables: environment.variables, functions: environment.functions
+                  ) else { return false }
+            return residual.isFinite && abs(residual) <= yTolerance
+        }
+        var deduplicated: [Double] = []
+        for root in roots.sorted() {
+            if deduplicated.last.map({ abs($0 - root) > xTolerance }) ?? true {
+                deduplicated.append(root)
+            }
+            if deduplicated.count == 16 { break }
+        }
+        return deduplicated.map {
+            map(x: $0, y: 0, viewport: viewport, frame: frame)
+        }
+    }
+
     static func path(for expression: GraphExpression, viewport: GraphViewport,
                      frame: CGRect, angleMode: String? = "radians",
                      environment: GraphMathEnvironment = .empty) -> UIBezierPath {
@@ -1783,6 +1858,19 @@ struct NativeGraphMathResult: Equatable, Sendable {
 /// input is parsed by SafeGraphExpression and is never passed to eval, a web
 /// provider, Python, or another arbitrary-code runtime.
 enum NativeGraphMath {
+    /// Shared residual evaluator for derived graph affordances. It deliberately
+    /// uses the same safe parser/environment as solve rather than sampling a
+    /// second, potentially inconsistent expression implementation.
+    static func evaluateForGraph(_ source: String, at x: Double,
+                                 angleMode: String? = "radians",
+                                 variables: [String: Double] = [:],
+                                 functions: [String: String] = [:]) throws -> Double {
+        let evaluator = try equationEvaluator(
+            source, angleMode: angleMode, variables: variables, functions: functions
+        )
+        return evaluator(x)
+    }
+
     static func calculate(_ source: String, angleMode: String? = "radians",
                           variables: [String: Double] = [:],
                           functions: [String: String] = [:])

@@ -290,6 +290,7 @@ private struct BoardEditorSurface: View {
     @State private var graphCreationRequest: GraphCreationRequest?
     @State private var editingGraph: GraphObject?
     @State private var interactiveGraph: GraphObject?
+    @State private var showDeleteBoardConfirmation = false
     @State private var canvasSize = CGSize.zero
     @AppStorage("vboard.study.inspectorWidth") private var studyPanelWidth = 0.0
     @AppStorage("vboard.study.panelCollapsed") private var studyPanelCollapsed = false
@@ -342,6 +343,14 @@ private struct BoardEditorSurface: View {
         }
         .navigationTitle(board.name).navigationBarTitleDisplayMode(.inline).toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
+                if interactiveGraph == nil {
+                    WorkspaceToolPalette(
+                        status: store.status.userLabel,
+                        undo: { store.undo(api: api) },
+                        redo: { store.redo(api: api) },
+                        retry: { Task { await store.saveNow(api: api) } }
+                    )
+                }
                 EditorToolMenu(activeTool: $activeTool)
                 Button { store.undo(api: api) } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!store.canUndo)
                 Button { store.redo(api: api) } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!store.canRedo)
@@ -363,9 +372,21 @@ private struct BoardEditorSurface: View {
                         Label("Apple Pencil Validation", systemImage: "pencil.and.scribble")
                     }
                     #endif
-                    Button(role: .destructive) { Task { await deleteBoard() } } label: { Label("Delete Board", systemImage: "trash") }
+                    Button(role: .destructive) {
+                        showDeleteBoardConfirmation = true
+                    } label: { Label("Delete Board", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
+        }
+        .confirmationDialog("Delete this board?",
+                            isPresented: $showDeleteBoardConfirmation,
+                            titleVisibility: .visible) {
+            Button("Delete Board", role: .destructive) {
+                Task { await deleteBoard() }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This board and content that belongs only to it will be permanently removed.")
         }
         .sheet(isPresented: $showImport) { ImportFlowView(folderID: board.folderID) { _ in showImport = false } }
         .sheet(item: $graphCreationRequest) { request in
@@ -494,6 +515,16 @@ private struct BoardEditorSurface: View {
                 onPencilPaletteDismiss: { pencilQuickPalettePoint = nil }
             )
                 .ignoresSafeArea(edges: .bottom)
+            if interactiveGraph == nil {
+                let transform = WorldScreenTransform(
+                    camera: liveCamera ?? store.editor.viewport,
+                    viewport: proxy.size
+                )
+                let corner = transform.screenPoint(for: document.viewBox.origin)
+                BoardDeleteAffordance { showDeleteBoardConfirmation = true }
+                    .position(x: corner.x + 14, y: corner.y + 14)
+                    .zIndex(12)
+            }
             ForEach(store.editor.objects.compactMap(\.graph).filter {
                 $0.id != interactiveGraph?.id
             }) { graph in
@@ -574,13 +605,6 @@ private struct BoardEditorSurface: View {
                 .zIndex(20)
                 }
             }
-            WorkspaceToolPalette(status: store.status.userLabel,
-                                 undo: { store.undo(api: api) },
-                                 redo: { store.redo(api: api) },
-                                 retry: { Task { await store.saveNow(api: api) } })
-            .padding(.bottom, 12)
-            .zIndex(30)
-
             if let point = pencilQuickPalettePoint {
                 Color.clear
                     .contentShape(Rectangle())

@@ -623,6 +623,27 @@ final class BoardDocumentStore: ObservableObject {
         scheduleSave(api: api)
     }
 
+    /// Idempotent transfer used before deleting a board from a lecture. A
+    /// retry may see the same object already saved; a conflicting object with
+    /// the same stable ID blocks deletion rather than silently overwriting it.
+    func canAppendTransferredObjects(_ objects: [CanvasObject]) -> Bool {
+        return objects.allSatisfy { object in
+            editor.objects.first(where: { $0.id == object.id }).map { $0 == object } ?? true
+        }
+    }
+
+    @discardableResult
+    func appendTransferredObjects(_ objects: [CanvasObject], api: APIClient) -> Bool {
+        guard canAppendTransferredObjects(objects) else { return false }
+        let existingIDs = Set(editor.objects.map(\.id))
+        let fresh = objects.filter { !existingIDs.contains($0.id) }
+        guard !fresh.isEmpty else { return true }
+        var next = editor
+        next.objects.append(contentsOf: fresh)
+        apply(next, api: api)
+        return true
+    }
+
     func undo(api: APIClient) {
         endGraphEditing()
         guard var previous = undoStack.popLast() else { return }

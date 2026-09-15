@@ -379,6 +379,48 @@ final class LectureWorkspaceStore: ObservableObject {
         await boardStores[boardID]?.saveNow(api: api)
     }
 
+    /// Saves every cross-board object into a surviving board before the
+    /// caller removes the source board. Returning false is a hard safety stop:
+    /// the UI must leave the board intact when a required scene cannot load or
+    /// a destination cannot accept/persist the transfer.
+    func prepareBoardDeletion(_ boardID: String, api: APIClient) async -> Bool {
+        guard let current = workspace,
+              let source = current.items.first(where: { $0.boardID == boardID }) else {
+            return false
+        }
+        requestDetail(for: [boardID], api: api)
+        if let task = sceneLoadTasks[boardID] { await task.value }
+        guard let sourceScene = scenes[boardID], boardStores[boardID] != nil else {
+            return false
+        }
+        let assignments = BoardDeletionTransferPlanner.assignments(
+            deleting: source,
+            objects: sourceScene.editor.objects,
+            surviving: current.items.filter { $0.boardID != boardID }
+        )
+        guard !assignments.isEmpty else { return true }
+
+        let required = Set(assignments.keys).union([boardID])
+        requestDetail(for: required, api: api)
+        let tasks = assignments.keys.compactMap { sceneLoadTasks[$0] }
+        for task in tasks { await task.value }
+        guard assignments.allSatisfy({ boardStores[$0.key] != nil }) else { return false }
+        guard assignments.allSatisfy({ boardStores[$0.key]?.canAppendTransferredObjects($0.value) == true })
+        else { return false }
+
+        for (destinationID, objects) in assignments {
+            guard let destination = boardStores[destinationID],
+                  destination.appendTransferredObjects(objects, api: api) else { return false }
+            refreshSceneSnapshot(destinationID, api: api)
+        }
+        for destinationID in assignments.keys {
+            guard let destination = boardStores[destinationID] else { return false }
+            await destination.saveNow(api: api)
+            guard destination.status == .clean else { return false }
+        }
+        return true
+    }
+
     func requestDetail(for boardIDs: Set<String>, api: APIClient) {
         guard let workspace else { return }
         let valid = Set(workspace.items.map(\.boardID))
@@ -975,6 +1017,11 @@ final class LectureWorkspaceStore: ObservableObject {
             guard
                   let transformed = path.copy(using: &affine) else { continue }
             local = local.union(transformed.boundingBoxOfPath)
+        }
+        if let foreign = BoardDeletionTransferPlanner.foreignContentBounds(
+            for: item, items: current.items, scenes: scenes
+        ) {
+            local = local.union(foreign)
         }
         if BoardAutoExpansionPolicy.isEligible(item.sourceKind) {
             let existingLocal = item.effectiveFrame.offsetBy(dx: -CGFloat(item.canvasX),

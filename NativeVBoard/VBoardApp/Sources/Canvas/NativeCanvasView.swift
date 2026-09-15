@@ -56,19 +56,48 @@ enum CanvasDesignTokens {
     static let dotColor = UIColor(red: 0.18, green: 0.25, blue: 0.32, alpha: 1)
 }
 
+struct CanvasColorPaletteEntry: Identifiable, Equatable, Sendable {
+    let name: String
+    let hex: String
+
+    var id: String { hex }
+}
+
 enum CanvasColorPalette {
     static let skyPink = "#F2C4D7"
-    static let standard = [
-        "#183153", "#111111", "#C62828", "#1565C0", "#2E7D32",
-        "#FFD60A", "#FF8A00", skyPink,
+    static let standardEntries = [
+        CanvasColorPaletteEntry(name: "Board Navy", hex: "#183153"),
+        CanvasColorPaletteEntry(name: "Ink Black", hex: "#111111"),
+        CanvasColorPaletteEntry(name: "Chalk Red", hex: "#C62828"),
+        CanvasColorPaletteEntry(name: "Blueprint Blue", hex: "#1565C0"),
+        CanvasColorPaletteEntry(name: "Campus Green", hex: "#2E7D32"),
+        CanvasColorPaletteEntry(name: "Sunbeam Yellow", hex: "#FFD60A"),
+        CanvasColorPaletteEntry(name: "Tangerine Pop", hex: "#FF8A00"),
+        CanvasColorPaletteEntry(name: "Sky Pink", hex: skyPink),
     ]
-    static let pencilQuick = [
-        "#111827", "#2563EB", "#DC2626", "#16A34A", "#7C3AED",
-        "#EA580C", "#DB2777", "#F8FAFC", skyPink,
+    static let pencilQuickEntries = [
+        CanvasColorPaletteEntry(name: "Midnight Ink", hex: "#111827"),
+        CanvasColorPaletteEntry(name: "Electric Blue", hex: "#2563EB"),
+        CanvasColorPaletteEntry(name: "Apple Red", hex: "#DC2626"),
+        CanvasColorPaletteEntry(name: "Field Green", hex: "#16A34A"),
+        CanvasColorPaletteEntry(name: "Violet Spark", hex: "#7C3AED"),
+        CanvasColorPaletteEntry(name: "Burnt Orange", hex: "#EA580C"),
+        CanvasColorPaletteEntry(name: "Berry Punch", hex: "#DB2777"),
+        CanvasColorPaletteEntry(name: "Cloud White", hex: "#F8FAFC"),
+        CanvasColorPaletteEntry(name: "Sky Pink", hex: skyPink),
     ]
+    static let standard = standardEntries.map(\.hex)
+    static let pencilQuick = pencilQuickEntries.map(\.hex)
+
+    private static let namesByHex = Dictionary(
+        (standardEntries + pencilQuickEntries).map {
+            ($0.hex.uppercased(), $0.name)
+        },
+        uniquingKeysWith: { first, _ in first }
+    )
 
     static func name(for hex: String) -> String {
-        hex.uppercased() == skyPink ? "Sky Pink" : "Color \(hex)"
+        namesByHex[hex.uppercased()] ?? "Custom Color"
     }
 
     static func accessibilityValue(for hex: String) -> String {
