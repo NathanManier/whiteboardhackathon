@@ -5148,7 +5148,10 @@ def create_blank_board() -> Response | tuple[Response, int]:
         return jsonify(error=str(exc)), 400
 
     width = 1600
-    height = 1000
+    # Blank writing surfaces intentionally start taller than photographed
+    # boards. This gives Pencil users useful vertical room without changing
+    # the fixed 1600-point board width or invoking the CV pipeline.
+    height = 2000
     now = time.time()
     board_id = secrets.token_hex(16)
     board_dir = board_directory(board_id, create=True)
@@ -5180,7 +5183,7 @@ def create_blank_board() -> Response | tuple[Response, int]:
         "x": 0,
         "y": 0,
         "width": width,
-        "height": 1500,
+        "height": 3000,
     }
     atomic_json(editor_path(board_dir), editor)
 

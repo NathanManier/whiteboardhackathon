@@ -105,6 +105,7 @@ class LectureWorkspaceTests(unittest.TestCase):
         board_dir = board_app.BOARDS_DIR / board["id"]
         metadata = board_app.read_metadata(board_dir)
         self.assertEqual(metadata["source"]["kind"], "blank_board")
+        self.assertEqual(metadata["dimensions"], {"width": 1600, "height": 2000})
         self.assertEqual(metadata["assets"], {"svg": "board.svg"})
         self.assertFalse((board_dir / "original.jpg").exists())
         self.assertFalse((board_dir / "master.png").exists())
@@ -112,7 +113,9 @@ class LectureWorkspaceTests(unittest.TestCase):
         self.assertEqual((board_dir / "board.svg").read_text(encoding="utf-8").count("<path"), 0)
         editor = json.loads((board_dir / "editor.json").read_text(encoding="utf-8"))
         self.assertEqual(editor["objects"], [])
-        self.assertEqual(editor["viewport"]["height"], 1500)
+        self.assertEqual(editor["viewport"], {
+            "x": 0, "y": 0, "width": 1600, "height": 3000,
+        })
         workspace = payload["workspace"]
         self.assertEqual([item["board_id"] for item in workspace["items"]],
                          [existing_id, board["id"]])
