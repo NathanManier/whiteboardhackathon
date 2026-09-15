@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 
 from .master_raster import MasterRaster
+from .gap_repair import repair_gaps
 
 INK_COLORS = ("black", "red", "blue", "green")
 LOGGER = logging.getLogger(__name__)
@@ -173,6 +174,7 @@ def detect_ink(
     confidence_threshold: float = 0.30,
     minimum_component_area: int | None = None,
     suppress_reflections: bool = True,
+    repair_short_gaps: bool = True,
 ) -> InkDetectionResult:
     """Segment black, red, blue, and green marker strokes from a BGR master.
 
@@ -274,6 +276,25 @@ def detect_ink(
             time.monotonic() - color_started,
         )
 
+    repair_metrics = {}
+    if repair_short_gaps:
+        # Use original masks as obstacles, never another repair as evidence.
+        originals = dict(masks)
+        gap_limit = max(3, min(12, round(max(image.shape[:2]) * 0.003)))
+        for color in INK_COLORS:
+            competing = np.maximum.reduce([originals[c] for c in INK_COLORS if c != color])
+            # Weak evidence must still prefer this pen color over every other.
+            other_confidence = np.maximum.reduce([maps[c] for c in INK_COLORS if c != color])
+            evidence = np.where(maps[color] > other_confidence, maps[color], 0)
+            threshold = confidence_threshold if color == "black" else min(confidence_threshold, 0.07)
+            repaired, detail = repair_gaps(originals[color], evidence, competing, threshold, gap_limit)
+            repaired.setflags(write=False)
+            masks[color] = repaired
+            selected = maps[color][repaired != 0]
+            summaries[color] = float(selected.mean()) if selected.size else 0.0
+            repair_metrics[color] = detail
+        LOGGER.info("GAP REPAIR END per_color=%s", repair_metrics)
+
     combined = np.maximum.reduce(list(masks.values()))
     combined = np.ascontiguousarray(combined)
     combined.setflags(write=False)
@@ -290,6 +311,7 @@ def detect_ink(
         MappingProxyType(
             {
                 "reflection_suppression": bool(suppress_reflections),
+                "gap_repair": repair_metrics,
                 "per_color": component_metrics,
                 "foreground_pixels": int(np.count_nonzero(combined)),
             }
